@@ -1,0 +1,4 @@
+# Build output — binaries are shipped as GitHub release assets, never committed.
+/dist/
+/out/
+*.log

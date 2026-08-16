@@ -1,0 +1,28 @@
+name: release
+
+# Push a tag like v0.7.0 → build the per-arch static binaries and publish them
+# as assets on a GitHub Release. The panel installs/updates from these assets
+# (console.php fanout_binary); the binaries are never committed to the repo.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: Build + checksums
+        run: ./release.sh "${GITHUB_REF_NAME#v}"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/xc_fanout-linux-*
+            dist/SHA256SUMS
