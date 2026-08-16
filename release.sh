@@ -43,5 +43,5 @@ for T in "${TARGETS[@]}"; do
 done
 
 ( cd "$OUT" && sha256sum xc_fanout-linux-* > SHA256SUMS )
-echo ">>> done — $OUT (tag as v$VERSION and attach these as release assets)"
+echo ">>> done — $OUT (tag as $VERSION and attach these as release assets)"
 ls -la "$OUT"

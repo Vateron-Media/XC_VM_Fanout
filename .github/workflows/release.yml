@@ -1,11 +1,11 @@
 name: release
 
-# Push a tag like v0.7.0 → build the per-arch static binaries and publish them
+# Push a tag like 0.7.0 → build the per-arch static binaries and publish them
 # as assets on a GitHub Release. The panel installs/updates from these assets
 # (console.php fanout_binary); the binaries are never committed to the repo.
 on:
   push:
-    tags: ['v*']
+    tags: ['[0-9]*']
 
 permissions:
   contents: write
