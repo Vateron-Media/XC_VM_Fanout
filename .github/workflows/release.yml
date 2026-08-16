@@ -1,8 +1,9 @@
 name: release
 
-# Push a tag like 0.7.0 → build the per-arch static binaries and publish them
-# as assets on a GitHub Release. The panel installs/updates from these assets
-# (console.php fanout_binary); the binaries are never committed to the repo.
+# Push a version tag (e.g. 0.7.0 — NO "v" prefix, per project convention) →
+# build the per-arch static binaries and publish them as assets on a GitHub
+# Release. The panel installs/updates from these assets (console.php
+# fanout_binary); the binaries are never committed to the repo.
 on:
   push:
     tags: ['[0-9]*']
@@ -19,7 +20,7 @@ jobs:
         with:
           go-version: '1.21'
       - name: Build + checksums
-        run: ./release.sh "${GITHUB_REF_NAME#v}"
+        run: ./release.sh "${GITHUB_REF_NAME}"
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:

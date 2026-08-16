@@ -29,12 +29,12 @@ daemon.
 
 ```bash
 ./release.sh 0.7.0        # runs go test, builds dist/xc_fanout-linux-* + SHA256SUMS
-git commit -am "release 0.7.0" && git tag v0.7.0 && git push --tags
+git commit -am "release 0.7.0" && git tag 0.7.0 && git push --tags
 ```
 
-Pushing the `v*` tag triggers `.github/workflows/release.yml`, which rebuilds and
+Pushing the version tag (no `v` prefix) triggers `.github/workflows/release.yml`, which rebuilds and
 attaches `dist/*` to the GitHub Release. (Or attach them manually:
-`gh release create v0.7.0 dist/*`.)
+`gh release create 0.7.0 dist/*`.)
 
 ## Develop
 
