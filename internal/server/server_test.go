@@ -33,7 +33,7 @@ func ctlRequest(t *testing.T, base, method, path, body string) int {
 }
 
 func TestControlRegisterAndUnregister(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	ts := httptest.NewServer(mgr.ControlHandler())
 	defer ts.Close()
 
@@ -66,7 +66,7 @@ func TestControlRegisterAndUnregister(t *testing.T) {
 }
 
 func TestControlRejectsBadRequests(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	ts := httptest.NewServer(mgr.ControlHandler())
 	defer ts.Close()
 
@@ -125,7 +125,7 @@ func TestIdleStopRespectsRefsAndAccess(t *testing.T) {
 }
 
 func TestControlStatusEndpoint(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	ts := httptest.NewServer(mgr.ControlHandler())
 	defer ts.Close()
 
@@ -155,7 +155,7 @@ func TestControlStatusEndpoint(t *testing.T) {
 // /live and segments it for /hls, with no puller involved.
 func TestIngestPushFeedsLiveAndHLS(t *testing.T) {
 	dir := t.TempDir()
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	mgr.SetIngestDir(dir)
 
 	sock, err := mgr.RegisterIngest("9", 0)
@@ -207,7 +207,7 @@ func TestIngestPushFeedsLiveAndHLS(t *testing.T) {
 // TestProbeReportsNoDataForDeadSource: probing a registered stream whose source
 // can't produce returns has_data=false within the wait window (off-air signal).
 func TestProbeReportsNoDataForDeadSource(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	ts := httptest.NewServer(mgr.ControlHandler())
 	defer ts.Close()
 
@@ -224,7 +224,7 @@ func TestProbeReportsNoDataForDeadSource(t *testing.T) {
 }
 
 func TestConnectionTrackingAndReconcileList(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	st := mgr.GetOrCreate("5")
 	st.addConn("uuidA")
 	st.addConn("uuidB")
@@ -296,7 +296,7 @@ func get(t *testing.T, url string) ([]byte, string, int) {
 }
 
 func TestServeHLSPlaylistAndSegment(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	feedStream(mgr.GetOrCreate("5"))
 	ts := httptest.NewServer(mgr.ClientHandler())
 	defer ts.Close()
@@ -316,7 +316,7 @@ func TestServeHLSPlaylistAndSegment(t *testing.T) {
 }
 
 func TestServe404s(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	feedStream(mgr.GetOrCreate("5"))
 	ts := httptest.NewServer(mgr.ClientHandler())
 	defer ts.Close()
@@ -329,7 +329,7 @@ func TestServe404s(t *testing.T) {
 }
 
 func TestServeLiveStreamsSnapshotThenTail(t *testing.T) {
-	mgr := NewManager(1<<20, 2, 6, time.Second)
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	st := mgr.GetOrCreate("5")
 	feedStream(st)
 	ts := httptest.NewServer(mgr.ClientHandler())

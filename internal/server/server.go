@@ -284,26 +284,29 @@ func (s *Stream) status() streamStatus {
 // Manager holds the live streams keyed by id.
 type Manager struct {
 	mu        sync.Mutex
-	streams   map[string]*Stream
-	maxGOP    int
-	hlsTarget float64
-	hlsWindow int
-	grace     time.Duration
-	ingestDir string // base dir for per-stream push-fed ingest sockets
+	streams     map[string]*Stream
+	maxGOP      int
+	maxPrebufMS int64 // ceiling for per-viewer client prebuffer (ms of TS history)
+	hlsTarget   float64
+	hlsWindow   int
+	grace       time.Duration
+	ingestDir   string // base dir for per-stream push-fed ingest sockets
 }
 
 // SetIngestDir sets the directory for per-stream ingest sockets (non-proxy tee).
 func (m *Manager) SetIngestDir(dir string) { m.ingestDir = dir }
 
-// NewManager configures hub join size, HLS segment target/window, and the
-// idle-stop grace period for control-managed streams.
-func NewManager(maxGOP int, hlsTarget float64, hlsWindow int, grace time.Duration) *Manager {
+// NewManager configures hub join size, the client-prebuffer ceiling (ms of live
+// TS history retained per stream), HLS segment target/window, and the idle-stop
+// grace period for control-managed streams.
+func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int, grace time.Duration) *Manager {
 	return &Manager{
-		streams:   make(map[string]*Stream),
-		maxGOP:    maxGOP,
-		hlsTarget: hlsTarget,
-		hlsWindow: hlsWindow,
-		grace:     grace,
+		streams:     make(map[string]*Stream),
+		maxGOP:      maxGOP,
+		maxPrebufMS: maxPrebufMS,
+		hlsTarget:   hlsTarget,
+		hlsWindow:   hlsWindow,
+		grace:       grace,
 	}
 }
 
@@ -354,7 +357,7 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 	st := m.streams[id]
 	if st == nil {
 		st = &Stream{
-			Hub:   hub.New(m.maxGOP),
+			Hub:   hub.New(m.maxGOP, m.maxPrebufMS),
 			Seg:   hlsseg.New(m.hlsTarget, m.hlsWindow),
 			chunk: defaultChunk,
 			grace: m.grace,
@@ -574,7 +577,20 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub, snap := st.Hub.Subscribe()
+	// client_prebuffer (seconds, from live.php's X-Accel URL) → a keyframe-aligned
+	// history burst on join, clamped to the daemon's retention ceiling. Absent/0
+	// keeps the minimal current-GOP clean join.
+	var prebufMS int64
+	if q := r.URL.Query().Get("prebuffer"); q != "" {
+		if sec, err := strconv.Atoi(q); err == nil && sec > 0 {
+			prebufMS = int64(sec) * 1000
+			if prebufMS > m.maxPrebufMS {
+				prebufMS = m.maxPrebufMS
+			}
+		}
+	}
+
+	sub, snap := st.Hub.Subscribe(prebufMS)
 	defer st.Hub.Unsubscribe(sub)
 	st.attach()
 	defer st.detach()

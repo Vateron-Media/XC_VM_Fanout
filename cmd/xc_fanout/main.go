@@ -48,6 +48,7 @@ func main() {
 	cookie := flag.String("cookie", "", "source Cookie header")
 	ffmpeg := flag.String("ffmpeg", "ffmpeg", "ffmpeg binary path")
 	maxGOP := flag.Int("maxgop", 10528000, "max join-snapshot size in bytes")
+	prebufferMax := flag.Int("prebuffer-max", 20, "ceiling (seconds) of live TS history retained per stream for client_prebuffer; a viewer's ?prebuffer= is clamped to this")
 	chunk := flag.Int("chunk", 12032, "ingest read size (aligned down to 188)")
 	hlsTarget := flag.Float64("hlstarget", 6, "HLS target segment duration (seconds)")
 	hlsWindow := flag.Int("hlswindow", 6, "HLS segments kept in the sliding window")
@@ -62,7 +63,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	mgr := server.NewManager(*maxGOP, *hlsTarget, *hlsWindow, time.Duration(*grace)*time.Second)
+	mgr := server.NewManager(*maxGOP, int64(*prebufferMax)*1000, *hlsTarget, *hlsWindow, time.Duration(*grace)*time.Second)
 	idir := *ingestDir
 	if idir == "" {
 		idir = filepath.Join(filepath.Dir(*sock), "ingest")

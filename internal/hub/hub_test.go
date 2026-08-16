@@ -15,12 +15,12 @@ func mkPkt(marker byte) []byte {
 // TestFanoutIdentical asserts every subscriber receives the exact same live
 // byte stream from a single producer.
 func TestFanoutIdentical(t *testing.T) {
-	h := New(1 << 20)
+	h := New(1<<20, 0)
 
 	const nSubs = 3
 	subs := make([]*Sub, nSubs)
 	for i := range subs {
-		subs[i], _ = h.Subscribe()
+		subs[i], _ = h.Subscribe(0)
 	}
 
 	const nChunks = 100 // < subQueue, so nothing is dropped
@@ -51,8 +51,8 @@ func TestFanoutIdentical(t *testing.T) {
 // TestSlowSubscriberDropped asserts a subscriber that never reads is dropped
 // once its queue overflows, and does not block the producer.
 func TestSlowSubscriberDropped(t *testing.T) {
-	h := New(1 << 20)
-	slow, _ := h.Subscribe()
+	h := New(1<<20, 0)
+	slow, _ := h.Subscribe(0)
 
 	// Publish well past the queue depth without ever reading `slow`.
 	for i := 0; i < subQueue+50; i++ {

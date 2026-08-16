@@ -38,9 +38,11 @@ type Hub struct {
 	join *tsjoin.State
 }
 
-// New returns a Hub whose join snapshot is capped at maxGOP bytes.
-func New(maxGOP int) *Hub {
-	return &Hub{subs: make(map[*Sub]struct{}), join: tsjoin.New(maxGOP)}
+// New returns a Hub. maxGOP caps a single GOP (bytes); maxPrebufMS is how many
+// milliseconds of keyframe-aligned history the join state keeps for client
+// prebuffer (0 = current GOP only).
+func New(maxGOP int, maxPrebufMS int64) *Hub {
+	return &Hub{subs: make(map[*Sub]struct{}), join: tsjoin.New(maxGOP, maxPrebufMS)}
 }
 
 // Publish folds a packet-aligned chunk into the join state and broadcasts it to
@@ -65,12 +67,14 @@ func (h *Hub) Publish(chunk []byte) {
 }
 
 // Subscribe registers a new subscriber and returns it together with the join
-// snapshot the caller must send before draining Sub.C(). Registering the
-// subscriber and capturing the snapshot happen under the same lock, so the live
-// tail continues exactly where the snapshot ends — no gap, no duplication.
-func (h *Hub) Subscribe() (*Sub, []byte) {
+// snapshot the caller must send before draining Sub.C(). prebufMS is how many
+// milliseconds of prebuffer the subscriber wants (0 = current GOP only).
+// Registering the subscriber and capturing the snapshot happen under the same
+// lock, so the live tail continues exactly where the snapshot ends — no gap, no
+// duplication.
+func (h *Hub) Subscribe(prebufMS int64) (*Sub, []byte) {
 	h.mu.Lock()
-	snap := h.join.Snapshot()
+	snap := h.join.Snapshot(prebufMS)
 	s := &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()
