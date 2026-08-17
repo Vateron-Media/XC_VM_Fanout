@@ -14,7 +14,7 @@
 
 ## Клиентская поверхность (для nginx)
 
-Роутинг — [`ClientHandler`](../internal/server/server.go). Сюда nginx проксирует
+Роутинг — [`ClientHandler`](../../internal/server/server.go). Сюда nginx проксирует
 запросы зрителей, обычно через `X-Accel-Redirect` из `live.php`.
 
 | Метод и путь | Назначение |
@@ -27,7 +27,7 @@
 ### `GET /live/<id>` — живой TS
 
 Держит соединение открытым и непрерывно льёт зрителю MPEG-TS. Обработчик —
-[`serveLive`](../internal/server/server.go).
+[`serveLive`](../../internal/server/server.go).
 
 **Query-параметры:**
 
@@ -58,7 +58,7 @@
 ### `GET /hls/<id>/index.m3u8` — плейлист HLS
 
 Возвращает текущий медиаплейлист, сгенерированный в памяти. Обработчик —
-[`serveHLS`](../internal/server/server.go).
+[`serveHLS`](../../internal/server/server.go).
 
 - Если сегментов ещё нет — `404 no segments yet`.
 - **Ответ:** `200`, `Content-Type: application/vnd.apple.mpegurl`, `Cache-Control: no-store`.
@@ -85,7 +85,7 @@
 
 ## Управляющая поверхность (только для PHP)
 
-Включается флагом `-ctl`. Роутинг — [`ControlHandler`](../internal/server/server.go).
+Включается флагом `-ctl`. Роутинг — [`ControlHandler`](../../internal/server/server.go).
 Сюда ходит **только PHP-панель**.
 
 | Метод и путь | Назначение |
@@ -182,7 +182,7 @@
 
 Прогревает зарегистрированный поток (запускает puller, как это сделал бы зритель) и
 ждёт появления данных, затем возвращает тот же JSON, что `GET /streams/<id>`.
-Обработчик — [`serveProbe`](../internal/server/server.go).
+Обработчик — [`serveProbe`](../../internal/server/server.go).
 
 | Параметр | По умолчанию | Максимум | Смысл |
 |----------|:-----------:|:--------:|-------|
@@ -196,7 +196,7 @@ PHP вызывает это после регистрации proxy-источн
 ### `GET /connections` — реконсиляция зрителей
 
 Возвращает JSON-массив uuid **всех** сейчас подключённых live-TS зрителей (значения
-`?c=`) по всем потокам. Обработчик — [`serveConnections`](../internal/server/server.go).
+`?c=`) по всем потокам. Обработчик — [`serveConnections`](../../internal/server/server.go).
 
 > uuid дедуплицируется **в пределах одного потока** (refcount на подключение). Глобальной
 > дедупликации по потокам нет: один и тот же uuid, подключённый к двум разным потокам,

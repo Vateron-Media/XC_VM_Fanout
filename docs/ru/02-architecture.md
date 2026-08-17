@@ -48,14 +48,14 @@
 
 | Пакет | Файл | Роль |
 |-------|------|------|
-| `server` | [server.go](../internal/server/server.go) | Реестр `id → Stream`, обе HTTP-поверхности, жизненный цикл потока on-demand. |
-| `hub` | [hub.go](../internal/hub/hub.go) | Fan-out одного TS-потока множеству подписчиков; медленных отбрасывает. |
-| `tsjoin` | [tsjoin.go](../internal/tsjoin/tsjoin.go) | Разбор MPEG-TS: PAT/PMT + кольцо GOP’ов для «чистого входа» и prebuffer. |
-| `hlsseg` | [hlsseg.go](../internal/hlsseg/hlsseg.go) | Нарезка живого TS в HLS-сегменты по видео-ключкадрам, полностью в RAM. |
-| `hlscrypt` | [hlscrypt.go](../internal/hlscrypt/hlscrypt.go) | AES-128-CBC шифрование HLS-сегментов (совместимо с панелью). |
-| `puller` | [puller.go](../internal/puller/puller.go) | Захват источника (прямой mp2t или ремукс ffmpeg), reconnect с backoff. |
-| `ingest` | [ingest.go](../internal/ingest/ingest.go) | Копирование TS-потока в publish-колбэк 188-байт-выровненными чанками. |
-| `cmd/xc_fanout` | [main.go](../cmd/xc_fanout/main.go) | Точка входа: флаги, поднятие сокетов, graceful shutdown. |
+| `server` | [server.go](../../internal/server/server.go) | Реестр `id → Stream`, обе HTTP-поверхности, жизненный цикл потока on-demand. |
+| `hub` | [hub.go](../../internal/hub/hub.go) | Fan-out одного TS-потока множеству подписчиков; медленных отбрасывает. |
+| `tsjoin` | [tsjoin.go](../../internal/tsjoin/tsjoin.go) | Разбор MPEG-TS: PAT/PMT + кольцо GOP’ов для «чистого входа» и prebuffer. |
+| `hlsseg` | [hlsseg.go](../../internal/hlsseg/hlsseg.go) | Нарезка живого TS в HLS-сегменты по видео-ключкадрам, полностью в RAM. |
+| `hlscrypt` | [hlscrypt.go](../../internal/hlscrypt/hlscrypt.go) | AES-128-CBC шифрование HLS-сегментов (совместимо с панелью). |
+| `puller` | [puller.go](../../internal/puller/puller.go) | Захват источника (прямой mp2t или ремукс ffmpeg), reconnect с backoff. |
+| `ingest` | [ingest.go](../../internal/ingest/ingest.go) | Копирование TS-потока в publish-колбэк 188-байт-выровненными чанками. |
+| `cmd/xc_fanout` | [main.go](../../cmd/xc_fanout/main.go) | Точка входа: флаги, поднятие сокетов, graceful shutdown. |
 
 ## Ключевые сущности
 

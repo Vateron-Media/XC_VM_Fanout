@@ -1,6 +1,6 @@
 # xc_fanout documentation
 
-**Language:** [Русский](../README.md) · English
+**Language:** [Русский](../ru/README.md) · English
 
 `xc_fanout` is XC_VM's native live-stream **fan-out** daemon:
 **one process pulls each source exactly once** and fans it out to many viewers

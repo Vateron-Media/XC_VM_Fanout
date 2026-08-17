@@ -43,7 +43,7 @@ git tag 0.7.0 && git push --tags          # тег БЕЗ префикса "v" �
 ## Что происходит после push тега
 
 Push тега вида `[0-9]*` (например `0.7.0`) триггерит workflow
-[`.github/workflows/release.yml`](../.github/workflows/release.yml):
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml):
 
 1. checkout, установка Go 1.21;
 2. `./release.sh "${GITHUB_REF_NAME}"` — пересборка бинарников и контрольных сумм;

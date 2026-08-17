@@ -16,7 +16,7 @@
 ## Точка входа данных — `Stream.Publish`
 
 Всё, что демон получает от источника, входит в поток через единственный метод
-[`Publish`](../internal/server/server.go):
+[`Publish`](../../internal/server/server.go):
 
 ```
 Publish(chunk):
@@ -32,7 +32,7 @@ Publish(chunk):
 
 ## Захват источника — `puller`
 
-[`puller.Run`](../internal/puller/puller.go) тянет источник, пока поток кому-то нужен,
+[`puller.Run`](../../internal/puller/puller.go) тянет источник, пока поток кому-то нужен,
 и **переподключается с экспоненциальным backoff** при обрыве: пауза растёт `1с → 2 → 4 → 8с`
 (потолок 8 с), сбрасывается при отмене.
 
@@ -66,7 +66,7 @@ ffmpeg -copyts -vsync 0 -nostats -nostdin -hide_banner -loglevel quiet -y
 
 ## Выравнивание пакетов — `ingest`
 
-[`ingest.Copy`](../internal/ingest/ingest.go) читает источник и вызывает `publish`
+[`ingest.Copy`](../../internal/ingest/ingest.go) читает источник и вызывает `publish`
 **чанками, кратными 188 байтам**. Если очередное чтение оборвалось на середине пакета,
 «хвост» переносится к следующему чтению — так все парсеры ниже (join, сегментатор)
 всегда получают только целые TS-пакеты. Размер чтения задаётся флагом `-chunk`
@@ -79,7 +79,7 @@ ffmpeg, и push-режим (данные из ingest-сокета).
 
 ## Fan-out TS — `hub`
 
-[`Hub`](../internal/hub/hub.go) — точка раздачи одного потока множеству подписчиков.
+[`Hub`](../../internal/hub/hub.go) — точка раздачи одного потока множеству подписчиков.
 Одна `Hub` на поток.
 
 - **`Publish(chunk)`**: **копирует** чанк (чтобы источник мог переиспользовать буфер),
@@ -100,7 +100,7 @@ ffmpeg, и push-режим (данные из ingest-сокета).
 **навсегда** — ни отбрасывание hub’ом, ни отмена HTTP-контекста не прерывают уже
 начавшуюся запись.
 
-Решение в [`serveLive`](../internal/server/server.go): каждая запись зрителю
+Решение в [`serveLive`](../../internal/server/server.go): каждая запись зрителю
 ограничивается **дедлайном** `-write-timeout` (по умолчанию 15 с). Залипшая запись
 превращается в ошибку, срабатывают отложенные `detach`/`removeConn`, и `fanout_sync`
 может закрыть строку `lines_live`. Здоровый realtime-зритель копит не больше ~1 с
@@ -114,7 +114,7 @@ ffmpeg, и push-режим (данные из ingest-сокета).
 ему байты «с текущего места», его плеер увидит середину видеокадра без PAT/PMT и без
 ключкадра — и не покажет ничего. Нужен «чистый вход».
 
-[`tsjoin.State`](../internal/tsjoin/tsjoin.go) честно **разбирает структуру MPEG-TS**
+[`tsjoin.State`](../../internal/tsjoin/tsjoin.go) честно **разбирает структуру MPEG-TS**
 (а не матчит по фиксированным смещениям, как легаси `ProxyCommand`) и держит ровно то,
 что нужно новому зрителю для старта:
 
@@ -143,7 +143,7 @@ ffmpeg, и push-режим (данные из ingest-сокета).
 
 ## HLS в памяти — `hlsseg`
 
-[`Segmenter`](../internal/hlsseg/hlsseg.go) превращает живой TS в HLS **целиком в
+[`Segmenter`](../../internal/hlsseg/hlsseg.go) превращает живой TS в HLS **целиком в
 оперативной памяти** — ничего не пишется на диск. Это заменяет старый ffmpeg `-f hls`,
 писавший `.ts`/`.m3u8` в tmpfs.
 
@@ -166,7 +166,7 @@ ffmpeg, и push-режим (данные из ingest-сокета).
 
 ## Шифрование HLS — `hlscrypt`
 
-[`hlscrypt.EncryptCBC`](../internal/hlscrypt/hlscrypt.go) шифрует HLS-сегменты
+[`hlscrypt.EncryptCBC`](../../internal/hlscrypt/hlscrypt.go) шифрует HLS-сегменты
 **AES-128-CBC + PKCS#7**, байт-в-байт совместимо с PHP-панелью:
 `openssl_encrypt(data, "aes-128-cbc", key, OPENSSL_RAW_DATA, iv)`.
 
