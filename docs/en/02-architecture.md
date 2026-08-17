@@ -79,8 +79,12 @@ All data enters `Stream` through a single point — the `Publish` method.
 
 ## Data flow: from source to viewer
 
-1. **Acquisition.** The `puller` pulls the source (or `ingest` accepts a push from a
-   producer). More detail — [04, "Source acquisition"](04-internals.md#source-acquisition--puller).
+1. **Acquisition.** Bytes reach the daemon one of two ways: **`puller`** pulls the source
+   itself — that is **proxy streams only** (`direct_proxy=1`, which have no panel ffmpeg);
+   **`ingest`** accepts a push from a producer — that is **regular (non-proxy) streams**,
+   where the panel ffmpeg emits its prepared output via a second `-f tee`. So a direct
+   source pull is proxy-only; regular streams reach the daemon as the ffmpeg output. More
+   detail — [04, "Source acquisition"](04-internals.md#source-acquisition--puller).
 2. **Alignment.** The bytes are cut into chunks that are multiples of 188 (the TS packet
    length), so that the parsers downstream always see whole packets (`ingest.Copy`).
 3. **Publishing.** `Stream.Publish(chunk)` feeds the chunk into two places at once:

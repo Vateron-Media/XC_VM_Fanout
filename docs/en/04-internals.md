@@ -32,6 +32,16 @@ marker is later read by the status (`GET /streams/<id>`) to determine off-air.
 
 ## Source acquisition — `puller`
 
+> **Important: the `puller` runs ONLY for proxy streams** (`direct_proxy=1`). Proxy
+> streams have no panel-side ffmpeg (they are passthrough — no transcode/logo), so
+> the daemon pulls the source itself. **Regular (non-proxy) streams reach the daemon
+> NOT through the puller but through `ingest`** — that is the panel ffmpeg's already
+> prepared output, emitted as a second `-f tee` output (one ffmpeg → both on-disk HLS
+> and the daemon); see [05, power modes](05-lifecycle.md#the-three-power-modes-of-a-stream). So
+> the "mp2t directly, without ffmpeg" below is **proxy-passthrough only**, not the
+> normal case: for normal streams the daemon always consumes the ffmpeg output, never
+> the raw source link.
+
 [`puller.Run`](../../internal/puller/puller.go) pulls the source for as long as the stream is needed by someone,
 and **reconnects with exponential backoff** on a break: the pause grows `1s → 2 → 4 → 8s`
 (capped at 8 s), and resets on cancellation.
