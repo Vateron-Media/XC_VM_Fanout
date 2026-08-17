@@ -31,6 +31,14 @@ import (
 
 const defaultChunk = 12032
 
+// defaultWriteTimeout bounds a single write to a live-TS viewer. A viewer that
+// cannot accept the next chunk within this window (its OS socket buffer is full
+// because it stopped draining — a backgrounded/force-switched player, a dropped
+// mobile link) is dropped so it can never pin the serveLive goroutine forever.
+// A healthy real-time viewer produces at most ~1s of backlog per second, so this
+// only ever fires on a genuinely stalled connection.
+const defaultWriteTimeout = 15 * time.Second
+
 // Stream bundles the TS fan-out (Hub) and in-memory HLS (Seg) for one source,
 // plus its on-demand lifecycle state.
 type Stream struct {
@@ -283,30 +291,40 @@ func (s *Stream) status() streamStatus {
 
 // Manager holds the live streams keyed by id.
 type Manager struct {
-	mu        sync.Mutex
-	streams     map[string]*Stream
-	maxGOP      int
-	maxPrebufMS int64 // ceiling for per-viewer client prebuffer (ms of TS history)
-	hlsTarget   float64
-	hlsWindow   int
-	grace       time.Duration
-	ingestDir   string // base dir for per-stream push-fed ingest sockets
+	mu           sync.Mutex
+	streams      map[string]*Stream
+	maxGOP       int
+	maxPrebufMS  int64 // ceiling for per-viewer client prebuffer (ms of TS history)
+	hlsTarget    float64
+	hlsWindow    int
+	grace        time.Duration
+	writeTimeout time.Duration // per-write deadline for live-TS viewers
+	ingestDir    string        // base dir for per-stream push-fed ingest sockets
 }
 
 // SetIngestDir sets the directory for per-stream ingest sockets (non-proxy tee).
 func (m *Manager) SetIngestDir(dir string) { m.ingestDir = dir }
+
+// SetWriteTimeout overrides the per-write deadline for live-TS viewers (0 keeps
+// the default). A stalled write past this window drops the viewer.
+func (m *Manager) SetWriteTimeout(d time.Duration) {
+	if d > 0 {
+		m.writeTimeout = d
+	}
+}
 
 // NewManager configures hub join size, the client-prebuffer ceiling (ms of live
 // TS history retained per stream), HLS segment target/window, and the idle-stop
 // grace period for control-managed streams.
 func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int, grace time.Duration) *Manager {
 	return &Manager{
-		streams:     make(map[string]*Stream),
-		maxGOP:      maxGOP,
-		maxPrebufMS: maxPrebufMS,
-		hlsTarget:   hlsTarget,
-		hlsWindow:   hlsWindow,
-		grace:       grace,
+		streams:      make(map[string]*Stream),
+		maxGOP:       maxGOP,
+		maxPrebufMS:  maxPrebufMS,
+		hlsTarget:    hlsTarget,
+		hlsWindow:    hlsWindow,
+		grace:        grace,
+		writeTimeout: defaultWriteTimeout,
 	}
 }
 
@@ -604,24 +622,39 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "no-store")
-	flusher, _ := w.(http.Flusher)
+
+	// Bound every write with a deadline. A viewer that stops draining its socket
+	// without cleanly closing the connection (a backgrounded/force-switched
+	// player, a dropped mobile link) fills its OS send buffer and blocks the
+	// write forever — neither sub.Done() (the hub drops the slow subscriber) nor
+	// r.Context().Done() can interrupt an in-flight Write. The deadline turns that
+	// stall into an error so the deferred detach/removeConn run and fanout_sync
+	// can close the lines_live row, instead of a ghost connection lingering on the
+	// stream the viewer already left.
+	rc := http.NewResponseController(w)
+	write := func(b []byte) error {
+		if err := rc.SetWriteDeadline(time.Now().Add(m.writeTimeout)); err != nil {
+			// Deadlines unsupported (shouldn't happen for a real conn) — fall back
+			// to a plain write rather than aborting the viewer.
+			_, werr := w.Write(b)
+			return werr
+		}
+		if _, err := w.Write(b); err != nil {
+			return err
+		}
+		return rc.Flush()
+	}
 
 	if len(snap) > 0 {
-		if _, err := w.Write(snap); err != nil {
+		if err := write(snap); err != nil {
 			return
-		}
-		if flusher != nil {
-			flusher.Flush()
 		}
 	}
 	for {
 		select {
 		case b := <-sub.C():
-			if _, err := w.Write(b); err != nil {
+			if err := write(b); err != nil {
 				return
-			}
-			if flusher != nil {
-				flusher.Flush()
 			}
 		case <-sub.Done():
 			return

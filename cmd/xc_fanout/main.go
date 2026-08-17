@@ -40,6 +40,7 @@ func main() {
 	ctl := flag.String("ctl", "", "control unix socket (PHP-only), e.g. /home/xc_vm/bin/xc_fanout/sockets/control.sock; empty = no control API")
 	ingestDir := flag.String("ingestdir", "", "dir for per-stream push-fed ingest sockets (non-proxy tee); empty = <sock dir>/ingest")
 	grace := flag.Int("grace", 10, "seconds to keep a control-managed puller alive after the last viewer")
+	writeTimeout := flag.Int("write-timeout", 15, "seconds a single write to a live-TS viewer may stall before the viewer is dropped (stalled/half-open client cleanup)")
 	id := flag.String("id", "", "stream id to feed at launch (testing; empty = serve only)")
 	in := flag.String("in", "", "input file for -id, or - for stdin (testing)")
 	source := flag.String("source", "", "comma-separated source URLs for -id (testing)")
@@ -64,6 +65,7 @@ func main() {
 	defer stop()
 
 	mgr := server.NewManager(*maxGOP, int64(*prebufferMax)*1000, *hlsTarget, *hlsWindow, time.Duration(*grace)*time.Second)
+	mgr.SetWriteTimeout(time.Duration(*writeTimeout) * time.Second)
 	idir := *ingestDir
 	if idir == "" {
 		idir = filepath.Join(filepath.Dir(*sock), "ingest")
