@@ -130,6 +130,14 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 	args := []string{
 		"-copyts", "-vsync", "0", "-nostats", "-nostdin", "-hide_banner",
 		"-loglevel", "quiet", "-y", "-user_agent", src.ua(),
+		// Cold-start bounds (ADR 0003, Phase C1a): cap input analysis so the first
+		// mpegts bytes appear quickly on a cold on-demand join, instead of ffmpeg
+		// spending its default 5s/5MB probing the source. 1s/1MB still identifies
+		// the PAT/PMT + codecs a live TS/HLS source presents. HTTP reconnect (as
+		// the panel's own ffmpeg uses) rides out a transient fetch hiccup during
+		// warm-up without dropping the pull. Input options — must precede -i.
+		"-probesize", "1000000", "-analyzeduration", "1000000",
+		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
 	}
 	if src.Cookie != "" {
 		args = append(args, "-headers", "Cookie: "+src.Cookie+"\r\n")
