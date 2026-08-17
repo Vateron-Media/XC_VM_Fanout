@@ -9,6 +9,10 @@ design and the phased cutover.
 Pure Go, `CGO_ENABLED=0` → one **static** binary per architecture runs on any
 Linux distro.
 
+## Documentation
+
+Full docs live in [`docs/`](docs/README.md), split by topic.
+
 ## This repo ships binaries as releases
 
 The **source** lives here; the compiled binaries are **GitHub Release assets**,
