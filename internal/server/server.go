@@ -22,11 +22,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Vateron-Media/xc_fanout/internal/hlscrypt"
-	"github.com/Vateron-Media/xc_fanout/internal/hlsseg"
-	"github.com/Vateron-Media/xc_fanout/internal/hub"
-	"github.com/Vateron-Media/xc_fanout/internal/ingest"
-	"github.com/Vateron-Media/xc_fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlsseg"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
 )
 
 const defaultChunk = 12032

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Vateron-Media/xc_fanout/internal/ingest"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 )
 
 // Source describes where and how to pull a live stream.

@@ -9,7 +9,7 @@ package hub
 import (
 	"sync"
 
-	"github.com/Vateron-Media/xc_fanout/internal/tsjoin"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsjoin"
 )
 
 // subQueue bounds how much a single subscriber may fall behind before it is

@@ -27,9 +27,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Vateron-Media/xc_fanout/internal/ingest"
-	"github.com/Vateron-Media/xc_fanout/internal/puller"
-	"github.com/Vateron-Media/xc_fanout/internal/server"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".

@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Vateron-Media/xc_fanout/internal/tsfixture"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
 )
 
 func serveTS(ct string, body []byte) *httptest.Server {

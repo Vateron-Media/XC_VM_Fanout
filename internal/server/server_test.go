@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Vateron-Media/xc_fanout/internal/puller"
-	"github.com/Vateron-Media/xc_fanout/internal/tsfixture"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
 )
 
 // ctlRequest issues one control-surface request and returns the status code.

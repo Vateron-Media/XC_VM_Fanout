@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Vateron-Media/xc_fanout/internal/tsfixture"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
 )
 
 func TestPtsDiffWraparound(t *testing.T) {

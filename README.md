@@ -1,4 +1,4 @@
-# xc_fanout
+# XC_VM_Fanout
 
 Native **live-stream fan-out daemon** for XC_VM — one process pulls each live
 source once and fans it out to many viewers via nginx, keeping PHP out of the
