@@ -273,11 +273,20 @@ func TestRatesEndpoint(t *testing.T) {
 	ts := httptest.NewServer(mgr.ControlHandler())
 	defer ts.Close()
 
+	// A connected viewer that has received no bytes yet must still appear as 0
+	// (a stall is the divergence signal we want to surface, not hide).
+	stalled := st.addConn("uuidStalled")
+	stalled.since = time.Now().Add(-2 * time.Second)
+
 	var got map[string]int
 	getJSON(t, ts.URL+"/rates", &got)
 	if kbps, ok := got["uuidR"]; !ok || kbps < 90 || kbps > 110 {
 		t.Fatalf("/rates[uuidR] = %v (ok=%v), want ~100 KB/s", got["uuidR"], ok)
 	}
+	if kbps, ok := got["uuidStalled"]; !ok || kbps != 0 {
+		t.Fatalf("/rates[uuidStalled] = %v (ok=%v), want 0 KB/s present", got["uuidStalled"], ok)
+	}
+	st.removeConn("uuidStalled")
 
 	st.removeConn("uuidR") // → gone
 	got = nil

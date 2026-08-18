@@ -521,7 +521,11 @@ func (m *Manager) serveRates(w http.ResponseWriter, _ *http.Request) {
 	rates := make(map[string]int)
 	for _, st := range streams {
 		for u, kbps := range st.connRates() {
-			if kbps > rates[u] {
+			// Include every active viewer, a genuine 0 KB/s (stalled/just-fed)
+			// among them — a stalled reading is exactly the divergence signal we
+			// want to surface, so keep it. On a cross-stream uuid clash the higher
+			// rate wins.
+			if v, ok := rates[u]; !ok || kbps > v {
 				rates[u] = kbps
 			}
 		}
