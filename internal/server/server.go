@@ -59,8 +59,8 @@ type Stream struct {
 	lastData   atomic.Int64 // UnixNano of the last non-empty Publish (0 = never); off-air signal
 	lastAccess atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
 
-	connMu sync.Mutex     // guards conns
-	conns  map[string]int // active live-TS viewer uuids (from the ?c= param) → refcount
+	connMu sync.Mutex           // guards conns (map + each connStat's refs/since)
+	conns  map[string]*connStat // active live-TS viewer uuids (from the ?c= param)
 
 	encMu  sync.RWMutex // guards hlsKey/hlsIV
 	hlsKey []byte       // AES-128 key for encrypted HLS segments (nil = plain)
@@ -98,26 +98,45 @@ func (s *Stream) encryptSegment(data []byte) []byte {
 	return data
 }
 
+// connStat tracks one live-TS viewer uuid: an active-connection refcount, the
+// attach time, and the bytes delivered so far. refs/since are guarded by the
+// stream's connMu; bytes is atomic so serveLive can account each write on the
+// hot path without taking the lock. Used for both disconnect reconciliation
+// (refs) and per-viewer transfer telemetry (bytes/since → KB/s, P4).
+type connStat struct {
+	refs  int
+	since time.Time
+	bytes atomic.Int64
+}
+
 // addConn records an active live-TS viewer by its connection uuid (passed by
-// live.php via the X-Accel URL). PHP marks these lines_live rows pid=0 and the
+// live.php via the X-Accel URL) and returns its connStat so the caller can
+// account delivered bytes. PHP marks these lines_live rows pid=0 and the
 // fanout_sync daemon reconciles them against this set — closing rows whose uuid
 // is no longer connected here, since PHP can't see the disconnect under X-Accel.
-func (s *Stream) addConn(uuid string) {
+func (s *Stream) addConn(uuid string) *connStat {
 	s.connMu.Lock()
+	defer s.connMu.Unlock()
 	if s.conns == nil {
-		s.conns = make(map[string]int)
+		s.conns = make(map[string]*connStat)
 	}
-	s.conns[uuid]++
-	s.connMu.Unlock()
+	cs := s.conns[uuid]
+	if cs == nil {
+		cs = &connStat{since: time.Now()}
+		s.conns[uuid] = cs
+	}
+	cs.refs++
+	return cs
 }
 
 func (s *Stream) removeConn(uuid string) {
 	s.connMu.Lock()
 	if s.conns != nil {
-		if s.conns[uuid] <= 1 {
-			delete(s.conns, uuid)
-		} else {
-			s.conns[uuid]--
+		if cs := s.conns[uuid]; cs != nil {
+			cs.refs--
+			if cs.refs <= 0 {
+				delete(s.conns, uuid)
+			}
 		}
 	}
 	s.connMu.Unlock()
@@ -130,6 +149,27 @@ func (s *Stream) connUUIDs() []string {
 		out = append(out, u)
 	}
 	s.connMu.Unlock()
+	return out
+}
+
+// connRates returns, per active viewer uuid, the average delivery rate in KB/s
+// since the connection attached (bytes / elapsed / 1024). This is the daemon-side
+// replacement for the legacy chase-read loop's DIVERGENCE_TMP_PATH speed file:
+// fanout_sync compares it to the stream's expected bitrate and records the
+// divergence for daemon-served viewers, whose rate PHP can no longer measure
+// itself (it left the byte path at X-Accel hand-off).
+func (s *Stream) connRates() map[string]int {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	now := time.Now()
+	out := make(map[string]int, len(s.conns))
+	for u, cs := range s.conns {
+		elapsed := now.Sub(cs.since).Seconds()
+		if elapsed <= 0 {
+			continue
+		}
+		out[u] = int(float64(cs.bytes.Load()) / elapsed / 1024.0)
+	}
 	return out
 }
 
@@ -441,6 +481,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/ingest/", m.serveIngest)
 	mux.HandleFunc("/probe/", m.serveProbe)
 	mux.HandleFunc("/connections", m.serveConnections)
+	mux.HandleFunc("/rates", m.serveRates)
 	return mux
 }
 
@@ -461,6 +502,33 @@ func (m *Manager) serveConnections(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(uuids)
+}
+
+// serveRates returns { "<uuid>": <avgKBs>, ... } across all streams — each
+// active live-TS viewer's average delivery rate (KB/s) since it attached. The
+// fanout_sync reconciler turns this into lines_live.divergence for daemon-served
+// viewers, restoring the transfer telemetry the legacy chase-read loop wrote to
+// DIVERGENCE_TMP_PATH before the byte path left PHP (ADR 0003, P4). On the rare
+// chance a uuid is live on more than one stream, the higher rate wins.
+func (m *Manager) serveRates(w http.ResponseWriter, _ *http.Request) {
+	m.mu.Lock()
+	streams := make([]*Stream, 0, len(m.streams))
+	for _, st := range m.streams {
+		streams = append(streams, st)
+	}
+	m.mu.Unlock()
+
+	rates := make(map[string]int)
+	for _, st := range streams {
+		for u, kbps := range st.connRates() {
+			if kbps > rates[u] {
+				rates[u] = kbps
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rates)
 }
 
 // serveProbe supports off-air detection (ADR 0003, Phase C): it prewarms a
@@ -614,9 +682,11 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	defer st.detach()
 
 	// Track this viewer by its connection uuid (from live.php's X-Accel URL) so
-	// fanout_sync can detect its disconnect and close the lines_live row.
+	// fanout_sync can detect its disconnect and close the lines_live row, and so
+	// delivered bytes are accounted for the per-viewer rate telemetry (P4).
+	var cs *connStat
 	if uuid := r.URL.Query().Get("c"); uuid != "" {
-		st.addConn(uuid)
+		cs = st.addConn(uuid)
 		defer st.removeConn(uuid)
 	}
 
@@ -636,10 +706,17 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		if err := rc.SetWriteDeadline(time.Now().Add(m.writeTimeout)); err != nil {
 			// Deadlines unsupported (shouldn't happen for a real conn) — fall back
 			// to a plain write rather than aborting the viewer.
-			_, werr := w.Write(b)
+			n, werr := w.Write(b)
+			if cs != nil && n > 0 {
+				cs.bytes.Add(int64(n))
+			}
 			return werr
 		}
-		if _, err := w.Write(b); err != nil {
+		n, err := w.Write(b)
+		if cs != nil && n > 0 {
+			cs.bytes.Add(int64(n))
+		}
+		if err != nil {
 			return err
 		}
 		return rc.Flush()

@@ -97,6 +97,7 @@ Only the **PHP panel** talks to this surface.
 | `DELETE /ingest/<id>` | Tear down a push stream. |
 | `GET /probe/<id>?wait=<ms>` | Warm up the source and wait for data. |
 | `GET /connections` | All uuids of active live-TS viewers. |
+| `GET /rates` | Per-viewer average delivery rate (KB/s), keyed by uuid. |
 
 ### `PUT` / `POST` `/streams/<id>` — register a pull source
 
@@ -207,6 +208,28 @@ The `fanout_sync` daemon reconciles this set against the `lines_live` rows and c
 no longer appears here — because under X-Accel PHP cannot see a viewer disconnect on its own.
 
 **Response:** `200`, `Content-Type: application/json`, body — for example `["uuid-1","uuid-2"]`.
+
+### `GET /rates` — per-viewer transfer telemetry
+
+Returns a JSON object mapping each active live-TS viewer's uuid to its **average delivery rate
+in KB/s** since the connection attached (`bytes / elapsed / 1024`). The handler is
+[`serveRates`](../../internal/server/server.go); it sums bytes the daemon actually wrote to each
+`?c=<uuid>` connection.
+
+This is the daemon-side replacement for the legacy `live.php` chase-read loop, which measured the
+same rate itself and wrote it to `DIVERGENCE_TMP_PATH/<uuid>`. Under X-Accel PHP is out of the byte
+path and can no longer see it, so the `fanout_sync` daemon polls this endpoint, compares each rate to
+the stream's expected bitrate (`streams_servers.bitrate / 8 * 0.92`) and records the shortfall as the
+viewer's `divergence` in `lines_live` / `lines_divergence` (ADR 0003, P4). On the rare chance a uuid
+is live on more than one stream, the higher rate wins.
+
+> Because the daemon **drops** a viewer that falls behind (slow-subscriber eviction + the write
+> deadline), a sustained-slow reading rarely appears here — a healthy realtime viewer's average
+> converges to the stream bitrate, so divergence for daemon-served viewers is normally ~0. The value
+> is the connection-speed signal and admin display, not a fast-pull fraud check (a viewer cannot pull
+> faster than the live tail is fanned out).
+
+**Response:** `200`, `Content-Type: application/json`, body — for example `{"uuid-1":512,"uuid-2":498}`.
 
 ---
 

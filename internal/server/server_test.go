@@ -259,6 +259,34 @@ func TestConnectionTrackingAndReconcileList(t *testing.T) {
 	}
 }
 
+// TestRatesEndpoint verifies the per-viewer delivery-rate telemetry (P4): the
+// daemon reports each active uuid's average KB/s since attach, and drops it on
+// disconnect. fanout_sync turns this into lines_live.divergence.
+func TestRatesEndpoint(t *testing.T) {
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
+	st := mgr.GetOrCreate("9")
+	cs := st.addConn("uuidR")
+	// 200 KB delivered over 2 s → 100 KB/s.
+	cs.since = time.Now().Add(-2 * time.Second)
+	cs.bytes.Store(200 * 1024)
+
+	ts := httptest.NewServer(mgr.ControlHandler())
+	defer ts.Close()
+
+	var got map[string]int
+	getJSON(t, ts.URL+"/rates", &got)
+	if kbps, ok := got["uuidR"]; !ok || kbps < 90 || kbps > 110 {
+		t.Fatalf("/rates[uuidR] = %v (ok=%v), want ~100 KB/s", got["uuidR"], ok)
+	}
+
+	st.removeConn("uuidR") // → gone
+	got = nil
+	getJSON(t, ts.URL+"/rates", &got)
+	if len(got) != 0 {
+		t.Fatalf("after disconnect /rates = %v, want empty", got)
+	}
+}
+
 func getJSON(t *testing.T, url string, v any) {
 	t.Helper()
 	resp, err := http.Get(url)
