@@ -1,0 +1,25 @@
+# End-to-end test bench for the xc_fanout daemon.
+#
+#   docker compose up --build --abort-on-container-exit --exit-code-from fanout
+#
+# `origin` is a long-lived fake source (MPEG-TS + HLS). `fanout` builds the
+# daemon and runs the Go integration suite against it, then exits with the
+# suite's status.
+services:
+  origin:
+    build:
+      context: .
+      dockerfile: origin/Dockerfile
+    # Healthcheck is defined in origin/Dockerfile.
+
+  fanout:
+    build:
+      context: ..
+      dockerfile: test/fanout/Dockerfile
+    depends_on:
+      origin:
+        condition: service_healthy
+    environment:
+      ORIGIN: http://origin:8080
+      XC_FANOUT_BIN: /usr/local/bin/xc_fanout
+      FFMPEG: ffmpeg
