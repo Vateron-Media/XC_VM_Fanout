@@ -340,10 +340,22 @@ type Manager struct {
 	grace        time.Duration
 	writeTimeout time.Duration // per-write deadline for live-TS viewers
 	ingestDir    string        // base dir for per-stream push-fed ingest sockets
+
+	ffmpegBin string        // ffmpeg path for the "send message" drawtext overlay
+	fontPath  string        // font file for the overlay text
+	signals   *signalStore  // pending per-uuid "send message" overlays
 }
 
 // SetIngestDir sets the directory for per-stream ingest sockets (non-proxy tee).
 func (m *Manager) SetIngestDir(dir string) { m.ingestDir = dir }
+
+// SetOverlay configures the ffmpeg binary + font used to burn an admin
+// "send message" text banner onto a signalled viewer's stream. Empty values
+// disable the overlay (a queued signal is then dropped, never breaking playback).
+func (m *Manager) SetOverlay(ffmpegBin, fontPath string) {
+	m.ffmpegBin = ffmpegBin
+	m.fontPath = fontPath
+}
 
 // SetWriteTimeout overrides the per-write deadline for live-TS viewers (0 keeps
 // the default). A stalled write past this window drops the viewer.
@@ -365,6 +377,7 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 		hlsWindow:    hlsWindow,
 		grace:        grace,
 		writeTimeout: defaultWriteTimeout,
+		signals:      newSignalStore(),
 	}
 }
 
@@ -482,6 +495,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/probe/", m.serveProbe)
 	mux.HandleFunc("/connections", m.serveConnections)
 	mux.HandleFunc("/rates", m.serveRates)
+	mux.HandleFunc("/signal/", m.serveSignal)
 	return mux
 }
 
@@ -533,6 +547,52 @@ func (m *Manager) serveRates(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rates)
+}
+
+// serveSignal queues an admin "send message" text overlay for one viewer uuid
+// (POST /signal/<uuid>). PHP's signal_send action calls this; the overlay is
+// applied one-shot to that viewer's next HLS segment (and TS window), then
+// cleared — reproducing the legacy SignalSender feature now that clients are
+// daemon-only. The overlay is best-effort: no ffmpeg/font ⇒ the signal is a
+// no-op, never a broken stream.
+func (m *Manager) serveSignal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	uuid := strings.TrimPrefix(r.URL.Path, "/signal/")
+	if uuid == "" {
+		http.Error(w, "missing uuid", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Message  string `json:"message"`
+		FontSize int    `json:"font_size"`
+		Color    string `json:"font_color"`
+		XYOffset string `json:"xy_offset"` // "<x>x<y>" or empty (⇒ random, like legacy)
+		TTL      int    `json:"ttl"`       // seconds a viewer has to pick it up; 0 = default
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Message == "" {
+		http.Error(w, "bad signal", http.StatusBadRequest)
+		return
+	}
+	if body.FontSize <= 0 {
+		body.FontSize = 20
+	}
+	ttl := body.TTL
+	if ttl <= 0 {
+		ttl = 30
+	}
+	x, y := parseXY(body.XYOffset)
+	m.signals.set(uuid, pendingSignal{
+		text:     body.Message,
+		fontSize: body.FontSize,
+		color:    body.Color,
+		x:        x,
+		y:        y,
+		expires:  time.Now().Add(time.Duration(ttl) * time.Second),
+	})
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // serveProbe supports off-air detection (ADR 0003, Phase C): it prewarms a
@@ -688,8 +748,10 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// Track this viewer by its connection uuid (from live.php's X-Accel URL) so
 	// fanout_sync can detect its disconnect and close the lines_live row, and so
 	// delivered bytes are accounted for the per-viewer rate telemetry (P4).
+	uuid := r.URL.Query().Get("c")
+	codec := r.URL.Query().Get("vc") // video codec, for a possible "send message" overlay
 	var cs *connStat
-	if uuid := r.URL.Query().Get("c"); uuid != "" {
+	if uuid != "" {
 		cs = st.addConn(uuid)
 		defer st.removeConn(uuid)
 	}
@@ -732,6 +794,16 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for {
+		// Admin "send message" overlay (rare): if one is queued for this viewer,
+		// burn it onto a short window of the stream via a transient ffmpeg, then
+		// fall back to the raw fan-out. peek keeps the hot path a single map read.
+		if uuid != "" && m.signals.peek(uuid) {
+			if sig, ok := m.signals.take(uuid); ok {
+				if !m.overlayTSWindow(st, sub, write, sig, codec) {
+					return
+				}
+			}
+		}
 		select {
 		case b := <-sub.C():
 			if err := write(b); err != nil {
@@ -783,6 +855,15 @@ func (m *Manager) serveHLS(w http.ResponseWriter, r *http.Request) {
 		if data == nil {
 			http.NotFound(w, r)
 			return
+		}
+		// Admin "send message" overlay for this viewer (one-shot): burn the text
+		// banner into this one segment, then the signal is cleared. Applied before
+		// encryption so the client still decrypts normally. ?c=<uuid> identifies
+		// the viewer, ?vc=<codec> its video codec (from segment.php's token).
+		if uuid := r.URL.Query().Get("c"); uuid != "" {
+			if sig, ok := m.signals.take(uuid); ok {
+				data = m.overlaySegment(data, sig, r.URL.Query().Get("vc"))
+			}
 		}
 		data = st.encryptSegment(data) // encrypted HLS when a key is set; else plain
 		w.Header().Set("Content-Type", "video/mp2t")

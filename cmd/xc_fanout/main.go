@@ -53,6 +53,7 @@ func main() {
 	chunk := flag.Int("chunk", 12032, "ingest read size (aligned down to 188)")
 	hlsTarget := flag.Float64("hlstarget", 6, "HLS target segment duration (seconds)")
 	hlsWindow := flag.Int("hlswindow", 6, "HLS segments kept in the sliding window")
+	font := flag.String("font", "", "font file for the admin \"send message\" drawtext overlay; empty disables the overlay")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -72,7 +73,8 @@ func main() {
 	}
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
-	mgr.StartReaper(ctx) // idle-stop sweep for control-managed streams (TS + HLS)
+	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
+	mgr.StartReaper(ctx)           // idle-stop sweep for control-managed streams (TS + HLS)
 
 	clientSrv, cleanupClient := serveUnix(*sock, mgr.ClientHandler())
 	ctlSrv, cleanupCtl := (*http.Server)(nil), func() {}

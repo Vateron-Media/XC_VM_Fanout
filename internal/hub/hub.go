@@ -81,6 +81,16 @@ func (h *Hub) Subscribe(prebufMS int64) (*Sub, []byte) {
 	return s, snap
 }
 
+// Snapshot returns a fresh clean-entry snapshot (PAT/PMT + keyframe, optionally
+// prebufMS of history) without subscribing — used to re-seed a decoder mid-stream
+// (e.g. the transient ffmpeg that burns a "send message" overlay for one viewer).
+func (h *Hub) Snapshot(prebufMS int64) []byte {
+	h.mu.Lock()
+	snap := h.join.Snapshot(prebufMS)
+	h.mu.Unlock()
+	return snap
+}
+
 // Unsubscribe removes a subscriber (idempotent).
 func (h *Hub) Unsubscribe(s *Sub) {
 	h.mu.Lock()
