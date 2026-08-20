@@ -21,7 +21,8 @@ The dynamic part (which streams to serve) arrives at runtime via the
 | `-maxgop` | `10528000` | Maximum join-snapshot size (bytes) — memory protection for streams without keyframes. |
 | `-hlstarget` | `6` | Target HLS segment duration (seconds). |
 | `-hlswindow` | `6` | How many HLS segments to keep in the sliding window. |
-| `-ffmpeg` | `ffmpeg` | Path to the ffmpeg binary (for remuxing non-mp2t sources). |
+| `-ffmpeg` | `ffmpeg` | Path to the ffmpeg binary (for remuxing non-mp2t sources, and for the "send message" `drawtext` overlay). Must be a build that has the `drawtext` filter for the overlay to work. |
+| `-font` | `""` (overlay off) | Path to a `.ttf` font for the "send message" overlay. Empty, or an ffmpeg without `drawtext`, disables the overlay (signals become no-ops). |
 | `-version` | — | Print the version and exit. |
 
 ### "launch / test" mode flags

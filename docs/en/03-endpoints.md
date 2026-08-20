@@ -34,7 +34,8 @@ Keeps the connection open and continuously streams MPEG-TS to the viewer. The ha
 | Parameter | Type | Meaning |
 |----------|-----|-------|
 | `prebuffer` | seconds (integer) | How much history to "catch up" on entry. Clamped by the `-prebuffer-max` ceiling (20 s by default). Absent/0 = minimal clean entry (current GOP only). |
-| `c` | uuid | The viewer's connection identifier (passed through by `live.php`). `fanout_sync` uses it to track disconnects and close the `lines_live` row. |
+| `c` | uuid | The viewer's connection identifier (passed through by `live.php`). `fanout_sync` uses it to track disconnects and close the `lines_live` row; a queued [`/signal/<uuid>`](#post-signaluuid--admin-send-message-overlay) overlay is matched against it. |
+| `vc` | codec | Source video codec, forwarded by `live.php`. Used only if a "send message" overlay is active for `?c=`, to keep the codec on the transient re-encode; ignored otherwise. |
 
 **What happens on connect:**
 
@@ -98,6 +99,7 @@ Only the **PHP panel** talks to this surface.
 | `GET /probe/<id>?wait=<ms>` | Warm up the source and wait for data. |
 | `GET /connections` | All uuids of active live-TS viewers. |
 | `GET /rates` | Per-viewer average delivery rate (KB/s), keyed by uuid. |
+| `POST /signal/<uuid>` | Queue a one-shot admin "send message" text overlay for one viewer. |
 
 ### `PUT` / `POST` `/streams/<id>` — register a pull source
 
@@ -230,6 +232,44 @@ is live on more than one stream, the higher rate wins.
 > faster than the live tail is fanned out).
 
 **Response:** `200`, `Content-Type: application/json`, body — for example `{"uuid-1":512,"uuid-2":498}`.
+
+### `POST /signal/<uuid>` — admin "send message" overlay
+
+Queues a **one-shot** text banner to be burned onto the video of the single viewer whose
+connection uuid is `<uuid>` (the `?c=` value). This is the daemon-side replacement for the
+legacy PHP byte-path overlay that Phase E removed — the admin "Send Message" feature. The panel
+posts it via [`FanoutClient::sendSignal`](../../../XC_VM/src/Streaming/Fanout/FanoutClient.php);
+the handler is [`serveSignal`](../../internal/server/server.go). The body is JSON:
+
+```json
+{
+  "message":     "Your subscription expires tomorrow",
+  "font_size":   24,
+  "font_color":  "white",
+  "xy_offset":   "150x110",
+  "ttl":         30
+}
+```
+
+| Field | Req. | Meaning |
+|------|:----:|-------|
+| `message` | yes | The text to draw. Escaped for ffmpeg `drawtext` (no shell involved). Empty → `400`. |
+| `font_size` | no | Point size (default 24). |
+| `font_color` | no | ffmpeg colour — a name (`white`) or `#RRGGBB`, optionally `name@0.8`. Sanitised; invalid → `white`. |
+| `xy_offset` | no | Position as `"<x>x<y>"`. Absent/malformed → a random position (150–380 × 110–250). |
+| `ttl` | no | Seconds the queued signal stays valid before it expires unshown. `0`/absent = no expiry. |
+
+**How it is consumed** (best-effort, one-shot, and it **never** breaks playback):
+
+- **HLS** (`serveHLS`): the next segment requested with a matching `?c=<uuid>` is re-encoded in
+  memory with the `drawtext` banner; on any ffmpeg error the plain segment is served.
+- **Live TS** (`serveLive`): the banner is burned onto a short (~5 s) transient window — a fresh
+  clean-join snapshot re-seeds a per-viewer ffmpeg, then the viewer rejoins the raw fan-out.
+
+Both consumers pass `?vc=<codec>` (the source video codec, forwarded by `live.php`) so the
+re-encode keeps the stream's codec; absent → `h264`. Requires the daemon to have been started with
+`-ffmpeg` **and** `-font` pointing at a `drawtext`-capable ffmpeg — without them the signal is a
+no-op. **Response:** `204 No Content` once queued (`400` on empty message, `405` on non-POST).
 
 ---
 

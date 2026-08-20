@@ -16,7 +16,7 @@ binary-installation mechanism.
                     │  console.php fanout_binary (installation)   │
                     └───────────────┬───────────────────────────┘
                                     │ control socket (-ctl)
-                                    │ PUT/GET/DELETE /streams,/ingest,/probe
+                                    │ PUT/GET/DELETE /streams,/ingest,/probe,/signal
                                     ▼
    viewer ──HTTP──► nginx ──X-Accel──► [ xc_fanout ] ──pulls/receives──► source
                        ▲   client socket (-sock)        │
@@ -63,6 +63,10 @@ PHP talks to the **control socket** (`-ctl`):
   replicating the legacy `startProxy` behavior but without letting the viewer hang on a dead
   source.
 - **Tearing down channels.** `DELETE /streams/<id>` or `DELETE /ingest/<id>`.
+- **"Send message" overlay.** The admin action posts `POST /signal/<uuid>` (via
+  `FanoutClient::sendSignal`) to queue a one-shot `drawtext` banner for one viewer; the daemon
+  burns it onto that viewer's next HLS segment / a short TS window. Replaces the legacy PHP
+  byte-path overlay removed in Phase E.
 
 ## fanout_sync — reconciles the viewer list
 
