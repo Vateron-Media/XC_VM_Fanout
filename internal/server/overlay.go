@@ -19,7 +19,7 @@ import (
 const overlayTSDuration = 5 * time.Second
 
 // pendingSignal is an admin "send message" overlay queued for one viewer uuid.
-// It reproduces the legacy SignalSender feature: a text banner burned into the
+// It reproduces the legacy admin "send message" feature: a text banner burned into the
 // video (ffmpeg drawtext) shown once to a single viewer, then cleared.
 type pendingSignal struct {
 	text     string
@@ -87,7 +87,7 @@ func (s *signalStore) take(uuid string) (pendingSignal, bool) {
 }
 
 // parseXY resolves the overlay position from the legacy "<x>x<y>" offset string,
-// falling back to a random position (matching SignalSender's rand ranges) when
+// falling back to a random position (matching the legacy overlay's rand ranges) when
 // it is empty or malformed.
 func parseXY(offset string) (int, int) {
 	if xs, ys, ok := strings.Cut(offset, "x"); ok {
@@ -132,7 +132,7 @@ func sanitizeColor(c string) string {
 }
 
 // overlaySegment re-encodes a self-contained MPEG-TS segment with a drawtext
-// banner (the admin "send message" feature). It mirrors SignalSender.php's
+// banner (the admin "send message" feature). It mirrors the legacy PHP byte-path overlay's
 // ffmpeg invocation but pipes the segment in and out in memory. On ANY error it
 // returns the original bytes unchanged — a signal must never break playback.
 func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []byte {

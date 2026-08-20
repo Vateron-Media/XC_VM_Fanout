@@ -552,7 +552,7 @@ func (m *Manager) serveRates(w http.ResponseWriter, _ *http.Request) {
 // serveSignal queues an admin "send message" text overlay for one viewer uuid
 // (POST /signal/<uuid>). PHP's signal_send action calls this; the overlay is
 // applied one-shot to that viewer's next HLS segment (and TS window), then
-// cleared — reproducing the legacy SignalSender feature now that clients are
+// cleared — reproducing the legacy admin "send message" feature now that clients are
 // daemon-only. The overlay is best-effort: no ffmpeg/font ⇒ the signal is a
 // no-op, never a broken stream.
 func (m *Manager) serveSignal(w http.ResponseWriter, r *http.Request) {
