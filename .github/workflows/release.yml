@@ -16,14 +16,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history + tags, needed for the changelog
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
       - name: Build + checksums
         run: ./release.sh "${GITHUB_REF_NAME}"
+      - name: Generate changelog
+        # Release body = the commits between the previous version tag and this
+        # one, so every release shows what actually changed without a hand-kept
+        # CHANGELOG. Meaningful commit subjects (feat:/fix:/docs: …) become the notes.
+        run: |
+          PREV=$(git describe --tags --abbrev=0 --match '[0-9]*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          echo "changelog range: ${PREV:-<start>}..${GITHUB_REF_NAME}"
+          {
+            echo "## Changes"
+            echo
+            if [ -n "$PREV" ]; then
+              git log --no-merges --pretty='- %s (%h)' "${PREV}..${GITHUB_REF_NAME}"
+            else
+              git log --no-merges --pretty='- %s (%h)' "${GITHUB_REF_NAME}"
+            fi
+          } > CHANGELOG_RELEASE.md
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: CHANGELOG_RELEASE.md
           files: |
             dist/xc_fanout-linux-*
             dist/SHA256SUMS

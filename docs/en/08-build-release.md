@@ -24,36 +24,62 @@ a stalled viewer, `serve_live_stall_test.go`).
 
 ## Cutting a release
 
+The version number lives in one place — the [`VERSION`](../../VERSION) file at the repo root.
+Everything else reads it from there, so a release only touches that file.
+
 ```bash
-./release.sh 0.7.0                       # go test + build dist/xc_fanout-linux-* + SHA256SUMS
-git commit -am "release 0.7.0"
-git tag 0.7.0 && git push --tags          # tag WITHOUT the "v" prefix — project convention
+# 1. Bump the version number — the single source of truth
+echo 0.9.1 > VERSION                        # or edit VERSION by hand
+VERSION="$(cat VERSION)"
+
+# 2. Build the artifacts. With no argument release.sh reads VERSION;
+#    with an argument it writes that into VERSION and uses it.
+./release.sh                                # == ./release.sh "$VERSION"
+
+# 3. Commit and tag with the same version
+git commit -am "release $VERSION"
+git tag "$VERSION" && git push --tags        # tag WITHOUT the "v" prefix — project convention
 ```
 
 What `release.sh` does:
 
-1. runs `go test ./...`;
-2. builds static binaries for the target architectures into `dist/xc_fanout-linux-*`;
-3. computes the checksums `dist/SHA256SUMS`.
+1. takes the version from its argument or from `VERSION` (`VERSION="${1:-$(cat VERSION)}"`);
+2. runs `go test ./...`;
+3. builds static binaries for the target architectures into `dist/xc_fanout-linux-*`;
+4. computes the checksums `dist/SHA256SUMS`.
 
 The version is stamped into the binary at build time via `-ldflags "-X main.version=…"`, so
-`xc_fanout -version` prints exactly the release version (the panel uses it to decide whether it
-needs to update).
+`xc_fanout -version` prints exactly the version from `VERSION` (the panel uses it to decide whether
+it needs to update).
 
 ## What happens after pushing a tag
 
-Pushing a tag of the form `[0-9]*` (for example `0.7.0`) triggers the workflow
+Pushing a tag of the form `[0-9]*` (the value from `VERSION`) triggers the workflow
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml):
 
-1. checkout, install Go 1.21;
+1. checkout of the full history with tags (`fetch-depth: 0`), install Go 1.21;
 2. `./release.sh "${GITHUB_REF_NAME}"` — rebuild of binaries and checksums;
-3. publish the assets (`dist/xc_fanout-linux-*` and `dist/SHA256SUMS`) to a **GitHub Release**
-   via `softprops/action-gh-release`.
+3. changelog generation — the commits between the previous and current tag are collected into the release body;
+4. publish the assets (`dist/xc_fanout-linux-*` and `dist/SHA256SUMS`) to a **GitHub Release**
+   via `softprops/action-gh-release`, with that changelog as the description.
 
-Manual alternative:
+### Changelog
+
+Each release's description is assembled automatically from the git history — the list of commits
+between the previous and current tag (`--match '[0-9]*'` skips non-release tags):
 
 ```bash
-gh release create 0.7.0 dist/*
+PREV=$(git describe --tags --abbrev=0 --match '[0-9]*' "$VERSION^")
+git log --no-merges --pretty='- %s (%h)' "$PREV..$VERSION"
+```
+
+So releases stay "alive" without a hand-kept CHANGELOG: meaningful commit subjects
+(`feat:`, `fix:`, `docs:` …) become the changelog on the GitHub Release page directly.
+
+Manual alternative (GitHub generates the notes itself):
+
+```bash
+gh release create "$VERSION" dist/* --generate-notes
 ```
 
 ## Project conventions

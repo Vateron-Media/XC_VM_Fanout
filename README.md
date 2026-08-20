@@ -31,14 +31,17 @@ daemon.
 
 ## Cut a release
 
+The version number lives in the `VERSION` file — bump it there, then everything reads it back:
+
 ```bash
-./release.sh 0.7.0        # runs go test, builds dist/xc_fanout-linux-* + SHA256SUMS
-git commit -am "release 0.7.0" && git tag 0.7.0 && git push --tags
+echo 0.9.1 > VERSION && VERSION="$(cat VERSION)"   # single source of truth
+./release.sh              # no arg → version from VERSION; runs go test, builds dist/* + SHA256SUMS
+git commit -am "release $VERSION" && git tag "$VERSION" && git push --tags
 ```
 
-Pushing the version tag (no `v` prefix) triggers `.github/workflows/release.yml`, which rebuilds and
-attaches `dist/*` to the GitHub Release. (Or attach them manually:
-`gh release create 0.7.0 dist/*`.)
+Pushing the version tag (no `v` prefix) triggers `.github/workflows/release.yml`, which rebuilds,
+generates a changelog from the commits since the previous tag, and attaches `dist/*` to the GitHub
+Release. (Or do it manually: `gh release create "$VERSION" dist/* --generate-notes`.)
 
 ## Develop
 

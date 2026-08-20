@@ -24,36 +24,62 @@ go run ./cmd/xc_fanout -h   # список флагов
 
 ## Выпуск версии
 
+Номер версии живёт в одном месте — в файле [`VERSION`](../../VERSION) в корне репозитория.
+Всё остальное берёт его оттуда, поэтому при выпуске правится только этот файл.
+
 ```bash
-./release.sh 0.7.0                       # go test + сборка dist/xc_fanout-linux-* + SHA256SUMS
-git commit -am "release 0.7.0"
-git tag 0.7.0 && git push --tags          # тег БЕЗ префикса "v" — соглашение проекта
+# 1. Поднимите номер версии — единственный источник правды
+echo 0.9.1 > VERSION                        # или отредактируйте VERSION вручную
+VERSION="$(cat VERSION)"
+
+# 2. Соберите артефакты. Без аргумента release.sh читает VERSION;
+#    с аргументом — сам записывает его в VERSION и использует.
+./release.sh                                # == ./release.sh "$VERSION"
+
+# 3. Закоммитьте и поставьте тег той же версией
+git commit -am "release $VERSION"
+git tag "$VERSION" && git push --tags        # тег БЕЗ префикса "v" — соглашение проекта
 ```
 
 Что делает `release.sh`:
 
-1. прогоняет `go test ./...`;
-2. собирает статические бинарники под архитектуры в `dist/xc_fanout-linux-*`;
-3. считает контрольные суммы `dist/SHA256SUMS`.
+1. берёт версию из аргумента или из `VERSION` (`VERSION="${1:-$(cat VERSION)}"`);
+2. прогоняет `go test ./...`;
+3. собирает статические бинарники под архитектуры в `dist/xc_fanout-linux-*`;
+4. считает контрольные суммы `dist/SHA256SUMS`.
 
 Версия штампуется в бинарник при сборке через `-ldflags "-X main.version=…"`, поэтому
-`xc_fanout -version` печатает именно версию релиза (панель по ней решает, нужно ли
+`xc_fanout -version` печатает именно версию из `VERSION` (панель по ней решает, нужно ли
 обновляться).
 
 ## Что происходит после push тега
 
-Push тега вида `[0-9]*` (например `0.7.0`) триггерит workflow
+Push тега вида `[0-9]*` (значение из `VERSION`) триггерит workflow
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml):
 
-1. checkout, установка Go 1.21;
+1. checkout всей истории с тегами (`fetch-depth: 0`), установка Go 1.21;
 2. `./release.sh "${GITHUB_REF_NAME}"` — пересборка бинарников и контрольных сумм;
-3. публикация ассетов (`dist/xc_fanout-linux-*` и `dist/SHA256SUMS`) на **GitHub Release**
-   через `softprops/action-gh-release`.
+3. генерация changelog — коммиты между предыдущим и текущим тегом собираются в тело релиза;
+4. публикация ассетов (`dist/xc_fanout-linux-*` и `dist/SHA256SUMS`) на **GitHub Release**
+   через `softprops/action-gh-release` с этим changelog в описании.
 
-Альтернатива вручную:
+### Changelog
+
+Описание каждого релиза собирается автоматически из истории git — списком коммитов
+между предыдущим и текущим тегом (`--match '[0-9]*'` пропускает нерелизные теги):
 
 ```bash
-gh release create 0.7.0 dist/*
+PREV=$(git describe --tags --abbrev=0 --match '[0-9]*' "$VERSION^")
+git log --no-merges --pretty='- %s (%h)' "$PREV..$VERSION"
+```
+
+Поэтому релизы «живые» без ручного ведения CHANGELOG: осмысленные сообщения коммитов
+(`feat:`, `fix:`, `docs:` …) сразу становятся changelog на странице GitHub Release.
+
+Альтернатива вручную (GitHub сгенерирует заметки сам):
+
+```bash
+gh release create "$VERSION" dist/* --generate-notes
 ```
 
 ## Соглашения проекта
