@@ -13,14 +13,66 @@
 ## Development
 
 ```bash
-go test ./...            # unit tests of all packages
-go vet ./...             # static analysis
 go run ./cmd/xc_fanout -h   # list of flags
+go vet ./...                # static analysis
 ```
 
-Every internal package has tests next to the code (`*_test.go`): `hub`, `tsjoin`,
-`hlsseg`, `hlscrypt`, `ingest`, `puller`, `server` (including a dedicated test for resetting
-a stalled viewer, `serve_live_stall_test.go`).
+## Testing
+
+Tests live next to the code (`*_test.go`) in every internal package. The common commands:
+
+```bash
+go test ./...                       # all unit tests
+go test -race ./...                 # with the race detector (do this before a release)
+go test -cover ./...                # per-package statement coverage
+go test -v ./internal/server -run TestOverlay   # one package / one test, verbose
+```
+
+The suite is fast (seconds) and needs no network, no sockets set up by hand, and no
+running daemon — each test wires up exactly what it needs in-process.
+
+### What each package tests
+
+| Package | What its tests cover |
+|---------|----------------------|
+| `hub` | Fan-out correctness (every subscriber gets the identical byte stream), slow-subscriber drop, snapshot/unsubscribe. |
+| `tsjoin` | Clean-join parsing (PAT/PMT + keyframe) and the prebuffer ring rewind. |
+| `hlsseg` | Segment cutting on keyframes, the sliding window, playlist output. |
+| `hlscrypt` | AES-128-CBC segment encryption round-trips. |
+| `ingest` | 188-byte packet alignment across read boundaries. |
+| `puller` | Source classification (direct mp2t vs ffmpeg remux), cold-start ffmpeg args, reconnect, and ffmpeg-failure surfacing (see below). |
+| `server` | The HTTP surfaces end to end: control API (register / ingest / signal / probe), live-TS and HLS serving, connection & rate tracking, the idle-stop reaper, the debug-stats snapshot, and a dedicated stalled-viewer reset (`serve_live_stall_test.go`). |
+| `dlog` | The debug log toggles on/off and stays silent when disabled. |
+
+Synthetic MPEG-TS inputs come from the `internal/tsfixture` helper (hand-built PAT/PMT/keyframe
+packets), so most tests are pure and deterministic with no external tools.
+
+### How the ffmpeg paths are tested
+
+ffmpeg is exercised two ways, on purpose:
+
+- **Fake ffmpeg** — a tiny shell stand-in written into a temp dir and passed as the ffmpeg
+  binary. It makes the branch deterministic: the remux happy path, a forced non-zero exit
+  (asserting the failure is surfaced, not swallowed as a clean stream end), a cancel that must
+  *not* be reported as a fault, and the overlay's graceful-fallback / disabled / start-failure
+  branches.
+- **Real system ffmpeg** — the overlay drawtext re-encode is also run end to end against the
+  machine's actual `ffmpeg`: the test synthesizes a real H.264 MPEG-TS with `lavfi` and burns a
+  real banner using a system TTF font, then checks the result is a valid, changed stream. It
+  **auto-skips** (with a log line) when `ffmpeg` or a known font is absent, and **logs which
+  binary and font it used** when present — so a test run always makes clear whether the real
+  encode path was exercised or skipped, rather than silently passing.
+
+Debug logging is off during tests; a test that wants to assert on log output enables it and
+captures the log writer (see `internal/dlog/*_test.go` for the pattern).
+
+### End-to-end bench
+
+Beyond the unit tests, [`test/`](../../test/) is a self-contained **end-to-end bench** (a separate
+Go module, so it never affects `go test ./...` at the root): a fake live origin server plus the real
+daemon wired together under Docker Compose, covering every operational mode — direct pull, HLS remux,
+failover, off-air, push/ingest, encrypted HLS, grace reaping, rate telemetry, stalled-viewer
+eviction and teardown. See [`test/README.md`](../../test/README.md) for how to run it.
 
 ## Cutting a release
 

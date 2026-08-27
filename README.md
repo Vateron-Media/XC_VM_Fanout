@@ -46,9 +46,14 @@ Release. (Or do it manually: `gh release create "$VERSION" dist/* --generate-not
 ## Develop
 
 ```bash
-go test ./...
+go test ./...          # unit tests (fast, no network/daemon needed)
+go test -race ./...    # with the race detector — do this before a release
+go test -cover ./...   # per-package coverage
 go vet ./...
 go run ./cmd/xc_fanout -h
 ```
 
-Requires Go >= 1.21.
+Requires Go >= 1.21. What each package tests, how the ffmpeg paths are exercised (a fake
+stand-in for deterministic branches, the real system ffmpeg for the overlay re-encode), and
+the end-to-end Docker bench in [`test/`](test/) are documented in
+[08. Build, test and release](docs/en/08-build-release.md#testing).
