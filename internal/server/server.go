@@ -905,7 +905,8 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 // differently from a plain broken pipe, and telling them apart is the whole
 // point of watching a stuck viewer in debug mode.
 func writeFailReason(err error) string {
-	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
 		return "write stalled past timeout (dropped)"
 	}
 	return "write failed: " + err.Error()

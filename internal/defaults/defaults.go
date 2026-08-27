@@ -15,6 +15,15 @@ package defaults
 
 import "time"
 
+// ── HTTP servers ───────────────────────────────────────────────────────────
+
+// HTTPReadHeaderTimeout bounds how long a client may take to send its request
+// headers before the server drops it. It bounds only the header read, not the
+// (long-lived) response body, so it is safe for the live-TS/HLS streaming
+// handlers while still cutting off a slow-loris client that opens a connection
+// and never finishes its request line.
+const HTTPReadHeaderTimeout = 10 * time.Second
+
 // ── Live-TS fan-out ────────────────────────────────────────────────────────
 
 const (

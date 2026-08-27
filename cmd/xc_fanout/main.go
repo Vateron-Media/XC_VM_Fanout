@@ -23,10 +23,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
@@ -51,7 +53,7 @@ func main() {
 	ffmpeg := flag.String("ffmpeg", "ffmpeg", "ffmpeg binary path")
 	maxGOP := flag.Int("maxgop", 10528000, "max join-snapshot size in bytes")
 	prebufferMax := flag.Int("prebuffer-max", 20, "ceiling (seconds) of live TS history retained per stream for client_prebuffer; a viewer's ?prebuffer= is clamped to this")
-	chunk := flag.Int("chunk", 12032, "ingest read size (aligned down to 188)")
+	chunk := flag.Int("chunk", defaults.IngestChunk, "ingest read size (aligned down to 188)")
 	hlsTarget := flag.Float64("hlstarget", 6, "HLS target segment duration (seconds)")
 	hlsWindow := flag.Int("hlswindow", 6, "HLS segments kept in the sliding window")
 	font := flag.String("font", "", "font file for the admin \"send message\" drawtext overlay; empty disables the overlay")
@@ -61,7 +63,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println(version)
+		fmt.Println(buildVersion())
 		return
 	}
 
@@ -71,7 +73,7 @@ func main() {
 	if *debug || isTruthy(os.Getenv("XC_FANOUT_DEBUG")) {
 		dlog.Enable(true)
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-		dlog.Logf("boot", "debug mode on; version=%s pid=%d", version, os.Getpid())
+		dlog.Logf("boot", "debug mode on; version=%s pid=%d", buildVersion(), os.Getpid())
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -156,7 +158,7 @@ func serveUnix(path string, h http.Handler) (*http.Server, func()) {
 	}
 	_ = os.Chmod(path, 0o660)
 
-	srv := &http.Server{Handler: h}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: defaults.HTTPReadHeaderTimeout}
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve %s: %v", path, err)
@@ -164,6 +166,38 @@ func serveUnix(path string, h http.Handler) (*http.Server, func()) {
 	}()
 	log.Printf("xc_fanout listening on unix:%s", path)
 	return srv, func() { _ = os.Remove(path) }
+}
+
+// buildVersion returns the ldflags-stamped version, or—when the binary was
+// built without -ldflags "-X main.version=…" (a plain `go build`, so version is
+// still "dev")—falls back to the VCS revision the Go toolchain embeds, so a
+// hand-built binary still identifies its commit instead of a bare "dev".
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+	var rev, dirty string
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if rev == "" {
+		return version
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	return "dev+" + rev + dirty
 }
 
 // isTruthy reports whether an env var value means "on" (1/true/yes/on).
