@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 )
 
@@ -27,6 +28,7 @@ type Source struct {
 	Proxy     string // "host:port" HTTP proxy, optional
 	Cookie    string // optional Cookie header value
 	FfmpegBin string // ffmpeg path; "ffmpeg" if empty
+	Label     string // stream id, for debug logging only (no effect on behaviour)
 }
 
 func (s Source) ua() string {
@@ -39,16 +41,25 @@ func (s Source) ua() string {
 // Run pulls src into publish until ctx is cancelled, reconnecting with capped
 // exponential backoff whenever the source ends or errors.
 func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
+	dlog.Logf("puller", "id=%s start; urls=%v proxy=%q", src.Label, src.URLs, src.Proxy)
 	backoff := time.Second
 	for ctx.Err() == nil {
-		if err := pullOnce(ctx, src, chunkSize, publish); err != nil && ctx.Err() == nil {
-			log.Printf("puller: %v (retry in %s)", err, backoff)
+		start := time.Now()
+		err := pullOnce(ctx, src, chunkSize, publish)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("puller: id=%s %v (retry in %s)", src.Label, err, backoff)
+		} else if ctx.Err() == nil {
+			// A pullOnce that returned nil/EOF means the source ended cleanly; the
+			// daemon still reconnects (live sources are not supposed to end).
+			dlog.Logf("puller", "id=%s source ended after %s (retry in %s)", src.Label, time.Since(start).Round(time.Millisecond), backoff)
 		}
 		if ctx.Err() != nil {
+			dlog.Logf("puller", "id=%s stop (context cancelled)", src.Label)
 			return
 		}
 		select {
 		case <-ctx.Done():
+			dlog.Logf("puller", "id=%s stop (context cancelled)", src.Label)
 			return
 		case <-time.After(backoff):
 		}
@@ -65,14 +76,17 @@ func pullOnce(ctx context.Context, src Source, chunkSize int, publish func([]byt
 	for _, raw := range src.URLs {
 		isTS, body, err := probe(ctx, src, raw)
 		if err != nil {
+			dlog.Logf("puller", "id=%s probe failed: %s: %v", src.Label, raw, err)
 			lastErr = err
 			continue
 		}
 		if isTS {
 			defer body.Close()
+			dlog.Logf("puller", "id=%s connected direct mpegts: %s", src.Label, raw)
 			return ingest.Copy(body, chunkSize, publish)
 		}
 		body.Close()
+		dlog.Logf("puller", "id=%s connected via ffmpeg remux: %s", src.Label, raw)
 		return runFfmpeg(ctx, src, raw, chunkSize, publish)
 	}
 	if lastErr == nil {

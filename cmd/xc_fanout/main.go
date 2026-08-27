@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
@@ -54,12 +55,23 @@ func main() {
 	hlsTarget := flag.Float64("hlstarget", 6, "HLS target segment duration (seconds)")
 	hlsWindow := flag.Int("hlswindow", 6, "HLS segments kept in the sliding window")
 	font := flag.String("font", "", "font file for the admin \"send message\" drawtext overlay; empty disables the overlay")
+	debug := flag.Bool("debug", false, "verbose debug log: narrate stream/puller/viewer/HLS/ingest activity and periodic per-stream state (also enabled by XC_FANOUT_DEBUG=1)")
+	statsEvery := flag.Int("debug-stats", 5, "seconds between periodic per-stream state snapshots in debug mode (0 disables the snapshot)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(version)
 		return
+	}
+
+	// Debug mode: -debug or XC_FANOUT_DEBUG=1. When on, switch the standard logger
+	// to microsecond timestamps so the timing of events (a slow probe, a stalled
+	// viewer, reconnect backoff) is legible.
+	if *debug || isTruthy(os.Getenv("XC_FANOUT_DEBUG")) {
+		dlog.Enable(true)
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		dlog.Logf("boot", "debug mode on; version=%s pid=%d", version, os.Getpid())
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -75,6 +87,9 @@ func main() {
 	mgr.SetIngestDir(idir)
 	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
 	mgr.StartReaper(ctx)           // idle-stop sweep for control-managed streams (TS + HLS)
+	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s grace=%ds write-timeout=%ds prebuffer-max=%ds hls=%.1fs/%dseg overlay=%v",
+		*sock, *ctl, idir, *grace, *writeTimeout, *prebufferMax, *hlsTarget, *hlsWindow, *font != "")
+	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
 
 	clientSrv, cleanupClient := serveUnix(*sock, mgr.ClientHandler())
 	ctlSrv, cleanupCtl := (*http.Server)(nil), func() {}
@@ -93,6 +108,7 @@ func main() {
 				Proxy:     *proxy,
 				Cookie:    *cookie,
 				FfmpegBin: *ffmpeg,
+				Label:     *id,
 			}
 			go func() {
 				puller.Run(ctx, src, *chunk, st.Publish)
@@ -148,6 +164,15 @@ func serveUnix(path string, h http.Handler) (*http.Server, func()) {
 	}()
 	log.Printf("xc_fanout listening on unix:%s", path)
 	return srv, func() { _ = os.Remove(path) }
+}
+
+// isTruthy reports whether an env var value means "on" (1/true/yes/on).
+func isTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func splitCSV(s string) []string {

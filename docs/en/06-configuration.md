@@ -23,6 +23,8 @@ The dynamic part (which streams to serve) arrives at runtime via the
 | `-hlswindow` | `6` | How many HLS segments to keep in the sliding window. |
 | `-ffmpeg` | `ffmpeg` | Path to the ffmpeg binary (for remuxing non-mp2t sources, and for the "send message" `drawtext` overlay). Must be a build that has the `drawtext` filter for the overlay to work. |
 | `-font` | `""` (overlay off) | Path to a `.ttf` font for the "send message" overlay. Empty, or an ffmpeg without `drawtext`, disables the overlay (signals become no-ops). |
+| `-debug` | `false` | Verbose debug log: narrate stream/puller/viewer/HLS/ingest activity plus a periodic per-stream state snapshot. Also enabled by `XC_FANOUT_DEBUG=1`. See ["Debug mode"](#debug-mode) below. |
+| `-debug-stats` | `5` | Seconds between the periodic per-stream state snapshots in debug mode (`0` disables just the snapshot; the event log stays on). |
 | `-version` | — | Print the version and exit. |
 
 ### "launch / test" mode flags
@@ -104,3 +106,39 @@ xc_fanout -id test -in ./sample.ts
 # Test a single stream from an external URL
 xc_fanout -id test -source https://example/live.m3u8 -ua "Mozilla/5.0"
 ```
+
+## Debug mode
+
+By default the daemon is nearly silent — it logs only startup, fatal errors, and
+source reconnects. When you need to see *what it is doing right now* and *where it
+is stuck*, turn on debug mode with `-debug` (or `XC_FANOUT_DEBUG=1`). Log
+timestamps switch to microsecond precision so the timing of a slow probe, a
+stalled viewer, or reconnect backoff is legible.
+
+Debug mode narrates every interesting event, each line tagged `[dbg <category>]`:
+
+| Category | What it reports |
+|----------|-----------------|
+| `boot` | Version, pid, and the resolved configuration at startup. |
+| `stream` | Stream created; puller starting/stopping (with the current viewer refcount). |
+| `puller` | Source pull start, which URL was chosen and how (direct mpegts vs ffmpeg remux), probe failures, clean source ends, reconnect backoff, and stop. |
+| `viewer` | Live-TS attach, and a single detach line per viewer with the **cause** — client closed, dropped as too slow (hub buffer full), or write stalled past `-write-timeout` — plus session duration and KB delivered. |
+| `hls` | Segments served (seq + size), and anomalies: playlist requested while still warming up / off-air, or a segment that rolled out of the window. |
+| `ingest` | Push-fed listener up, producer connect/disconnect. |
+| `ctl` | Control-API actions: register/unregister, probe prewarm and its result. |
+| `signal` | "Send message" overlay queued and applied. |
+| `reaper` | Idle-stop of a control-managed stream after the grace window. |
+| `stats` | A periodic per-stream snapshot (every `-debug-stats` seconds): `running`, `ingest`, viewer `refs`, hub `subs`, tracked `conns`, and `data_age` (a growing `data_age` on a running stream is the **off-air** signal). |
+
+```bash
+# Full debug, per-stream snapshot every 2 s
+xc_fanout -sock … -ctl … -debug -debug-stats 2
+
+# Same via the environment (handy for systemd drop-ins)
+XC_FANOUT_DEBUG=1 xc_fanout -sock … -ctl …
+```
+
+When debug is off, the instrumentation costs a single atomic load per call site and
+formats nothing, so it is safe to leave the calls in the hot paths (per-chunk
+publish, per-viewer write). Filter the output by category with `grep`, e.g.
+`journalctl -u xc_fanout | grep '\[dbg viewer'` to watch only viewer churn.

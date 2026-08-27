@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlsseg"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
@@ -44,6 +45,8 @@ const defaultWriteTimeout = 15 * time.Second
 type Stream struct {
 	Hub *hub.Hub
 	Seg *hlsseg.Segmenter
+
+	id string // stream id, set at creation; for debug logging
 
 	mu      sync.Mutex
 	cfg     *puller.Source // nil = externally fed (launch mode / ingest); set = daemon pulls
@@ -202,9 +205,11 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 			if err != nil {
 				return // listener closed (stopIngestLocked)
 			}
+			dlog.Logf("ingest", "id=%s producer connected on %s", s.id, sockPath)
 			go func(c net.Conn) {
 				defer c.Close()
-				_ = ingest.Copy(c, ch, s.Publish)
+				err := ingest.Copy(c, ch, s.Publish)
+				dlog.Logf("ingest", "id=%s producer disconnected: %v", s.id, err)
 			}(conn)
 		}
 	}()
@@ -245,6 +250,7 @@ func (s *Stream) setConfig(src puller.Source, chunk int) {
 	if chunk > 0 {
 		s.chunk = chunk
 	}
+	dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, src.URLs, src.Proxy, s.refs)
 	if s.refs > 0 {
 		s.startLocked()
 	}
@@ -258,11 +264,14 @@ func (s *Stream) startLocked() {
 	s.cancel = cancel
 	s.running = true
 	cfg, chunk := *s.cfg, s.chunk
+	cfg.Label = s.id
+	dlog.Logf("stream", "id=%s puller starting (refs=%d)", s.id, s.refs)
 	go puller.Run(ctx, cfg, chunk, s.Publish)
 }
 
 func (s *Stream) stopLocked() {
 	if s.running && s.cancel != nil {
+		dlog.Logf("stream", "id=%s puller stopping", s.id)
 		s.cancel()
 	}
 	s.running = false
@@ -303,7 +312,8 @@ func (s *Stream) idleStopLocked(now time.Time) {
 	if !s.running || s.cfg == nil || s.refs > 0 {
 		return
 	}
-	if now.Sub(time.Unix(0, s.lastAccess.Load())) >= s.grace {
+	if idle := now.Sub(time.Unix(0, s.lastAccess.Load())); idle >= s.grace {
+		dlog.Logf("reaper", "id=%s idle-stop (no viewers, idle %s ≥ grace %s)", s.id, idle.Round(time.Second), s.grace)
 		s.stopLocked()
 	}
 }
@@ -341,9 +351,9 @@ type Manager struct {
 	writeTimeout time.Duration // per-write deadline for live-TS viewers
 	ingestDir    string        // base dir for per-stream push-fed ingest sockets
 
-	ffmpegBin string        // ffmpeg path for the "send message" drawtext overlay
-	fontPath  string        // font file for the overlay text
-	signals   *signalStore  // pending per-uuid "send message" overlays
+	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
+	fontPath  string       // font file for the overlay text
+	signals   *signalStore // pending per-uuid "send message" overlays
 }
 
 // SetIngestDir sets the directory for per-stream ingest sockets (non-proxy tee).
@@ -414,6 +424,54 @@ func (m *Manager) StartReaper(ctx context.Context) {
 	}()
 }
 
+// StartDebugStats logs a compact per-stream state snapshot every `every` while
+// debug mode is on: for each stream, whether its puller is running (or it is
+// push-fed via ingest), how many live-TS viewers hold a ref, the hub subscriber
+// count, tracked viewer uuids, and the age of the last data (a growing data_age
+// on a running stream is the off-air signal). This is the "what is the daemon
+// doing right now" view. No-op when debug is off or every <= 0, so it costs
+// nothing in normal operation. Call once from main.
+func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
+	if !dlog.On() || every <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				m.mu.Lock()
+				streams := make([]*Stream, 0, len(m.streams))
+				for _, st := range m.streams {
+					streams = append(streams, st)
+				}
+				m.mu.Unlock()
+				if len(streams) == 0 {
+					dlog.Logf("stats", "no streams registered")
+					continue
+				}
+				for _, st := range streams {
+					st.mu.Lock()
+					running, refs, ingesting := st.running, st.refs, st.ingestLn != nil
+					st.mu.Unlock()
+					st.connMu.Lock()
+					conns := len(st.conns)
+					st.connMu.Unlock()
+					dataAge := "never"
+					if ld := st.lastData.Load(); ld != 0 {
+						dataAge = time.Since(time.Unix(0, ld)).Round(time.Millisecond).String()
+					}
+					dlog.Logf("stats", "id=%s running=%v ingest=%v refs=%d subs=%d conns=%d data_age=%s",
+						st.id, running, ingesting, refs, st.Hub.Count(), conns, dataAge)
+				}
+			}
+		}
+	}()
+}
+
 // Get returns the stream for id, or nil.
 func (m *Manager) Get(id string) *Stream {
 	m.mu.Lock()
@@ -428,12 +486,14 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 	st := m.streams[id]
 	if st == nil {
 		st = &Stream{
+			id:    id,
 			Hub:   hub.New(m.maxGOP, m.maxPrebufMS),
 			Seg:   hlsseg.New(m.hlsTarget, m.hlsWindow),
 			chunk: defaultChunk,
 			grace: m.grace,
 		}
 		m.streams[id] = st
+		dlog.Logf("stream", "id=%s created", id)
 	}
 	return st
 }
@@ -456,8 +516,10 @@ func (m *Manager) RegisterIngest(id string, chunk int) (string, error) {
 	err := st.startIngestLocked(sock, chunk)
 	st.mu.Unlock()
 	if err != nil {
+		dlog.Logf("ingest", "id=%s listen failed on %s: %v", id, sock, err)
 		return "", err
 	}
+	dlog.Logf("ingest", "id=%s listening on %s", id, sock)
 	return sock, nil
 }
 
@@ -473,6 +535,7 @@ func (m *Manager) Unregister(id string) {
 	m.mu.Lock()
 	delete(m.streams, id)
 	m.mu.Unlock()
+	dlog.Logf("ctl", "id=%s unregistered and removed", id)
 }
 
 // ClientHandler routes the nginx-facing surface: live TS, HLS, health.
@@ -592,6 +655,7 @@ func (m *Manager) serveSignal(w http.ResponseWriter, r *http.Request) {
 		y:        y,
 		expires:  time.Now().Add(time.Duration(ttl) * time.Second),
 	})
+	dlog.Logf("signal", "queued overlay uuid=%s ttl=%ds msg=%q", uuid, ttl, body.Message)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -626,13 +690,16 @@ func (m *Manager) serveProbe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	st.touch() // start the puller (pull-fed) + bump lastAccess
+	dlog.Logf("ctl", "id=%s probe: prewarming, waiting up to %dms for data", id, waitMs)
 	deadline := time.Now().Add(time.Duration(waitMs) * time.Millisecond)
 	for st.lastData.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	status := st.status()
+	dlog.Logf("ctl", "id=%s probe result: has_data=%v since_data_ms=%d", id, status.HasData, status.SinceDataMs)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(st.status())
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 // serveIngest is the push-fed control surface: PUT /ingest/<id> starts (or
@@ -756,6 +823,20 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		defer st.removeConn(uuid)
 	}
 
+	// Debug: narrate this viewer's whole live-TS session — attach, then a single
+	// disconnect line with the cause (client closed / hub dropped it as too slow /
+	// write stalled past the timeout), how long it lasted and how much it got.
+	start := time.Now()
+	reason := "client closed"
+	dlog.Logf("viewer", "id=%s live attach uuid=%s prebuffer=%dms subs=%d", id, uuid, prebufMS, st.Hub.Count())
+	defer func() {
+		var sent int64
+		if cs != nil {
+			sent = cs.bytes.Load()
+		}
+		dlog.Logf("viewer", "id=%s live detach uuid=%s reason=%q dur=%s sent=%dKB", id, uuid, reason, time.Since(start).Round(time.Millisecond), sent/1024)
+	}()
+
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -790,6 +871,7 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 
 	if len(snap) > 0 {
 		if err := write(snap); err != nil {
+			reason = writeFailReason(err)
 			return
 		}
 	}
@@ -799,7 +881,9 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		// fall back to the raw fan-out. peek keeps the hot path a single map read.
 		if uuid != "" && m.signals.peek(uuid) {
 			if sig, ok := m.signals.take(uuid); ok {
+				dlog.Logf("signal", "id=%s uuid=%s applying overlay to live TS window", id, uuid)
 				if !m.overlayTSWindow(st, sub, write, sig, codec) {
+					reason = "client closed (during overlay)"
 					return
 				}
 			}
@@ -807,14 +891,28 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		select {
 		case b := <-sub.C():
 			if err := write(b); err != nil {
+				reason = writeFailReason(err)
 				return
 			}
 		case <-sub.Done():
+			reason = "dropped: too slow (hub buffer full)"
 			return
 		case <-r.Context().Done():
+			reason = "client closed"
 			return
 		}
 	}
+}
+
+// writeFailReason labels why a live-TS write failed: a stall past the per-write
+// deadline (a backgrounded/half-open player whose socket buffer filled) reads
+// differently from a plain broken pipe, and telling them apart is the whole
+// point of watching a stuck viewer in debug mode.
+func writeFailReason(err error) string {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return "write stalled past timeout (dropped)"
+	}
+	return "write failed: " + err.Error()
 }
 
 // serveHLS handles /hls/<id>/index.m3u8 and /hls/<id>/<seq>.ts.
@@ -838,6 +936,7 @@ func (m *Manager) serveHLS(w http.ResponseWriter, r *http.Request) {
 	case file == "index.m3u8":
 		pl := st.Seg.Playlist()
 		if pl == "" {
+			dlog.Logf("hls", "id=%s playlist requested but no segments yet (warming up / off-air)", id)
 			http.Error(w, "no segments yet", http.StatusNotFound)
 			return
 		}
@@ -853,9 +952,11 @@ func (m *Manager) serveHLS(w http.ResponseWriter, r *http.Request) {
 		}
 		data := st.Seg.Segment(seq)
 		if data == nil {
+			dlog.Logf("hls", "id=%s segment %d not found (rolled out of window or never existed)", id, seq)
 			http.NotFound(w, r)
 			return
 		}
+		dlog.Logf("hls", "id=%s segment %d served (%dKB)", id, seq, len(data)/1024)
 		// Admin "send message" overlay for this viewer (one-shot): burn the text
 		// banner into this one segment, then the signal is cleared. Applied before
 		// encryption so the client still decrypts normally. ?c=<uuid> identifies
