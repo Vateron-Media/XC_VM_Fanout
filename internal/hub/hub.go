@@ -9,12 +9,13 @@ package hub
 import (
 	"sync"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsjoin"
 )
 
 // subQueue bounds how much a single subscriber may fall behind before it is
 // dropped (number of pending chunks).
-const subQueue = 256
+const subQueue = defaults.SubscriberQueue
 
 // Sub is a single subscriber's delivery channel.
 type Sub struct {

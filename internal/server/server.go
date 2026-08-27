@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlsseg"
@@ -30,15 +31,10 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
 )
 
-const defaultChunk = 12032
-
-// defaultWriteTimeout bounds a single write to a live-TS viewer. A viewer that
-// cannot accept the next chunk within this window (its OS socket buffer is full
-// because it stopped draining — a backgrounded/force-switched player, a dropped
-// mobile link) is dropped so it can never pin the serveLive goroutine forever.
-// A healthy real-time viewer produces at most ~1s of backlog per second, so this
-// only ever fires on a genuinely stalled connection.
-const defaultWriteTimeout = 15 * time.Second
+// Operational defaults live in internal/defaults; these aliases keep the local
+// names the hot paths read by. See that package for the rationale behind each.
+const defaultChunk = defaults.IngestChunk
+const defaultWriteTimeout = defaults.WriteTimeout
 
 // Stream bundles the TS fan-out (Hub) and in-memory HLS (Seg) for one source,
 // plus its on-demand lifecycle state.
@@ -679,21 +675,21 @@ func (m *Manager) serveProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	waitMs := 5000
+	waitMs := defaults.ProbeDefaultWaitMS
 	if q := r.URL.Query().Get("wait"); q != "" {
 		if v, err := strconv.Atoi(q); err == nil && v >= 0 {
 			waitMs = v
 		}
 	}
-	if waitMs > 30000 {
-		waitMs = 30000
+	if waitMs > defaults.ProbeMaxWaitMS {
+		waitMs = defaults.ProbeMaxWaitMS
 	}
 
 	st.touch() // start the puller (pull-fed) + bump lastAccess
 	dlog.Logf("ctl", "id=%s probe: prewarming, waiting up to %dms for data", id, waitMs)
 	deadline := time.Now().Add(time.Duration(waitMs) * time.Millisecond)
 	for st.lastData.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(defaults.ProbePollInterval)
 	}
 
 	status := st.status()

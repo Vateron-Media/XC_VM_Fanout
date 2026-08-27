@@ -10,6 +10,8 @@ import (
 	"math"
 	"strings"
 	"sync"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 )
 
 const packetSize = 188
@@ -53,15 +55,15 @@ type Segmenter struct {
 // last window segments.
 func New(targetDur float64, window int) *Segmenter {
 	if targetDur <= 0 {
-		targetDur = 6
+		targetDur = defaults.HLSDefaultTargetSec
 	}
 	if window < 1 {
-		window = 3
+		window = defaults.HLSDefaultWindow
 	}
 	return &Segmenter{
 		targetDur: targetDur,
 		window:    window,
-		maxSeg:    16 * 1024 * 1024,
+		maxSeg:    defaults.HLSMaxSegmentBytes,
 		pmtPID:    -1,
 		videoPID:  -1,
 	}

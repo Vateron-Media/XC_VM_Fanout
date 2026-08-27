@@ -14,6 +14,8 @@
 // at fixed byte offsets.
 package tsjoin
 
+import "github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
+
 // PacketSize is the fixed MPEG-TS packet length.
 const PacketSize = 188
 
@@ -51,7 +53,7 @@ func New(maxGOP int, maxPrebufMS int64) *State {
 	// Backstop the ring at a generous high-bitrate estimate (~24 Mbit/s ≈ 3000
 	// bytes/ms) so a stream whose PCR cannot be parsed can never grow it without
 	// bound. Duration-based pruning does the real work when PCR is present.
-	s.maxRing = int(maxPrebufMS) * 3000
+	s.maxRing = int(maxPrebufMS) * defaults.JoinRingBytesPerMS
 	return s
 }
 

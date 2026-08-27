@@ -10,13 +10,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 )
 
 // overlayTSDuration is how long an admin "send message" banner stays burned onto
 // a live-TS viewer's stream before it rejoins the raw fan-out. Mirrors the legacy
 // one-segment overlay; kept short since it costs a transient per-viewer re-encode.
-const overlayTSDuration = 5 * time.Second
+const overlayTSDuration = defaults.OverlayTSDuration
 
 // pendingSignal is an admin "send message" overlay queued for one viewer uuid.
 // It reproduces the legacy admin "send message" feature: a text banner burned into the
@@ -140,7 +141,7 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 		return seg
 	}
 	if codec == "" {
-		codec = "h264"
+		codec = defaults.OverlayDefaultCodec
 	}
 	filter := "drawtext=fontfile=" + m.fontPath +
 		":text='" + escapeDrawtext(sig.text) + "'" +
@@ -149,7 +150,7 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 		":y=" + strconv.Itoa(sig.y) +
 		":fontcolor=" + sanitizeColor(sig.color)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaults.OverlaySegmentTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
 		"-nostdin", "-hide_banner", "-loglevel", "quiet", "-y",
@@ -185,7 +186,7 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 		return true
 	}
 	if codec == "" {
-		codec = "h264"
+		codec = defaults.OverlayDefaultCodec
 	}
 	filter := "drawtext=fontfile=" + m.fontPath +
 		":text='" + escapeDrawtext(sig.text) + "'" +
@@ -194,7 +195,7 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 		":y=" + strconv.Itoa(sig.y) +
 		":fontcolor=" + sanitizeColor(sig.color)
 
-	ctx, cancel := context.WithTimeout(context.Background(), overlayTSDuration+10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), overlayTSDuration+defaults.OverlayTSWindowGrace)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
 		"-nostdin", "-hide_banner", "-loglevel", "quiet", "-y",

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 )
@@ -42,7 +43,7 @@ func (s Source) ua() string {
 // exponential backoff whenever the source ends or errors.
 func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 	dlog.Logf("puller", "id=%s start; urls=%v proxy=%q", src.Label, src.URLs, src.Proxy)
-	backoff := time.Second
+	backoff := defaults.PullBackoffInitial
 	for ctx.Err() == nil {
 		start := time.Now()
 		err := pullOnce(ctx, src, chunkSize, publish)
@@ -63,7 +64,7 @@ func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 8*time.Second {
+		if backoff < defaults.PullBackoffMax {
 			backoff *= 2
 		}
 	}
@@ -150,7 +151,7 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 		// the PAT/PMT + codecs a live TS/HLS source presents. HTTP reconnect (as
 		// the panel's own ffmpeg uses) rides out a transient fetch hiccup during
 		// warm-up without dropping the pull. Input options — must precede -i.
-		"-probesize", "1000000", "-analyzeduration", "1000000",
+		"-probesize", defaults.PullFfmpegProbeSize, "-analyzeduration", defaults.PullFfmpegAnalyzeDuration,
 		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
 	}
 	if src.Cookie != "" {
