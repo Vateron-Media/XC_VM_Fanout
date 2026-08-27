@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 )
 
@@ -153,7 +154,7 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 	ctx, cancel := context.WithTimeout(context.Background(), defaults.OverlaySegmentTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
-		"-nostdin", "-hide_banner", "-loglevel", "quiet", "-y",
+		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-i", "pipe:0",
 		"-filter_complex", filter,
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
@@ -162,10 +163,14 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 		"-f", "mpegts", "pipe:1",
 	)
 	cmd.Stdin = bytes.NewReader(seg)
-	var out bytes.Buffer
+	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil || out.Len() == 0 {
-		return seg // graceful: serve the plain segment on any encode failure
+		// graceful: serve the plain segment on any encode failure, but log why so
+		// a misconfigured font/codec doesn't fail silently on every signal.
+		dlog.Logf("signal", "overlay segment re-encode failed (%v), serving plain: %s", err, strings.TrimSpace(errBuf.String()))
+		return seg
 	}
 	return out.Bytes()
 }
@@ -198,7 +203,7 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 	ctx, cancel := context.WithTimeout(context.Background(), overlayTSDuration+defaults.OverlayTSWindowGrace)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
-		"-nostdin", "-hide_banner", "-loglevel", "quiet", "-y",
+		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-fflags", "+genpts", "-i", "pipe:0",
 		"-filter_complex", filter,
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
@@ -206,9 +211,16 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 		"-mpegts_flags", "+initial_discontinuity",
 		"-f", "mpegts", "pipe:1",
 	)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
 	stdin, err1 := cmd.StdinPipe()
 	stdout, err2 := cmd.StdoutPipe()
-	if err1 != nil || err2 != nil || cmd.Start() != nil {
+	if err1 != nil || err2 != nil {
+		dlog.Logf("signal", "overlay TS window: pipe setup failed (%v / %v), continuing raw", err1, err2)
+		return true
+	}
+	if err := cmd.Start(); err != nil {
+		dlog.Logf("signal", "overlay TS window: ffmpeg start failed (%v), continuing raw", err)
 		return true // couldn't start ffmpeg → continue raw
 	}
 
@@ -254,6 +266,10 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 	}
 	close(stopFeed)
 	<-feedDone
-	_ = cmd.Wait()
+	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+		// ctx.Err() != nil means our own deadline/kill ended the window (expected);
+		// anything else is a real overlay ffmpeg failure worth surfacing.
+		dlog.Logf("signal", "overlay TS window: ffmpeg exited (%v): %s", err, strings.TrimSpace(errBuf.String()))
+	}
 	return ok
 }

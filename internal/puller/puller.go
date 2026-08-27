@@ -15,12 +15,38 @@ import (
 	"net/url"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 )
+
+// tailBuffer keeps only the last max bytes written to it — a bounded sink for a
+// child process's stderr, so a chatty ffmpeg can never grow memory without bound
+// while we still keep the most recent lines to explain why it exited.
+type tailBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = t.buf[len(t.buf)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.TrimSpace(string(t.buf))
+}
 
 // Source describes where and how to pull a live stream.
 type Source struct {
@@ -143,8 +169,11 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 		bin = "ffmpeg"
 	}
 	args := []string{
+		// -loglevel error (not quiet): ffmpeg only speaks up on a genuine error,
+		// which we capture from stderr and log — the mpegts byte stream is on
+		// stdout, a separate pipe, so this never pollutes it.
 		"-copyts", "-vsync", "0", "-nostats", "-nostdin", "-hide_banner",
-		"-loglevel", "quiet", "-y", "-user_agent", src.ua(),
+		"-loglevel", "error", "-y", "-user_agent", src.ua(),
 		// Cold-start bounds (ADR 0003, Phase C1a): cap input analysis so the first
 		// mpegts bytes appear quickly on a cold on-demand join, instead of ffmpeg
 		// spending its default 5s/5MB probing the source. 1s/1MB still identifies
@@ -167,6 +196,8 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 	)
 
 	cmd := exec.CommandContext(ctx, bin, args...)
+	stderr := &tailBuffer{max: 4096}
+	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -175,6 +206,22 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 		return err
 	}
 	copyErr := ingest.Copy(stdout, chunkSize, publish)
-	_ = cmd.Wait()
+	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return copyErr // we cancelled it (stream stop/shutdown) — not a fault
+	}
+	if waitErr != nil {
+		if tail := stderr.String(); tail != "" {
+			dlog.Logf("puller", "id=%s ffmpeg exited (%v): %s", src.Label, waitErr, tail)
+		} else {
+			dlog.Logf("puller", "id=%s ffmpeg exited: %v", src.Label, waitErr)
+		}
+		// A non-zero ffmpeg exit that closed stdout cleanly would otherwise reach
+		// Run() as a plain EOF and look like a normal source end; surface the real
+		// cause so it is logged and backed off on, not silently retried as "ended".
+		if copyErr == nil || copyErr == io.EOF {
+			return fmt.Errorf("ffmpeg: %w", waitErr)
+		}
+	}
 	return copyErr
 }

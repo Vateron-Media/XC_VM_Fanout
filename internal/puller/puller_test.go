@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
 )
@@ -90,6 +91,56 @@ func TestFfmpegBranchRemuxes(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("ffmpeg branch delivered %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+// TestFfmpegExitSurfaced: when ffmpeg exits non-zero after closing stdout
+// cleanly, runFfmpeg must surface the failure (not let it reach Run as a plain
+// EOF that looks like a normal source end), and carry ffmpeg's stderr for the log.
+func TestFfmpegExitSurfaced(t *testing.T) {
+	dir := t.TempDir()
+	// A stand-in ffmpeg that writes a diagnostic to stderr and exits 1 with no
+	// stdout — i.e. a source ffmpeg could not open/decode.
+	fake := filepath.Join(dir, "fakeffmpeg")
+	script := "#!/bin/sh\necho 'boom: could not open source' >&2\nexit 1\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := serveTS("video/mp4", []byte("not a TS stream"))
+	defer srv.Close()
+
+	err := pullOnce(context.Background(),
+		Source{URLs: []string{srv.URL}, FfmpegBin: fake, Label: "t"}, 12032, func([]byte) {})
+	if err == nil || err == io.EOF {
+		t.Fatalf("ffmpeg exit 1 must surface as an error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ffmpeg") {
+		t.Fatalf("error should identify ffmpeg, got %q", err.Error())
+	}
+}
+
+// TestFfmpegCancelNotSurfaced: when the context is cancelled (stream stop /
+// shutdown), the ffmpeg kill must NOT be reported as a fault.
+func TestFfmpegCancelNotSurfaced(t *testing.T) {
+	dir := t.TempDir()
+	// A stand-in ffmpeg that runs until killed. `exec` replaces the shell so the
+	// context kill lands on sleep directly (otherwise the grandchild outlives the
+	// killed shell, holding the stdout pipe open until it exits on its own).
+	fake := filepath.Join(dir, "fakeffmpeg")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srv := serveTS("video/mp4", []byte("not a TS stream"))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+	err := pullOnce(ctx, Source{URLs: []string{srv.URL}, FfmpegBin: fake}, 12032, func([]byte) {})
+	// The contract: a cancel-induced ffmpeg kill must never be reported as an
+	// "ffmpeg: …" fault (whatever benign EOF/read error the pipe returns is fine).
+	if err != nil && strings.Contains(err.Error(), "ffmpeg:") {
+		t.Fatalf("cancel surfaced an ffmpeg fault: %q", err.Error())
 	}
 }
 
