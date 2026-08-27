@@ -69,3 +69,41 @@ func TestSlowSubscriberDropped(t *testing.T) {
 		t.Fatalf("hub should have 0 subscribers after dropping the slow one, got %d", h.Count())
 	}
 }
+
+// TestUnsubscribeRemovesAndClosesDone: Unsubscribe drops the subscriber from the
+// fan-out and closes its Done channel; a second call is a harmless no-op.
+func TestUnsubscribeRemovesAndClosesDone(t *testing.T) {
+	h := New(1<<20, 0)
+	sub, _ := h.Subscribe(0)
+	if h.Count() != 1 {
+		t.Fatalf("Count after Subscribe = %d, want 1", h.Count())
+	}
+
+	h.Unsubscribe(sub)
+	if h.Count() != 0 {
+		t.Fatalf("Count after Unsubscribe = %d, want 0", h.Count())
+	}
+	select {
+	case <-sub.Done():
+		// closed as expected
+	default:
+		t.Fatal("Unsubscribe must close the subscriber's Done channel")
+	}
+
+	h.Unsubscribe(sub) // idempotent: must not panic on a double close
+}
+
+// TestSnapshotReturnsCleanEntryWithoutSubscribing: Snapshot yields the current
+// join snapshot (here PAT+PMT+keyframe) without registering a subscriber.
+func TestSnapshotReturnsCleanEntryWithoutSubscribing(t *testing.T) {
+	h := New(1<<20, 0)
+	h.Publish(mkPkt(1))
+
+	snap := h.Snapshot(0)
+	if len(snap) == 0 || snap[0] != 0x47 {
+		t.Fatalf("Snapshot must return TS-aligned bytes, got %d bytes", len(snap))
+	}
+	if h.Count() != 0 {
+		t.Fatalf("Snapshot must not subscribe; Count = %d, want 0", h.Count())
+	}
+}
