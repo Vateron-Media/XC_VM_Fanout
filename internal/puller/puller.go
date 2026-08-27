@@ -56,6 +56,7 @@ type Source struct {
 	Cookie    string // optional Cookie header value
 	FfmpegBin string // ffmpeg path; "ffmpeg" if empty
 	Label     string // stream id, for debug logging only (no effect on behaviour)
+	Insecure  bool   // skip upstream TLS certificate verification (see -source-insecure)
 }
 
 func (s Source) ua() string {
@@ -123,7 +124,11 @@ func pullOnce(ctx context.Context, src Source, chunkSize int, publish func([]byt
 }
 
 func httpClient(src Source) (*http.Client, error) {
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	// Upstream TLS verification is opt-in (src.Insecure, from -source-insecure).
+	// The panel commonly pulls sources with self-signed or mismatched certs, so
+	// the daemon defaults to skipping verification — but a deployment that pulls
+	// only trusted HTTPS origins can turn it on.
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: src.Insecure}}
 	if src.Proxy != "" {
 		pu, err := url.Parse("http://" + src.Proxy)
 		if err != nil {

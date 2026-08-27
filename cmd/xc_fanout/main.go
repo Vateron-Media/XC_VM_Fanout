@@ -57,6 +57,7 @@ func main() {
 	hlsTarget := flag.Float64("hlstarget", 6, "HLS target segment duration (seconds)")
 	hlsWindow := flag.Int("hlswindow", 6, "HLS segments kept in the sliding window")
 	font := flag.String("font", "", "font file for the admin \"send message\" drawtext overlay; empty disables the overlay")
+	sourceInsecure := flag.Bool("source-insecure", true, "skip TLS certificate verification when pulling HTTPS sources (default true: the panel commonly pulls self-signed/mismatched-cert upstreams; set false to require valid certs)")
 	debug := flag.Bool("debug", false, "verbose debug log: narrate stream/puller/viewer/HLS/ingest activity and periodic per-stream state (also enabled by XC_FANOUT_DEBUG=1)")
 	statsEvery := flag.Int("debug-stats", 5, "seconds between periodic per-stream state snapshots in debug mode (0 disables the snapshot)")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -87,6 +88,7 @@ func main() {
 	}
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
+	mgr.SetSourceInsecure(*sourceInsecure)
 	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
 	mgr.StartReaper(ctx)           // idle-stop sweep for control-managed streams (TS + HLS)
 	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s grace=%ds write-timeout=%ds prebuffer-max=%ds hls=%.1fs/%dseg overlay=%v",
@@ -104,18 +106,17 @@ func main() {
 		st := mgr.GetOrCreate(*id)
 		switch {
 		case *source != "":
+			// Pinned launch feed: runs through the Manager like a control-managed
+			// source (so status/running/reaper stay consistent), just without
+			// waiting for a viewer.
 			src := puller.Source{
 				URLs:      splitCSV(*source),
 				UserAgent: *ua,
 				Proxy:     *proxy,
 				Cookie:    *cookie,
 				FfmpegBin: *ffmpeg,
-				Label:     *id,
 			}
-			go func() {
-				puller.Run(ctx, src, *chunk, st.Publish)
-				log.Printf("puller for id=%s stopped", *id)
-			}()
+			mgr.RunPinned(ctx, *id, src, *chunk)
 		case *in != "":
 			go func() {
 				r := os.Stdin

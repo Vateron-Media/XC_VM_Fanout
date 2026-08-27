@@ -23,6 +23,7 @@ The dynamic part (which streams to serve) arrives at runtime via the
 | `-hlswindow` | `6` | How many HLS segments to keep in the sliding window. |
 | `-ffmpeg` | `ffmpeg` | Path to the ffmpeg binary (for remuxing non-mp2t sources, and for the "send message" `drawtext` overlay). Must be a build that has the `drawtext` filter for the overlay to work. |
 | `-font` | `""` (overlay off) | Path to a `.ttf` font for the "send message" overlay. Empty, or an ffmpeg without `drawtext`, disables the overlay (signals become no-ops). |
+| `-source-insecure` | `true` | Skip TLS certificate verification when pulling HTTPS sources. Default `true` because the panel commonly pulls upstreams with self-signed or mismatched certs; set `false` to require valid certificates. Applies to both control-registered and launch (`-source`) pulls. |
 | `-debug` | `false` | Verbose debug log: narrate stream/puller/viewer/HLS/ingest activity plus a periodic per-stream state snapshot. Also enabled by `XC_FANOUT_DEBUG=1`. See ["Debug mode"](#debug-mode) below. |
 | `-debug-stats` | `5` | Seconds between the periodic per-stream state snapshots in debug mode (`0` disables just the snapshot; the event log stays on). |
 | `-version` | — | Print the version and exit. |

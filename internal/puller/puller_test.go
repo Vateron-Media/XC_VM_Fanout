@@ -46,6 +46,31 @@ func TestProbeClassifiesContentType(t *testing.T) {
 	}
 }
 
+// TestSourceTLSVerification: Insecure skips upstream cert verification (a
+// self-signed HTTPS source is accepted), while Insecure=false rejects it.
+func TestSourceTLSVerification(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		_, _ = w.Write([]byte("x"))
+	}))
+	defer srv.Close()
+
+	// Insecure (the daemon default): the self-signed cert is accepted.
+	isTS, body, err := probe(context.Background(), Source{Insecure: true}, srv.URL)
+	if err != nil {
+		t.Fatalf("insecure probe of a self-signed TLS source failed: %v", err)
+	}
+	body.Close()
+	if !isTS {
+		t.Fatal("video/mp2t must classify as direct TS")
+	}
+
+	// Verification on: the self-signed cert must be rejected.
+	if _, _, err := probe(context.Background(), Source{Insecure: false}, srv.URL); err == nil {
+		t.Fatal("secure probe must reject a self-signed certificate")
+	}
+}
+
 func TestDirectPullStreamsBytes(t *testing.T) {
 	payload := tsfixture.Concat(
 		tsfixture.PAT(0x100),

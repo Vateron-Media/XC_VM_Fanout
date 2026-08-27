@@ -165,6 +165,42 @@ func TestStartReaperIdleStops(t *testing.T) {
 	}
 }
 
+// TestRunPinnedLifecycle: a launch/test feed marks the stream running with a
+// pin ref immediately, is exempt from the idle-stop reaper, and clears running
+// when its context is cancelled.
+func TestRunPinnedLifecycle(t *testing.T) {
+	mgr := NewManager(1<<20, 0, 2, 6, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A source that refuses fast so the puller loops without ever yielding data.
+	mgr.RunPinned(ctx, "L", puller.Source{URLs: []string{"http://127.0.0.1:1/dead.ts"}}, 0)
+
+	st := mgr.Get("L")
+	if st == nil {
+		t.Fatal("pinned stream missing after RunPinned")
+	}
+	if s := st.status(); !s.Running || s.Refs != 1 {
+		t.Fatalf("pinned status = %+v, want running with a pin ref", s)
+	}
+
+	// The reaper must leave a pinned stream alone even with stale access (refs>0).
+	st.lastAccess.Store(time.Now().Add(-time.Hour).UnixNano())
+	st.mu.Lock()
+	st.idleStopLocked(time.Now())
+	st.mu.Unlock()
+	if !st.status().Running {
+		t.Fatal("idle-stop hit a pinned launch feed (refs>0 must be exempt)")
+	}
+
+	// Cancelling the context stops the puller and clears running.
+	cancel()
+	stopped := waitFor(func() bool { return !st.status().Running })
+	if !stopped {
+		t.Fatal("pinned puller did not clear running after context cancel")
+	}
+}
+
 func TestServeSignalQueuesOverlay(t *testing.T) {
 	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	ts := httptest.NewServer(mgr.ControlHandler())

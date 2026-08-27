@@ -350,7 +350,13 @@ type Manager struct {
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
 	signals   *signalStore // pending per-uuid "send message" overlays
+
+	sourceInsecure bool // default for puller.Source.Insecure on registered sources
 }
+
+// SetSourceInsecure sets whether pull sources skip upstream TLS verification
+// (applied to every control-registered source). See the -source-insecure flag.
+func (m *Manager) SetSourceInsecure(v bool) { m.sourceInsecure = v }
 
 // SetIngestDir sets the directory for per-stream ingest sockets (non-proxy tee).
 func (m *Manager) SetIngestDir(dir string) { m.ingestDir = dir }
@@ -496,7 +502,39 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 
 // Register sets a stream's pull config (control API).
 func (m *Manager) Register(id string, src puller.Source, chunk int) {
+	src.Insecure = m.sourceInsecure
 	m.GetOrCreate(id).setConfig(src, chunk)
+}
+
+// RunPinned feeds a stream for the whole process lifetime (launch/test mode,
+// -id/-source): it stores the pull config, starts the puller immediately bound
+// to ctx, and marks the stream running with a permanent pin ref so status and
+// the debug snapshot reflect it and the reaper never idle-stops it. Unlike a
+// control-managed stream it does not wait for a viewer. Cancelling ctx (SIGINT/
+// SIGTERM) stops the puller and clears running.
+func (m *Manager) RunPinned(ctx context.Context, id string, src puller.Source, chunk int) {
+	src.Insecure = m.sourceInsecure
+	src.Label = id
+	st := m.GetOrCreate(id)
+	st.mu.Lock()
+	c := src
+	st.cfg = &c
+	if chunk > 0 {
+		st.chunk = chunk
+	}
+	st.running = true
+	st.refs++ // permanent pin: no viewer needed, and the reaper leaves refs>0 alone
+	cfg, ch := *st.cfg, st.chunk
+	st.mu.Unlock()
+	st.lastAccess.Store(time.Now().UnixNano())
+	dlog.Logf("stream", "id=%s launch puller starting (pinned)", id)
+	go func() {
+		puller.Run(ctx, cfg, ch, st.Publish)
+		st.mu.Lock()
+		st.running = false
+		st.mu.Unlock()
+		dlog.Logf("stream", "id=%s launch puller stopped", id)
+	}()
 }
 
 // RegisterIngest puts a stream in push-fed mode: it listens on
