@@ -29,28 +29,36 @@ import (
 // Values is the resolved, validated tuning the daemon applies. The json tags are
 // the on-disk schema (also what the panel writes).
 type Values struct {
-	PrebufferMaxSec int     `json:"prebuffer_max_sec"`
-	HLSTargetSec    float64 `json:"hls_target_sec"`
-	HLSWindow       int     `json:"hls_window"`
-	GraceSec        int     `json:"grace_sec"`
-	WriteTimeoutSec int     `json:"write_timeout_sec"`
-	ChunkBytes      int     `json:"chunk_bytes"`
-	MaxGOPBytes     int     `json:"max_gop_bytes"`
-	SourceInsecure  bool    `json:"source_insecure"`
+	PrebufferMaxSec    int     `json:"prebuffer_max_sec"`
+	ClientPrebufferSec int     `json:"client_prebuffer_sec"`
+	HLSTargetSec       float64 `json:"hls_target_sec"`
+	HLSWindow          int     `json:"hls_window"`
+	GraceSec           int     `json:"grace_sec"`
+	WriteTimeoutSec    int     `json:"write_timeout_sec"`
+	ChunkBytes         int     `json:"chunk_bytes"`
+	MaxGOPBytes        int     `json:"max_gop_bytes"`
+	SourceInsecure     bool    `json:"source_insecure"`
+	IdleBufferSec      int     `json:"idle_buffer_sec"`
+	IdleBufferGraceSec int     `json:"idle_buffer_grace_sec"`
+	IdleHlsWindow      int     `json:"idle_hls_window"`
 }
 
 // Defaults is the built-in fallback (see defaults.Cfg*): what the daemon writes
 // for a missing file and backfills for a missing key.
 func Defaults() Values {
 	return Values{
-		PrebufferMaxSec: defaults.CfgPrebufferMaxSec,
-		HLSTargetSec:    defaults.CfgHLSTargetSec,
-		HLSWindow:       defaults.CfgHLSWindow,
-		GraceSec:        defaults.CfgGraceSec,
-		WriteTimeoutSec: defaults.CfgWriteTimeoutSec,
-		ChunkBytes:      defaults.CfgChunkBytes,
-		MaxGOPBytes:     defaults.CfgMaxGOPBytes,
-		SourceInsecure:  defaults.CfgSourceInsecure,
+		PrebufferMaxSec:    defaults.CfgPrebufferMaxSec,
+		ClientPrebufferSec: defaults.CfgClientPrebufferSec,
+		HLSTargetSec:       defaults.CfgHLSTargetSec,
+		HLSWindow:          defaults.CfgHLSWindow,
+		GraceSec:           defaults.CfgGraceSec,
+		WriteTimeoutSec:    defaults.CfgWriteTimeoutSec,
+		ChunkBytes:         defaults.CfgChunkBytes,
+		MaxGOPBytes:        defaults.CfgMaxGOPBytes,
+		SourceInsecure:     defaults.CfgSourceInsecure,
+		IdleBufferSec:      defaults.CfgIdleBufferSec,
+		IdleBufferGraceSec: defaults.CfgIdleBufferGraceSec,
+		IdleHlsWindow:      defaults.CfgIdleHlsWindow,
 	}
 }
 
@@ -58,14 +66,18 @@ func Defaults() Values {
 // stays nil — that is how a missing key (to backfill) is told apart from one
 // explicitly set to a zero value (e.g. prebuffer 0 = "current GOP only").
 type file struct {
-	PrebufferMaxSec *int     `json:"prebuffer_max_sec"`
-	HLSTargetSec    *float64 `json:"hls_target_sec"`
-	HLSWindow       *int     `json:"hls_window"`
-	GraceSec        *int     `json:"grace_sec"`
-	WriteTimeoutSec *int     `json:"write_timeout_sec"`
-	ChunkBytes      *int     `json:"chunk_bytes"`
-	MaxGOPBytes     *int     `json:"max_gop_bytes"`
-	SourceInsecure  *bool    `json:"source_insecure"`
+	PrebufferMaxSec    *int     `json:"prebuffer_max_sec"`
+	ClientPrebufferSec *int     `json:"client_prebuffer_sec"`
+	HLSTargetSec       *float64 `json:"hls_target_sec"`
+	HLSWindow          *int     `json:"hls_window"`
+	GraceSec           *int     `json:"grace_sec"`
+	WriteTimeoutSec    *int     `json:"write_timeout_sec"`
+	ChunkBytes         *int     `json:"chunk_bytes"`
+	MaxGOPBytes        *int     `json:"max_gop_bytes"`
+	SourceInsecure     *bool    `json:"source_insecure"`
+	IdleBufferSec      *int     `json:"idle_buffer_sec"`
+	IdleBufferGraceSec *int     `json:"idle_buffer_grace_sec"`
+	IdleHlsWindow      *int     `json:"idle_hls_window"`
 }
 
 // Load reads path, returns the resolved (defaults-overlaid, clamped) values, and
@@ -102,6 +114,10 @@ func Load(path string) (Values, bool, error) {
 		v.PrebufferMaxSec = *f.PrebufferMaxSec
 	}
 	overlay(f.PrebufferMaxSec != nil)
+	if f.ClientPrebufferSec != nil {
+		v.ClientPrebufferSec = *f.ClientPrebufferSec
+	}
+	overlay(f.ClientPrebufferSec != nil)
 	if f.HLSTargetSec != nil {
 		v.HLSTargetSec = *f.HLSTargetSec
 	}
@@ -130,6 +146,18 @@ func Load(path string) (Values, bool, error) {
 		v.SourceInsecure = *f.SourceInsecure
 	}
 	overlay(f.SourceInsecure != nil)
+	if f.IdleBufferSec != nil {
+		v.IdleBufferSec = *f.IdleBufferSec
+	}
+	overlay(f.IdleBufferSec != nil)
+	if f.IdleBufferGraceSec != nil {
+		v.IdleBufferGraceSec = *f.IdleBufferGraceSec
+	}
+	overlay(f.IdleBufferGraceSec != nil)
+	if f.IdleHlsWindow != nil {
+		v.IdleHlsWindow = *f.IdleHlsWindow
+	}
+	overlay(f.IdleHlsWindow != nil)
 
 	v.clamp()
 
@@ -166,11 +194,15 @@ func Save(path string, v Values) error {
 // (or a hand-edited file) can never push the daemon into a pathological state.
 func (v *Values) clamp() {
 	v.PrebufferMaxSec = clampInt(v.PrebufferMaxSec, 0, 120)
+	v.ClientPrebufferSec = clampInt(v.ClientPrebufferSec, 0, 120)
 	v.HLSWindow = clampInt(v.HLSWindow, 1, 20)
 	v.GraceSec = clampInt(v.GraceSec, 1, 3600)
 	v.WriteTimeoutSec = clampInt(v.WriteTimeoutSec, 1, 600)
 	v.ChunkBytes = clampInt(v.ChunkBytes, 188, 4<<20)
 	v.MaxGOPBytes = clampInt(v.MaxGOPBytes, 188, 256<<20)
+	v.IdleBufferSec = clampInt(v.IdleBufferSec, 0, 60)
+	v.IdleBufferGraceSec = clampInt(v.IdleBufferGraceSec, 0, 3600)
+	v.IdleHlsWindow = clampInt(v.IdleHlsWindow, 0, 20)
 	if v.HLSTargetSec < 1 {
 		v.HLSTargetSec = 1
 	} else if v.HLSTargetSec > 30 {

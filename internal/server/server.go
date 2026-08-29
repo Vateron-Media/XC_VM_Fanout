@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,13 +45,16 @@ type Stream struct {
 
 	id string // stream id, set at creation; for debug logging
 
-	mu      sync.Mutex
-	cfg     *puller.Source // nil = externally fed (launch mode / ingest); set = daemon pulls
-	chunk   int
-	grace   time.Duration
-	running bool
-	cancel  context.CancelFunc
-	refs    int // live TS viewers currently connected
+	mgr *Manager // owning manager, for the viewer-gated buffer restore/gate
+
+	mu       sync.Mutex
+	cfg      *puller.Source // nil = externally fed (launch mode / ingest); set = daemon pulls
+	chunk    int
+	grace    time.Duration
+	running  bool
+	cancel   context.CancelFunc
+	refs     int  // live TS viewers currently connected
+	buffered bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
 
 	ingestLn   net.Listener // non-nil = push-fed: the producer (ffmpeg tee) connects here
 	ingestSock string       // path of the ingest listener socket (for cleanup)
@@ -279,6 +283,7 @@ func (s *Stream) attach() {
 	s.lastAccess.Store(time.Now().UnixNano())
 	s.mu.Lock()
 	s.refs++
+	s.ensureBufferedLocked()
 	s.startLocked()
 	s.mu.Unlock()
 }
@@ -298,8 +303,22 @@ func (s *Stream) detach() {
 func (s *Stream) touch() {
 	s.lastAccess.Store(time.Now().UnixNano())
 	s.mu.Lock()
+	s.ensureBufferedLocked()
 	s.startLocked()
 	s.mu.Unlock()
+}
+
+// ensureBufferedLocked pumps the ring back to the full prebuffer + HLS view if
+// the stream was gated down to the idle floor. Called when a viewer returns (TS
+// attach or HLS touch) so the audience gets the configured buffer depth again —
+// the ring then refills over the next prebuffer window. Caller holds s.mu.
+func (s *Stream) ensureBufferedLocked() {
+	if s.buffered || s.mgr == nil {
+		return
+	}
+	s.buffered = true
+	s.mgr.applyBufferLocked(s)
+	dlog.Logf("buffer", "id=%s ring restored to full (viewer returned)", s.id)
 }
 
 // idleStopLocked stops the puller when it is control-managed, has no live
@@ -312,6 +331,31 @@ func (s *Stream) idleStopLocked(now time.Time) {
 		dlog.Logf("reaper", "id=%s idle-stop (no viewers, idle %s ≥ grace %s)", s.id, idle.Round(time.Second), s.grace)
 		s.stopLocked()
 	}
+}
+
+// gateIdleBufferLocked collapses an unwatched stream's ring to the idle floor
+// (dropping the HLS view) so idle channels cost near-nothing in RAM. A stream is
+// unwatched when it has no live TS viewers and nothing has touched it (TS attach
+// or HLS request) within the idle-buffer grace window. Restored the instant a
+// viewer returns (ensureBufferedLocked). Returns true when it actually gated this
+// call, so the reaper can force the freed heap back to the OS. No-op (false) when
+// the gate is disabled (grace <= 0) or the stream is already gated. Caller holds
+// s.mu.
+func (s *Stream) gateIdleBufferLocked(now time.Time) bool {
+	if s.mgr == nil || !s.buffered || s.refs > 0 {
+		return false
+	}
+	graceNS := s.mgr.idleBufferGraceNS.Load()
+	if graceNS <= 0 {
+		return false
+	}
+	if now.UnixNano()-s.lastAccess.Load() < graceNS {
+		return false
+	}
+	s.buffered = false
+	s.mgr.applyBufferLocked(s)
+	dlog.Logf("buffer", "id=%s ring gated to idle floor (%dms, no viewers)", s.id, s.mgr.idleBufferMS.Load())
+	return true
 }
 
 // streamStatus is the control-API GET payload: enough for the PHP auth endpoint
@@ -340,16 +384,27 @@ type Manager struct {
 	mu      sync.Mutex
 	streams map[string]*Stream
 	maxGOP  int
-	// maxPrebufMS and writeTimeout are read off m.mu on hot paths (the client
-	// handler / per-write), so they are atomic — ApplyConfig can retune them live
-	// without a lock. hlsTarget/hlsWindow/grace are read only under m.mu (stream
-	// creation), so they stay plain fields guarded by it.
-	maxPrebufMS  atomic.Int64 // ceiling for per-viewer client prebuffer (ms of TS history)
-	hlsTarget    float64
-	hlsWindow    int
-	grace        time.Duration
-	writeTimeout atomic.Int64 // per-write deadline for live-TS viewers (nanoseconds)
-	ingestDir    string       // base dir for per-stream push-fed ingest sockets
+	// maxPrebufMS/writeTimeout/hlsTargetMS/hlsWindow/idleBuffer* are read off m.mu
+	// on hot paths (the client handler, the reaper's buffer gate, the attach/touch
+	// buffer restore), so they are atomic — ApplyConfig retunes them live without a
+	// lock. grace is read only under m.mu (stream creation), so it stays a plain
+	// field guarded by it.
+	maxPrebufMS    atomic.Int64 // ring size + ceiling for per-viewer client prebuffer (ms of TS history)
+	clientPrebufMS atomic.Int64 // default per-viewer join burst (ms), served without a ?prebuffer= param
+	hlsTargetMS    atomic.Int64 // HLS target segment duration (ms) the ring must cover
+	hlsWindow      atomic.Int64 // HLS segments kept in the sliding window
+	grace          time.Duration
+	writeTimeout   atomic.Int64 // per-write deadline for live-TS viewers (nanoseconds)
+
+	// idleBufferMS is the TS ring history (ms) an unwatched stream collapses to;
+	// idleBufferGraceNS is the no-viewer window (ns) before it does, 0 = gate off;
+	// idleHlsWindow is how many HLS segments a gated stream keeps cutting so HLS
+	// still opens (0 = drop HLS while idle).
+	idleBufferMS      atomic.Int64
+	idleBufferGraceNS atomic.Int64
+	idleHlsWindow     atomic.Int64
+
+	ingestDir string // base dir for per-stream push-fed ingest sockets
 
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
@@ -393,15 +448,19 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 	m := &Manager{
 		streams:      make(map[string]*Stream),
 		maxGOP:       maxGOP,
-		hlsTarget:    hlsTarget,
-		hlsWindow:    hlsWindow,
 		grace:        grace,
 		defaultChunk: defaultChunk,
 		signals:      newSignalStore(),
 	}
 	m.maxPrebufMS.Store(maxPrebufMS)
+	m.clientPrebufMS.Store(maxPrebufMS) // default: serve the whole ring until config overrides
+	m.hlsTargetMS.Store(int64(hlsTarget * 1000))
+	m.hlsWindow.Store(int64(hlsWindow))
 	m.writeTimeout.Store(int64(defaultWriteTimeout))
 	m.sourceInsecure.Store(true)
+	m.idleBufferMS.Store(int64(defaults.CfgIdleBufferSec) * 1000)
+	m.idleBufferGraceNS.Store(int64(time.Duration(defaults.CfgIdleBufferGraceSec) * time.Second))
+	m.idleHlsWindow.Store(int64(defaults.CfgIdleHlsWindow))
 	return m
 }
 
@@ -412,8 +471,14 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 // from the config-poll goroutine while streams are serving.
 func (m *Manager) ApplyConfig(v config.Values) {
 	m.maxPrebufMS.Store(int64(v.PrebufferMaxSec) * 1000)
+	m.clientPrebufMS.Store(int64(v.ClientPrebufferSec) * 1000)
+	m.hlsTargetMS.Store(int64(v.HLSTargetSec * 1000))
+	m.hlsWindow.Store(int64(v.HLSWindow))
 	m.writeTimeout.Store(int64(time.Duration(v.WriteTimeoutSec) * time.Second))
 	m.sourceInsecure.Store(v.SourceInsecure)
+	m.idleBufferMS.Store(int64(v.IdleBufferSec) * 1000)
+	m.idleBufferGraceNS.Store(int64(time.Duration(v.IdleBufferGraceSec) * time.Second))
+	m.idleHlsWindow.Store(int64(v.IdleHlsWindow))
 
 	// Update the new-stream defaults and snapshot the live set under m.mu, then
 	// reconfigure each stream outside the lock (each takes its own hub/seg lock;
@@ -421,8 +486,6 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	// maxGOP/defaultChunk apply to streams created after this point (existing
 	// hubs keep the join cap they were built with); prebuffer/HLS retune live.
 	m.mu.Lock()
-	m.hlsTarget = v.HLSTargetSec
-	m.hlsWindow = v.HLSWindow
 	m.grace = time.Duration(v.GraceSec) * time.Second
 	m.maxGOP = v.MaxGOPBytes
 	m.defaultChunk = v.ChunkBytes
@@ -432,11 +495,36 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	}
 	m.mu.Unlock()
 
-	mp := int64(v.PrebufferMaxSec) * 1000
-	htMS := int64(v.HLSTargetSec * 1000)
+	// Reconfigure each stream to the depth its current audience warrants: a
+	// fully-buffered (watched) stream to the new full prebuffer/HLS, a gated
+	// (idle) one to the new idle floor — so a config change never un-gates an
+	// unwatched stream. st.mu orders before the hub lock everywhere.
 	for _, st := range streams {
-		st.Hub.Configure(mp, htMS, v.HLSWindow)
+		st.mu.Lock()
+		m.applyBufferLocked(st)
+		st.mu.Unlock()
 	}
+}
+
+// applyBufferLocked (re)configures st.Hub to the depth its gate state warrants:
+// the full prebuffer + HLS view when buffered, or the idle floor (HLS off) when
+// gated. Reads the live config atomics. Caller holds st.mu.
+func (m *Manager) applyBufferLocked(st *Stream) {
+	if st.buffered {
+		st.Hub.Configure(m.maxPrebufMS.Load(), m.hlsTargetMS.Load(), int(m.hlsWindow.Load()))
+		return
+	}
+	// Gated (idle): shrink the TS prebuffer to the floor but KEEP cutting HLS with
+	// a reduced window, so an HLS client still opens instantly with a short
+	// playlist instead of an empty one — the ring floor then follows the HLS window
+	// (recompute sizes it to cover both). idle HLS window 0 drops HLS entirely
+	// (TS-only idle: max saving, but the first HLS viewer waits for a rebuild).
+	idleWin := int(m.idleHlsWindow.Load())
+	idleHLSTarget := m.hlsTargetMS.Load()
+	if idleWin <= 0 {
+		idleHLSTarget = 0
+	}
+	st.Hub.Configure(m.idleBufferMS.Load(), idleHLSTarget, idleWin)
 }
 
 // StartReaper runs the idle-stop sweep until ctx is cancelled: control-managed
@@ -462,10 +550,22 @@ func (m *Manager) StartReaper(ctx context.Context) {
 					streams = append(streams, st)
 				}
 				m.mu.Unlock()
+				gated := false
 				for _, st := range streams {
 					st.mu.Lock()
 					st.idleStopLocked(now)
+					if st.gateIdleBufferLocked(now) {
+						gated = true
+					}
 					st.mu.Unlock()
+				}
+				// A gate collapsed at least one ring: the dropped GOP bytes are now
+				// GC garbage, but Go hands freed pages back to the OS only lazily
+				// (the background scavenger paces itself), so RSS would sit flat for
+				// minutes. Force the release now so idle memory actually drops — and
+				// only when something was gated, so a quiet sweep costs nothing.
+				if gated {
+					debug.FreeOSMemory()
 				}
 			}
 		}
@@ -534,14 +634,17 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 	st := m.streams[id]
 	if st == nil {
 		st = &Stream{
-			id:    id,
-			Hub:   hub.New(m.maxGOP, m.maxPrebufMS.Load()),
-			chunk: m.defaultChunk,
-			grace: m.grace,
+			id:       id,
+			mgr:      m,
+			Hub:      hub.New(m.maxGOP, m.maxPrebufMS.Load()),
+			chunk:    m.defaultChunk,
+			grace:    m.grace,
+			buffered: true,
 		}
 		// Size the single cache to also cover the HLS window (target/window) so
-		// HLS can be cut from it on demand.
-		st.Hub.Configure(m.maxPrebufMS.Load(), int64(m.hlsTarget*1000), m.hlsWindow)
+		// HLS can be cut from it on demand. A newly created stream starts fully
+		// buffered; the reaper gates it down if it draws no audience.
+		st.Hub.Configure(m.maxPrebufMS.Load(), m.hlsTargetMS.Load(), int(m.hlsWindow.Load()))
 		m.streams[id] = st
 		dlog.Logf("stream", "id=%s created", id)
 	}
@@ -876,17 +979,19 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// client_prebuffer (seconds, from live.php's X-Accel URL) → a keyframe-aligned
-	// history burst on join, clamped to the daemon's retention ceiling. Absent/0
-	// keeps the minimal current-GOP clean join.
-	var prebufMS int64
+	// Join burst: a keyframe-aligned history burst sent on connect so the viewer
+	// starts with a real buffer instead of ~1 GOP. The depth is a DAEMON setting
+	// (client_prebuffer_sec) served on every join — the panel does not pass it as a
+	// URL param. A per-request ?prebuffer=<sec> (> 0) still overrides it for callers
+	// that do set one. Clamped to the ring (maxPrebufMS).
+	prebufMS := m.clientPrebufMS.Load()
 	if q := r.URL.Query().Get("prebuffer"); q != "" {
 		if sec, err := strconv.Atoi(q); err == nil && sec > 0 {
 			prebufMS = int64(sec) * 1000
-			if mp := m.maxPrebufMS.Load(); prebufMS > mp {
-				prebufMS = mp
-			}
 		}
+	}
+	if mp := m.maxPrebufMS.Load(); prebufMS > mp {
+		prebufMS = mp
 	}
 
 	sub, snap := st.Hub.Subscribe(prebufMS)
