@@ -11,7 +11,6 @@ import (
 // is restored to the full buffer the instant a viewer returns.
 func TestViewerGateIdleBuffer(t *testing.T) {
 	m := NewManager(1<<20, 20000, 6, 6, 100*time.Millisecond)
-	m.idleBufferMS.Store(2000)
 	m.idleBufferGraceNS.Store(int64(100 * time.Millisecond))
 
 	st := m.GetOrCreate("1")
@@ -62,5 +61,31 @@ func TestViewerGateIdleBuffer(t *testing.T) {
 	st.mu.Unlock()
 	if !st.buffered {
 		t.Fatal("a disabled gate must keep the stream buffered")
+	}
+}
+
+// TestResolvePrebufMS: the panel is authoritative — a passed ?prebuffer= is
+// honored as-is (including 0); a blank param falls back to the daemon default;
+// everything is clamped to the ring.
+func TestResolvePrebufMS(t *testing.T) {
+	m := NewManager(1<<20, 40000, 6, 6, time.Second) // ring ceiling 40 s
+	m.defaultPrebufMS.Store(8000)                    // fallback 8 s
+
+	cases := []struct {
+		name  string
+		param string
+		want  int64
+	}{
+		{"absent → default", "", 8000},
+		{"explicit 0 honored (not overridden)", "0", 0},
+		{"explicit value", "15", 15000},
+		{"clamped to ring", "999", 40000},
+		{"garbage → default", "abc", 8000},
+		{"negative → default", "-5", 8000},
+	}
+	for _, c := range cases {
+		if got := m.resolvePrebufMS(c.param); got != c.want {
+			t.Errorf("%s: resolvePrebufMS(%q) = %d, want %d", c.name, c.param, got, c.want)
+		}
 	}
 }

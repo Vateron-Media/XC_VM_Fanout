@@ -72,14 +72,20 @@ type State struct {
 	// HLS segment view over the ring (hlsTargetMS == 0 disables it). The ring is
 	// the single cache; HLS segments are cut from these GOPs on demand rather than
 	// buffered a second time.
-	prebufMS    int64    // TS client-prebuffer depth (ms)
+	prebufMS    int64    // TS client-prebuffer depth (ms) = the buffer / ring size
 	hlsTargetMS int64    // HLS target segment duration (ms); 0 = HLS view off
-	hlsWindow   int      // HLS segments kept in the playlist window
+	hlsWindow   int      // HLS segments listed in the playlist window (display cap)
 	nextGOPID   int64    // next GOP id to assign
 	segs        []hlsSeg // closed segments, oldest→newest
 	nextSeq     int      // next HLS media sequence number
 	segStartID  int64    // open segment's first GOP id, or -1 = none open
 	segStartPTS int64    // open segment's start HLS clock (90 kHz)
+
+	// Viewer gate: when gated (no audience), the ring collapses to prebufMS ×
+	// idleRatio to free memory, HLS keeps cutting from the smaller ring so the
+	// playlist stays openable, and it grows back when SetGated(false) restores it.
+	gated     bool
+	idleRatio float64 // fraction of the buffer kept while gated (0 < r ≤ 1)
 }
 
 // New returns a State. maxGOP caps a single GOP (bytes, guarding streams with no
@@ -87,22 +93,26 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1}
+	s := &State{pmtPID: -1, videoPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
 
-// recompute sizes the ring to cover BOTH the TS prebuffer and the HLS window
-// (plus one segment of margin, so a segment still listed in the playlist is
-// guaranteed assemblable when the client fetches it), and its byte backstop
+// recompute sizes the ring to the buffer (prebufMS) and its byte backstop
 // (~24 Mbit/s ≈ 3000 bytes/ms, so a stream whose PCR cannot be parsed can never
-// grow the ring without bound). Prunes immediately when it shrinks.
+// grow the ring without bound). The HLS window is a DISPLAY cap, not a ring
+// driver: HLS is cut from whatever the ring holds. When gated the ring collapses
+// to prebufMS × idleRatio; a small floor keeps ~2 segments so the HLS playlist
+// stays openable. Prunes immediately when it shrinks.
 func (s *State) recompute() {
 	need := s.prebufMS
-	if s.hlsWindow > 0 && s.hlsTargetMS > 0 {
-		if w := int64(s.hlsWindow+1) * s.hlsTargetMS; w > need {
-			need = w
-		}
+	if s.gated {
+		need = int64(float64(need) * s.idleRatio)
+	}
+	// HLS must retain ≥ ~2 segments or its playlist goes empty and the stream
+	// won't open; floor the ring there whenever the HLS view is on.
+	if s.hlsTargetMS > 0 && need < 2*s.hlsTargetMS {
+		need = 2 * s.hlsTargetMS
 	}
 	if need < 0 {
 		need = 0
@@ -114,13 +124,37 @@ func (s *State) recompute() {
 	}
 }
 
-// SetRing live-reconfigures the TS client-prebuffer depth (ms). The ring still
-// also covers the HLS window. Caller (Hub) serialises access.
+// SetRing live-reconfigures the buffer depth (ms). Caller (Hub) serialises access.
 func (s *State) SetRing(maxPrebufMS int64) {
 	if maxPrebufMS < 0 {
 		maxPrebufMS = 0
 	}
 	s.prebufMS = maxPrebufMS
+	s.recompute()
+}
+
+// SetGated collapses the ring to the idle fraction (true) or restores it to the
+// full buffer (false). HLS keeps cutting either way. Caller (Hub) serialises.
+func (s *State) SetGated(gated bool) {
+	if s.gated == gated {
+		return
+	}
+	s.gated = gated
+	s.recompute()
+}
+
+// SetIdleRatio sets the fraction of the buffer retained while gated (clamped to
+// (0, 1]). Caller (Hub) serialises access.
+func (s *State) SetIdleRatio(r float64) {
+	if r <= 0 {
+		r = 0.5
+	} else if r > 1 {
+		r = 1
+	}
+	if s.idleRatio == r {
+		return
+	}
+	s.idleRatio = r
 	s.recompute()
 }
 
@@ -307,11 +341,19 @@ func (s *State) HLSPlaylist() string {
 	if len(s.segs) == 0 {
 		return ""
 	}
-	start := 0
-	if s.hlsWindow > 0 && len(s.segs) > s.hlsWindow {
-		start = len(s.segs) - s.hlsWindow
+	// Reserve the single oldest in-ring segment as a fetch margin, so a listed
+	// segment can't age out between playlist render and HLSSegment fetch (the ring
+	// no longer carries a +1-segment margin). Only when more than one exists, so a
+	// minimal (gated) ring still serves its one segment.
+	avail := s.segs
+	if len(avail) > 1 {
+		avail = avail[1:]
 	}
-	win := s.segs[start:]
+	start := 0
+	if s.hlsWindow > 0 && len(avail) > s.hlsWindow {
+		start = len(avail) - s.hlsWindow
+	}
+	win := avail[start:]
 	maxDur := 0.0
 	for _, sg := range win {
 		if d := float64(sg.durMS) / 1000.0; d > maxDur {

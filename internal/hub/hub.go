@@ -102,6 +102,21 @@ func (h *Hub) Configure(prebufMS, hlsTargetMS int64, hlsWindow int) {
 	h.mu.Unlock()
 }
 
+// SetGated collapses the ring to the idle fraction (true) or restores the full
+// buffer (false) — the viewer gate. HLS keeps being cut from the ring either way.
+func (h *Hub) SetGated(gated bool) {
+	h.mu.Lock()
+	h.join.SetGated(gated)
+	h.mu.Unlock()
+}
+
+// SetIdleRatio sets the fraction of the buffer kept while gated (0 < r ≤ 1).
+func (h *Hub) SetIdleRatio(r float64) {
+	h.mu.Lock()
+	h.join.SetIdleRatio(r)
+	h.mu.Unlock()
+}
+
 // HLSPlaylist renders the HLS media playlist from the ring's segment view, or ""
 // when no segments are ready yet. Serialised against the producer.
 func (h *Hub) HLSPlaylist() string {

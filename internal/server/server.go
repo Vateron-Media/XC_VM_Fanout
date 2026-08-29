@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -354,7 +355,7 @@ func (s *Stream) gateIdleBufferLocked(now time.Time) bool {
 	}
 	s.buffered = false
 	s.mgr.applyBufferLocked(s)
-	dlog.Logf("buffer", "id=%s ring gated to idle floor (%dms, no viewers)", s.id, s.mgr.idleBufferMS.Load())
+	dlog.Logf("buffer", "id=%s ring gated to idle fraction (%.2f, no viewers)", s.id, s.mgr.idleRatio())
 	return true
 }
 
@@ -389,20 +390,18 @@ type Manager struct {
 	// buffer restore), so they are atomic — ApplyConfig retunes them live without a
 	// lock. grace is read only under m.mu (stream creation), so it stays a plain
 	// field guarded by it.
-	maxPrebufMS    atomic.Int64 // ring size + ceiling for per-viewer client prebuffer (ms of TS history)
-	clientPrebufMS atomic.Int64 // default per-viewer join burst (ms), served without a ?prebuffer= param
-	hlsTargetMS    atomic.Int64 // HLS target segment duration (ms) the ring must cover
-	hlsWindow      atomic.Int64 // HLS segments kept in the sliding window
-	grace          time.Duration
-	writeTimeout   atomic.Int64 // per-write deadline for live-TS viewers (nanoseconds)
+	maxPrebufMS     atomic.Int64 // the buffer/ring size (ms of TS history) + ceiling for a per-viewer burst
+	defaultPrebufMS atomic.Int64 // per-viewer join burst (ms) fallback ONLY when the panel passes no ?prebuffer=
+	hlsTargetMS     atomic.Int64 // HLS target segment duration (ms); HLS is cut from the ring, not sized by it
+	hlsWindow       atomic.Int64 // HLS segments listed in the playlist (display cap)
+	grace           time.Duration
+	writeTimeout    atomic.Int64 // per-write deadline for live-TS viewers (nanoseconds)
 
-	// idleBufferMS is the TS ring history (ms) an unwatched stream collapses to;
-	// idleBufferGraceNS is the no-viewer window (ns) before it does, 0 = gate off;
-	// idleHlsWindow is how many HLS segments a gated stream keeps cutting so HLS
-	// still opens (0 = drop HLS while idle).
-	idleBufferMS      atomic.Int64
-	idleBufferGraceNS atomic.Int64
-	idleHlsWindow     atomic.Int64
+	// idleBufferGraceNS is the no-viewer window (ns) before an unwatched stream's
+	// ring collapses, 0 = gate off; idleBufferRatioBits is the fraction of the
+	// buffer kept while gated (math.Float64bits, read on the hot path).
+	idleBufferGraceNS   atomic.Int64
+	idleBufferRatioBits atomic.Uint64
 
 	ingestDir string // base dir for per-stream push-fed ingest sockets
 
@@ -453,15 +452,35 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 		signals:      newSignalStore(),
 	}
 	m.maxPrebufMS.Store(maxPrebufMS)
-	m.clientPrebufMS.Store(maxPrebufMS) // default: serve the whole ring until config overrides
+	m.defaultPrebufMS.Store(int64(defaults.CfgDefaultPrebufferSec) * 1000) // fallback only; panel is authoritative
 	m.hlsTargetMS.Store(int64(hlsTarget * 1000))
 	m.hlsWindow.Store(int64(hlsWindow))
 	m.writeTimeout.Store(int64(defaultWriteTimeout))
 	m.sourceInsecure.Store(true)
-	m.idleBufferMS.Store(int64(defaults.CfgIdleBufferSec) * 1000)
 	m.idleBufferGraceNS.Store(int64(time.Duration(defaults.CfgIdleBufferGraceSec) * time.Second))
-	m.idleHlsWindow.Store(int64(defaults.CfgIdleHlsWindow))
+	m.idleBufferRatioBits.Store(math.Float64bits(defaults.CfgIdleBufferRatio))
 	return m
+}
+
+// idleRatio returns the configured fraction of the buffer kept while gated.
+func (m *Manager) idleRatio() float64 { return math.Float64frombits(m.idleBufferRatioBits.Load()) }
+
+// resolvePrebufMS decides a viewer's join-burst depth (ms). The panel is
+// authoritative: `param` is the ?prebuffer= it passed (client or restreamer
+// value) and is honored as-is when present, including an explicit "0". A blank
+// param (the request carried none) falls back to the daemon default. Clamped to
+// the ring (maxPrebufMS).
+func (m *Manager) resolvePrebufMS(param string) int64 {
+	prebufMS := m.defaultPrebufMS.Load()
+	if param != "" {
+		if sec, err := strconv.Atoi(param); err == nil && sec >= 0 {
+			prebufMS = int64(sec) * 1000
+		}
+	}
+	if mp := m.maxPrebufMS.Load(); prebufMS > mp {
+		prebufMS = mp
+	}
+	return prebufMS
 }
 
 // ApplyConfig live-applies operator tuning (from the polled config file) to the
@@ -471,14 +490,13 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 // from the config-poll goroutine while streams are serving.
 func (m *Manager) ApplyConfig(v config.Values) {
 	m.maxPrebufMS.Store(int64(v.PrebufferMaxSec) * 1000)
-	m.clientPrebufMS.Store(int64(v.ClientPrebufferSec) * 1000)
+	m.defaultPrebufMS.Store(int64(v.DefaultPrebufferSec) * 1000)
 	m.hlsTargetMS.Store(int64(v.HLSTargetSec * 1000))
 	m.hlsWindow.Store(int64(v.HLSWindow))
 	m.writeTimeout.Store(int64(time.Duration(v.WriteTimeoutSec) * time.Second))
 	m.sourceInsecure.Store(v.SourceInsecure)
-	m.idleBufferMS.Store(int64(v.IdleBufferSec) * 1000)
 	m.idleBufferGraceNS.Store(int64(time.Duration(v.IdleBufferGraceSec) * time.Second))
-	m.idleHlsWindow.Store(int64(v.IdleHlsWindow))
+	m.idleBufferRatioBits.Store(math.Float64bits(v.IdleBufferRatio))
 
 	// Update the new-stream defaults and snapshot the live set under m.mu, then
 	// reconfigure each stream outside the lock (each takes its own hub/seg lock;
@@ -506,25 +524,14 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	}
 }
 
-// applyBufferLocked (re)configures st.Hub to the depth its gate state warrants:
-// the full prebuffer + HLS view when buffered, or the idle floor (HLS off) when
-// gated. Reads the live config atomics. Caller holds st.mu.
+// applyBufferLocked (re)tunes st.Hub from the live config and its gate state. The
+// buffer (ring) + HLS view are the same for watched and idle; the gate only flips
+// the ring to the idle fraction. HLS keeps being cut from the ring either way, so
+// an idle stream still serves a (shorter) playlist. Caller holds st.mu.
 func (m *Manager) applyBufferLocked(st *Stream) {
-	if st.buffered {
-		st.Hub.Configure(m.maxPrebufMS.Load(), m.hlsTargetMS.Load(), int(m.hlsWindow.Load()))
-		return
-	}
-	// Gated (idle): shrink the TS prebuffer to the floor but KEEP cutting HLS with
-	// a reduced window, so an HLS client still opens instantly with a short
-	// playlist instead of an empty one — the ring floor then follows the HLS window
-	// (recompute sizes it to cover both). idle HLS window 0 drops HLS entirely
-	// (TS-only idle: max saving, but the first HLS viewer waits for a rebuild).
-	idleWin := int(m.idleHlsWindow.Load())
-	idleHLSTarget := m.hlsTargetMS.Load()
-	if idleWin <= 0 {
-		idleHLSTarget = 0
-	}
-	st.Hub.Configure(m.idleBufferMS.Load(), idleHLSTarget, idleWin)
+	st.Hub.Configure(m.maxPrebufMS.Load(), m.hlsTargetMS.Load(), int(m.hlsWindow.Load()))
+	st.Hub.SetIdleRatio(m.idleRatio())
+	st.Hub.SetGated(!st.buffered)
 }
 
 // StartReaper runs the idle-stop sweep until ctx is cancelled: control-managed
@@ -641,10 +648,11 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 			grace:    m.grace,
 			buffered: true,
 		}
-		// Size the single cache to also cover the HLS window (target/window) so
-		// HLS can be cut from it on demand. A newly created stream starts fully
-		// buffered; the reaper gates it down if it draws no audience.
+		// Size the single cache (the buffer) and the HLS view cut from it. A newly
+		// created stream starts fully buffered; the reaper gates it to the idle
+		// fraction if it draws no audience.
 		st.Hub.Configure(m.maxPrebufMS.Load(), m.hlsTargetMS.Load(), int(m.hlsWindow.Load()))
+		st.Hub.SetIdleRatio(m.idleRatio())
 		m.streams[id] = st
 		dlog.Logf("stream", "id=%s created", id)
 	}
@@ -980,19 +988,13 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Join burst: a keyframe-aligned history burst sent on connect so the viewer
-	// starts with a real buffer instead of ~1 GOP. The depth is a DAEMON setting
-	// (client_prebuffer_sec) served on every join — the panel does not pass it as a
-	// URL param. A per-request ?prebuffer=<sec> (> 0) still overrides it for callers
-	// that do set one. Clamped to the ring (maxPrebufMS).
-	prebufMS := m.clientPrebufMS.Load()
-	if q := r.URL.Query().Get("prebuffer"); q != "" {
-		if sec, err := strconv.Atoi(q); err == nil && sec > 0 {
-			prebufMS = int64(sec) * 1000
-		}
-	}
-	if mp := m.maxPrebufMS.Load(); prebufMS > mp {
-		prebufMS = mp
-	}
+	// starts with a real buffer instead of ~1 GOP. The PANEL is authoritative — it
+	// knows client vs restreamer and passes the right value in ?prebuffer= (its
+	// client_prebuffer / restreamer_prebuffer setting), which we honor AS IS,
+	// including an explicit 0 (= current GOP). The daemon's defaultPrebufMS is only
+	// a fallback for a request that carries no prebuffer param at all. Clamped to
+	// the ring (maxPrebufMS).
+	prebufMS := m.resolvePrebufMS(r.URL.Query().Get("prebuffer"))
 
 	sub, snap := st.Hub.Subscribe(prebufMS)
 	defer st.Hub.Unsubscribe(sub)

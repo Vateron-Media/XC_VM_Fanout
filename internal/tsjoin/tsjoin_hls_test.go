@@ -2,6 +2,7 @@ package tsjoin
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -42,7 +43,7 @@ func keyPTS(t90 int64) []byte {
 		10: byte((t90 & 1) << 7),
 		// PES payload starts at 5 + adaptation_field_length = 12.
 		12: 0x00, 13: 0x00, 14: 0x01, // PES start code
-		15: 0xe0, // stream_id (video)
+		15: 0xe0,           // stream_id (video)
 		16: 0x00, 17: 0x00, // PES packet length (0 = unbounded)
 		18: 0x80, // '10' marker
 		19: 0x80, // PTS_DTS_flags = PTS only
@@ -56,13 +57,15 @@ func keyPTS(t90 int64) []byte {
 	})
 }
 
-// feedHLS primes PAT/PMT then feeds `n` keyframe GOPs `stepSec` apart, and
-// returns the State configured for HLS with the given target/window.
-func feedHLS(t *testing.T, targetMS int64, window, n, stepSec int) *State {
+// feedHLS primes PAT/PMT then feeds `n` keyframe GOPs `stepSec` apart into a
+// State whose buffer (ring) is `bufSec` seconds. In the unified model the ring
+// size IS the buffer; HLS is cut from whatever it holds (hls_window is a display
+// cap). targetMS 0 disables the HLS view.
+func feedHLS(t *testing.T, bufSec int, targetMS int64, window, n, stepSec int) *State {
 	t.Helper()
 	const tick = 90000 // 1s in 90 kHz ticks
-	s := New(1<<20, 0)
-	s.Configure(0, targetMS, window)
+	s := New(1<<20, int64(bufSec)*1000)
+	s.Configure(int64(bufSec)*1000, targetMS, window)
 	s.Update(patPacket(0x100))
 	s.Update(pmtPacket())
 	for i := 0; i < n; i++ {
@@ -71,34 +74,46 @@ func feedHLS(t *testing.T, targetMS int64, window, n, stepSec int) *State {
 	return s
 }
 
-func TestHLSSegmentsCutFromRing(t *testing.T) {
-	// 2 s target, window 3, keyframes 2 s apart: each new keyframe closes the
-	// previous 2 s segment. 6 keyframes → segs seq0..seq4, oldest aged out of the
-	// 4-segment ring → playlist window shows the last 3.
-	s := feedHLS(t, 2000, 3, 6, 2)
+// lastSeq returns the sequence number of the last "<seq>.ts" line in a playlist.
+func lastSeq(t *testing.T, pl string) int {
+	t.Helper()
+	seq, found := 0, false
+	for _, line := range strings.Split(pl, "\n") {
+		if strings.HasSuffix(line, ".ts") {
+			if n, err := strconv.Atoi(strings.TrimSuffix(line, ".ts")); err == nil {
+				seq, found = n, true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no segment uri in playlist:\n%s", pl)
+	}
+	return seq
+}
+
+func TestHLSCutsAndServes(t *testing.T) {
+	// 30 s buffer holds everything; 8 keyframes 2 s apart → 7 closed segments;
+	// window 3 → the last 3 are listed (the single oldest in-ring segment is held
+	// back as a fetch margin).
+	s := feedHLS(t, 30, 2000, 3, 8, 2)
 
 	pl := s.HLSPlaylist()
 	if pl == "" {
 		t.Fatal("expected a non-empty playlist")
 	}
 	if n := strings.Count(pl, "#EXTINF:"); n != 3 {
-		t.Fatalf("want 3 segments in the window, got %d\n%s", n, pl)
-	}
-	if !strings.Contains(pl, "#EXTINF:2.000,") {
-		t.Fatalf("want 2.000 s segments:\n%s", pl)
-	}
-	if !strings.Contains(pl, "#EXT-X-MEDIA-SEQUENCE:2\n") {
-		t.Fatalf("want media-sequence 2 (oldest two aged/rotated out):\n%s", pl)
+		t.Fatalf("want 3 listed segments, got %d\n%s", n, pl)
 	}
 	if !strings.Contains(pl, "#EXT-X-TARGETDURATION:2\n") {
 		t.Fatalf("want target-duration 2:\n%s", pl)
 	}
 
-	// A segment still in the playlist is assemblable from the ring: PAT + PMT +
-	// its GOP, packet-aligned, starting with the PAT.
-	seg := s.HLSSegment(4) // newest closed segment
+	// The newest listed segment assembles from the ring: PAT + PMT + its GOPs,
+	// packet-aligned, starting with the PAT.
+	seq := lastSeq(t, pl)
+	seg := s.HLSSegment(seq)
 	if seg == nil {
-		t.Fatal("HLSSegment(4) should assemble from the ring")
+		t.Fatalf("HLSSegment(%d) should assemble from the ring", seq)
 	}
 	if len(seg)%PacketSize != 0 {
 		t.Fatalf("segment not packet-aligned: %d bytes", len(seg))
@@ -109,12 +124,21 @@ func TestHLSSegmentsCutFromRing(t *testing.T) {
 	if !bytes.Equal(seg[PacketSize:2*PacketSize], pmtPacket()) {
 		t.Fatal("segment must carry PAT then PMT")
 	}
-
-	// A segment that has aged out of the ring is gone (nil), never a torn read.
-	if s.HLSSegment(0) != nil {
-		t.Fatal("aged-out segment 0 should be nil")
+	if s.HLSSegment(999) != nil {
+		t.Fatal("unknown segment should be nil")
 	}
-	// An unknown seq is nil.
+}
+
+func TestHLSAgesOutOnSmallRing(t *testing.T) {
+	// Small (6 s) buffer: the oldest segments age out of the ring, but HLS still
+	// opens with a short playlist and an aged-out segment reads back nil.
+	s := feedHLS(t, 6, 2000, 10, 8, 2)
+	if pl := s.HLSPlaylist(); pl == "" {
+		t.Fatal("a small ring must still serve a (short) playlist")
+	}
+	if s.HLSSegment(0) != nil {
+		t.Fatal("an aged-out segment must be nil, never a torn read")
+	}
 	if s.HLSSegment(999) != nil {
 		t.Fatal("unknown segment should be nil")
 	}
@@ -122,7 +146,7 @@ func TestHLSSegmentsCutFromRing(t *testing.T) {
 
 func TestHLSDisabledYieldsNothing(t *testing.T) {
 	// targetMS 0 = HLS view off: keyframes still ring for TS, but no segments.
-	s := feedHLS(t, 0, 3, 6, 2)
+	s := feedHLS(t, 6, 0, 3, 6, 2)
 	if pl := s.HLSPlaylist(); pl != "" {
 		t.Fatalf("HLS disabled must yield no playlist, got:\n%s", pl)
 	}
@@ -131,30 +155,44 @@ func TestHLSDisabledYieldsNothing(t *testing.T) {
 	}
 }
 
-func TestHLSGrowsWindowAsKeyframesArrive(t *testing.T) {
-	// Fewer keyframes than the window: playlist grows, no aging yet.
-	s := feedHLS(t, 2000, 10, 4, 2) // kf0..kf3 → seg0,seg1,seg2 closed; kf3 open
-	pl := s.HLSPlaylist()
-	if n := strings.Count(pl, "#EXTINF:"); n != 3 {
-		t.Fatalf("want 3 closed segments, got %d\n%s", n, pl)
-	}
-	if !strings.Contains(pl, "#EXT-X-MEDIA-SEQUENCE:0\n") {
-		t.Fatalf("want media-sequence 0 (nothing aged out):\n%s", pl)
+func TestHLSGrowsAsKeyframesArrive(t *testing.T) {
+	// Few keyframes, big window: 4 keyframes → 3 closed → 2 listed (oldest reserved).
+	s := feedHLS(t, 30, 2000, 10, 4, 2)
+	if n := strings.Count(s.HLSPlaylist(), "#EXTINF:"); n != 2 {
+		t.Fatalf("want 2 listed segments, got %d\n%s", n, s.HLSPlaylist())
 	}
 }
 
-// TestHLSConfigureResizesRing verifies the ring is sized to cover the HLS window
-// even when the TS prebuffer is 0 (so HLS has history to cut from).
-func TestHLSConfigureResizesRing(t *testing.T) {
-	s := New(1<<20, 0)
-	s.Configure(0, 4000, 3) // window 3 × 4 s → ring must hold ≥ ~16 s, not 0
-	if s.ring90 <= 0 {
-		t.Fatalf("ring must be sized to the HLS window, ring90=%d", s.ring90)
+// TestGateShrinksRingButKeepsHLS verifies the unified model: gating collapses the
+// ring to the idle fraction (freeing memory) yet HLS stays openable, and ungating
+// restores the full buffer.
+func TestGateShrinksRingButKeepsHLS(t *testing.T) {
+	s := feedHLS(t, 30, 2000, 6, 12, 2)
+	s.SetIdleRatio(0.5)
+	full := s.ring90
+	fullSegs := strings.Count(s.HLSPlaylist(), "#EXTINF:")
+	if fullSegs == 0 {
+		t.Fatal("watched playlist should be non-empty")
 	}
-	// Lowering the window shrinks the ring again.
-	prev := s.ring90
-	s.Configure(0, 2000, 1)
-	if s.ring90 >= prev {
-		t.Fatalf("ring should shrink when the HLS window shrinks: %d -> %d", prev, s.ring90)
+
+	s.SetGated(true)
+	if s.ring90 >= full {
+		t.Fatalf("gated ring should shrink: %d -> %d", full, s.ring90)
+	}
+	// Feed more so the shrunk ring settles; HLS must still open.
+	for i := 12; i < 20; i++ {
+		s.Update(keyPTS(int64(i) * 2 * 90000))
+	}
+	pl := s.HLSPlaylist()
+	if pl == "" {
+		t.Fatal("a gated stream must still serve a playlist (HLS stays openable)")
+	}
+	if n := strings.Count(pl, "#EXTINF:"); n > fullSegs {
+		t.Fatalf("gated playlist should not exceed the full one: %d vs %d", n, fullSegs)
+	}
+
+	s.SetGated(false)
+	if s.ring90 != full {
+		t.Fatalf("ungating should restore the ring: %d != %d", s.ring90, full)
 	}
 }

@@ -29,36 +29,40 @@ import (
 // Values is the resolved, validated tuning the daemon applies. The json tags are
 // the on-disk schema (also what the panel writes).
 type Values struct {
-	PrebufferMaxSec    int     `json:"prebuffer_max_sec"`
-	ClientPrebufferSec int     `json:"client_prebuffer_sec"`
-	HLSTargetSec       float64 `json:"hls_target_sec"`
-	HLSWindow          int     `json:"hls_window"`
-	GraceSec           int     `json:"grace_sec"`
-	WriteTimeoutSec    int     `json:"write_timeout_sec"`
-	ChunkBytes         int     `json:"chunk_bytes"`
-	MaxGOPBytes        int     `json:"max_gop_bytes"`
-	SourceInsecure     bool    `json:"source_insecure"`
-	IdleBufferSec      int     `json:"idle_buffer_sec"`
+	PrebufferMaxSec int     `json:"prebuffer_max_sec"` // the buffer/ring size (ms of TS history), drives TS + HLS depth
+	HLSTargetSec    float64 `json:"hls_target_sec"`
+	HLSWindow       int     `json:"hls_window"` // HLS segments listed (display cap), not a ring driver
+	GraceSec        int     `json:"grace_sec"`
+	WriteTimeoutSec int     `json:"write_timeout_sec"`
+	ChunkBytes      int     `json:"chunk_bytes"`
+	MaxGOPBytes     int     `json:"max_gop_bytes"`
+	SourceInsecure  bool    `json:"source_insecure"`
+	// DefaultPrebufferSec is only a fallback per-viewer join burst for a request
+	// that carries no ?prebuffer=; the panel is authoritative (client vs restreamer)
+	// and passes the value per-request, which the daemon honors as-is (including 0).
+	DefaultPrebufferSec int `json:"default_prebuffer_sec"`
+	// IdleBufferGraceSec is the no-viewer window before the ring collapses (0 = gate
+	// off); IdleBufferRatio is the fraction of the buffer kept while unwatched. HLS
+	// keeps being cut from the reduced ring, so it stays openable.
 	IdleBufferGraceSec int     `json:"idle_buffer_grace_sec"`
-	IdleHlsWindow      int     `json:"idle_hls_window"`
+	IdleBufferRatio    float64 `json:"idle_buffer_ratio"`
 }
 
 // Defaults is the built-in fallback (see defaults.Cfg*): what the daemon writes
 // for a missing file and backfills for a missing key.
 func Defaults() Values {
 	return Values{
-		PrebufferMaxSec:    defaults.CfgPrebufferMaxSec,
-		ClientPrebufferSec: defaults.CfgClientPrebufferSec,
-		HLSTargetSec:       defaults.CfgHLSTargetSec,
-		HLSWindow:          defaults.CfgHLSWindow,
-		GraceSec:           defaults.CfgGraceSec,
-		WriteTimeoutSec:    defaults.CfgWriteTimeoutSec,
-		ChunkBytes:         defaults.CfgChunkBytes,
-		MaxGOPBytes:        defaults.CfgMaxGOPBytes,
-		SourceInsecure:     defaults.CfgSourceInsecure,
-		IdleBufferSec:      defaults.CfgIdleBufferSec,
-		IdleBufferGraceSec: defaults.CfgIdleBufferGraceSec,
-		IdleHlsWindow:      defaults.CfgIdleHlsWindow,
+		PrebufferMaxSec:     defaults.CfgPrebufferMaxSec,
+		HLSTargetSec:        defaults.CfgHLSTargetSec,
+		HLSWindow:           defaults.CfgHLSWindow,
+		GraceSec:            defaults.CfgGraceSec,
+		WriteTimeoutSec:     defaults.CfgWriteTimeoutSec,
+		ChunkBytes:          defaults.CfgChunkBytes,
+		MaxGOPBytes:         defaults.CfgMaxGOPBytes,
+		SourceInsecure:      defaults.CfgSourceInsecure,
+		DefaultPrebufferSec: defaults.CfgDefaultPrebufferSec,
+		IdleBufferGraceSec:  defaults.CfgIdleBufferGraceSec,
+		IdleBufferRatio:     defaults.CfgIdleBufferRatio,
 	}
 }
 
@@ -66,18 +70,17 @@ func Defaults() Values {
 // stays nil — that is how a missing key (to backfill) is told apart from one
 // explicitly set to a zero value (e.g. prebuffer 0 = "current GOP only").
 type file struct {
-	PrebufferMaxSec    *int     `json:"prebuffer_max_sec"`
-	ClientPrebufferSec *int     `json:"client_prebuffer_sec"`
-	HLSTargetSec       *float64 `json:"hls_target_sec"`
-	HLSWindow          *int     `json:"hls_window"`
-	GraceSec           *int     `json:"grace_sec"`
-	WriteTimeoutSec    *int     `json:"write_timeout_sec"`
-	ChunkBytes         *int     `json:"chunk_bytes"`
-	MaxGOPBytes        *int     `json:"max_gop_bytes"`
-	SourceInsecure     *bool    `json:"source_insecure"`
-	IdleBufferSec      *int     `json:"idle_buffer_sec"`
-	IdleBufferGraceSec *int     `json:"idle_buffer_grace_sec"`
-	IdleHlsWindow      *int     `json:"idle_hls_window"`
+	PrebufferMaxSec     *int     `json:"prebuffer_max_sec"`
+	HLSTargetSec        *float64 `json:"hls_target_sec"`
+	HLSWindow           *int     `json:"hls_window"`
+	GraceSec            *int     `json:"grace_sec"`
+	WriteTimeoutSec     *int     `json:"write_timeout_sec"`
+	ChunkBytes          *int     `json:"chunk_bytes"`
+	MaxGOPBytes         *int     `json:"max_gop_bytes"`
+	SourceInsecure      *bool    `json:"source_insecure"`
+	DefaultPrebufferSec *int     `json:"default_prebuffer_sec"`
+	IdleBufferGraceSec  *int     `json:"idle_buffer_grace_sec"`
+	IdleBufferRatio     *float64 `json:"idle_buffer_ratio"`
 }
 
 // Load reads path, returns the resolved (defaults-overlaid, clamped) values, and
@@ -114,10 +117,10 @@ func Load(path string) (Values, bool, error) {
 		v.PrebufferMaxSec = *f.PrebufferMaxSec
 	}
 	overlay(f.PrebufferMaxSec != nil)
-	if f.ClientPrebufferSec != nil {
-		v.ClientPrebufferSec = *f.ClientPrebufferSec
+	if f.DefaultPrebufferSec != nil {
+		v.DefaultPrebufferSec = *f.DefaultPrebufferSec
 	}
-	overlay(f.ClientPrebufferSec != nil)
+	overlay(f.DefaultPrebufferSec != nil)
 	if f.HLSTargetSec != nil {
 		v.HLSTargetSec = *f.HLSTargetSec
 	}
@@ -146,18 +149,14 @@ func Load(path string) (Values, bool, error) {
 		v.SourceInsecure = *f.SourceInsecure
 	}
 	overlay(f.SourceInsecure != nil)
-	if f.IdleBufferSec != nil {
-		v.IdleBufferSec = *f.IdleBufferSec
-	}
-	overlay(f.IdleBufferSec != nil)
 	if f.IdleBufferGraceSec != nil {
 		v.IdleBufferGraceSec = *f.IdleBufferGraceSec
 	}
 	overlay(f.IdleBufferGraceSec != nil)
-	if f.IdleHlsWindow != nil {
-		v.IdleHlsWindow = *f.IdleHlsWindow
+	if f.IdleBufferRatio != nil {
+		v.IdleBufferRatio = *f.IdleBufferRatio
 	}
-	overlay(f.IdleHlsWindow != nil)
+	overlay(f.IdleBufferRatio != nil)
 
 	v.clamp()
 
@@ -194,15 +193,18 @@ func Save(path string, v Values) error {
 // (or a hand-edited file) can never push the daemon into a pathological state.
 func (v *Values) clamp() {
 	v.PrebufferMaxSec = clampInt(v.PrebufferMaxSec, 0, 120)
-	v.ClientPrebufferSec = clampInt(v.ClientPrebufferSec, 0, 120)
+	v.DefaultPrebufferSec = clampInt(v.DefaultPrebufferSec, 0, 120)
 	v.HLSWindow = clampInt(v.HLSWindow, 1, 20)
 	v.GraceSec = clampInt(v.GraceSec, 1, 3600)
 	v.WriteTimeoutSec = clampInt(v.WriteTimeoutSec, 1, 600)
 	v.ChunkBytes = clampInt(v.ChunkBytes, 188, 4<<20)
 	v.MaxGOPBytes = clampInt(v.MaxGOPBytes, 188, 256<<20)
-	v.IdleBufferSec = clampInt(v.IdleBufferSec, 0, 60)
 	v.IdleBufferGraceSec = clampInt(v.IdleBufferGraceSec, 0, 3600)
-	v.IdleHlsWindow = clampInt(v.IdleHlsWindow, 0, 20)
+	if v.IdleBufferRatio < 0.1 {
+		v.IdleBufferRatio = 0.1
+	} else if v.IdleBufferRatio > 1 {
+		v.IdleBufferRatio = 1
+	}
 	if v.HLSTargetSec < 1 {
 		v.HLSTargetSec = 1
 	} else if v.HLSTargetSec > 30 {
