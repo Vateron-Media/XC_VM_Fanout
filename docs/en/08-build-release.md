@@ -36,8 +36,8 @@ running daemon — each test wires up exactly what it needs in-process.
 | Package | What its tests cover |
 |---------|----------------------|
 | `hub` | Fan-out correctness (every subscriber gets the identical byte stream), slow-subscriber drop, snapshot/unsubscribe. |
-| `tsjoin` | Clean-join parsing (PAT/PMT + keyframe) and the prebuffer ring rewind. |
-| `hlsseg` | Segment cutting on keyframes, the sliding window, playlist output. |
+| `tsjoin` | Clean-join parsing (PAT/PMT + keyframe), the prebuffer ring rewind, and the HLS-from-ring view (segment cutting on keyframes, the display window, playlist/segment assembly). |
+| `config` | The self-healing JSON contract: self-create when absent, backfill missing keys, keep defaults on malformed, atomic write, clamp ranges. |
 | `hlscrypt` | AES-128-CBC segment encryption round-trips. |
 | `ingest` | 188-byte packet alignment across read boundaries. |
 | `puller` | Source classification (direct mp2t vs ffmpeg remux), cold-start ffmpeg args, reconnect, and ffmpeg-failure surfacing (see below). |

@@ -33,14 +33,15 @@ Keeps the connection open and continuously streams MPEG-TS to the viewer. The ha
 
 | Parameter | Type | Meaning |
 |----------|-----|-------|
-| `prebuffer` | seconds (integer) | How much history to "catch up" on entry. Clamped by the `-prebuffer-max` ceiling (20 s by default). Absent/0 = minimal clean entry (current GOP only). |
+| `prebuffer` | seconds (integer) | How much history to "catch up" on entry. The **panel** chooses this (client vs restreamer) and the daemon honors it **as-is, including an explicit `0`** (= current GOP only), bounded only by what the ring holds (`prebuffer_max_sec`). **Absent** = fall back to the `default_prebuffer_sec` [config key](06-configuration.md#per-viewer-prebuffer) (`0` by default). |
 | `c` | uuid | The viewer's connection identifier (passed through by `live.php`). `fanout_sync` uses it to track disconnects and close the `lines_live` row; a queued [`/signal/<uuid>`](#post-signaluuid--admin-send-message-overlay) overlay is matched against it. |
 | `vc` | codec | Source video codec, forwarded by `live.php`. Used only if a "send message" overlay is active for `?c=`, to keep the codec on the transient re-encode; ignored otherwise. |
 
 **What happens on connect:**
 
 1. Finds the stream by `<id>` (otherwise `404`).
-2. Reads the prebuffer from `?prebuffer=` and clamps it to the ceiling.
+2. Reads the prebuffer from `?prebuffer=` and honors it as-is (falling back to
+   `default_prebuffer_sec` when the param is absent).
 3. Atomically takes a "clean-entry snapshot" (PAT/PMT + the needed tail of GOPs) and
    subscribes to the live tail — without a gap or duplication.
 4. `attach()` — accounts for the viewer and **starts the puller on the first viewer**
@@ -51,7 +52,7 @@ Keeps the connection open and continuously streams MPEG-TS to the viewer. The ha
 **Response:** `200`, `Content-Type: video/mp2t`, `Cache-Control: no-store`, body — an
 infinite TS stream. `404` if the stream is not registered.
 
-**Protection against "stalled" viewers:** each write is bounded by the `-write-timeout` deadline
+**Protection against "stalled" viewers:** each write is bounded by the `write_timeout_sec` deadline
 (15 s by default). A viewer that stops reading the socket without a clean close
 (a minimized player, a dropped mobile link) is torn down — otherwise it would permanently
 block the delivery goroutine. For details, see [04, "Guarding against stalled viewers"](04-internals.md#guarding-against-stalled-viewers).

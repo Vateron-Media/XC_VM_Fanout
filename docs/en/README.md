@@ -17,7 +17,7 @@ project, read in order: 01 → 02 → then whatever interests you.
 | 03 | [endpoints.md](03-endpoints.md) | **HTTP endpoints.** Full reference for both surfaces: paths, methods, parameters, bodies, responses. |
 | 04 | [internals.md](04-internals.md) | **Internal mechanisms.** How the TS fan-out, clean join, prebuffer, HLS segmentation, encryption and source acquisition work. |
 | 05 | [lifecycle.md](05-lifecycle.md) | **Stream lifecycle.** On-demand start/stop, pull/push/launch modes, the reaper. |
-| 06 | [configuration.md](06-configuration.md) | **Parameters and flags.** What the daemon consumes at startup: CLI flags, defaults, what tunes what. |
+| 06 | [configuration.md](06-configuration.md) | **Parameters and configuration.** The daemon's two input surfaces: the launch-time CLI flags and the panel-editable JSON config file (buffer/HLS/idle tuning, applied live), plus the 0.10.0→0.11.0 flag migration. |
 | 07 | [integration.md](07-integration.md) | **Integration with the XC_VM panel.** How nginx, PHP, `fanout_sync` and binary install work with it. |
 | 08 | [build-release.md](08-build-release.md) | **Build, test, release.** How to build, run the tests, cut a version. |
 

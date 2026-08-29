@@ -13,15 +13,15 @@
                     └───────────┬───────────┘
                                 │  188-byte-aligned MPEG-TS chunks
                          Stream.Publish(chunk)
+                                │
+                       ┌────────▼─────────┐
+                       │   Hub → tsjoin   │   the single per-stream buffer
+                       │  GOP ring + HLS  │   (HLS is a metadata view over the ring)
+                       │  segment index   │
+                       └────────┬─────────┘
                           ┌─────┴─────┐
-                          ▼           ▼
-                   ┌────────────┐  ┌────────────────┐
-                   │  Hub (TS)  │  │ Segmenter(HLS) │
-                   │  fan-out   │  │ segment window │
-                   └─────┬──────┘  └───────┬────────┘
-                         │                 │
               GET /live/<id>        GET /hls/<id>/index.m3u8
-              (video/mp2t)          GET /hls/<id>/<seq>.ts
+              (video/mp2t)          GET /hls/<id>/<seq>.ts  (assembled from the ring)
                          │                 │
                      ┌───▼─────────────────▼───┐
                      │      nginx (X-Accel)     │  → viewer
@@ -51,12 +51,13 @@ machine is faster.
 |---------|------|------|
 | `server` | [server.go](../../internal/server/server.go) | Registry `id → Stream`, both HTTP surfaces, on-demand stream lifecycle. |
 | `hub` | [hub.go](../../internal/hub/hub.go) | Fan-out of a single TS stream to many subscribers; drops the slow ones. |
-| `tsjoin` | [tsjoin.go](../../internal/tsjoin/tsjoin.go) | MPEG-TS parsing: PAT/PMT + a GOP ring for a "clean entry" and prebuffer. |
-| `hlsseg` | [hlsseg.go](../../internal/hlsseg/hlsseg.go) | Slicing live TS into HLS segments at video keyframes, entirely in RAM. |
-| `hlscrypt` | [hlscrypt.go](../../internal/hlscrypt/hlscrypt.go) | AES-128-CBC encryption of HLS segments (compatible with the panel). |
+| `tsjoin` | [tsjoin.go](../../internal/tsjoin/tsjoin.go) | The single per-stream buffer: PAT/PMT + a GOP ring for the "clean entry" and prebuffer, **and** the HLS segment index derived from that ring. |
+| `hlscrypt` | [hlscrypt.go](../../internal/hlscrypt/hlscrypt.go) | AES-128-CBC encryption of HLS segments (compatible with the panel), applied on the fly as a segment is assembled. |
 | `puller` | [puller.go](../../internal/puller/puller.go) | Source acquisition (direct mp2t or ffmpeg remux), reconnect with backoff. |
 | `ingest` | [ingest.go](../../internal/ingest/ingest.go) | Copying a TS stream into the publish callback in 188-byte-aligned chunks. |
-| `cmd/xc_fanout` | [main.go](../../cmd/xc_fanout/main.go) | Entry point: flags, socket setup, graceful shutdown. |
+| `config` | [config.go](../../internal/config/config.go) | The panel↔daemon tuning bridge: a self-healing JSON file, polled and applied live. |
+| `defaults` | [defaults.go](../../internal/defaults/defaults.go) | The built-in operational tuning constants (the config-file seeds and other invariants). |
+| `cmd/xc_fanout` | [main.go](../../cmd/xc_fanout/main.go) | Entry point: flags, config load/poll, socket setup, graceful shutdown. |
 
 ## Key entities
 
@@ -70,10 +71,10 @@ surfaces, and runs the **reaper** (the background cleanup of idle streams).
 
 A single live stream. It combines:
 
-- **`Hub`** — serving live TS;
-- **`Segmenter`** — HLS in memory;
+- **`Hub`** — fan-out plus the single `tsjoin` buffer that serves **both** live TS and HLS
+  (HLS derived from the ring — no separate segmenter);
 - **lifecycle state** — pulling/not pulling, the number of viewers (`refs`), timestamps of
-  the last data and the last access, the encryption key.
+  the last data and the last access, the encryption key, the idle-buffer gate.
 
 All data enters `Stream` through a single point — the `Publish` method.
 
@@ -87,16 +88,15 @@ All data enters `Stream` through a single point — the `Publish` method.
    detail — [04, "Source acquisition"](04-internals.md#source-acquisition--puller).
 2. **Alignment.** The bytes are cut into chunks that are multiples of 188 (the TS packet
    length), so that the parsers downstream always see whole packets (`ingest.Copy`).
-3. **Publishing.** `Stream.Publish(chunk)` feeds the chunk into two places at once:
-   - `Hub.Publish` — into the TS fan-out;
-   - `Segmenter.Feed` — into the HLS segmenter;
-   - and updates the liveness marker `lastData` (for off-air detection).
+3. **Publishing.** `Stream.Publish(chunk)` feeds the chunk into the `Hub`, which folds it into
+   the single `tsjoin` ring, and updates the liveness marker `lastData` (for off-air detection).
+   There is one buffer — both TS and HLS are served from it.
 4. **Serving TS.** Every viewer `GET /live/<id>` first receives from the `Hub` a
    "clean-entry snapshot" (PAT/PMT + the current GOP, optionally a prebuffer), then the
    live tail. A slow viewer is dropped so as not to hold back the rest.
-5. **Serving HLS.** The `Segmenter` slices the stream into segments at video keyframes and
-   keeps a sliding window of the last N segments + the playlist. The player polls
-   `index.m3u8` and downloads `<seq>.ts`.
+5. **Serving HLS.** HLS is a **view over the ring**: a segment index (metadata only) drives the
+   playlist, and each `<seq>.ts` request is assembled from the ring's GOPs on the fly (encrypted
+   if the stream has a key). The player polls `index.m3u8` and downloads `<seq>.ts`.
 6. **Outward.** Live TS and HLS **segments** are served by nginx via `X-Accel`, proxying to
    the client socket. The HLS **playlist** (`index.m3u8`) is the exception: it is fetched
    and rewritten to authorized URLs by PHP itself (see
@@ -108,6 +108,9 @@ All data enters `Stream` through a single point — the `Publish` method.
   subscribers).
 - **PHP outside the byte path.** Video does not pass through PHP — only control commands.
 - **Nothing to disk.** Both TS and HLS live in RAM.
+- **One buffer, not two.** A single TS ring per stream serves live-TS *and* HLS (HLS is a
+  metadata view over it); an unwatched stream collapses that ring. See
+  [ADR 0001](../adr/0001-single-ts-cache-hls-on-demand.md).
 - **On-demand.** The source is pulled only while there are viewers; otherwise it stops
   (see [05. Lifecycle](05-lifecycle.md)).
 - **The slow don't hold back the fast.** A viewer that can't keep up reading the data is

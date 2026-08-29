@@ -88,6 +88,6 @@ XC_FANOUT_BIN=/tmp/xc_fanout ORIGIN=http://127.0.0.1:18080 FFMPEG=ffmpeg \
 | `TestConnectionsAndRates` | `?c=<uuid>` shows in `/connections` and `/rates`. |
 | `TestGraceReaper` | The puller idle-stops after the last viewer + grace. |
 | `TestDeleteTeardown` | `DELETE` makes status/live `404`. |
-| `TestStalledViewerEviction` | A non-draining viewer is dropped after `-write-timeout`. |
+| `TestStalledViewerEviction` | A non-draining viewer is dropped after `write_timeout_sec`. |
 | `TestIngestPush` | Push mode: a producer feeds the ingest socket, a viewer receives it. |
 | `TestLaunchModeSource` / `TestLaunchModeFile` | `-id/-source` and `-id/-in` launch feeds without the control API. |

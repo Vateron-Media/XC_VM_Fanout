@@ -59,10 +59,23 @@ The source is stopped by a background cleanup — the **reaper**
 - **What it does:** it walks all streams and calls `idleStopLocked` for each.
 - **Stop condition** (`idleStopLocked`): the stream is **pull-managed** (a source `cfg` is
   set — i.e. the puller is running) **and** `refs == 0` (no live-TS viewers) **and** at least
-  `-grace` (10 s by default) has passed since the last `lastAccess`.
+  `grace_sec` (10 s by default) has passed since the last `lastAccess`.
 
 This is a **single idle-stop path** for both TS and HLS audiences: HLS-only viewers no longer
 let the source "fall asleep" under them, because every one of their requests moves `lastAccess`.
+
+### The idle-buffer gate
+
+The same reaper sweep also **shrinks memory for streams that are fed but unwatched** (since
+0.11.0). A stream with no live viewer and no viewer touch (a TS attach or an HLS request) for
+`idle_buffer_grace_sec` (30 s by default) has its `tsjoin` ring **collapsed** to
+`prebuffer_max_sec × idle_buffer_ratio` (half by default); the instant a viewer returns it is
+pumped back to the full buffer. HLS keeps being cut from the reduced ring, so an idle HLS
+channel's playlist stays non-empty and openable. After a sweep that gated at least one stream the
+reaper calls `debug.FreeOSMemory()` once, so the freed pages actually return to the OS. Set
+`idle_buffer_grace_sec = 0` to disable the gate. See
+[06, "The idle-buffer gate"](06-configuration.md#the-idle-buffer-gate) and
+[ADR 0001](../adr/0001-single-ts-cache-hls-on-demand.md).
 
 > Push/ingest streams are **not subject** to this rule: they have no `cfg`, so `idleStopLocked`
 > exits immediately for them. Their power is determined by the producer (as long as the
@@ -83,10 +96,11 @@ stops the puller under the usual idle rule. More on the endpoint itself —
 ```
 1. PHP: PUT /streams/<id> {urls:[…]}      → config registered, puller not running yet
 2. Viewer: GET /live/<id>                 → attach(): refs=1, puller starts
-3. puller: probe → mp2t directly / ffmpeg → Publish(chunk) → Hub + Segmenter
+3. puller: probe → mp2t directly / ffmpeg → Publish(chunk) → Hub (single ring; HLS derived)
 4. More viewers: GET /live / GET /hls/…    → refs grows / lastAccess moves
 5. Viewers leave                           → detach(): refs drops; HLS moves lastAccess
-6. refs=0 and silence ≥ grace              → reaper: puller stopped
+6a. no viewer/touch ≥ idle_buffer_grace    → reaper: ring collapsed to the idle fraction
+6b. refs=0 and silence ≥ grace             → reaper: puller stopped
 7. New viewer                              → puller starts again (step 2)
 8. PHP: DELETE /streams/<id>               → config cleared, puller stopped, stream removed
 ```

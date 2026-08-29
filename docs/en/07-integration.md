@@ -78,17 +78,17 @@ The solution: `live.php` creates a `lines_live` row with `pid=0` and passes the 
 connection-uuid via `?c=<uuid>`. The `fanout_sync` daemon periodically reads
 `GET /connections` (the list of uuids of all active live-TS viewers across all streams) and
 **closes rows** whose uuid is no longer in that list. The daemon, for its part, reliably detects
-disconnects — including by dropping "stuck" viewers on `-write-timeout`
+disconnects — including by dropping "stuck" viewers on `write_timeout_sec`
 (see [04](04-internals.md#guarding-against-stalled-viewers)).
 
 > **Closing is not instantaneous.** Between a viewer's actual departure and the closing of the
-> row, the following accumulates: up to `-write-timeout` (15 s) — until the daemon drops the
+> row, the following accumulates: up to `write_timeout_sec` (15 s) — until the daemon drops the
 > stuck connection and removes the uuid from `/connections`; + the `fanout_sync` reconciliation
 > interval (~10 s); and the row is not closed earlier than the connect-grace of `fanout_sync`
 > itself (~20 s from creation — protection against a race on connect). Net result: a "ghost"
 > after an unclean disconnect lives up to ~25–35 s, then the slot is freed. On a clean
 > connection close the daemon removes the uuid immediately, without waiting for
-> `-write-timeout`.
+> `write_timeout_sec`.
 
 ## Installing and updating the binary
 
