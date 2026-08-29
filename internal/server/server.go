@@ -26,7 +26,6 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
-	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlsseg"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
@@ -37,11 +36,11 @@ import (
 const defaultChunk = defaults.IngestChunk
 const defaultWriteTimeout = defaults.WriteTimeout
 
-// Stream bundles the TS fan-out (Hub) and in-memory HLS (Seg) for one source,
-// plus its on-demand lifecycle state.
+// Stream bundles the fan-out for one source plus its on-demand lifecycle state.
+// The Hub owns the single TS cache; HLS is cut from that cache on demand (see
+// Hub.HLSPlaylist / HLSSegment), not buffered a second time.
 type Stream struct {
 	Hub *hub.Hub
-	Seg *hlsseg.Segmenter
 
 	id string // stream id, set at creation; for debug logging
 
@@ -227,14 +226,14 @@ func (s *Stream) stopIngestLocked() {
 	}
 }
 
-// Publish feeds one packet-aligned chunk into both the TS fan-out and the HLS
-// segmenter, and records data liveness (for off-air detection via status()).
+// Publish feeds one packet-aligned chunk into the fan-out (which also folds it
+// into the single TS cache HLS is cut from) and records data liveness (for
+// off-air detection via status()).
 func (s *Stream) Publish(chunk []byte) {
 	if len(chunk) > 0 {
 		s.lastData.Store(time.Now().UnixNano())
 	}
 	s.Hub.Publish(chunk)
-	s.Seg.Feed(chunk)
 }
 
 // setConfig registers/updates the pull config; if viewers are already waiting it
@@ -338,9 +337,9 @@ func (s *Stream) status() streamStatus {
 
 // Manager holds the live streams keyed by id.
 type Manager struct {
-	mu           sync.Mutex
-	streams      map[string]*Stream
-	maxGOP       int
+	mu      sync.Mutex
+	streams map[string]*Stream
+	maxGOP  int
 	// maxPrebufMS and writeTimeout are read off m.mu on hot paths (the client
 	// handler / per-write), so they are atomic — ApplyConfig can retune them live
 	// without a lock. hlsTarget/hlsWindow/grace are read only under m.mu (stream
@@ -350,7 +349,7 @@ type Manager struct {
 	hlsWindow    int
 	grace        time.Duration
 	writeTimeout atomic.Int64 // per-write deadline for live-TS viewers (nanoseconds)
-	ingestDir    string        // base dir for per-stream push-fed ingest sockets
+	ingestDir    string       // base dir for per-stream push-fed ingest sockets
 
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
@@ -434,9 +433,9 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	m.mu.Unlock()
 
 	mp := int64(v.PrebufferMaxSec) * 1000
+	htMS := int64(v.HLSTargetSec * 1000)
 	for _, st := range streams {
-		st.Hub.SetPrebuffer(mp)
-		st.Seg.SetWindow(v.HLSTargetSec, v.HLSWindow)
+		st.Hub.Configure(mp, htMS, v.HLSWindow)
 	}
 }
 
@@ -537,10 +536,12 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 		st = &Stream{
 			id:    id,
 			Hub:   hub.New(m.maxGOP, m.maxPrebufMS.Load()),
-			Seg:   hlsseg.New(m.hlsTarget, m.hlsWindow),
 			chunk: m.defaultChunk,
 			grace: m.grace,
 		}
+		// Size the single cache to also cover the HLS window (target/window) so
+		// HLS can be cut from it on demand.
+		st.Hub.Configure(m.maxPrebufMS.Load(), int64(m.hlsTarget*1000), m.hlsWindow)
 		m.streams[id] = st
 		dlog.Logf("stream", "id=%s created", id)
 	}
@@ -1016,7 +1017,7 @@ func (m *Manager) serveHLS(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case file == "index.m3u8":
-		pl := st.Seg.Playlist()
+		pl := st.Hub.HLSPlaylist()
 		if pl == "" {
 			dlog.Logf("hls", "id=%s playlist requested but no segments yet (warming up / off-air)", id)
 			http.Error(w, "no segments yet", http.StatusNotFound)
@@ -1032,7 +1033,7 @@ func (m *Manager) serveHLS(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		data := st.Seg.Segment(seq)
+		data := st.Hub.HLSSegment(seq)
 		if data == nil {
 			dlog.Logf("hls", "id=%s segment %d not found (rolled out of window or never existed)", id, seq)
 			http.NotFound(w, r)

@@ -62,21 +62,6 @@ const (
 	PullFfmpegAnalyzeDuration = "1000000"
 )
 
-// ── In-memory HLS segmenter ────────────────────────────────────────────────
-
-const (
-	// HLSDefaultTargetSec / HLSDefaultWindow are the guard fallbacks applied when
-	// a Segmenter is created with a non-positive target duration or a window < 1
-	// (main.go always passes valid flag values, so these only fire on a
-	// programmatic New with bad numbers).
-	HLSDefaultTargetSec = 6.0
-	HLSDefaultWindow    = 3
-
-	// HLSMaxSegmentBytes caps a single HLS segment: a stream whose keyframes are
-	// rare or absent can never grow one segment without bound.
-	HLSMaxSegmentBytes = 16 * 1024 * 1024
-)
-
 // ── TS join / prebuffer ring ───────────────────────────────────────────────
 
 // JoinRingBytesPerMS backstops the prebuffer ring at a generous high-bitrate

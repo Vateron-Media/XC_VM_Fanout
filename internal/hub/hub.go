@@ -92,13 +92,32 @@ func (h *Hub) Snapshot(prebufMS int64) []byte {
 	return snap
 }
 
-// SetPrebuffer live-reconfigures the per-stream prebuffer ring depth (ms of
-// keyframe history). Reducing it frees the retained history right away; this is
+// Configure live-reconfigures the TS prebuffer depth (ms) and the HLS segment
+// view (target ms, window). The ring is the single cache; HLS is cut from it, so
+// one call retunes both. A reduced depth frees retained history at once — this is
 // how a panel-driven config change shrinks memory without recreating the stream.
-func (h *Hub) SetPrebuffer(maxPrebufMS int64) {
+func (h *Hub) Configure(prebufMS, hlsTargetMS int64, hlsWindow int) {
 	h.mu.Lock()
-	h.join.SetRing(maxPrebufMS)
+	h.join.Configure(prebufMS, hlsTargetMS, hlsWindow)
 	h.mu.Unlock()
+}
+
+// HLSPlaylist renders the HLS media playlist from the ring's segment view, or ""
+// when no segments are ready yet. Serialised against the producer.
+func (h *Hub) HLSPlaylist() string {
+	h.mu.Lock()
+	pl := h.join.HLSPlaylist()
+	h.mu.Unlock()
+	return pl
+}
+
+// HLSSegment assembles HLS segment seq from the ring, or nil if it is unknown or
+// has aged out. Serialised against the producer.
+func (h *Hub) HLSSegment(seq int) []byte {
+	h.mu.Lock()
+	b := h.join.HLSSegment(seq)
+	h.mu.Unlock()
+	return b
 }
 
 // Unsubscribe removes a subscriber (idempotent).

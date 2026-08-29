@@ -64,7 +64,13 @@ func startDaemon(t *testing.T, extraFlags ...string) *daemon {
 		ingestDir: filepath.Join(dir, "ingest"),
 	}
 
-	args := []string{"-sock", d.sock, "-ctl", d.ctl, "-ingestdir", d.ingestDir}
+	// Operator tuning (grace, hls target/window, prebuffer, write timeout, chunk,
+	// maxgop) lives in the JSON config now, not on the CLI. Translate any such
+	// scenario "flags" into a config file and point -config at it (also gives the
+	// daemon a writable config path in the temp dir instead of the /home default).
+	cfgPath := filepath.Join(dir, "config.json")
+	extraFlags = writeConfigFromFlags(t, cfgPath, extraFlags)
+	args := []string{"-sock", d.sock, "-ctl", d.ctl, "-ingestdir", d.ingestDir, "-config", cfgPath}
 	args = append(args, extraFlags...)
 	// If the caller opted out of the control API, drop -ctl.
 	if hasFlag(extraFlags, "-noctl") {
@@ -97,6 +103,62 @@ func startDaemon(t *testing.T, extraFlags ...string) *daemon {
 	}
 	t.Fatalf("daemon did not become healthy on %s", d.sock)
 	return nil
+}
+
+// writeConfigFromFlags pulls the retired tuning "flags" out of a scenario's extra
+// args, writes them as a partial JSON config at path (the daemon backfills the
+// rest with its defaults), and returns the remaining, still-real flags.
+func writeConfigFromFlags(t *testing.T, path string, flags []string) []string {
+	t.Helper()
+	cfg := map[string]any{}
+	var rest []string
+	for i := 0; i < len(flags); i++ {
+		key, isFloat := "", false
+		switch flags[i] {
+		case "-grace":
+			key = "grace_sec"
+		case "-write-timeout":
+			key = "write_timeout_sec"
+		case "-prebuffer-max":
+			key = "prebuffer_max_sec"
+		case "-hlswindow":
+			key = "hls_window"
+		case "-chunk":
+			key = "chunk_bytes"
+		case "-maxgop":
+			key = "max_gop_bytes"
+		case "-hlstarget":
+			key, isFloat = "hls_target_sec", true
+		default:
+			rest = append(rest, flags[i])
+			continue
+		}
+		if i+1 >= len(flags) {
+			t.Fatalf("flag %s needs a value", flags[i])
+		}
+		i++
+		if isFloat {
+			f, err := strconv.ParseFloat(flags[i], 64)
+			if err != nil {
+				t.Fatalf("bad value for %s: %v", key, err)
+			}
+			cfg[key] = f
+		} else {
+			n, err := strconv.Atoi(flags[i])
+			if err != nil {
+				t.Fatalf("bad value for %s: %v", key, err)
+			}
+			cfg[key] = n
+		}
+	}
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return rest
 }
 
 func hasFlag(flags []string, name string) bool {
