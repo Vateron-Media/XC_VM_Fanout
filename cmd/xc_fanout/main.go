@@ -169,6 +169,9 @@ func main() {
 // the file changes. It is mtime-gated, so a steady file costs one stat per tick.
 // A read or parse error is logged and the current tuning kept — a bad config
 // (or a mid-write torn read) never interrupts streaming; the next tick retries.
+// If the file is deleted out from under a running daemon it is recreated,
+// preserving the running tuning (or the built-in defaults if nothing has loaded
+// yet), so the self-healing contract holds at runtime, not just at startup.
 func pollConfig(ctx context.Context, path string, every time.Duration, mgr *server.Manager) {
 	if every < time.Second {
 		every = time.Second
@@ -176,6 +179,7 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 	t := time.NewTicker(every)
 	defer t.Stop()
 	var lastMod time.Time
+	var current *config.Values // last successfully applied tuning, or nil
 	for {
 		select {
 		case <-ctx.Done():
@@ -183,7 +187,32 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 		case <-t.C:
 			fi, err := os.Stat(path)
 			if err != nil {
-				continue // absent/unreadable: the flag defaults stand; retry next tick
+				if !os.IsNotExist(err) {
+					continue // unreadable (perms, etc.): keep current, retry next tick
+				}
+				// Deleted at runtime — recreate it so the self-healing contract
+				// holds. Preserve the running tuning if we have it; otherwise fall
+				// back to the built-in defaults (config.Load self-creates them).
+				if current != nil {
+					if werr := config.Save(path, *current); werr != nil {
+						log.Printf("config: recreate %s failed: %v", path, werr)
+						continue
+					}
+					dlog.Logf("config", "recreated %s after deletion (kept running tuning)", path)
+				} else {
+					v, _, lerr := config.Load(path)
+					if lerr != nil {
+						log.Printf("config: recreate %s failed: %v", path, lerr)
+						continue
+					}
+					current = &v
+					mgr.ApplyConfig(v)
+					dlog.Logf("config", "recreated %s after deletion (defaults)", path)
+				}
+				if nfi, serr := os.Stat(path); serr == nil {
+					lastMod = nfi.ModTime() // re-arm the mtime gate on the recreated file
+				}
+				continue
 			}
 			if fi.ModTime().Equal(lastMod) {
 				continue
@@ -194,6 +223,7 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 				log.Printf("config reload: %v (keeping current tuning)", err)
 				continue
 			}
+			current = &v
 			mgr.ApplyConfig(v)
 			dlog.Logf("config", "applied %s: prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds",
 				path, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec)
