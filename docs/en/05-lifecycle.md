@@ -67,7 +67,7 @@ let the source "fall asleep" under them, because every one of their requests mov
 ### The idle-buffer gate
 
 The same reaper sweep also **shrinks memory for streams that are fed but unwatched** (since
-0.11.0). A stream with no live viewer and no viewer touch (a TS attach or an HLS request) for
+0.11.1). A stream with no live viewer and no viewer touch (a TS attach or an HLS request) for
 `idle_buffer_grace_sec` (30 s by default) has its `tsjoin` ring **collapsed** to
 `prebuffer_max_sec × idle_buffer_ratio` (half by default); the instant a viewer returns it is
 pumped back to the full buffer. HLS keeps being cut from the reduced ring, so an idle HLS

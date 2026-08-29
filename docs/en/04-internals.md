@@ -24,7 +24,7 @@ Publish(chunk):
     Hub.Publish(chunk)                                  // into the single TS ring
 ```
 
-Since 0.11.0 there is **one** buffer: `Hub.Publish` folds the chunk into the `tsjoin` ring, and
+Since 0.11.1 there is **one** buffer: `Hub.Publish` folds the chunk into the `tsjoin` ring, and
 both the live-TS fan-out and HLS are served from that ring (HLS as a metadata view — see
 ["HLS is a view over the ring"](#hls-is-a-view-over-the-ring--hls-from-tsjoin)). The `lastData`
 marker is later read by the status (`GET /streams/<id>`) to determine off-air.
@@ -134,7 +134,7 @@ a new viewer needs to start:
 - a **ring of GOPs** — blocks "from one keyframe to the next keyframe", each tagged
   with a **monotonic id** and a time from the PCR clock (90 kHz).
 
-Since **0.11.0** this ring is the daemon's **single per-stream buffer**: it serves the live-TS
+Since **0.11.1** this ring is the daemon's **single per-stream buffer**: it serves the live-TS
 clean join and prebuffer, *and* HLS is derived from it (see
 ["HLS is a view over the ring"](#hls-is-a-view-over-the-ring--hls-from-tsjoin) below and
 [ADR 0001](../adr/0001-single-ts-cache-hls-on-demand.md)). The separate HLS byte store that used
@@ -166,9 +166,9 @@ carries no `?prebuffer=` at all does the daemon fall back to the `default_prebuf
 
 ## HLS is a view over the ring — HLS from `tsjoin`
 
-Before 0.11.0 HLS lived in a separate package (`hlsseg`) that re-parsed the same TS and stored a
+Before 0.11.1 HLS lived in a separate package (`hlsseg`) that re-parsed the same TS and stored a
 **second copy** of the bytes as finished segments. Two buffers holding essentially the same data
-drove ~80 GB of RAM at 350 channels. **0.11.0 removes that store**: the [`tsjoin`](#clean-join-and-prebuffer--tsjoin)
+drove ~80 GB of RAM at 350 channels. **0.11.1 removes that store**: the [`tsjoin`](#clean-join-and-prebuffer--tsjoin)
 ring is the single source, and HLS is a **lightweight metadata view** over it — no second byte
 store. See [ADR 0001](../adr/0001-single-ts-cache-hls-on-demand.md) for the full rationale.
 

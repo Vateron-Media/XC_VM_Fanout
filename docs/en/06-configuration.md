@@ -1,6 +1,6 @@
 # 06. Parameters and configuration
 
-> What the daemon consumes as input. Since **0.11.0** this comes from **two** places:
+> What the daemon consumes as input. Since **0.11.1** this comes from **two** places:
 > the **command-line flags** (placement, identity, debug — set once at launch), and a
 > **JSON config file** (the operator tuning — buffer sizes, timeouts, HLS — edited by the
 > panel and applied live, no restart). The entry point is
@@ -8,7 +8,7 @@
 
 Historically (≤ 0.10.0) the daemon had **no config file** and every knob was a launch flag.
 The problem: the panel never set those flags, so a value like the prebuffer depth or the HLS
-window could not be changed without a rebuild. In **0.11.0** the operator tuning moved into a
+window could not be changed without a rebuild. In **0.11.1** the operator tuning moved into a
 JSON file the panel edits and the daemon polls; the flags that carried those knobs were retired
 (see [Migration from 0.10.0](#migration-from-0100) below).
 
@@ -128,7 +128,7 @@ A minimal file the daemon writes on a fresh node:
 
 ### The buffer / ring
 
-Since 0.11.0 there is **one** per-stream buffer, not two: the keyframe-aligned TS ring in
+Since 0.11.1 there is **one** per-stream buffer, not two: the keyframe-aligned TS ring in
 [`tsjoin`](04-internals.md#clean-join-and-prebuffer--tsjoin). `prebuffer_max_sec` sizes it, and
 HLS is a **view** over it (see [ADR 0001](../adr/0001-single-ts-cache-hls-on-demand.md)). So this
 one number drives both the live-TS prebuffer and how deep the HLS window can reach.
@@ -214,10 +214,10 @@ xc_fanout -id test -source https://example/live.m3u8 -ua "Mozilla/5.0"
 
 ## Migration from 0.10.0
 
-The following flags existed in ≤ 0.10.0 and were **removed** in 0.11.0. Their values are now keys
+The following flags existed in ≤ 0.10.0 and were **removed** in 0.11.1. Their values are now keys
 in the [config file](#the-keys), editable from the panel and applied live:
 
-| Retired flag (≤ 0.10.0) | Now (0.11.0) |
+| Retired flag (≤ 0.10.0) | Now (0.11.1) |
 |-------------------------|--------------|
 | `-prebuffer-max` | `prebuffer_max_sec` (default raised `20 → 40`) |
 | `-hlstarget` | `hls_target_sec` |
@@ -228,7 +228,7 @@ in the [config file](#the-keys), editable from the panel and applied live:
 | `-maxgop` | `max_gop_bytes` |
 | `-source-insecure` | `source_insecure` |
 
-New in 0.11.0 and not present as a flag before: `default_prebuffer_sec`, `idle_buffer_grace_sec`,
+New in 0.11.1 and not present as a flag before: `default_prebuffer_sec`, `idle_buffer_grace_sec`,
 `idle_buffer_ratio`, and the two flags that drive the file itself — `-config` and
 `-config-interval`. No action is needed on upgrade: on first run the daemon writes the file with
 these defaults; an existing panel that only knows the older keys still works (the daemon backfills
