@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/config"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
@@ -340,23 +341,32 @@ type Manager struct {
 	mu           sync.Mutex
 	streams      map[string]*Stream
 	maxGOP       int
-	maxPrebufMS  int64 // ceiling for per-viewer client prebuffer (ms of TS history)
+	// maxPrebufMS and writeTimeout are read off m.mu on hot paths (the client
+	// handler / per-write), so they are atomic — ApplyConfig can retune them live
+	// without a lock. hlsTarget/hlsWindow/grace are read only under m.mu (stream
+	// creation), so they stay plain fields guarded by it.
+	maxPrebufMS  atomic.Int64 // ceiling for per-viewer client prebuffer (ms of TS history)
 	hlsTarget    float64
 	hlsWindow    int
 	grace        time.Duration
-	writeTimeout time.Duration // per-write deadline for live-TS viewers
+	writeTimeout atomic.Int64 // per-write deadline for live-TS viewers (nanoseconds)
 	ingestDir    string        // base dir for per-stream push-fed ingest sockets
 
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
 	signals   *signalStore // pending per-uuid "send message" overlays
 
-	sourceInsecure bool // default for puller.Source.Insecure on registered sources
+	// defaultChunk is the source read size stamped onto a stream at creation
+	// (read under m.mu). sourceInsecure is read off m.mu when registering a pull,
+	// so it is atomic. Both are retunable live via ApplyConfig (new streams/pulls
+	// pick up the change).
+	defaultChunk   int
+	sourceInsecure atomic.Bool // default for puller.Source.Insecure on registered sources
 }
 
 // SetSourceInsecure sets whether pull sources skip upstream TLS verification
 // (applied to every control-registered source). See the -source-insecure flag.
-func (m *Manager) SetSourceInsecure(v bool) { m.sourceInsecure = v }
+func (m *Manager) SetSourceInsecure(v bool) { m.sourceInsecure.Store(v) }
 
 // SetIngestDir sets the directory for per-stream ingest sockets (non-proxy tee).
 func (m *Manager) SetIngestDir(dir string) { m.ingestDir = dir }
@@ -373,7 +383,7 @@ func (m *Manager) SetOverlay(ffmpegBin, fontPath string) {
 // the default). A stalled write past this window drops the viewer.
 func (m *Manager) SetWriteTimeout(d time.Duration) {
 	if d > 0 {
-		m.writeTimeout = d
+		m.writeTimeout.Store(int64(d))
 	}
 }
 
@@ -381,15 +391,52 @@ func (m *Manager) SetWriteTimeout(d time.Duration) {
 // TS history retained per stream), HLS segment target/window, and the idle-stop
 // grace period for control-managed streams.
 func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int, grace time.Duration) *Manager {
-	return &Manager{
+	m := &Manager{
 		streams:      make(map[string]*Stream),
 		maxGOP:       maxGOP,
-		maxPrebufMS:  maxPrebufMS,
 		hlsTarget:    hlsTarget,
 		hlsWindow:    hlsWindow,
 		grace:        grace,
-		writeTimeout: defaultWriteTimeout,
+		defaultChunk: defaultChunk,
 		signals:      newSignalStore(),
+	}
+	m.maxPrebufMS.Store(maxPrebufMS)
+	m.writeTimeout.Store(int64(defaultWriteTimeout))
+	m.sourceInsecure.Store(true)
+	return m
+}
+
+// ApplyConfig live-applies operator tuning (from the polled config file) to the
+// running daemon. New streams pick up the new values at creation; every existing
+// stream's prebuffer ring and HLS window are reconfigured in place, so lowering
+// them frees memory within one poll — no restart, no viewer drop. Safe to call
+// from the config-poll goroutine while streams are serving.
+func (m *Manager) ApplyConfig(v config.Values) {
+	m.maxPrebufMS.Store(int64(v.PrebufferMaxSec) * 1000)
+	m.writeTimeout.Store(int64(time.Duration(v.WriteTimeoutSec) * time.Second))
+	m.sourceInsecure.Store(v.SourceInsecure)
+
+	// Update the new-stream defaults and snapshot the live set under m.mu, then
+	// reconfigure each stream outside the lock (each takes its own hub/seg lock;
+	// holding m.mu across all of them would block GetOrCreate needlessly).
+	// maxGOP/defaultChunk apply to streams created after this point (existing
+	// hubs keep the join cap they were built with); prebuffer/HLS retune live.
+	m.mu.Lock()
+	m.hlsTarget = v.HLSTargetSec
+	m.hlsWindow = v.HLSWindow
+	m.grace = time.Duration(v.GraceSec) * time.Second
+	m.maxGOP = v.MaxGOPBytes
+	m.defaultChunk = v.ChunkBytes
+	streams := make([]*Stream, 0, len(m.streams))
+	for _, st := range m.streams {
+		streams = append(streams, st)
+	}
+	m.mu.Unlock()
+
+	mp := int64(v.PrebufferMaxSec) * 1000
+	for _, st := range streams {
+		st.Hub.SetPrebuffer(mp)
+		st.Seg.SetWindow(v.HLSTargetSec, v.HLSWindow)
 	}
 }
 
@@ -489,9 +536,9 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 	if st == nil {
 		st = &Stream{
 			id:    id,
-			Hub:   hub.New(m.maxGOP, m.maxPrebufMS),
+			Hub:   hub.New(m.maxGOP, m.maxPrebufMS.Load()),
 			Seg:   hlsseg.New(m.hlsTarget, m.hlsWindow),
-			chunk: defaultChunk,
+			chunk: m.defaultChunk,
 			grace: m.grace,
 		}
 		m.streams[id] = st
@@ -502,7 +549,7 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 
 // Register sets a stream's pull config (control API).
 func (m *Manager) Register(id string, src puller.Source, chunk int) {
-	src.Insecure = m.sourceInsecure
+	src.Insecure = m.sourceInsecure.Load()
 	m.GetOrCreate(id).setConfig(src, chunk)
 }
 
@@ -513,7 +560,7 @@ func (m *Manager) Register(id string, src puller.Source, chunk int) {
 // control-managed stream it does not wait for a viewer. Cancelling ctx (SIGINT/
 // SIGTERM) stops the puller and clears running.
 func (m *Manager) RunPinned(ctx context.Context, id string, src puller.Source, chunk int) {
-	src.Insecure = m.sourceInsecure
+	src.Insecure = m.sourceInsecure.Load()
 	src.Label = id
 	st := m.GetOrCreate(id)
 	st.mu.Lock()
@@ -835,8 +882,8 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	if q := r.URL.Query().Get("prebuffer"); q != "" {
 		if sec, err := strconv.Atoi(q); err == nil && sec > 0 {
 			prebufMS = int64(sec) * 1000
-			if prebufMS > m.maxPrebufMS {
-				prebufMS = m.maxPrebufMS
+			if mp := m.maxPrebufMS.Load(); prebufMS > mp {
+				prebufMS = mp
 			}
 		}
 	}
@@ -884,7 +931,7 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// stream the viewer already left.
 	rc := http.NewResponseController(w)
 	write := func(b []byte) error {
-		if err := rc.SetWriteDeadline(time.Now().Add(m.writeTimeout)); err != nil {
+		if err := rc.SetWriteDeadline(time.Now().Add(time.Duration(m.writeTimeout.Load()))); err != nil {
 			// Deadlines unsupported (shouldn't happen for a real conn) — fall back
 			// to a plain write rather than aborting the viewer.
 			n, werr := w.Write(b)

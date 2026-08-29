@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/config"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
@@ -42,24 +43,22 @@ func main() {
 	sock := flag.String("sock", "/home/xc_vm/bin/xc_fanout/sockets/http.sock", "client unix socket (nginx-facing)")
 	ctl := flag.String("ctl", "", "control unix socket (PHP-only), e.g. /home/xc_vm/bin/xc_fanout/sockets/control.sock; empty = no control API")
 	ingestDir := flag.String("ingestdir", "", "dir for per-stream push-fed ingest sockets (non-proxy tee); empty = <sock dir>/ingest")
-	grace := flag.Int("grace", 10, "seconds to keep a control-managed puller alive after the last viewer")
-	writeTimeout := flag.Int("write-timeout", 15, "seconds a single write to a live-TS viewer may stall before the viewer is dropped (stalled/half-open client cleanup)")
 	id := flag.String("id", "", "stream id to feed at launch (testing; empty = serve only)")
 	in := flag.String("in", "", "input file for -id, or - for stdin (testing)")
 	source := flag.String("source", "", "comma-separated source URLs for -id (testing)")
 	ua := flag.String("ua", "", "source User-Agent")
 	proxy := flag.String("proxy", "", "source HTTP proxy host:port")
 	cookie := flag.String("cookie", "", "source Cookie header")
-	ffmpeg := flag.String("ffmpeg", "ffmpeg", "ffmpeg binary path")
-	maxGOP := flag.Int("maxgop", 10528000, "max join-snapshot size in bytes")
-	prebufferMax := flag.Int("prebuffer-max", 20, "ceiling (seconds) of live TS history retained per stream for client_prebuffer; a viewer's ?prebuffer= is clamped to this")
-	chunk := flag.Int("chunk", defaults.IngestChunk, "ingest read size (aligned down to 188)")
-	hlsTarget := flag.Float64("hlstarget", 6, "HLS target segment duration (seconds)")
-	hlsWindow := flag.Int("hlswindow", 6, "HLS segments kept in the sliding window")
+	ffmpeg := flag.String("ffmpeg", "ffmpeg", "ffmpeg binary path (for the admin \"send message\" overlay)")
 	font := flag.String("font", "", "font file for the admin \"send message\" drawtext overlay; empty disables the overlay")
-	sourceInsecure := flag.Bool("source-insecure", true, "skip TLS certificate verification when pulling HTTPS sources (default true: the panel commonly pulls self-signed/mismatched-cert upstreams; set false to require valid certs)")
 	debug := flag.Bool("debug", false, "verbose debug log: narrate stream/puller/viewer/HLS/ingest activity and periodic per-stream state (also enabled by XC_FANOUT_DEBUG=1)")
 	statsEvery := flag.Int("debug-stats", 5, "seconds between periodic per-stream state snapshots in debug mode (0 disables the snapshot)")
+	// Operator tuning (prebuffer, HLS window, grace, write timeout, chunk, maxgop,
+	// TLS) is NOT flags any more — the panel never set them. It lives in the JSON
+	// config below, which the daemon self-creates, self-heals (backfills missing
+	// keys), and polls. See internal/config.
+	configPath := flag.String("config", "/home/xc_vm/bin/xc_fanout/config.json", "operator-tuning JSON (prebuffer_max_sec, hls_target_sec, hls_window, grace_sec, write_timeout_sec, chunk_bytes, max_gop_bytes, source_insecure). Self-created with defaults if absent; missing keys backfilled; polled and applied live. Empty disables the file (built-in defaults are used)")
+	configInterval := flag.Int("config-interval", 60, "seconds between config-file reloads (re-read only when the file's mtime changes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -80,20 +79,40 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	mgr := server.NewManager(*maxGOP, int64(*prebufferMax)*1000, *hlsTarget, *hlsWindow, time.Duration(*grace)*time.Second)
-	mgr.SetWriteTimeout(time.Duration(*writeTimeout) * time.Second)
+	// Operator tuning comes from the panel-editable JSON config (the CLI no longer
+	// carries these knobs). Load self-creates a missing file with the built-in
+	// defaults and backfills any key an older panel omitted; an empty -config or a
+	// malformed file falls back to the built-in defaults. The daemon then polls the
+	// file and applies changes live (prebuffer/HLS retune existing streams).
+	cfg := config.Defaults()
+	if *configPath != "" {
+		if v, wrote, err := config.Load(*configPath); err != nil {
+			log.Printf("config: %v (using built-in defaults)", err)
+		} else {
+			cfg = v
+			if wrote {
+				log.Printf("config: seeded/backfilled %s", *configPath)
+			}
+		}
+	}
+
+	mgr := server.NewManager(cfg.MaxGOPBytes, int64(cfg.PrebufferMaxSec)*1000, cfg.HLSTargetSec, cfg.HLSWindow, time.Duration(cfg.GraceSec)*time.Second)
+	mgr.ApplyConfig(cfg) // also stamps write-timeout, source-insecure and chunk from the config
 	idir := *ingestDir
 	if idir == "" {
 		idir = filepath.Join(filepath.Dir(*sock), "ingest")
 	}
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
-	mgr.SetSourceInsecure(*sourceInsecure)
 	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
 	mgr.StartReaper(ctx)           // idle-stop sweep for control-managed streams (TS + HLS)
-	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s grace=%ds write-timeout=%ds prebuffer-max=%ds hls=%.1fs/%dseg overlay=%v",
-		*sock, *ctl, idir, *grace, *writeTimeout, *prebufferMax, *hlsTarget, *hlsWindow, *font != "")
+	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds chunk=%dB maxgop=%dB insecure=%v overlay=%v",
+		*sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, *font != "")
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
+
+	if *configPath != "" {
+		go pollConfig(ctx, *configPath, time.Duration(*configInterval)*time.Second, mgr)
+	}
 
 	clientSrv, cleanupClient := serveUnix(*sock, mgr.ClientHandler())
 	ctlSrv, cleanupCtl := (*http.Server)(nil), func() {}
@@ -116,7 +135,7 @@ func main() {
 				Cookie:    *cookie,
 				FfmpegBin: *ffmpeg,
 			}
-			mgr.RunPinned(ctx, *id, src, *chunk)
+			mgr.RunPinned(ctx, *id, src, cfg.ChunkBytes)
 		case *in != "":
 			go func() {
 				r := os.Stdin
@@ -126,9 +145,9 @@ func main() {
 						log.Fatalf("open %s: %v", *in, err)
 					}
 					defer f.Close()
-					_ = ingest.Copy(f, *chunk, st.Publish)
+					_ = ingest.Copy(f, cfg.ChunkBytes, st.Publish)
 				} else {
-					_ = ingest.Copy(r, *chunk, st.Publish)
+					_ = ingest.Copy(r, cfg.ChunkBytes, st.Publish)
 				}
 				log.Printf("ingest for id=%s finished", *id)
 			}()
@@ -144,6 +163,42 @@ func main() {
 	}
 	cleanupClient()
 	cleanupCtl()
+}
+
+// pollConfig re-reads the operator-tuning file every `every` and applies it when
+// the file changes. It is mtime-gated, so a steady file costs one stat per tick.
+// A read or parse error is logged and the current tuning kept — a bad config
+// (or a mid-write torn read) never interrupts streaming; the next tick retries.
+func pollConfig(ctx context.Context, path string, every time.Duration, mgr *server.Manager) {
+	if every < time.Second {
+		every = time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	var lastMod time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fi, err := os.Stat(path)
+			if err != nil {
+				continue // absent/unreadable: the flag defaults stand; retry next tick
+			}
+			if fi.ModTime().Equal(lastMod) {
+				continue
+			}
+			lastMod = fi.ModTime()
+			v, _, err := config.Load(path)
+			if err != nil {
+				log.Printf("config reload: %v (keeping current tuning)", err)
+				continue
+			}
+			mgr.ApplyConfig(v)
+			dlog.Logf("config", "applied %s: prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds",
+				path, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec)
+		}
+	}
 }
 
 // serveUnix starts an HTTP server on a fresh unix socket and returns it with a

@@ -57,6 +57,21 @@ func New(maxGOP int, maxPrebufMS int64) *State {
 	return s
 }
 
+// SetRing live-reconfigures how much keyframe history the ring retains for
+// client prebuffer (maxPrebufMS milliseconds) and its byte backstop, then prunes
+// at once so a reduced window frees the now-excess GOPs immediately instead of
+// only as they age out. Caller (Hub) serialises access.
+func (s *State) SetRing(maxPrebufMS int64) {
+	if maxPrebufMS < 0 {
+		maxPrebufMS = 0
+	}
+	s.ring90 = maxPrebufMS * pcrHz
+	s.maxRing = int(maxPrebufMS) * defaults.JoinRingBytesPerMS
+	if len(s.gops) > 0 {
+		s.prune()
+	}
+}
+
 // Update scans a packet-aligned chunk and folds it into the join state.
 // Bytes that are not 188-aligned or lack the 0x47 sync byte are skipped.
 func (s *State) Update(chunk []byte) {

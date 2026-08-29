@@ -69,6 +69,26 @@ func New(targetDur float64, window int) *Segmenter {
 	}
 }
 
+// SetWindow live-reconfigures the target segment duration and how many finished
+// segments the sliding window keeps in RAM. A reduced window drops the oldest
+// segments immediately — the kept tail is copied into a fresh slice so the old
+// backing array (and the dropped segments' bytes) is released to the GC at once.
+func (s *Segmenter) SetWindow(targetDur float64, window int) {
+	if targetDur <= 0 {
+		targetDur = defaults.HLSDefaultTargetSec
+	}
+	if window < 1 {
+		window = defaults.HLSDefaultWindow
+	}
+	s.mu.Lock()
+	s.targetDur = targetDur
+	s.window = window
+	if len(s.segs) > window {
+		s.segs = append([]Segment(nil), s.segs[len(s.segs)-window:]...)
+	}
+	s.mu.Unlock()
+}
+
 // Feed folds a packet-aligned chunk into the current segment, cutting a new
 // segment whenever a video keyframe lands at least targetDur past the last cut.
 func (s *Segmenter) Feed(chunk []byte) {

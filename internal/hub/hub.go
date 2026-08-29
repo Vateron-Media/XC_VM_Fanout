@@ -92,6 +92,15 @@ func (h *Hub) Snapshot(prebufMS int64) []byte {
 	return snap
 }
 
+// SetPrebuffer live-reconfigures the per-stream prebuffer ring depth (ms of
+// keyframe history). Reducing it frees the retained history right away; this is
+// how a panel-driven config change shrinks memory without recreating the stream.
+func (h *Hub) SetPrebuffer(maxPrebufMS int64) {
+	h.mu.Lock()
+	h.join.SetRing(maxPrebufMS)
+	h.mu.Unlock()
+}
+
 // Unsubscribe removes a subscriber (idempotent).
 func (h *Hub) Unsubscribe(s *Sub) {
 	h.mu.Lock()

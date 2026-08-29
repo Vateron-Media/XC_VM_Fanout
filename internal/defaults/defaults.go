@@ -85,6 +85,28 @@ const (
 // work when PCR is present. Ring capacity = prebuffer-ms × this.
 const JoinRingBytesPerMS = 3000
 
+// ── Operator tuning: config-file seeds ─────────────────────────────────────
+//
+// These seed the panel-editable JSON config (internal/config). They are what
+// the daemon writes when the config file is absent, and what it backfills for
+// any key an (older) panel omits — so the on-disk file always carries the full
+// current schema and a version skew between panel and daemon never throws. An
+// admin overrides these from the panel; here they are only the fallback.
+//
+// Unlike the invariants above, these ARE the operator-facing defaults. They used
+// to be CLI-flag literals in cmd/xc_fanout/main.go; that surface is retired (the
+// panel never set the flags) and the values live here now.
+const (
+	CfgPrebufferMaxSec = 20       // live-TS history kept per stream for client_prebuffer (seconds)
+	CfgHLSTargetSec    = 6.0      // HLS target segment duration (seconds)
+	CfgHLSWindow       = 6        // HLS segments kept in the sliding window (in RAM)
+	CfgGraceSec        = 10       // idle-stop grace for control-managed streams (seconds)
+	CfgWriteTimeoutSec = 15       // per-write deadline for a live-TS viewer (seconds)
+	CfgChunkBytes      = 12032    // source read size for daemon-pulled streams (aligned down to 188)
+	CfgMaxGOPBytes     = 10528000 // cap on a single join-snapshot GOP (bytes)
+	CfgSourceInsecure  = true     // skip upstream TLS verification when pulling HTTPS sources
+)
+
 // ── /probe off-air prewarm ─────────────────────────────────────────────────
 
 const (
