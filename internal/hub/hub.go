@@ -17,6 +17,29 @@ import (
 // dropped (number of pending chunks).
 const subQueue = defaults.SubscriberQueue
 
+// snapPool recycles the join-burst buffer a viewer receives on connect. That
+// burst is a contiguous copy of up to the whole prebuffer ring (tens of MB at a
+// deep prebuffer); allocating one per connect is the biggest transient on the hot
+// path and, under many concurrent joins, drives the process heap high-water mark
+// that the runtime then holds resident. Pooling caps the live buffers at the
+// concurrent-join count and lets them be reused; sync.Pool still releases idle
+// ones to GC, so nothing is pinned. Buffers are stored by pointer to avoid an
+// allocation on every Put.
+var snapPool = sync.Pool{New: func() any { b := make([]byte, 0); return &b }}
+
+func snapGet() []byte { return (*snapPool.Get().(*[]byte))[:0] }
+
+// ReleaseSnapshot returns a join-burst buffer (from Subscribe) to the pool once
+// the caller has finished writing it. Safe to call once with any snapshot slice;
+// a nil/empty-capacity slice is ignored.
+func ReleaseSnapshot(b []byte) {
+	if cap(b) == 0 {
+		return
+	}
+	b = b[:0]
+	snapPool.Put(&b)
+}
+
 // Sub is a single subscriber's delivery channel.
 type Sub struct {
 	ch   chan []byte
@@ -47,13 +70,27 @@ func New(maxGOP int, maxPrebufMS int64) *Hub {
 }
 
 // Publish folds a packet-aligned chunk into the join state and broadcasts it to
-// every subscriber. Slow subscribers are dropped rather than blocked. The chunk
-// is copied, so the caller may reuse its buffer.
+// every subscriber. Slow subscribers are dropped rather than blocked.
+//
+// The per-chunk copy is made ONLY when there are subscribers: a subscriber holds
+// the buffer in its channel across later Publish calls, so it must get a stable
+// copy the caller cannot overwrite. With no subscribers (a fed-but-unwatched
+// stream — the common idle case) the chunk is folded in place: join.Update copies
+// what it retains into the ring's own (recycled) GOP buffers and keeps no
+// reference to the input, and Update runs to completion before Publish returns, so
+// the caller may reuse its buffer either way. Skipping the copy here removes the
+// dominant per-chunk allocation on idle streams (it was the main remaining GC
+// churn once GOP buffers were recycled).
 func (h *Hub) Publish(chunk []byte) {
+	h.mu.Lock()
+	if len(h.subs) == 0 {
+		h.join.Update(chunk)
+		h.mu.Unlock()
+		return
+	}
+
 	b := make([]byte, len(chunk))
 	copy(b, chunk)
-
-	h.mu.Lock()
 	h.join.Update(b)
 	for s := range h.subs {
 		select {
@@ -72,10 +109,12 @@ func (h *Hub) Publish(chunk []byte) {
 // milliseconds of prebuffer the subscriber wants (0 = current GOP only).
 // Registering the subscriber and capturing the snapshot happen under the same
 // lock, so the live tail continues exactly where the snapshot ends — no gap, no
-// duplication.
+// duplication. The returned snapshot is drawn from a pool; the caller SHOULD
+// ReleaseSnapshot it once written so the buffer can be reused.
 func (h *Hub) Subscribe(prebufMS int64) (*Sub, []byte) {
+	buf := snapGet()
 	h.mu.Lock()
-	snap := h.join.Snapshot(prebufMS)
+	snap := h.join.SnapshotInto(buf, prebufMS)
 	s := &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()

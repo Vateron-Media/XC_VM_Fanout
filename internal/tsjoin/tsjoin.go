@@ -69,6 +69,12 @@ type State struct {
 	ring90   int64  // history retained, in 90 kHz ticks (0 = current GOP only)
 	maxRing  int    // absolute byte ceiling for the whole ring — memory backstop
 
+	// freeBufs recycles the byte arrays of GOPs dropped by prune so opening the
+	// next GOP reuses one instead of allocating a fresh array every keyframe. This
+	// turns the steady-state GOP allocate-and-discard (≈ bitrate, the GC sawtooth)
+	// into ~zero. Capped at defaults.JoinFreeGOPBufs; buffers hold len 0, cap kept.
+	freeBufs [][]byte
+
 	// HLS segment view over the ring (hlsTargetMS == 0 disables it). The ring is
 	// the single cache; HLS segments are cut from these GOPs on demand rather than
 	// buffered a second time.
@@ -233,7 +239,7 @@ func (s *State) Update(chunk []byte) {
 					s.hlsOnKeyframe(id, pts)
 				}
 			}
-			s.gops = append(s.gops, gop{id: id, data: append([]byte(nil), pkt...), pcr: s.lastPCR, pts: pts})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts})
 			s.prune()
 		case len(s.gops) > 0:
 			g := &s.gops[len(s.gops)-1]
@@ -247,7 +253,7 @@ func (s *State) Update(chunk []byte) {
 			// open an HLS segment.
 			id := s.nextGOPID
 			s.nextGOPID++
-			s.gops = append(s.gops, gop{id: id, data: append([]byte(nil), pkt...), pcr: s.lastPCR, pts: -1})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: -1})
 		}
 	}
 }
@@ -258,6 +264,9 @@ func (s *State) Update(chunk []byte) {
 func (s *State) prune() {
 	if s.ring90 <= 0 {
 		if len(s.gops) > 1 {
+			for i := 0; i < len(s.gops)-1; i++ {
+				s.putBuf(s.gops[i].data)
+			}
 			s.gops = append(s.gops[:0], s.gops[len(s.gops)-1])
 		}
 		return
@@ -272,6 +281,9 @@ func (s *State) prune() {
 			drop++
 		}
 		if drop > 0 {
+			for i := 0; i < drop; i++ {
+				s.putBuf(s.gops[i].data)
+			}
 			s.gops = append(s.gops[:0], s.gops[drop:]...)
 		}
 	}
@@ -282,6 +294,7 @@ func (s *State) prune() {
 	}
 	for total > s.maxRing && len(s.gops) > 1 {
 		total -= len(s.gops[0].data)
+		s.putBuf(s.gops[0].data)
 		s.gops = append(s.gops[:0], s.gops[1:]...)
 	}
 	s.hlsPrune()
@@ -409,6 +422,16 @@ func (s *State) HLSSegment(seq int) []byte {
 // with no parseable PCR) yields just the current GOP. The run is clamped to what
 // the ring holds. The returned slice is a fresh copy owned by the caller.
 func (s *State) Snapshot(reqMS int64) []byte {
+	return s.SnapshotInto(nil, reqMS)
+}
+
+// SnapshotInto is Snapshot writing into dst (its contents are overwritten; grown
+// only if it is too small). It lets the caller supply a pooled buffer so a viewer
+// join does not allocate a fresh full-ring copy each time — the dominant transient
+// allocation on the connect path, which otherwise sets the heap high-water mark
+// under many concurrent joins. The returned slice aliases dst when it fit. Caller
+// serialises access and must not retain dst past the returned slice's use.
+func (s *State) SnapshotInto(dst []byte, reqMS int64) []byte {
 	start := len(s.gops) - 1
 	if start < 0 {
 		start = 0
@@ -427,12 +450,7 @@ func (s *State) Snapshot(reqMS int64) []byte {
 		}
 	}
 
-	n := len(s.lastPAT) + len(s.lastPMT)
-	for i := start; i < len(s.gops); i++ {
-		n += len(s.gops[i].data)
-	}
-	out := make([]byte, 0, n)
-	out = append(out, s.lastPAT...)
+	out := append(dst[:0], s.lastPAT...)
 	out = append(out, s.lastPMT...)
 	for i := start; i < len(s.gops); i++ {
 		out = append(out, s.gops[i].data...)
@@ -450,6 +468,33 @@ func readPCR(pkt []byte) int64 {
 
 func cloneInto(dst, src []byte) []byte {
 	return append(dst[:0], src...)
+}
+
+// getBuf returns a recycled GOP data buffer (length 0, capacity preserved), or a
+// nil slice when the free list is empty — the caller's append then allocates a
+// fresh array exactly as before, so warm-up behaviour is byte-identical. Used when
+// opening a new GOP (or a pre-roll block). Caller (Hub) serialises access.
+func (s *State) getBuf() []byte {
+	n := len(s.freeBufs)
+	if n == 0 {
+		return nil
+	}
+	b := s.freeBufs[n-1]
+	s.freeBufs[n-1] = nil // drop the slot's reference so it can't pin the array
+	s.freeBufs = s.freeBufs[:n-1]
+	return b[:0]
+}
+
+// putBuf recycles a dropped GOP's backing array for reuse, capacity preserved.
+// Called only from prune (under the hub lock), where the GOP has just left the
+// ring and no reader can still reference it — every reader copies GOP bytes out
+// under the same lock. Buffers past the cap are left to GC, which is what we want
+// on a gating ring-shrink (the goal there is to release memory).
+func (s *State) putBuf(b []byte) {
+	if cap(b) == 0 || len(s.freeBufs) >= defaults.JoinFreeGOPBufs {
+		return
+	}
+	s.freeBufs = append(s.freeBufs, b[:0])
 }
 
 // parsePMTPID extracts the first program's PMT PID from a PAT packet.

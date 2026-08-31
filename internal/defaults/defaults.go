@@ -70,6 +70,16 @@ const (
 // work when PCR is present. Ring capacity = prebuffer-ms × this.
 const JoinRingBytesPerMS = 3000
 
+// JoinFreeGOPBufs caps the per-stream free list of recycled GOP data buffers. Each
+// keyframe-aligned GOP is stored in its own byte array; without recycling, every
+// GOP that ages out of the ring is freshly allocated on open and thrown to GC on
+// prune — an allocate-and-discard rate ≈ the stream bitrate, which is the GC
+// sawtooth. Recycling the dropped arrays through this list makes steady-state GOP
+// allocation ~0. Open/prune alternate, so occupancy is ~1-2; a gating ring-shrink
+// frees many at once and the excess past this cap is dropped to GC (the point
+// being to release memory then). Kept small so retention is ~a few GOPs per stream.
+const JoinFreeGOPBufs = 4
+
 // ── Operator tuning: config-file seeds ─────────────────────────────────────
 //
 // These seed the panel-editable JSON config (internal/config). They are what
@@ -96,6 +106,40 @@ const (
 	CfgSourceInsecure      = true     // skip upstream TLS verification when pulling HTTPS sources
 	CfgIdleBufferGraceSec  = 30       // no-viewer window before the ring collapses (seconds); 0 = gate off
 	CfgIdleBufferRatio     = 0.5      // fraction of the buffer kept while unwatched (HLS still cut from it)
+)
+
+// ── Memory management (soft limit + idle-heap scavenge) ────────────────────
+//
+// The daemon holds only a bounded working set (per-stream prebuffer rings, sized
+// by prebuffer_max_sec × bitrate), but the Go runtime keeps freed pages resident
+// and returns them to the OS only lazily. These bound that: a soft heap limit
+// caps runaway growth (so 500 streams degrade into harder GC, not unbounded RSS),
+// and a periodic scavenge returns idle heap so RSS tracks the working set. Both
+// are O(1) in stream count and need no per-stream tuning.
+const (
+	// MemLimitFraction is the fraction of detected system (or cgroup) memory used
+	// as the runtime soft memory limit (debug.SetMemoryLimit / GOMEMLIMIT). A
+	// ceiling, not a reservation: the GC only intensifies as usage nears it, so a
+	// daemon whose working set stays well below never feels it. An explicit
+	// GOMEMLIMIT in the environment overrides this (auto-limit is then skipped).
+	MemLimitFraction = 0.80
+
+	// GCPercent is the GC target growth (GOGC): the heap may grow this percent over
+	// the live set before a collection. The default 100 lets the heap reach ~2×
+	// live between GCs, which on a many-stream fan-out is a large RSS swing on top
+	// of a working set that is itself inflated ~1.4× by GOP append-growth capacity.
+	// 50 halves that headroom (heap ~1.5× live) for a much tighter RSS band; the
+	// extra GC cost is negligible here (the daemon is I/O-bound, CPU near idle).
+	// An explicit GOGC in the environment overrides this.
+	GCPercent = 50
+
+	// MemScavengeInterval is how often the idle-heap sweep runs; MemScavengeIdleMin
+	// is how much freed-but-unreturned heap (HeapIdle−HeapReleased) must be present
+	// before it forces a release, so a quiet daemon does not GC for nothing. The
+	// interval is short so freed pages return to the OS promptly instead of piling
+	// up into a tall sawtooth between sweeps.
+	MemScavengeInterval = 20 * time.Second
+	MemScavengeIdleMin  = 64 << 20 // 64 MiB
 )
 
 // ── /probe off-air prewarm ─────────────────────────────────────────────────

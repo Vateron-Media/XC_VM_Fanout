@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -76,6 +77,12 @@ func main() {
 		dlog.Logf("boot", "debug mode on; version=%s pid=%d", buildVersion(), os.Getpid())
 	}
 
+	// Bound the runtime's memory footprint: a soft heap limit derived from the
+	// box's RAM (so growth under load degrades into harder GC, not unbounded RSS)
+	// plus a periodic idle-heap scavenge (StartMemoryScavenger below) so freed
+	// pages actually return to the OS. Both are independent of the stream count.
+	applyAutoMemLimit()
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -106,6 +113,7 @@ func main() {
 	mgr.SetIngestDir(idir)
 	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
 	mgr.StartReaper(ctx)           // idle-stop sweep for control-managed streams (TS + HLS)
+	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS
 	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds chunk=%dB maxgop=%dB insecure=%v overlay=%v",
 		*sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, *font != "")
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
@@ -284,6 +292,66 @@ func buildVersion() string {
 		rev = rev[:12]
 	}
 	return "dev+" + rev + dirty
+}
+
+// applyAutoMemLimit gives the Go runtime a soft memory limit derived from the
+// box's memory, so the daemon's footprint degrades into more-aggressive GC under
+// load instead of growing RSS without bound — the memory-safety knob that scales
+// with the machine, not the stream count. It is a ceiling, not a reservation: a
+// working set well under it never triggers it. Skipped (leaving the runtime
+// default / any operator value) when GOMEMLIMIT is set in the environment, so an
+// explicit override always wins. Best-effort: if the budget can't be detected it
+// does nothing rather than guess.
+func applyAutoMemLimit() {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return // operator set it explicitly; the runtime already applied it
+	}
+	budget := systemMemoryBytes()
+	if budget <= 0 {
+		log.Printf("mem: could not detect system memory; no soft limit set")
+		return
+	}
+	limit := int64(float64(budget) * defaults.MemLimitFraction)
+	debug.SetMemoryLimit(limit)
+	log.Printf("mem: soft limit %d MiB (%.0f%% of %d MiB detected); periodic idle-heap scavenge on",
+		limit>>20, defaults.MemLimitFraction*100, budget>>20)
+
+	// Tighten GC growth so the heap tracks the working set instead of ballooning to
+	// ~2× live between collections (a large RSS swing on a many-stream fan-out). An
+	// explicit GOGC in the environment wins, mirroring the GOMEMLIMIT handling above.
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(defaults.GCPercent)
+		log.Printf("mem: GC target set to %d%% (GOGC) for a tighter heap", defaults.GCPercent)
+	}
+}
+
+// systemMemoryBytes returns the memory budget to size the soft limit against: the
+// cgroup v2 limit when the daemon runs under a finite one (a container), else the
+// physical RAM from /proc/meminfo. Returns 0 if neither can be read.
+func systemMemoryBytes() int64 {
+	// cgroup v2: a finite memory.max is the real ceiling the OOM killer enforces.
+	if b, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" && s != "max" {
+			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+				return v
+			}
+		}
+	}
+	// Physical RAM: MemTotal is in kB.
+	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if !strings.HasPrefix(line, "MemTotal:") {
+				continue
+			}
+			f := strings.Fields(line) // ["MemTotal:", "4004156", "kB"]
+			if len(f) >= 2 {
+				if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil && kb > 0 {
+					return kb * 1024
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // isTruthy reports whether an env var value means "on" (1/true/yes/on).

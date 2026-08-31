@@ -107,3 +107,60 @@ func TestSnapshotReturnsCleanEntryWithoutSubscribing(t *testing.T) {
 		t.Fatalf("Snapshot must not subscribe; Count = %d, want 0", h.Count())
 	}
 }
+
+// TestPublishNoSubsCopiesIntoRing: with no subscribers Publish folds the chunk in
+// place (no per-chunk copy), but the ring must still hold an INDEPENDENT copy —
+// mutating the caller's buffer after Publish must not corrupt the buffered data.
+// This pins the safety of the no-copy fast path.
+func TestPublishNoSubsCopiesIntoRing(t *testing.T) {
+	h := New(1<<20, 0)
+	chunk := mkPkt(9) // p[0]=0x47, p[3]=9
+	h.Publish(chunk)  // no subscribers → in-place fold
+
+	// Overwrite the caller's buffer; the ring must be unaffected.
+	for i := range chunk {
+		chunk[i] = 0xEE
+	}
+	snap := h.Snapshot(0)
+	if len(snap) != 188 || snap[0] != 0x47 || snap[3] != 9 {
+		t.Fatalf("ring must hold an independent copy; got len=%d byte[0]=%#x byte[3]=%d", len(snap), snap[0], snap[3])
+	}
+
+	// And a subscriber that joins afterwards still receives the buffered content.
+	sub, s2 := h.Subscribe(0)
+	if len(s2) != 188 || s2[3] != 9 {
+		t.Fatalf("late subscriber join burst wrong; got len=%d byte[3]=%d", len(s2), s2[3])
+	}
+	h.Unsubscribe(sub)
+	ReleaseSnapshot(s2)
+}
+
+// TestSubscribeSnapshotPoolRoundTrip: the join burst from Subscribe is correct,
+// and a released buffer is handed back out on the next Subscribe (pool reuse)
+// without corrupting the content.
+func TestSubscribeSnapshotPoolRoundTrip(t *testing.T) {
+	h := New(1<<20, 0)
+	h.Publish(mkPkt(7))
+
+	sub1, snap1 := h.Subscribe(0)
+	if len(snap1) == 0 || snap1[0] != 0x47 {
+		t.Fatalf("Subscribe join burst must be TS-aligned, got %d bytes", len(snap1))
+	}
+	// Copy the expected content before releasing (the buffer may be reused/overwritten).
+	want := append([]byte(nil), snap1...)
+	h.Unsubscribe(sub1)
+	ReleaseSnapshot(snap1)
+
+	// Next Subscribe should still yield identical, uncorrupted content even though
+	// it may draw the recycled buffer.
+	sub2, snap2 := h.Subscribe(0)
+	if !bytes.Equal(snap2, want) {
+		t.Fatalf("recycled join burst differs from the original: got %d bytes, want %d", len(snap2), len(want))
+	}
+	h.Unsubscribe(sub2)
+	ReleaseSnapshot(snap2)
+
+	// ReleaseSnapshot on a nil/empty slice must be a harmless no-op.
+	ReleaseSnapshot(nil)
+	ReleaseSnapshot([]byte{})
+}

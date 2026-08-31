@@ -135,6 +135,109 @@ func TestPruneDropsHistoryBeyondRing(t *testing.T) {
 	}
 }
 
+// TestSnapshotIntoMatchesAndReuses checks the pooled-buffer path: SnapshotInto
+// yields byte-identical output to Snapshot, reuses a supplied buffer's backing
+// array when it is large enough (no allocation), and grows a too-small one.
+func TestSnapshotIntoMatchesAndReuses(t *testing.T) {
+	const tick = 90000
+	s := New(10*1024*1024, 10_000)
+	filler := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x10})
+	for i := 0; i < 6; i++ {
+		s.Update(keyPCR(int64(i) * 2 * tick))
+		s.Update(filler)
+	}
+
+	want := s.Snapshot(4000)
+
+	// Nil dst behaves exactly like Snapshot.
+	if got := s.SnapshotInto(nil, 4000); string(got) != string(want) {
+		t.Fatalf("SnapshotInto(nil) mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+
+	// A buffer with ample capacity is reused in place (same backing array).
+	buf := make([]byte, 0, len(want)+512)
+	got := s.SnapshotInto(buf, 4000)
+	if string(got) != string(want) {
+		t.Fatalf("SnapshotInto(buf) content mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+	if &got[:cap(got)][0] != &buf[:cap(buf)][0] {
+		t.Fatalf("SnapshotInto did not reuse the supplied buffer's backing array")
+	}
+
+	// A short (but non-nil) buffer still yields correct content (grown as needed).
+	if got := s.SnapshotInto(make([]byte, 0, 1), 4000); string(got) != string(want) {
+		t.Fatalf("SnapshotInto(short) content mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+// TestPruneRecyclesGopBuffers proves the free-list: a GOP dropped by prune has its
+// backing array recycled, and the next opened GOP reuses that same array instead of
+// allocating a fresh one (pointer identity). This is what turns the steady-state
+// GOP allocate-and-discard into ~zero.
+func TestPruneRecyclesGopBuffers(t *testing.T) {
+	const tick = 90000
+	s := New(10*1024*1024, 2_000) // 2s ring → old GOPs prune quickly
+	filler := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x10})
+
+	// GOPs 2s apart (PCR 0,2,4,6,8s); the 2s ring drops the older ones, feeding the
+	// free list. Each GOP is key + filler so its buffer has real capacity.
+	for i := 0; i < 5; i++ {
+		s.Update(keyPCR(int64(i) * 2 * tick))
+		s.Update(filler)
+	}
+	if len(s.freeBufs) == 0 {
+		t.Fatalf("prune recycled no buffers; free list is empty")
+	}
+
+	// getBuf pops the last entry, so that is the array the next GOP will reuse.
+	want := s.freeBufs[len(s.freeBufs)-1]
+	if cap(want) == 0 {
+		t.Fatalf("recycled buffer has zero capacity")
+	}
+	wantPtr := &want[:1][0]
+
+	// Open one more GOP: its data must land in the recycled backing array.
+	s.Update(keyPCR(int64(5) * 2 * tick))
+	got := &s.gops[len(s.gops)-1].data[0]
+	if got != wantPtr {
+		t.Fatalf("new GOP did not reuse the recycled backing array")
+	}
+}
+
+// TestUpdateSteadyStateAllocations guards the whole point of the refactor: once the
+// free list is warm, an Update that opens a GOP and appends a packet allocates no
+// GOP data arrays. Inputs are pre-built so the measurement sees only Update's own
+// allocations (the per-GOP data churn — the sawtooth — which must be gone).
+func TestUpdateSteadyStateAllocations(t *testing.T) {
+	const tick = 90000
+	const runs = 300
+	s := New(10*1024*1024, 2_000)
+	filler := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x10})
+
+	// Pre-build all keyframe packets (advancing PCR) so building them doesn't count
+	// against Update's allocation budget.
+	keys := make([][]byte, 40+runs+2)
+	for i := range keys {
+		keys[i] = keyPCR(int64(i) * 2 * tick)
+	}
+
+	// Warm up: reach steady state so recycled buffers have grown to GOP size.
+	for i := 0; i < 40; i++ {
+		s.Update(keys[i])
+		s.Update(filler)
+	}
+
+	i := 40
+	avg := testing.AllocsPerRun(runs, func() {
+		s.Update(keys[i])
+		s.Update(filler)
+		i++
+	})
+	if avg > 0.1 {
+		t.Fatalf("steady-state Update allocates %.2f objs/op; recycling should keep it ~0", avg)
+	}
+}
+
 func concat(parts ...[]byte) []byte {
 	var out []byte
 	for _, p := range parts {

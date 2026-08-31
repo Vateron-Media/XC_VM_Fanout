@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -579,6 +580,41 @@ func (m *Manager) StartReaper(ctx context.Context) {
 	}()
 }
 
+// StartMemoryScavenger periodically returns idle heap to the OS. The Go runtime
+// frees dropped GOP/snapshot memory to its own heap promptly but hands the pages
+// back to the OS only lazily (the background scavenger paces itself over minutes
+// to hours), so after a viewer burst subsides the process RSS sits at its
+// high-water mark indefinitely. This sweep checks how much freed-but-unreturned
+// heap the runtime is holding (HeapIdle−HeapReleased) and, when it exceeds
+// threshold, forces the release so idle RSS tracks the working set instead. It is
+// O(1) in stream count (one check, one occasional GC), unlike the per-stream
+// idle-buffer gate, and fires regardless of whether any stream is gated. A read
+// costs a brief ReadMemStats; the forced GC only runs when there is real memory
+// to reclaim, so a quiet daemon pays almost nothing. Call once from main.
+func (m *Manager) StartMemoryScavenger(ctx context.Context, interval time.Duration, threshold uint64) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		var ms runtime.MemStats
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runtime.ReadMemStats(&ms)
+				retained := ms.HeapIdle - ms.HeapReleased
+				if retained >= threshold {
+					debug.FreeOSMemory()
+					dlog.Logf("mem", "scavenged: returned ~%dMB idle heap to OS (was holding %dMB free)", retained>>20, retained>>20)
+				}
+			}
+		}
+	}()
+}
+
 // StartDebugStats logs a compact per-stream state snapshot every `every` while
 // debug mode is on: for each stream, whether its puller is running (or it is
 // push-fed via ingest), how many live-TS viewers hold a ref, the hub subscriber
@@ -1058,11 +1094,18 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		return rc.Flush()
 	}
 
+	// Write the join burst, then return its (pooled) buffer at once — the viewer
+	// holds no reference to it past this write, so it can be reused by the next
+	// connect instead of lingering as garbage for the whole session.
+	var snapErr error
 	if len(snap) > 0 {
-		if err := write(snap); err != nil {
-			reason = writeFailReason(err)
-			return
-		}
+		snapErr = write(snap)
+	}
+	hub.ReleaseSnapshot(snap)
+	snap = nil
+	if snapErr != nil {
+		reason = writeFailReason(snapErr)
+		return
 	}
 	for {
 		// Admin "send message" overlay (rare): if one is queued for this viewer,
