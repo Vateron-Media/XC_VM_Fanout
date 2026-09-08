@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -70,10 +71,27 @@ func (s Source) ua() string {
 // exponential backoff whenever the source ends or errors.
 func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 	dlog.Logf("puller", "id=%s start; urls=%v proxy=%q", src.Label, src.URLs, src.Proxy)
+
+	// One client — and so one connection pool — for the whole puller, not one per
+	// probe. A fresh http.Transport per attempt meant no connection was ever
+	// reused (a full TCP + TLS handshake on every reconnect) and, worse, each
+	// abandoned transport kept whatever it had pooled: a source that ended
+	// cleanly had its connection returned to that pool, where — a zero-value
+	// transport having no idle timeout — it stayed open with its reader goroutine
+	// forever, unreachable because the transport itself was garbage. A source
+	// reconnecting on the 8 s backoff ceiling leaked a socket and two goroutines
+	// every 8 s. CloseIdleConnections on the way out returns the rest.
+	client, cerr := httpClient(src)
+	if cerr != nil {
+		log.Printf("puller: id=%s %v", src.Label, cerr)
+		return
+	}
+	defer client.CloseIdleConnections()
+
 	backoff := defaults.PullBackoffInitial
 	for ctx.Err() == nil {
 		start := time.Now()
-		err := pullOnce(ctx, src, chunkSize, publish)
+		err := pullOnce(ctx, client, src, chunkSize, publish)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("puller: id=%s %v (retry in %s)", src.Label, err, backoff)
 		} else if ctx.Err() == nil {
@@ -99,10 +117,10 @@ func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 
 // pullOnce tries each URL once: mp2t is streamed directly, otherwise ffmpeg
 // remuxes it. Returns when the chosen source ends or errors.
-func pullOnce(ctx context.Context, src Source, chunkSize int, publish func([]byte)) error {
+func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize int, publish func([]byte)) error {
 	var lastErr error
 	for _, raw := range src.URLs {
-		isTS, body, err := probe(ctx, src, raw)
+		isTS, body, err := probe(ctx, client, src, raw)
 		if err != nil {
 			dlog.Logf("puller", "id=%s probe failed: %s: %v", src.Label, raw, err)
 			lastErr = err
@@ -128,7 +146,20 @@ func httpClient(src Source) (*http.Client, error) {
 	// The panel commonly pulls sources with self-signed or mismatched certs, so
 	// the daemon defaults to skipping verification — but a deployment that pulls
 	// only trusted HTTPS origins can turn it on.
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: src.Insecure}}
+	//
+	// The timeouts bound everything EXCEPT the body: connect, TLS and the wait for
+	// response headers each get a deadline, and idle pooled connections expire. A
+	// zero-value Transport has none of these, so a source that accepted a
+	// connection and then went quiet held its puller open indefinitely. The body
+	// itself stays unbounded — it is a live stream, and there is no Client.Timeout
+	// for the same reason.
+	tr := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: src.Insecure},
+		DialContext:           (&net.Dialer{Timeout: defaults.PullDialTimeout, KeepAlive: defaults.PullKeepAlive}).DialContext,
+		TLSHandshakeTimeout:   defaults.PullTLSTimeout,
+		ResponseHeaderTimeout: defaults.PullHeaderTimeout,
+		IdleConnTimeout:       defaults.PullIdleConnTimeout,
+	}
 	if src.Proxy != "" {
 		pu, err := url.Parse("http://" + src.Proxy)
 		if err != nil {
@@ -141,11 +172,7 @@ func httpClient(src Source) (*http.Client, error) {
 
 // probe opens the URL and reports whether it is served as MPEG-TS. On success
 // the returned body is left open for the caller to stream or close.
-func probe(ctx context.Context, src Source, raw string) (bool, io.ReadCloser, error) {
-	c, err := httpClient(src)
-	if err != nil {
-		return false, nil, err
-	}
+func probe(ctx context.Context, c *http.Client, src Source, raw string) (bool, io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
 		return false, nil, err

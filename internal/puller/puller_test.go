@@ -25,7 +25,7 @@ func serveTS(ct string, body []byte) *httptest.Server {
 func TestProbeClassifiesContentType(t *testing.T) {
 	tsSrv := serveTS("video/mp2t", []byte("x"))
 	defer tsSrv.Close()
-	isTS, body, err := probe(context.Background(), Source{}, tsSrv.URL)
+	isTS, body, err := probe(context.Background(), mustClient(t, Source{}), Source{}, tsSrv.URL)
 	if err != nil {
 		t.Fatalf("probe mp2t: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestProbeClassifiesContentType(t *testing.T) {
 
 	otherSrv := serveTS("video/mp4", []byte("x"))
 	defer otherSrv.Close()
-	isTS, body, err = probe(context.Background(), Source{}, otherSrv.URL)
+	isTS, body, err = probe(context.Background(), mustClient(t, Source{}), Source{}, otherSrv.URL)
 	if err != nil {
 		t.Fatalf("probe mp4: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestSourceTLSVerification(t *testing.T) {
 	defer srv.Close()
 
 	// Insecure (the daemon default): the self-signed cert is accepted.
-	isTS, body, err := probe(context.Background(), Source{Insecure: true}, srv.URL)
+	isTS, body, err := probe(context.Background(), mustClient(t, Source{Insecure: true}), Source{Insecure: true}, srv.URL)
 	if err != nil {
 		t.Fatalf("insecure probe of a self-signed TLS source failed: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestSourceTLSVerification(t *testing.T) {
 	}
 
 	// Verification on: the self-signed cert must be rejected.
-	if _, _, err := probe(context.Background(), Source{Insecure: false}, srv.URL); err == nil {
+	if _, _, err := probe(context.Background(), mustClient(t, Source{Insecure: false}), Source{Insecure: false}, srv.URL); err == nil {
 		t.Fatal("secure probe must reject a self-signed certificate")
 	}
 }
@@ -81,7 +81,7 @@ func TestDirectPullStreamsBytes(t *testing.T) {
 	defer srv.Close()
 
 	var got []byte
-	err := pullOnce(context.Background(), Source{URLs: []string{srv.URL}}, 12032,
+	err := pullOnce(context.Background(), mustClient(t, Source{}), Source{URLs: []string{srv.URL}}, 12032,
 		func(b []byte) { got = append(got, b...) })
 	if err != nil && err != io.EOF {
 		t.Fatalf("pullOnce: %v", err)
@@ -108,7 +108,7 @@ func TestFfmpegBranchRemuxes(t *testing.T) {
 	defer srv.Close()
 
 	var got []byte
-	err := pullOnce(context.Background(),
+	err := pullOnce(context.Background(), mustClient(t, Source{}),
 		Source{URLs: []string{srv.URL}, FfmpegBin: fake}, 12032,
 		func(b []byte) { got = append(got, b...) })
 	if err != nil && err != io.EOF {
@@ -135,7 +135,7 @@ func TestFfmpegExitSurfaced(t *testing.T) {
 	srv := serveTS("video/mp4", []byte("not a TS stream"))
 	defer srv.Close()
 
-	err := pullOnce(context.Background(),
+	err := pullOnce(context.Background(), mustClient(t, Source{}),
 		Source{URLs: []string{srv.URL}, FfmpegBin: fake, Label: "t"}, 12032, func([]byte) {})
 	if err == nil || err == io.EOF {
 		t.Fatalf("ffmpeg exit 1 must surface as an error, got %v", err)
@@ -161,7 +161,7 @@ func TestFfmpegCancelNotSurfaced(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
-	err := pullOnce(ctx, Source{URLs: []string{srv.URL}, FfmpegBin: fake}, 12032, func([]byte) {})
+	err := pullOnce(ctx, mustClient(t, Source{}), Source{URLs: []string{srv.URL}, FfmpegBin: fake}, 12032, func([]byte) {})
 	// The contract: a cancel-induced ffmpeg kill must never be reported as an
 	// "ffmpeg: …" fault (whatever benign EOF/read error the pipe returns is fine).
 	if err != nil && strings.Contains(err.Error(), "ffmpeg:") {
@@ -191,7 +191,7 @@ func TestFfmpegColdStartArgs(t *testing.T) {
 	srv := serveTS("video/mp4", []byte("not a TS stream"))
 	defer srv.Close()
 
-	if err := pullOnce(context.Background(),
+	if err := pullOnce(context.Background(), mustClient(t, Source{}),
 		Source{URLs: []string{srv.URL}, FfmpegBin: fake}, 12032, func([]byte) {}); err != nil && err != io.EOF {
 		t.Fatalf("pullOnce (ffmpeg): %v", err)
 	}
@@ -231,4 +231,16 @@ func TestFfmpegColdStartArgs(t *testing.T) {
 	if p := idx("-analyzeduration"); p >= 0 && p+1 < len(args) && args[p+1] != "1000000" {
 		t.Errorf("analyzeduration = %s, want 1000000", args[p+1])
 	}
+}
+
+// mustClient builds the shared per-puller HTTP client the way Run does, so the
+// tests exercise probe/pullOnce through the same transport bounds production uses.
+func mustClient(t *testing.T, src Source) *http.Client {
+	t.Helper()
+	c, err := httpClient(src)
+	if err != nil {
+		t.Fatalf("httpClient: %v", err)
+	}
+	t.Cleanup(c.CloseIdleConnections)
+	return c
 }

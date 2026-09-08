@@ -26,6 +26,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -77,11 +78,10 @@ func main() {
 		dlog.Logf("boot", "debug mode on; version=%s pid=%d", buildVersion(), os.Getpid())
 	}
 
-	// Bound the runtime's memory footprint: a soft heap limit derived from the
-	// box's RAM (so growth under load degrades into harder GC, not unbounded RSS)
-	// plus a periodic idle-heap scavenge (StartMemoryScavenger below) so freed
-	// pages actually return to the OS. Both are independent of the stream count.
-	applyAutoMemLimit()
+	// Tighten GC growth so the heap tracks the working set instead of ballooning
+	// between collections. The soft memory limit is applied once the config is
+	// loaded below, since an operator may pin it there (mem_limit_mb).
+	applyGCPercent()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -103,6 +103,11 @@ func main() {
 		}
 	}
 
+	// Bound the runtime's memory footprint: a soft heap limit from the operator's
+	// budget (or the cgroup/host one), plus the periodic idle-heap scavenge below
+	// so freed pages actually return to the OS. Both are O(1) in stream count.
+	applyMemLimit(cfg.MemLimitMB)
+
 	mgr := server.NewManager(cfg.MaxGOPBytes, int64(cfg.PrebufferMaxSec)*1000, cfg.HLSTargetSec, cfg.HLSWindow, time.Duration(cfg.GraceSec)*time.Second)
 	mgr.ApplyConfig(cfg) // also stamps write-timeout, source-insecure and chunk from the config
 	idir := *ingestDir
@@ -111,11 +116,11 @@ func main() {
 	}
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
-	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
-	mgr.StartReaper(ctx)           // idle-stop sweep for control-managed streams (TS + HLS)
+	mgr.SetOverlay(*ffmpeg, *font)                                                           // admin "send message" drawtext overlay (no font ⇒ disabled)
+	mgr.StartReaper(ctx)                                                                     // idle-stop sweep for control-managed streams (TS + HLS)
 	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS
-	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds chunk=%dB maxgop=%dB insecure=%v overlay=%v",
-		*sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, *font != "")
+	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds chunk=%dB maxgop=%dB insecure=%v overlay=%v",
+		*sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ViewerIdleTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, *font != "")
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
 
 	if *configPath != "" {
@@ -233,8 +238,9 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 			}
 			current = &v
 			mgr.ApplyConfig(v)
-			dlog.Logf("config", "applied %s: prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds",
-				path, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec)
+			applyMemLimit(v.MemLimitMB)
+			dlog.Logf("config", "applied %s: prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds",
+				path, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec, v.ViewerIdleTimeoutSec)
 		}
 	}
 }
@@ -294,60 +300,106 @@ func buildVersion() string {
 	return "dev+" + rev + dirty
 }
 
-// applyAutoMemLimit gives the Go runtime a soft memory limit derived from the
-// box's memory, so the daemon's footprint degrades into more-aggressive GC under
-// load instead of growing RSS without bound — the memory-safety knob that scales
-// with the machine, not the stream count. It is a ceiling, not a reservation: a
-// working set well under it never triggers it. Skipped (leaving the runtime
-// default / any operator value) when GOMEMLIMIT is set in the environment, so an
-// explicit override always wins. Best-effort: if the budget can't be detected it
-// does nothing rather than guess.
-func applyAutoMemLimit() {
+// applyGCPercent tightens GC growth (GOGC): the heap may grow this percent over
+// the live set before a collection. The default 100 lets the heap reach ~2× live
+// between GCs, which on a many-stream fan-out is a large RSS swing on top of a
+// working set already inflated by GOP append-growth capacity. An explicit GOGC in
+// the environment always wins. Set once at boot; it is not a per-config knob.
+func applyGCPercent() {
+	if os.Getenv("GOGC") != "" {
+		return
+	}
+	debug.SetGCPercent(defaults.GCPercent)
+	log.Printf("mem: GC target set to %d%% (GOGC) for a tighter heap", defaults.GCPercent)
+}
+
+// applyMemLimit sets the Go soft memory limit (debug.SetMemoryLimit / GOMEMLIMIT).
+// It is a ceiling, not a reservation: the GC only intensifies as usage nears it,
+// so a working set well under it never feels it. Skipped entirely when GOMEMLIMIT
+// is set in the environment, so an explicit operator override always wins.
+//
+// The budget, in order: mem_limit_mb from the config when set, else the cgroup
+// limit this process actually runs under, else a share of the box's RAM. The
+// host fallback deliberately claims a smaller share than a cgroup one — a cgroup
+// limit is this daemon's own budget, whereas the machine is shared with nginx,
+// MySQL, PHP-FPM and one ffmpeg per stream, and taking 80% of it lets the fan-out
+// grow until it starves the processes feeding it. Safe to call again on a config
+// reload; the limit is re-applied live.
+func applyMemLimit(explicitMB int) {
 	if os.Getenv("GOMEMLIMIT") != "" {
 		return // operator set it explicitly; the runtime already applied it
 	}
-	budget := systemMemoryBytes()
-	if budget <= 0 {
-		log.Printf("mem: could not detect system memory; no soft limit set")
+	if explicitMB > 0 {
+		if appliedMemLimit.Swap(int64(explicitMB)<<20) != int64(explicitMB)<<20 {
+			debug.SetMemoryLimit(int64(explicitMB) << 20)
+			log.Printf("mem: soft limit %d MiB (mem_limit_mb)", explicitMB)
+		}
 		return
 	}
-	limit := int64(float64(budget) * defaults.MemLimitFraction)
-	debug.SetMemoryLimit(limit)
-	log.Printf("mem: soft limit %d MiB (%.0f%% of %d MiB detected); periodic idle-heap scavenge on",
-		limit>>20, defaults.MemLimitFraction*100, budget>>20)
-
-	// Tighten GC growth so the heap tracks the working set instead of ballooning to
-	// ~2× live between collections (a large RSS swing on a many-stream fan-out). An
-	// explicit GOGC in the environment wins, mirroring the GOMEMLIMIT handling above.
-	if os.Getenv("GOGC") == "" {
-		debug.SetGCPercent(defaults.GCPercent)
-		log.Printf("mem: GC target set to %d%% (GOGC) for a tighter heap", defaults.GCPercent)
+	budget, source, fraction := memoryBudget()
+	if budget <= 0 {
+		log.Printf("mem: could not detect a memory budget; no soft limit set")
+		return
 	}
+	limit := int64(float64(budget) * fraction)
+	if appliedMemLimit.Swap(limit) == limit {
+		return // unchanged: every config poll re-applies, but only a change is news
+	}
+	debug.SetMemoryLimit(limit)
+	log.Printf("mem: soft limit %d MiB (%.0f%% of %d MiB %s); periodic idle-heap scavenge on",
+		limit>>20, fraction*100, budget>>20, source)
 }
 
-// systemMemoryBytes returns the memory budget to size the soft limit against: the
-// cgroup v2 limit when the daemon runs under a finite one (a container), else the
-// physical RAM from /proc/meminfo. Returns 0 if neither can be read.
-func systemMemoryBytes() int64 {
+// appliedMemLimit is the limit currently in force, so a config reload that does
+// not change it is a no-op rather than a repeated log line.
+var appliedMemLimit atomic.Int64
+
+// memoryBudget returns the memory this process should size its soft limit
+// against, a label for it, and the fraction of it to claim: the cgroup limit when
+// the daemon runs under a finite one (v2 first, then v1 — a v1-only host was
+// previously missed entirely and silently fell back to the whole machine's RAM),
+// else the physical RAM from /proc/meminfo. Returns 0 if neither can be read.
+func memoryBudget() (int64, string, float64) {
+	host := physicalMemoryBytes()
+
 	// cgroup v2: a finite memory.max is the real ceiling the OOM killer enforces.
 	if b, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
 		if s := strings.TrimSpace(string(b)); s != "" && s != "max" {
 			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
-				return v
+				return v, "cgroup v2 limit", defaults.MemLimitFraction
 			}
 		}
 	}
-	// Physical RAM: MemTotal is in kB.
-	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
-		for _, line := range strings.Split(string(b), "\n") {
-			if !strings.HasPrefix(line, "MemTotal:") {
-				continue
+	// cgroup v1: "unlimited" is expressed as a sentinel near the int64 ceiling
+	// rather than a keyword, so treat any limit at or above physical RAM as no
+	// limit at all instead of reading it as a budget.
+	if b, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && v > 0 {
+			if host <= 0 || v < host {
+				return v, "cgroup v1 limit", defaults.MemLimitFraction
 			}
-			f := strings.Fields(line) // ["MemTotal:", "4004156", "kB"]
-			if len(f) >= 2 {
-				if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil && kb > 0 {
-					return kb * 1024
-				}
+		}
+	}
+	if host > 0 {
+		return host, "system RAM", defaults.MemLimitHostFraction
+	}
+	return 0, "", 0
+}
+
+// physicalMemoryBytes reads MemTotal (kB) from /proc/meminfo, or 0.
+func physicalMemoryBytes() int64 {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		f := strings.Fields(line) // ["MemTotal:", "4004156", "kB"]
+		if len(f) >= 2 {
+			if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil && kb > 0 {
+				return kb * 1024
 			}
 		}
 	}

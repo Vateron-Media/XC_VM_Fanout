@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
@@ -33,7 +34,16 @@ type pendingSignal struct {
 
 // signalStore holds the pending per-uuid overlays. PHP pushes them over the
 // control socket (POST /signal/<uuid>); serveHLS/serveLive consume them one-shot.
+//
+// n mirrors len(m) as an atomic. serveLive consults this store on EVERY chunk it
+// delivers, so with the lock alone the whole daemon's live-TS fan-out — every
+// viewer of every stream, tens of thousands of chunks a second — funnelled
+// through one mutex to ask a question whose answer is almost always "no": a
+// signal is a manual admin action, so the map is empty essentially always. The
+// counter turns that question into a single atomic load and the mutex is taken
+// only when a signal really is queued.
 type signalStore struct {
+	n  atomic.Int64 // == len(m); read on the live-TS hot path without the lock
 	mu sync.Mutex
 	m  map[string]pendingSignal
 }
@@ -46,14 +56,16 @@ func (s *signalStore) set(uuid string, sig pendingSignal) {
 		s.m = make(map[string]pendingSignal)
 	}
 	s.m[uuid] = sig
+	s.n.Store(int64(len(s.m)))
 	s.mu.Unlock()
 }
 
 // peek reports whether a live (non-expired) signal is queued for uuid, without
 // consuming it. Cheap guard so the hot path skips the map delete when there is
-// nothing to apply.
+// nothing to apply — and, via n, skips the lock entirely when nothing is queued
+// for anyone.
 func (s *signalStore) peek(uuid string) bool {
-	if uuid == "" {
+	if uuid == "" || s.n.Load() == 0 {
 		return false
 	}
 	s.mu.Lock()
@@ -64,6 +76,7 @@ func (s *signalStore) peek(uuid string) bool {
 	}
 	if !sig.expires.IsZero() && time.Now().After(sig.expires) {
 		delete(s.m, uuid)
+		s.n.Store(int64(len(s.m)))
 		return false
 	}
 	return true
@@ -72,7 +85,7 @@ func (s *signalStore) peek(uuid string) bool {
 // take returns and removes a non-expired signal for uuid (one-shot, mirroring
 // the legacy per-segment overlay that unlinked the signal file after applying).
 func (s *signalStore) take(uuid string) (pendingSignal, bool) {
-	if uuid == "" {
+	if uuid == "" || s.n.Load() == 0 {
 		return pendingSignal{}, false
 	}
 	s.mu.Lock()
@@ -82,6 +95,7 @@ func (s *signalStore) take(uuid string) (pendingSignal, bool) {
 		return pendingSignal{}, false
 	}
 	delete(s.m, uuid)
+	s.n.Store(int64(len(s.m)))
 	if !sig.expires.IsZero() && time.Now().After(sig.expires) {
 		return pendingSignal{}, false
 	}
@@ -156,7 +170,13 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
 		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-i", "pipe:0",
-		"-filter_complex", filter,
+		// -vf, not -filter_complex: an unlabeled filtergraph input used to bind
+		// itself to the first video stream, but ffmpeg 7 refuses to resolve it
+		// alongside -map 0 ("Cannot find a matching stream for unlabeled input pad")
+		// and the whole re-encode fails — which, being best-effort, showed up as the
+		// signal silently doing nothing. -vf applies to the mapped video stream on
+		// every ffmpeg version, and -map 0 keeps audio/subs flowing as before.
+		"-vf", filter,
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
 		"-acodec", "copy", "-scodec", "copy",
 		"-mpegts_flags", "+initial_discontinuity",
@@ -205,7 +225,7 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
 		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-fflags", "+genpts", "-i", "pipe:0",
-		"-filter_complex", filter,
+		"-vf", filter, // see overlaySegment: -filter_complex cannot bind under ffmpeg 7
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
 		"-acodec", "copy", "-scodec", "copy",
 		"-mpegts_flags", "+initial_discontinuity",

@@ -111,24 +111,49 @@ func (h *Hub) Publish(chunk []byte) {
 // lock, so the live tail continues exactly where the snapshot ends — no gap, no
 // duplication. The returned snapshot is drawn from a pool; the caller SHOULD
 // ReleaseSnapshot it once written so the buffer can be reused.
+//
+// Only the CAPTURE is under the lock. The copy that follows is the expensive
+// part — up to the whole ring, ~5 ms for a 40 s / 14 MB prebuffer — and running
+// it under the lock stalled the stream's producer for that long on every join,
+// serialising a join storm (a channel going live, an EPG event) into a stall
+// proportional to the number of joiners. The capture pins the GOP buffers so
+// prune cannot recycle them mid-copy; everything published from the moment of
+// registration reaches this subscriber through its channel instead, so releasing
+// the lock early costs no atomicity.
 func (h *Hub) Subscribe(prebufMS int64) (*Sub, []byte) {
 	buf := snapGet()
 	h.mu.Lock()
-	snap := h.join.SnapshotInto(buf, prebufMS)
+	head, parts := h.join.SnapshotPin(buf, prebufMS)
 	s := &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()
-	return s, snap
+
+	return s, h.copyPinned(head, parts)
 }
 
 // Snapshot returns a fresh clean-entry snapshot (PAT/PMT + keyframe, optionally
 // prebufMS of history) without subscribing — used to re-seed a decoder mid-stream
 // (e.g. the transient ffmpeg that burns a "send message" overlay for one viewer).
+// Like Subscribe, it copies with the lock released.
 func (h *Hub) Snapshot(prebufMS int64) []byte {
 	h.mu.Lock()
-	snap := h.join.Snapshot(prebufMS)
+	head, parts := h.join.SnapshotPin(nil, prebufMS)
 	h.mu.Unlock()
-	return snap
+	return h.copyPinned(head, parts)
+}
+
+// copyPinned appends a pinned capture's GOP bytes to head and releases the pin.
+// Runs with the lock RELEASED: the pin is what makes that safe.
+func (h *Hub) copyPinned(head []byte, parts [][]byte) []byte {
+	defer func() {
+		h.mu.Lock()
+		h.join.Unpin()
+		h.mu.Unlock()
+	}()
+	for _, p := range parts {
+		head = append(head, p...)
+	}
+	return head
 }
 
 // Configure live-reconfigures the TS prebuffer depth (ms) and the HLS segment
@@ -174,6 +199,17 @@ func (h *Hub) HLSSegment(seq int) []byte {
 	return b
 }
 
+// NoKeyframeCuts reports how many ring blocks were closed because the source
+// produced no random-access point within the GOP cap. Non-zero means this source
+// carries no random_access_indicator — which is also why it yields no HLS
+// segments. Surfaced in the debug per-stream snapshot.
+func (h *Hub) NoKeyframeCuts() int64 {
+	h.mu.Lock()
+	n := h.join.NoKeyframeCuts()
+	h.mu.Unlock()
+	return n
+}
+
 // Unsubscribe removes a subscriber (idempotent).
 func (h *Hub) Unsubscribe(s *Sub) {
 	h.mu.Lock()
@@ -182,6 +218,24 @@ func (h *Hub) Unsubscribe(s *Sub) {
 		s.close()
 	}
 	h.mu.Unlock()
+}
+
+// CloseAll drops every subscriber, as Unsubscribe does for one. Called when a
+// stream is torn down (DELETE /streams|/ingest): without it the viewers attached
+// at that moment keep blocking on a hub that will never publish again — their
+// handler goroutines, their connStat entries and the whole Stream (hub, ring and
+// all) stay alive until each client happens to disconnect, while the stream is
+// already out of the registry and so invisible to /connections. Closing them lets
+// serveLive return and run its deferred detach/removeConn.
+func (h *Hub) CloseAll() int {
+	h.mu.Lock()
+	n := len(h.subs)
+	for s := range h.subs {
+		delete(h.subs, s)
+		s.close()
+	}
+	h.mu.Unlock()
+	return n
 }
 
 // Count returns the current number of subscribers.

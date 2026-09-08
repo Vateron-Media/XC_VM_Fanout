@@ -69,6 +69,13 @@ type State struct {
 	ring90   int64  // history retained, in 90 kHz ticks (0 = current GOP only)
 	maxRing  int    // absolute byte ceiling for the whole ring — memory backstop
 
+	// pins counts snapshots currently copying out of the ring. While non-zero,
+	// prune must not RECYCLE a dropped GOP's array (it leaves it to GC instead):
+	// a snapshot in flight holds slices into those arrays and is copying them
+	// with the lock released, so handing one to a new GOP would rewrite bytes
+	// mid-copy. See SnapshotPin.
+	pins int
+
 	// freeBufs recycles the byte arrays of GOPs dropped by prune so opening the
 	// next GOP reuses one instead of allocating a fresh array every keyframe. This
 	// turns the steady-state GOP allocate-and-discard (≈ bitrate, the GC sawtooth)
@@ -86,6 +93,20 @@ type State struct {
 	nextSeq     int      // next HLS media sequence number
 	segStartID  int64    // open segment's first GOP id, or -1 = none open
 	segStartPTS int64    // open segment's start HLS clock (90 kHz)
+
+	// plCache is the last rendered playlist, valid until the segment list changes.
+	// Every HLS viewer polls index.m3u8 on its own schedule, so an audience of a few
+	// hundred re-rendered an identical string hundreds of times a second, each time
+	// holding the hub lock against the producer. The list only changes when a
+	// segment closes or ages out, which is once per hls_target_sec.
+	plCache string
+	plValid bool
+
+	// noKeyframeCuts counts blocks closed because the source produced no
+	// random-access point within maxGOP bytes — see Update. A non-zero count is
+	// the signal that a source carries no random_access_indicator at all, which is
+	// also why it yields no HLS segments.
+	noKeyframeCuts int64
 
 	// Viewer gate: when gated (no audience), the ring collapses to prebufMS ×
 	// idleRatio to free memory, HLS keeps cutting from the smaller ring so the
@@ -178,6 +199,7 @@ func (s *State) Configure(prebufMS, hlsTargetMS int64, hlsWindow int) {
 		hlsWindow = 0
 	}
 	s.prebufMS, s.hlsTargetMS, s.hlsWindow = prebufMS, hlsTargetMS, hlsWindow
+	s.plValid = false // the window (and whether HLS runs at all) may have changed
 	s.recompute()
 }
 
@@ -241,19 +263,33 @@ func (s *State) Update(chunk []byte) {
 			}
 			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts})
 			s.prune()
-		case len(s.gops) > 0:
+		case len(s.gops) > 0 && len(s.gops[len(s.gops)-1].data)+PacketSize <= s.maxGOP:
 			g := &s.gops[len(s.gops)-1]
-			if len(g.data) < s.maxGOP {
-				g.data = append(g.data, pkt...)
-			}
+			g.data = append(g.data, pkt...)
 		default:
-			// Pre-roll before the first keyframe: keep a provisional block so an
-			// early join still gets recent packets (matches the old
-			// accumulate-until-keyframe behaviour). Not a keyframe, so it does not
-			// open an HLS segment.
+			// Two cases open a fresh block here, neither of them a keyframe (so
+			// neither opens an HLS segment):
+			//
+			//  1. Pre-roll before the first keyframe — keep a provisional block so an
+			//     early join still gets recent packets.
+			//  2. The open block has reached maxGOP without a random-access point.
+			//     Some sources never set random_access_indicator at all; those used
+			//     to grow one block to the cap and then SILENTLY DISCARD every packet
+			//     after it. The ring froze — one block, never pruned (pruning needs
+			//     two), so the stream held maxGOP forever, and every joining viewer
+			//     was served that same stale block from whenever the cap was hit,
+			//     ahead of the live tail. Cutting a new block instead keeps the ring
+			//     rolling: prune bounds it like any other stream and a joiner gets
+			//     recent bytes. (HLS still yields nothing for such a source — a
+			//     segment must start at a random-access point to decode — which is
+			//     what noKeyframeCuts surfaces.)
+			if len(s.gops) > 0 {
+				s.noKeyframeCuts++
+			}
 			id := s.nextGOPID
 			s.nextGOPID++
 			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: -1})
+			s.prune()
 		}
 	}
 }
@@ -328,6 +364,7 @@ func (s *State) hlsOnKeyframe(newID, newPTS int64) {
 		}
 		s.segs = append(s.segs, hlsSeg{seq: s.nextSeq, startID: s.segStartID, endID: endID, durMS: d / pcrHz})
 		s.nextSeq++
+		s.plValid = false
 		s.segStartID, s.segStartPTS = newID, newPTS
 	}
 }
@@ -345,6 +382,7 @@ func (s *State) hlsPrune() {
 	}
 	if drop > 0 {
 		s.segs = append(s.segs[:0], s.segs[drop:]...)
+		s.plValid = false
 	}
 }
 
@@ -353,6 +391,9 @@ func (s *State) hlsPrune() {
 func (s *State) HLSPlaylist() string {
 	if len(s.segs) == 0 {
 		return ""
+	}
+	if s.plValid {
+		return s.plCache
 	}
 	// Reserve the single oldest in-ring segment as a fetch margin, so a listed
 	// segment can't age out between playlist render and HLSSegment fetch (the ring
@@ -380,7 +421,8 @@ func (s *State) HLSPlaylist() string {
 	for _, sg := range win {
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%d.ts\n", float64(sg.durMS)/1000.0, sg.seq)
 	}
-	return b.String()
+	s.plCache, s.plValid = b.String(), true
+	return s.plCache
 }
 
 // HLSSegment assembles segment seq from the ring on demand: latest PAT + PMT
@@ -431,7 +473,37 @@ func (s *State) Snapshot(reqMS int64) []byte {
 // allocation on the connect path, which otherwise sets the heap high-water mark
 // under many concurrent joins. The returned slice aliases dst when it fit. Caller
 // serialises access and must not retain dst past the returned slice's use.
+//
+// This does the whole copy inline, so a caller holding a lock holds it for the
+// duration. Hub uses the two-phase SnapshotPin/Unpin below instead, to copy with
+// the lock released.
 func (s *State) SnapshotInto(dst []byte, reqMS int64) []byte {
+	out, parts := s.SnapshotPin(dst, reqMS)
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	s.Unpin()
+	return out
+}
+
+// SnapshotPin is the first half of a join snapshot: it writes the header
+// (latest PAT + PMT, which are mutated in place as new ones arrive and so must be
+// copied while the caller still holds its lock) into dst, and returns it together
+// with the GOP byte slices that follow. It PINS those buffers, so the caller may
+// release its lock, append the parts at leisure, and then call Unpin.
+//
+// The point is that appending them is the expensive part — up to the whole ring,
+// measured at ~5 ms for a 40 s / 14 MB prebuffer — and doing it under the hub
+// lock stalls the stream's producer for that long on every viewer join. A join
+// storm (a channel going live, an EPG event) serialised those stalls: a hundred
+// restreamers joining at once took the stream off the air for half a second.
+//
+// The captured slices have the lengths they had at this instant, so the open GOP
+// growing afterwards is invisible to the copy — which is also what makes this
+// safe to pair with registering a subscriber under the same lock: everything
+// published after that point reaches the viewer through its channel, everything
+// before it is in these bytes, with no gap and no duplication.
+func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 	start := len(s.gops) - 1
 	if start < 0 {
 		start = 0
@@ -452,11 +524,28 @@ func (s *State) SnapshotInto(dst []byte, reqMS int64) []byte {
 
 	out := append(dst[:0], s.lastPAT...)
 	out = append(out, s.lastPMT...)
+
+	parts := make([][]byte, 0, len(s.gops)-start)
 	for i := start; i < len(s.gops); i++ {
-		out = append(out, s.gops[i].data...)
+		parts = append(parts, s.gops[i].data)
 	}
-	return out
+	s.pins++
+	return out, parts
 }
+
+// Unpin releases a SnapshotPin, letting prune recycle dropped GOP buffers again.
+// Caller (Hub) serialises access, and must call it exactly once per SnapshotPin.
+func (s *State) Unpin() {
+	if s.pins > 0 {
+		s.pins--
+	}
+}
+
+// NoKeyframeCuts reports how many blocks were closed because the source gave no
+// random-access point within maxGOP bytes. Non-zero means this source carries no
+// random_access_indicator — which is also why it produces no HLS segments.
+// Caller (Hub) serialises access.
+func (s *State) NoKeyframeCuts() int64 { return s.noKeyframeCuts }
 
 // readPCR extracts the 33-bit PCR base (90 kHz) from a packet whose adaptation
 // field carries it. The caller has verified afc has adaptation, pkt[4] > 0 and
@@ -487,11 +576,15 @@ func (s *State) getBuf() []byte {
 
 // putBuf recycles a dropped GOP's backing array for reuse, capacity preserved.
 // Called only from prune (under the hub lock), where the GOP has just left the
-// ring and no reader can still reference it — every reader copies GOP bytes out
-// under the same lock. Buffers past the cap are left to GC, which is what we want
-// on a gating ring-shrink (the goal there is to release memory).
+// ring. Buffers past the cap are left to GC, which is what we want on a gating
+// ring-shrink (the goal there is to release memory).
+//
+// Recycling is suspended while a snapshot is pinned: that reader is copying GOP
+// bytes with the lock released, so its arrays must not be handed to a new GOP
+// underneath it. They go to GC for the duration instead, which the reader's own
+// slices keep alive for exactly as long as it needs them.
 func (s *State) putBuf(b []byte) {
-	if cap(b) == 0 || len(s.freeBufs) >= defaults.JoinFreeGOPBufs {
+	if cap(b) == 0 || s.pins > 0 || len(s.freeBufs) >= defaults.JoinFreeGOPBufs {
 		return
 	}
 	s.freeBufs = append(s.freeBufs, b[:0])

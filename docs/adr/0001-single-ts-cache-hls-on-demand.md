@@ -69,9 +69,16 @@ Two supporting details make the gate observable and correct in production:
 - **Forced OS release.** Collapsing a ring turns its dropped GOP bytes into GC
   garbage, but Go returns freed pages to the OS only lazily (the background
   scavenger paces itself), so RSS would sit flat for minutes and the win would be
-  invisible. The reaper calls `debug.FreeOSMemory()` once per sweep *iff* it
-  gated at least one stream, so idle RAM actually drops without costing anything on
-  a quiet sweep.
+  invisible. A sweep that gated at least one stream therefore forces the release.
+  *Amended in 0.11.4:* the reaper **signals** the memory scavenger instead of
+  calling `debug.FreeOSMemory()` inline. That call is a full stop-the-world GC plus
+  a page-return sweep, and the reaper runs every `grace/2` (5 s at the default
+  grace) — which, together with a `lastAccess` defect that made streams gate the
+  moment their last viewer left, kept the daemon in near-continuous full
+  collections, re-faulting the pages it had just handed back. The release now
+  happens in one place, floored two minutes apart, with a gate event bypassing the
+  floor because its garbage is known-real. See
+  [05, "Returning memory to the OS"](../en/05-lifecycle.md#returning-memory-to-the-os).
 - **Per-viewer prebuffer is the panel's call.** The join-burst depth differs by
   audience — a client vs a **restreamer** — and only the panel knows which (it maps
   `is_restreamer` → `client_prebuffer` / `restreamer_prebuffer`) and passes the

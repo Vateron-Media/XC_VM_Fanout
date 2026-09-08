@@ -11,6 +11,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Build this module alone. A go.work in a parent directory (a checkout that sits
+# inside a larger workspace) would otherwise drag in sibling modules that are not
+# part of this repo and fail the build before it starts.
+export GOWORK=off
+
 VERSION="${1:-$(cat VERSION)}"
 [ -n "${1:-}" ] && echo "$VERSION" > VERSION
 

@@ -17,8 +17,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +61,13 @@ type Stream struct {
 	ingestLn   net.Listener // non-nil = push-fed: the producer (ffmpeg tee) connects here
 	ingestSock string       // path of the ingest listener socket (for cleanup)
 
+	// ingestConns are the producer connections accepted on ingestLn. Tracked so a
+	// teardown can close them: closing the listener alone leaves an already-connected
+	// producer feeding a Stream that is no longer in the registry — an orphan whose
+	// ring is unreachable and never freed.
+	ingestMu    sync.Mutex
+	ingestConns map[net.Conn]struct{}
+
 	lastData   atomic.Int64 // UnixNano of the last non-empty Publish (0 = never); off-air signal
 	lastAccess atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
 
@@ -70,6 +77,20 @@ type Stream struct {
 	encMu  sync.RWMutex // guards hlsKey/hlsIV
 	hlsKey []byte       // AES-128 key for encrypted HLS segments (nil = plain)
 	hlsIV  []byte       // AES-128-CBC IV
+
+	segMu    sync.Mutex        // guards segCache/segOrder
+	segCache map[int]*segEntry // seq → the bytes served for it (post-encryption)
+	segOrder []int             // seqs in insertion order, for eviction
+}
+
+// segEntry is one cached HLS segment. ready is closed once data is final, so the
+// first requester assembles-and-encrypts while every other viewer asking for the
+// same seq waits for that one result instead of repeating the work — the join of
+// a channel's whole HLS audience onto a fresh segment is exactly simultaneous, so
+// without this single-flight the cache would still let the herd through.
+type segEntry struct {
+	ready chan struct{}
+	data  []byte
 }
 
 // setEnc configures per-segment HLS encryption from hex key/iv (16 bytes each);
@@ -86,6 +107,7 @@ func (s *Stream) setEnc(keyHex, ivHex string) {
 	s.encMu.Lock()
 	s.hlsKey, s.hlsIV = k, iv
 	s.encMu.Unlock()
+	s.dropSegCache() // cached segments carry the OLD key's ciphertext
 }
 
 // encryptSegment returns the segment encrypted for HLS when a key is set, else
@@ -101,6 +123,65 @@ func (s *Stream) encryptSegment(data []byte) []byte {
 		return enc
 	}
 	return data
+}
+
+// hlsSegment returns the bytes to serve for HLS segment seq — assembled from the
+// ring and, when the stream has a key, AES-encrypted — reusing a recent result
+// when one is cached. Every viewer of a channel fetches byte-identical segments,
+// so doing this per request meant each one paid a full copy of the segment out of
+// the ring plus a full AES pass over it; at a 2 MB segment that is several ms of
+// CPU and ~7 MB of garbage per viewer per segment, scaling linearly with the
+// audience. Returns nil when seq is unknown or has aged out of the ring.
+//
+// A miss is NOT cached: seq may simply not have closed yet, and a nil pinned in
+// the map would then hide the segment once it does.
+func (s *Stream) hlsSegment(seq int) []byte {
+	s.segMu.Lock()
+	if e := s.segCache[seq]; e != nil {
+		s.segMu.Unlock()
+		<-e.ready
+		return e.data
+	}
+	e := &segEntry{ready: make(chan struct{})}
+	if s.segCache == nil {
+		s.segCache = make(map[int]*segEntry)
+	}
+	s.segCache[seq] = e
+	s.segOrder = append(s.segOrder, seq)
+	for len(s.segOrder) > defaults.HLSSegCacheEntries {
+		delete(s.segCache, s.segOrder[0])
+		s.segOrder = append(s.segOrder[:0], s.segOrder[1:]...)
+	}
+	s.segMu.Unlock()
+
+	if raw := s.Hub.HLSSegment(seq); raw != nil {
+		e.data = s.encryptSegment(raw)
+	}
+	close(e.ready)
+
+	if e.data == nil {
+		s.segMu.Lock()
+		if s.segCache[seq] == e {
+			delete(s.segCache, seq)
+			for i, q := range s.segOrder {
+				if q == seq {
+					s.segOrder = append(s.segOrder[:i], s.segOrder[i+1:]...)
+					break
+				}
+			}
+		}
+		s.segMu.Unlock()
+	}
+	return e.data
+}
+
+// dropSegCache releases the cached segments. Called when the key changes (the
+// ciphertext is stale) and when the stream is gated idle — a channel nobody
+// watches should not hold segment copies on top of its ring.
+func (s *Stream) dropSegCache() {
+	s.segMu.Lock()
+	s.segCache, s.segOrder = nil, nil
+	s.segMu.Unlock()
 }
 
 // connStat tracks one live-TS viewer uuid: an active-connection refcount, the
@@ -208,7 +289,9 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 				return // listener closed (stopIngestLocked)
 			}
 			dlog.Logf("ingest", "id=%s producer connected on %s", s.id, sockPath)
+			s.addIngestConn(conn)
 			go func(c net.Conn) {
+				defer s.removeIngestConn(c)
 				defer c.Close()
 				err := ingest.Copy(c, ch, s.Publish)
 				dlog.Logf("ingest", "id=%s producer disconnected: %v", s.id, err)
@@ -218,13 +301,47 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 	return nil
 }
 
-// stopIngestLocked closes the ingest listener and removes its socket. In-flight
-// producer connections end when the producer (ffmpeg) itself stops. Caller holds
-// s.mu.
+func (s *Stream) addIngestConn(c net.Conn) {
+	s.ingestMu.Lock()
+	if s.ingestConns == nil {
+		s.ingestConns = make(map[net.Conn]struct{})
+	}
+	s.ingestConns[c] = struct{}{}
+	s.ingestMu.Unlock()
+}
+
+func (s *Stream) removeIngestConn(c net.Conn) {
+	s.ingestMu.Lock()
+	delete(s.ingestConns, c)
+	s.ingestMu.Unlock()
+}
+
+// closeIngestConns hangs up on every connected producer. Takes only ingestMu, so
+// it is safe to call with s.mu held (the accept path never takes s.mu).
+func (s *Stream) closeIngestConns() int {
+	s.ingestMu.Lock()
+	n := len(s.ingestConns)
+	for c := range s.ingestConns {
+		_ = c.Close()
+	}
+	s.ingestConns = nil
+	s.ingestMu.Unlock()
+	return n
+}
+
+// stopIngestLocked closes the ingest listener, hangs up on every connected
+// producer and removes the socket. Closing the listener alone was not enough: a
+// producer already connected (the stream's ffmpeg tee, which the panel may stop a
+// moment later, or never) went on feeding a Stream that Unregister had just taken
+// out of the registry — an orphan holding a full ring that nothing could reach or
+// free. Caller holds s.mu.
 func (s *Stream) stopIngestLocked() {
 	if s.ingestLn != nil {
 		_ = s.ingestLn.Close()
 		s.ingestLn = nil
+	}
+	if n := s.closeIngestConns(); n > 0 {
+		dlog.Logf("ingest", "id=%s closed %d in-flight producer connection(s)", s.id, n)
 	}
 	if s.ingestSock != "" {
 		_ = os.Remove(s.ingestSock)
@@ -292,7 +409,18 @@ func (s *Stream) attach() {
 
 // detach drops a live TS viewer. The reaper stops the puller once refs reach 0
 // and no HLS access has touched the stream for the grace window.
+//
+// It marks lastAccess: attach() stamps it on arrival and nothing moves it during
+// the session, so without this the mark is as old as the session was long — and
+// the moment the last viewer left, `now - lastAccess` already exceeded both
+// grace_sec and idle_buffer_grace_sec. The puller was killed and the ring
+// collapsed on the very next reaper tick, for every session longer than the grace
+// itself, i.e. all of them: a channel change tore down the source ffmpeg and cold-
+// started it seconds later, and the gate fired (and forced a heap release) on
+// nearly every sweep. The grace windows only mean anything if the clock starts
+// when the audience actually leaves.
 func (s *Stream) detach() {
+	s.lastAccess.Store(time.Now().UnixNano())
 	s.mu.Lock()
 	s.refs--
 	s.mu.Unlock()
@@ -356,6 +484,7 @@ func (s *Stream) gateIdleBufferLocked(now time.Time) bool {
 	}
 	s.buffered = false
 	s.mgr.applyBufferLocked(s)
+	s.dropSegCache()
 	dlog.Logf("buffer", "id=%s ring gated to idle fraction (%.2f, no viewers)", s.id, s.mgr.idleRatio())
 	return true
 }
@@ -403,6 +532,13 @@ type Manager struct {
 	// buffer kept while gated (math.Float64bits, read on the hot path).
 	idleBufferGraceNS   atomic.Int64
 	idleBufferRatioBits atomic.Uint64
+
+	// viewerIdleNS drops a live-TS viewer that has received nothing for this long
+	// (0 = never); read on the connect path. gatedSinceScavenge is set by the
+	// reaper when it collapses a ring, so the memory scavenger knows there is real
+	// garbage to hand back and can bypass its rate floor for it.
+	viewerIdleNS       atomic.Int64
+	gatedSinceScavenge atomic.Bool
 
 	ingestDir string // base dir for per-stream push-fed ingest sockets
 
@@ -460,6 +596,7 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 	m.sourceInsecure.Store(true)
 	m.idleBufferGraceNS.Store(int64(time.Duration(defaults.CfgIdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(defaults.CfgIdleBufferRatio))
+	m.viewerIdleNS.Store(int64(time.Duration(defaults.CfgViewerIdleTimeoutSec) * time.Second))
 	return m
 }
 
@@ -498,6 +635,7 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	m.sourceInsecure.Store(v.SourceInsecure)
 	m.idleBufferGraceNS.Store(int64(time.Duration(v.IdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(v.IdleBufferRatio))
+	m.viewerIdleNS.Store(int64(time.Duration(v.ViewerIdleTimeoutSec) * time.Second))
 
 	// Update the new-stream defaults and snapshot the live set under m.mu, then
 	// reconfigure each stream outside the lock (each takes its own hub/seg lock;
@@ -568,12 +706,16 @@ func (m *Manager) StartReaper(ctx context.Context) {
 					st.mu.Unlock()
 				}
 				// A gate collapsed at least one ring: the dropped GOP bytes are now
-				// GC garbage, but Go hands freed pages back to the OS only lazily
-				// (the background scavenger paces itself), so RSS would sit flat for
-				// minutes. Force the release now so idle memory actually drops — and
-				// only when something was gated, so a quiet sweep costs nothing.
+				// GC garbage, but Go hands freed pages back to the OS only lazily,
+				// so RSS would sit flat for minutes. Hand that fact to the memory
+				// scavenger rather than forcing a full stop-the-world GC here: this
+				// sweep runs every grace/2 (5 s at the default grace), and calling
+				// FreeOSMemory from it put the daemon in near-continuous full
+				// collections, re-faulting the pages it had just returned. The
+				// scavenger owns the release, and this flag lets it skip its rate
+				// floor because the garbage is known-real.
 				if gated {
-					debug.FreeOSMemory()
+					m.gatedSinceScavenge.Store(true)
 				}
 			}
 		}
@@ -585,31 +727,53 @@ func (m *Manager) StartReaper(ctx context.Context) {
 // back to the OS only lazily (the background scavenger paces itself over minutes
 // to hours), so after a viewer burst subsides the process RSS sits at its
 // high-water mark indefinitely. This sweep checks how much freed-but-unreturned
-// heap the runtime is holding (HeapIdle−HeapReleased) and, when it exceeds
-// threshold, forces the release so idle RSS tracks the working set instead. It is
-// O(1) in stream count (one check, one occasional GC), unlike the per-stream
-// idle-buffer gate, and fires regardless of whether any stream is gated. A read
-// costs a brief ReadMemStats; the forced GC only runs when there is real memory
-// to reclaim, so a quiet daemon pays almost nothing. Call once from main.
+// heap the runtime is holding and, when it exceeds threshold, forces the release
+// so idle RSS tracks the working set instead. Call once from main.
+//
+// Two things keep the cure from being worse than the disease:
+//
+//   - The check reads runtime/metrics, which does NOT stop the world.
+//     runtime.ReadMemStats does, and it ran on every sweep — a global pause every
+//     20 s, charged to every stream, to answer a question about none of them.
+//   - A forced release is a full GC plus a page-return sweep. On a busy daemon the
+//     idle-heap threshold is met almost continuously, so releases are floored at
+//     minGap apart; otherwise the process lives in back-to-back collections and
+//     thrashes the pages it just gave back. A ring collapse (the reaper's idle
+//     gate) is known-real garbage and skips the floor.
 func (m *Manager) StartMemoryScavenger(ctx context.Context, interval time.Duration, threshold uint64) {
+	m.startMemoryScavenger(ctx, interval, threshold, defaults.MemScavengeMinGap)
+}
+
+func (m *Manager) startMemoryScavenger(ctx context.Context, interval time.Duration, threshold uint64, minGap time.Duration) {
 	if interval <= 0 {
 		return
 	}
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
-		var ms runtime.MemStats
+		// heap/free is memory the runtime holds free and STILL BACKED by physical
+		// pages — i.e. exactly what a release would hand back. (It is disjoint from
+		// heap/released, the part already returned, so this is the runtime/metrics
+		// spelling of the old HeapIdle−HeapReleased, not a term of it.)
+		samples := []metrics.Sample{{Name: "/memory/classes/heap/free:bytes"}}
+		var lastRelease time.Time
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-t.C:
-				runtime.ReadMemStats(&ms)
-				retained := ms.HeapIdle - ms.HeapReleased
-				if retained >= threshold {
-					debug.FreeOSMemory()
-					dlog.Logf("mem", "scavenged: returned ~%dMB idle heap to OS (was holding %dMB free)", retained>>20, retained>>20)
+			case now := <-t.C:
+				metrics.Read(samples)
+				retained := samples[0].Value.Uint64()
+				if retained < threshold {
+					continue
 				}
+				gated := m.gatedSinceScavenge.Swap(false)
+				if !gated && !lastRelease.IsZero() && now.Sub(lastRelease) < minGap {
+					continue // rate floor: not worth another full GC yet
+				}
+				lastRelease = now
+				debug.FreeOSMemory()
+				dlog.Logf("mem", "scavenged: returned ~%dMB idle heap to OS (gate=%v)", retained>>20, gated)
 			}
 		}
 	}()
@@ -655,8 +819,11 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 					if ld := st.lastData.Load(); ld != 0 {
 						dataAge = time.Since(time.Unix(0, ld)).Round(time.Millisecond).String()
 					}
-					dlog.Logf("stats", "id=%s running=%v ingest=%v refs=%d subs=%d conns=%d data_age=%s",
-						st.id, running, ingesting, refs, st.Hub.Count(), conns, dataAge)
+					// nokf > 0 means the source carries no random_access_indicator: the
+					// ring is being cut on the byte cap instead of on keyframes, and
+					// HLS cannot produce segments for it at all.
+					dlog.Logf("stats", "id=%s running=%v ingest=%v refs=%d subs=%d conns=%d data_age=%s nokf=%d",
+						st.id, running, ingesting, refs, st.Hub.Count(), conns, dataAge, st.Hub.NoKeyframeCuts())
 				}
 			}
 		}
@@ -753,6 +920,14 @@ func (m *Manager) RegisterIngest(id string, chunk int) (string, error) {
 }
 
 // Unregister stops and removes a control-managed stream (pull or ingest).
+//
+// It also drops the viewers still attached. They are about to be served by
+// nothing — the puller is stopped and the producer hung up — and once the stream
+// leaves the registry they are invisible to /connections, so PHP closes their
+// lines_live rows while their handler goroutines sit forever on a hub that will
+// never publish again, pinning the Stream, its hub and its whole ring. Closing
+// the subscribers lets each serveLive return and run its deferred cleanup, so the
+// viewer reconnects (and re-authorises) instead of freezing on an orphan.
 func (m *Manager) Unregister(id string) {
 	if st := m.Get(id); st != nil {
 		st.mu.Lock()
@@ -760,6 +935,10 @@ func (m *Manager) Unregister(id string) {
 		st.stopLocked()
 		st.stopIngestLocked()
 		st.mu.Unlock()
+		if n := st.Hub.CloseAll(); n > 0 {
+			dlog.Logf("ctl", "id=%s dropped %d attached viewer(s) on teardown", id, n)
+		}
+		st.dropSegCache()
 	}
 	m.mu.Lock()
 	delete(m.streams, id)
@@ -1094,6 +1273,29 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		return rc.Flush()
 	}
 
+	// Guard against a viewer that receives nothing at all. The per-write deadline
+	// above can only fire while there are bytes to write, so it does not cover the
+	// other half of the problem: a stream that goes off-air stops producing chunks,
+	// nothing is ever written, and a client whose socket is half-open (a dropped
+	// mobile link that sent no FIN nor RST) is never noticed by anyone — not by us,
+	// and not by nginx, which is equally idle. That connection sat in the select
+	// below forever, holding its uuid in /connections as a ghost the reconciler
+	// could never clear. Polled on a coarse ticker rather than a per-chunk timer
+	// reset: quarter-timeout precision is plenty, and the hot path stays a
+	// timestamp store.
+	var idleC <-chan time.Time
+	idleTimeout := time.Duration(m.viewerIdleNS.Load())
+	if idleTimeout > 0 {
+		tick := idleTimeout / 4
+		if tick <= 0 {
+			tick = idleTimeout // never hand NewTicker a zero interval
+		}
+		tk := time.NewTicker(tick)
+		defer tk.Stop()
+		idleC = tk.C
+	}
+	lastChunk := time.Now()
+
 	// Write the join burst, then return its (pooled) buffer at once — the viewer
 	// holds no reference to it past this write, so it can be reused by the next
 	// connect instead of lingering as garbage for the whole session.
@@ -1107,6 +1309,7 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		reason = writeFailReason(snapErr)
 		return
 	}
+	lastChunk = time.Now()
 	for {
 		// Admin "send message" overlay (rare): if one is queued for this viewer,
 		// burn it onto a short window of the stream via a transient ffmpeg, then
@@ -1118,14 +1321,24 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 					reason = "client closed (during overlay)"
 					return
 				}
+				// The overlay goroutine drained sub.C() for the window, so no chunk
+				// reached the idle check meanwhile — don't count that as silence.
+				lastChunk = time.Now()
 			}
 		}
 		select {
 		case b := <-sub.C():
+			lastChunk = time.Now()
 			if err := write(b); err != nil {
 				reason = writeFailReason(err)
 				return
 			}
+		case now := <-idleC:
+			if now.Sub(lastChunk) < idleTimeout {
+				continue
+			}
+			reason = "no data for " + idleTimeout.String() + " (source off-air; dropped)"
+			return
 		case <-sub.Done():
 			reason = "dropped: too slow (hub buffer full)"
 			return
@@ -1183,23 +1396,35 @@ func (m *Manager) serveHLS(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		data := st.Hub.HLSSegment(seq)
+		// Admin "send message" overlay for this viewer (one-shot): burn the text
+		// banner into this one segment, then the signal is cleared. Applied before
+		// encryption so the client still decrypts normally. ?c=<uuid> identifies
+		// the viewer, ?vc=<codec> its video codec (from segment.php's token). These
+		// bytes are this viewer's alone, so this path bypasses the shared cache
+		// (both ways: it neither reads a cached segment nor poisons one).
+		uuid := r.URL.Query().Get("c")
+		if uuid != "" && m.signals.peek(uuid) {
+			if sig, ok := m.signals.take(uuid); ok {
+				data := st.Hub.HLSSegment(seq)
+				if data == nil {
+					http.NotFound(w, r)
+					return
+				}
+				data = st.encryptSegment(m.overlaySegment(data, sig, r.URL.Query().Get("vc")))
+				w.Header().Set("Content-Type", "video/mp2t")
+				_, _ = w.Write(data)
+				return
+			}
+		}
+		// Assembled from the ring and encrypted ONCE per segment, then shared by
+		// every viewer asking for it.
+		data := st.hlsSegment(seq)
 		if data == nil {
 			dlog.Logf("hls", "id=%s segment %d not found (rolled out of window or never existed)", id, seq)
 			http.NotFound(w, r)
 			return
 		}
 		dlog.Logf("hls", "id=%s segment %d served (%dKB)", id, seq, len(data)/1024)
-		// Admin "send message" overlay for this viewer (one-shot): burn the text
-		// banner into this one segment, then the signal is cleared. Applied before
-		// encryption so the client still decrypts normally. ?c=<uuid> identifies
-		// the viewer, ?vc=<codec> its video codec (from segment.php's token).
-		if uuid := r.URL.Query().Get("c"); uuid != "" {
-			if sig, ok := m.signals.take(uuid); ok {
-				data = m.overlaySegment(data, sig, r.URL.Query().Get("vc"))
-			}
-		}
-		data = st.encryptSegment(data) // encrypted HLS when a key is set; else plain
 		w.Header().Set("Content-Type", "video/mp2t")
 		_, _ = w.Write(data)
 

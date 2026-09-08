@@ -46,6 +46,13 @@ type Values struct {
 	// keeps being cut from the reduced ring, so it stays openable.
 	IdleBufferGraceSec int     `json:"idle_buffer_grace_sec"`
 	IdleBufferRatio    float64 `json:"idle_buffer_ratio"`
+	// ViewerIdleTimeoutSec drops a live-TS viewer that has received no data for
+	// this long (0 = never). It is what bounds a ghost connection on an off-air
+	// stream: the per-write deadline can only fire while there are bytes to write.
+	ViewerIdleTimeoutSec int `json:"viewer_idle_timeout_sec"`
+	// MemLimitMB is an explicit ceiling (MiB) for the Go soft memory limit;
+	// 0 = derive it from the cgroup limit, else a share of the box's RAM.
+	MemLimitMB int `json:"mem_limit_mb"`
 }
 
 // Defaults is the built-in fallback (see defaults.Cfg*): what the daemon writes
@@ -63,6 +70,9 @@ func Defaults() Values {
 		DefaultPrebufferSec: defaults.CfgDefaultPrebufferSec,
 		IdleBufferGraceSec:  defaults.CfgIdleBufferGraceSec,
 		IdleBufferRatio:     defaults.CfgIdleBufferRatio,
+
+		ViewerIdleTimeoutSec: defaults.CfgViewerIdleTimeoutSec,
+		MemLimitMB:           defaults.CfgMemLimitMB,
 	}
 }
 
@@ -81,6 +91,9 @@ type file struct {
 	DefaultPrebufferSec *int     `json:"default_prebuffer_sec"`
 	IdleBufferGraceSec  *int     `json:"idle_buffer_grace_sec"`
 	IdleBufferRatio     *float64 `json:"idle_buffer_ratio"`
+
+	ViewerIdleTimeoutSec *int `json:"viewer_idle_timeout_sec"`
+	MemLimitMB           *int `json:"mem_limit_mb"`
 }
 
 // Load reads path, returns the resolved (defaults-overlaid, clamped) values, and
@@ -157,6 +170,14 @@ func Load(path string) (Values, bool, error) {
 		v.IdleBufferRatio = *f.IdleBufferRatio
 	}
 	overlay(f.IdleBufferRatio != nil)
+	if f.ViewerIdleTimeoutSec != nil {
+		v.ViewerIdleTimeoutSec = *f.ViewerIdleTimeoutSec
+	}
+	overlay(f.ViewerIdleTimeoutSec != nil)
+	if f.MemLimitMB != nil {
+		v.MemLimitMB = *f.MemLimitMB
+	}
+	overlay(f.MemLimitMB != nil)
 
 	v.clamp()
 
@@ -200,6 +221,12 @@ func (v *Values) clamp() {
 	v.ChunkBytes = clampInt(v.ChunkBytes, 188, 4<<20)
 	v.MaxGOPBytes = clampInt(v.MaxGOPBytes, 188, 256<<20)
 	v.IdleBufferGraceSec = clampInt(v.IdleBufferGraceSec, 0, 3600)
+	// 0 disables the viewer idle-drop; anything above 0 is floored at 5 s so a
+	// typo cannot start culling healthy viewers between two chunks.
+	if v.ViewerIdleTimeoutSec != 0 {
+		v.ViewerIdleTimeoutSec = clampInt(v.ViewerIdleTimeoutSec, 5, 3600)
+	}
+	v.MemLimitMB = clampInt(v.MemLimitMB, 0, 1<<20)
 	if v.IdleBufferRatio < 0.1 {
 		v.IdleBufferRatio = 0.1
 	} else if v.IdleBufferRatio > 1 {
