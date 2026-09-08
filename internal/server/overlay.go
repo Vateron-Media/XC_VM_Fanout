@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
@@ -33,7 +34,16 @@ type pendingSignal struct {
 
 // signalStore holds the pending per-uuid overlays. PHP pushes them over the
 // control socket (POST /signal/<uuid>); serveHLS/serveLive consume them one-shot.
+//
+// n mirrors len(m) as an atomic. serveLive consults this store on EVERY chunk it
+// delivers, so with the lock alone the whole daemon's live-TS fan-out — every
+// viewer of every stream, tens of thousands of chunks a second — funnelled
+// through one mutex to ask a question whose answer is almost always "no": a
+// signal is a manual admin action, so the map is empty essentially always. The
+// counter turns that question into a single atomic load and the mutex is taken
+// only when a signal really is queued.
 type signalStore struct {
+	n  atomic.Int64 // == len(m); read on the live-TS hot path without the lock
 	mu sync.Mutex
 	m  map[string]pendingSignal
 }
@@ -46,14 +56,16 @@ func (s *signalStore) set(uuid string, sig pendingSignal) {
 		s.m = make(map[string]pendingSignal)
 	}
 	s.m[uuid] = sig
+	s.n.Store(int64(len(s.m)))
 	s.mu.Unlock()
 }
 
 // peek reports whether a live (non-expired) signal is queued for uuid, without
 // consuming it. Cheap guard so the hot path skips the map delete when there is
-// nothing to apply.
+// nothing to apply — and, via n, skips the lock entirely when nothing is queued
+// for anyone.
 func (s *signalStore) peek(uuid string) bool {
-	if uuid == "" {
+	if uuid == "" || s.n.Load() == 0 {
 		return false
 	}
 	s.mu.Lock()
@@ -64,6 +76,7 @@ func (s *signalStore) peek(uuid string) bool {
 	}
 	if !sig.expires.IsZero() && time.Now().After(sig.expires) {
 		delete(s.m, uuid)
+		s.n.Store(int64(len(s.m)))
 		return false
 	}
 	return true
@@ -72,7 +85,7 @@ func (s *signalStore) peek(uuid string) bool {
 // take returns and removes a non-expired signal for uuid (one-shot, mirroring
 // the legacy per-segment overlay that unlinked the signal file after applying).
 func (s *signalStore) take(uuid string) (pendingSignal, bool) {
-	if uuid == "" {
+	if uuid == "" || s.n.Load() == 0 {
 		return pendingSignal{}, false
 	}
 	s.mu.Lock()
@@ -82,6 +95,7 @@ func (s *signalStore) take(uuid string) (pendingSignal, bool) {
 		return pendingSignal{}, false
 	}
 	delete(s.m, uuid)
+	s.n.Store(int64(len(s.m)))
 	if !sig.expires.IsZero() && time.Now().After(sig.expires) {
 		return pendingSignal{}, false
 	}

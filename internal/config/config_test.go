@@ -129,3 +129,49 @@ func TestLoadMalformedKeepsDefaultsNoOverwrite(t *testing.T) {
 		t.Fatalf("malformed file was rewritten: %q", b)
 	}
 }
+
+// TestViewerIdleAndMemLimitBackfill: the two keys added for the ghost-connection
+// drop and the memory budget must self-heal like every other key — an older
+// panel that writes neither must not change the daemon's behaviour, and the
+// rewritten file must carry them for the panel to pick up.
+func TestViewerIdleAndMemLimitBackfill(t *testing.T) {
+	p := write(t, `{"prebuffer_max_sec":10}`)
+	v, wrote, err := Load(p)
+	if err != nil || !wrote {
+		t.Fatalf("load: wrote=%v err=%v", wrote, err)
+	}
+	if v.ViewerIdleTimeoutSec != Defaults().ViewerIdleTimeoutSec {
+		t.Errorf("viewer_idle_timeout_sec = %d, want the default %d", v.ViewerIdleTimeoutSec, Defaults().ViewerIdleTimeoutSec)
+	}
+	if v.MemLimitMB != 0 {
+		t.Errorf("mem_limit_mb = %d, want 0 (auto)", v.MemLimitMB)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"viewer_idle_timeout_sec", "mem_limit_mb"} {
+		if _, ok := raw[k]; !ok {
+			t.Errorf("backfilled file is missing %q", k)
+		}
+	}
+}
+
+// TestViewerIdleClamp: 0 disables the drop and must survive as 0; anything else
+// is floored so a typo cannot start culling healthy viewers between two chunks.
+func TestViewerIdleClamp(t *testing.T) {
+	for _, c := range []struct{ in, want int }{
+		{0, 0}, {1, 5}, {30, 30}, {99999, 3600}, {-4, 5},
+	} {
+		v := Defaults()
+		v.ViewerIdleTimeoutSec = c.in
+		v.clamp()
+		if v.ViewerIdleTimeoutSec != c.want {
+			t.Errorf("clamp(%d) = %d, want %d", c.in, v.ViewerIdleTimeoutSec, c.want)
+		}
+	}
+}

@@ -101,10 +101,12 @@ never push the daemon into a pathological state.
 | `grace_sec` | `10` | `1…3600` | Idle-stop grace for control-managed streams: how long a source stays alive after the last viewer leaves (the reaper window). |
 | `write_timeout_sec` | `15` | `1…600` | Per-write deadline for a live-TS viewer before a stalled connection is dropped. |
 | `chunk_bytes` | `12032` | `188…4 MiB` | Source read size for daemon-pulled streams (rounded down to a multiple of 188). |
-| `max_gop_bytes` | `10528000` | `188…256 MiB` | Cap on a single join-snapshot GOP (memory protection for streams without keyframes). |
+| `max_gop_bytes` | `10528000` | `188…256 MiB` | Cap on a single ring block. A source that gives no keyframe within this many bytes has a block **cut** here (see [Sources without keyframes](04-internals.md#sources-without-keyframes)). |
 | `source_insecure` | `true` | — | Skip upstream TLS verification when pulling HTTPS sources. `true` because the panel commonly pulls upstreams with self-signed / mismatched certs; set `false` to require valid certificates. |
 | `idle_buffer_grace_sec` | `30` | `0…3600` | No-viewer window before the ring collapses (`0` = the idle gate is off). See [The idle-buffer gate](#the-idle-buffer-gate). |
 | `idle_buffer_ratio` | `0.5` | `0.1…1` | Fraction of the buffer kept while a stream is unwatched. HLS is still cut from the reduced ring, so the channel stays openable. |
+| `viewer_idle_timeout_sec` | `30` | `0`, or `5…3600` | Drop a live-TS viewer that has received **nothing** for this long (`0` = never). This is what bounds a ghost on an off-air stream — `write_timeout_sec` can only fire while there are bytes to write. See [Guarding against stalled and idle viewers](04-internals.md#guarding-against-stalled-viewers). |
+| `mem_limit_mb` | `0` (auto) | `0…1 TiB` | Explicit ceiling (MiB) for the Go soft memory limit. `0` derives it from the cgroup limit, else a share of the box's RAM. See [The memory budget](#the-memory-budget). |
 
 A minimal file the daemon writes on a fresh node:
 
@@ -120,7 +122,9 @@ A minimal file the daemon writes on a fresh node:
   "source_insecure": true,
   "default_prebuffer_sec": 0,
   "idle_buffer_grace_sec": 30,
-  "idle_buffer_ratio": 0.5
+  "idle_buffer_ratio": 0.5,
+  "viewer_idle_timeout_sec": 30,
+  "mem_limit_mb": 0
 }
 ```
 
@@ -136,8 +140,12 @@ one number drives both the live-TS prebuffer and how deep the HLS window can rea
 - **`prebuffer_max_sec`** — the cap on the TS history a stream holds. Directly the per-stream RAM
   ceiling. Must be ≥ the HLS window (`hls_window · hls_target_sec`) for HLS to reach its full
   depth; the default 40 covers a 6×6 window comfortably.
-- **`max_gop_bytes`** — the size limit of a single GOP snapshot; protection against memory growth
-  on streams where keyframes are rare or absent.
+- **`max_gop_bytes`** — the size limit of a single ring block. Normally never reached: blocks are
+  cut on keyframes, which arrive far more often. It is what bounds a source whose keyframes are
+  rare or absent — reaching it forces a block boundary, so the ring keeps rolling instead of
+  freezing. (Before 0.11.3 it was a discard threshold: everything past it was thrown away and the
+  stream stalled at one block. See
+  [04, "Sources without keyframes"](04-internals.md#sources-without-keyframes).)
 - **`chunk_bytes`** — the size of source read chunks. Rounded down to a multiple of 188.
 
 ### The idle-buffer gate
@@ -168,6 +176,29 @@ imposes nothing on its own.
   dead connections faster, but with a higher risk of hitting a slow-but-alive one. 15 s has
   headroom, since a healthy realtime viewer accumulates ≤ 1 s of lag per second. See
   [04, "Guarding against stalled viewers"](04-internals.md#guarding-against-stalled-viewers).
+- **`viewer_idle_timeout_sec`** — the threshold for dropping an **idle** viewer, i.e. one being
+  sent nothing at all. `write_timeout_sec` covers a viewer that will not *read*; this covers a
+  stream that has nothing to *write*. Must stay comfortably above a source blip (reconnect backoff
+  tops out at 8 s, plus an ffmpeg cold start), or a recovering source costs its viewers their
+  connections; `0` disables the drop and restores the pre-0.11.3 behaviour of holding such a
+  viewer forever.
+
+### The memory budget
+
+The daemon gives the Go runtime a **soft** memory limit (`GOMEMLIMIT`): a ceiling, not a
+reservation — the GC only intensifies as usage approaches it, and a working set well below it
+never feels it. The budget is taken, in order:
+
+1. **`mem_limit_mb`**, when set. Use this on a shared panel node: you know the split between the
+   daemon, nginx, MySQL, PHP-FPM and the streams' ffmpeg processes, and the daemon does not.
+2. the **cgroup limit** this process runs under (v2 `memory.max`, then v1
+   `memory.limit_in_bytes`) — its own budget, so **80%** of it is claimed;
+3. otherwise the box's **physical RAM**, of which only **50%** is claimed — the machine is shared,
+   and taking most of it lets the fan-out grow until it starves the very processes feeding it.
+
+`GOMEMLIMIT` in the environment overrides all of this (the daemon then sets nothing). The chosen
+limit and its source are logged at startup, and `mem_limit_mb` is re-applied live on a config
+reload.
 
 ### HLS
 
@@ -255,7 +286,7 @@ Debug mode narrates every interesting event, each line tagged `[dbg <category>]`
 | `ctl` | Control-API actions: register/unregister, probe prewarm and its result. |
 | `signal` | "Send message" overlay queued and applied. |
 | `reaper` | Idle-stop of a control-managed stream after the grace window, and idle-buffer gating (ring collapse / restore). |
-| `stats` | A periodic per-stream snapshot (every `-debug-stats` seconds): `running`, `ingest`, viewer `refs`, hub `subs`, tracked `conns`, and `data_age` (a growing `data_age` on a running stream is the **off-air** signal). |
+| `stats` | A periodic per-stream snapshot (every `-debug-stats` seconds): `running`, `ingest`, viewer `refs`, hub `subs`, tracked `conns`, `data_age` (a growing `data_age` on a running stream is the **off-air** signal) and `nokf` (ring blocks cut on the byte cap for want of a keyframe — non-zero means this source carries no random-access points, and so can never produce HLS segments). |
 
 ```bash
 # Full debug, per-stream snapshot every 2 s

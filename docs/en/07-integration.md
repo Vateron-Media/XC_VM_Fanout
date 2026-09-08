@@ -89,6 +89,11 @@ disconnects — including by dropping "stuck" viewers on `write_timeout_sec`
 > after an unclean disconnect lives up to ~25–35 s, then the slot is freed. On a clean
 > connection close the daemon removes the uuid immediately, without waiting for
 > `write_timeout_sec`.
+>
+> **On an off-air stream the bound is `viewer_idle_timeout_sec`** (30 s) instead of
+> `write_timeout_sec`: with nothing being written, the write deadline never arms. Before 0.11.3
+> there was no bound at all in that case and the ghost was permanent — see
+> [04, "Guarding against stalled and idle viewers"](04-internals.md#guarding-against-stalled-and-idle-viewers).
 
 ## Installing and updating the binary
 

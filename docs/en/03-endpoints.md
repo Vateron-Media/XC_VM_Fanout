@@ -55,7 +55,13 @@ infinite TS stream. `404` if the stream is not registered.
 **Protection against "stalled" viewers:** each write is bounded by the `write_timeout_sec` deadline
 (15 s by default). A viewer that stops reading the socket without a clean close
 (a minimized player, a dropped mobile link) is torn down — otherwise it would permanently
-block the delivery goroutine. For details, see [04, "Guarding against stalled viewers"](04-internals.md#guarding-against-stalled-viewers).
+block the delivery goroutine.
+
+**Protection against "idle" viewers:** a viewer that is sent **nothing** for
+`viewer_idle_timeout_sec` (30 s by default) is likewise dropped. The write deadline only fires
+while there are bytes to write, so it does not cover an off-air stream — where nothing is written,
+nothing times out, and a half-open client would linger forever. `0` disables it. For both, see
+[04, "Guarding against stalled and idle viewers"](04-internals.md#guarding-against-stalled-and-idle-viewers).
 
 ### `GET /hls/<id>/index.m3u8` — HLS playlist
 
@@ -156,8 +162,17 @@ shows a "not on air" page. `404` if the stream is not registered.
 
 ### `DELETE /streams/<id>` — remove a stream
 
-Clears the config, stops the puller, closes the ingest listener, and removes the stream from
-the registry. **Response:** `204`.
+Clears the config, stops the puller, closes the ingest listener **and every producer connected to
+it**, **drops the viewers still attached**, and removes the stream from the registry.
+**Response:** `204`.
+
+> **Why the teardown is that thorough** (0.11.3). Removing the stream from the registry makes its
+> viewers invisible to [`/connections`](#get-connections--viewer-reconciliation), so `fanout_sync`
+> closes their `lines_live` rows — while their handler goroutines would sit forever on a hub that
+> will never publish again, pinning the stream, its hub and its whole ring as an unreachable
+> orphan. Likewise, closing only the ingest *listener* left an already-connected producer (the
+> stream's ffmpeg tee) feeding that orphan. Both are now hung up on, so a viewer reconnects (and
+> re-authorises) instead of freezing on a dead stream, and the memory is actually released.
 
 ### `PUT` / `POST` `/ingest/<id>` — push mode
 
