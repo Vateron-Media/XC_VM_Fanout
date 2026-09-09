@@ -53,7 +53,8 @@ machine is faster.
 | `hub` | [hub.go](../../internal/hub/hub.go) | Fan-out of a single TS stream to many subscribers; drops the slow ones. |
 | `tsjoin` | [tsjoin.go](../../internal/tsjoin/tsjoin.go) | The single per-stream buffer: PAT/PMT + a GOP ring for the "clean entry" and prebuffer, **and** the HLS segment index derived from that ring. |
 | `hlscrypt` | [hlscrypt.go](../../internal/hlscrypt/hlscrypt.go) | AES-128-CBC encryption of HLS segments (compatible with the panel), applied on the fly as a segment is assembled. |
-| `puller` | [puller.go](../../internal/puller/puller.go) | Source acquisition (direct mp2t or ffmpeg remux), reconnect with backoff. |
+| `puller` | [puller.go](../../internal/puller/puller.go) | Source acquisition (direct mp2t, native conversion or ffmpeg remux), reconnect with backoff. |
+| `nativesrc` | [nativesrc](../../internal/nativesrc) | In-process conversion of a non-mp2t source (HLS/udp/rtp) to MPEG-TS, so the common case needs no ffmpeg child. Refuses anything it cannot take, and the puller falls back to ffmpeg. |
 | `ingest` | [ingest.go](../../internal/ingest/ingest.go) | Copying a TS stream into the publish callback in 188-byte-aligned chunks. |
 | `config` | [config.go](../../internal/config/config.go) | The panel↔daemon tuning bridge: a self-healing JSON file, polled and applied live. |
 | `defaults` | [defaults.go](../../internal/defaults/defaults.go) | The built-in operational tuning constants (the config-file seeds and other invariants). |

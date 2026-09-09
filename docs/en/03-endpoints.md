@@ -121,7 +121,8 @@ Registers a source that the daemon will pull **itself**. The body is JSON:
   "ffmpeg": "/usr/bin/ffmpeg",
   "chunk":  12032,
   "key":    "<hex 16 bytes, optional>",
-  "iv":     "<hex 16 bytes, optional>"
+  "iv":     "<hex 16 bytes, optional>",
+  "backend": "auto | ffmpeg | native (optional)"
 }
 ```
 
@@ -132,6 +133,7 @@ Registers a source that the daemon will pull **itself**. The body is JSON:
 | `proxy` | no | HTTP proxy `host:port`. |
 | `cookie` | no | Value of the `Cookie` header. |
 | `ffmpeg` | no | Path to ffmpeg (for remuxing non-mp2t sources). |
+| `backend` | no | Pins how **this** stream's non-mp2t source is converted, overriding `source_backend`: `auto`, `ffmpeg` or `native`. Omitted (the usual case) takes the node-wide setting — so send it only for a channel that needs pinning. An unknown value is ignored rather than honoured, so a typo can never take a channel off air. See [The source backend](06-configuration.md#the-source-backend). |
 | `chunk` | no | Ingest read size (aligned down to 188). |
 | `key`, `iv` | no | Hex, 16 bytes each — enable HLS encryption. TS fan-out is always plain. |
 

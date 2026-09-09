@@ -175,3 +175,40 @@ func TestViewerIdleClamp(t *testing.T) {
 		}
 	}
 }
+
+// TestSourceBackendBackfillAndClamp: the backend key self-heals like every other
+// one, and an unknown value falls back to the default rather than throwing — a
+// typo in the panel must never stop sources from being pulled.
+func TestSourceBackendBackfillAndClamp(t *testing.T) {
+	p := write(t, `{"prebuffer_max_sec":10}`)
+	v, wrote, err := Load(p)
+	if err != nil || !wrote {
+		t.Fatalf("load: wrote=%v err=%v", wrote, err)
+	}
+	if v.SourceBackend != Defaults().SourceBackend {
+		t.Errorf("source_backend = %q, want the default %q", v.SourceBackend, Defaults().SourceBackend)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["source_backend"]; !ok {
+		t.Error("backfilled file is missing source_backend")
+	}
+
+	for _, c := range []struct{ in, want string }{
+		{"auto", "auto"}, {"ffmpeg", "ffmpeg"}, {"native", "native"},
+		{"", Defaults().SourceBackend}, {"FFMPEG", Defaults().SourceBackend}, {"nonsense", Defaults().SourceBackend},
+	} {
+		v := Defaults()
+		v.SourceBackend = c.in
+		v.clamp()
+		if v.SourceBackend != c.want {
+			t.Errorf("clamp(%q) = %q, want %q", c.in, v.SourceBackend, c.want)
+		}
+	}
+}

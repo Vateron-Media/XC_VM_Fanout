@@ -53,6 +53,10 @@ type Values struct {
 	// MemLimitMB is an explicit ceiling (MiB) for the Go soft memory limit;
 	// 0 = derive it from the cgroup limit, else a share of the box's RAM.
 	MemLimitMB int `json:"mem_limit_mb"`
+	// SourceBackend is how a non-mp2t source becomes MPEG-TS: "auto" (native
+	// where possible, ffmpeg otherwise), "ffmpeg" (always), or "native" (no
+	// fallback — testing only).
+	SourceBackend string `json:"source_backend"`
 }
 
 // Defaults is the built-in fallback (see defaults.Cfg*): what the daemon writes
@@ -73,6 +77,7 @@ func Defaults() Values {
 
 		ViewerIdleTimeoutSec: defaults.CfgViewerIdleTimeoutSec,
 		MemLimitMB:           defaults.CfgMemLimitMB,
+		SourceBackend:        defaults.CfgSourceBackend,
 	}
 }
 
@@ -92,8 +97,9 @@ type file struct {
 	IdleBufferGraceSec  *int     `json:"idle_buffer_grace_sec"`
 	IdleBufferRatio     *float64 `json:"idle_buffer_ratio"`
 
-	ViewerIdleTimeoutSec *int `json:"viewer_idle_timeout_sec"`
-	MemLimitMB           *int `json:"mem_limit_mb"`
+	ViewerIdleTimeoutSec *int    `json:"viewer_idle_timeout_sec"`
+	MemLimitMB           *int    `json:"mem_limit_mb"`
+	SourceBackend        *string `json:"source_backend"`
 }
 
 // Load reads path, returns the resolved (defaults-overlaid, clamped) values, and
@@ -178,6 +184,10 @@ func Load(path string) (Values, bool, error) {
 		v.MemLimitMB = *f.MemLimitMB
 	}
 	overlay(f.MemLimitMB != nil)
+	if f.SourceBackend != nil {
+		v.SourceBackend = *f.SourceBackend
+	}
+	overlay(f.SourceBackend != nil)
 
 	v.clamp()
 
@@ -227,6 +237,13 @@ func (v *Values) clamp() {
 		v.ViewerIdleTimeoutSec = clampInt(v.ViewerIdleTimeoutSec, 5, 3600)
 	}
 	v.MemLimitMB = clampInt(v.MemLimitMB, 0, 1<<20)
+	// An unknown backend falls back to the safe default rather than throwing:
+	// a typo in the panel must never stop streams from being pulled.
+	switch v.SourceBackend {
+	case "auto", "ffmpeg", "native":
+	default:
+		v.SourceBackend = defaults.CfgSourceBackend
+	}
 	if v.IdleBufferRatio < 0.1 {
 		v.IdleBufferRatio = 0.1
 	} else if v.IdleBufferRatio > 1 {

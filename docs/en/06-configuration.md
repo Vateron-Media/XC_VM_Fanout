@@ -106,6 +106,7 @@ never push the daemon into a pathological state.
 | `idle_buffer_grace_sec` | `30` | `0…3600` | No-viewer window before the ring collapses (`0` = the idle gate is off). See [The idle-buffer gate](#the-idle-buffer-gate). |
 | `idle_buffer_ratio` | `0.5` | `0.1…1` | Fraction of the buffer kept while a stream is unwatched. HLS is still cut from the reduced ring, so the channel stays openable. |
 | `viewer_idle_timeout_sec` | `30` | `0`, or `5…3600` | Drop a live-TS viewer that has received **nothing** for this long (`0` = never). This is what bounds a ghost on an off-air stream — `write_timeout_sec` can only fire while there are bytes to write. See [Guarding against stalled and idle viewers](04-internals.md#guarding-against-stalled-viewers). |
+| `source_backend` | `auto` | `auto`, `ffmpeg`, `native` | How a **non-mp2t** source becomes MPEG-TS. See [The source backend](#the-source-backend). An unknown value falls back to `auto`. |
 | `mem_limit_mb` | `0` (auto) | `0…1 TiB` | Explicit ceiling (MiB) for the Go soft memory limit. `0` derives it from the cgroup limit, else a share of the box's RAM. See [The memory budget](#the-memory-budget). |
 
 A minimal file the daemon writes on a fresh node:
@@ -124,7 +125,8 @@ A minimal file the daemon writes on a fresh node:
   "idle_buffer_grace_sec": 30,
   "idle_buffer_ratio": 0.5,
   "viewer_idle_timeout_sec": 30,
-  "mem_limit_mb": 0
+  "mem_limit_mb": 0,
+  "source_backend": "auto"
 }
 ```
 
@@ -182,6 +184,31 @@ imposes nothing on its own.
   tops out at 8 s, plus an ffmpeg cold start), or a recovering source costs its viewers their
   connections; `0` disables the drop and restores the pre-0.11.4 behaviour of holding such a
   viewer forever.
+
+### The source backend
+
+A source already served as `video/mp2t` is streamed straight through and never touched by this
+setting. Everything else — an HLS playlist, a udp feed — has to be converted, and this chooses how:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | Convert **in-process** where [`nativesrc`](04-internals.md#native-conversion--nativesrc) can, **ffmpeg** for everything it declines. |
+| `ffmpeg` | Always spawn ffmpeg. The pre-0.12 behaviour, kept as the kill-switch. |
+| `native` | Native only — a source the native reader declines **fails** instead of falling back. For finding out what is actually eligible on a node; **not for production**, where a declined source means a dead channel rather than a slightly more expensive one. |
+
+`auto` is the default because the fallback makes it strictly safer than `ffmpeg`: anything the
+native reader will not take runs exactly the pipeline it ran before, while the common case (HLS
+with TS segments) stops costing a child process per stream. The win is one fewer ~27 MB process
+per proxy stream, plus no process spawn on each on-demand join.
+
+Applied live on a config reload, and it takes effect on the **next** pull — a stream already
+connected keeps the path it started on until it reconnects.
+
+**Per-stream override.** `PUT /streams/<id>` accepts a
+[`backend`](03-endpoints.md#put--post-streamsid--register-a-pull-source) field that pins one
+channel, so a single troublesome source can be forced to ffmpeg without changing the node. An
+unknown value there is ignored (the stream takes the node-wide setting) rather than pinning
+something that does not exist.
 
 ### The memory budget
 

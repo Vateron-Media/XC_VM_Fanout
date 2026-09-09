@@ -54,10 +54,50 @@ certificate verification, **with no timeout** — the stream is long-lived) and 
 
 - **`video/mp2t`** → the bytes are **streamed directly** (`ingest.Copy`), without ffmpeg — this is
   the cheapest path;
-- **anything else** (HLS playlist, etc.) → **ffmpeg** is launched, which remuxes the
-  source into MPEG-TS.
+- **anything else** (HLS playlist, etc.) → converted to MPEG-TS, **natively where possible and by
+  ffmpeg otherwise** — see below.
 
 This is a port of the `ProxyCommand::getActiveStream` logic from the legacy panel.
+
+### Native conversion — `nativesrc`
+
+Converting a non-mp2t source used to mean one **ffmpeg child process per stream**, which for the
+overwhelmingly common case — HLS whose segments are already MPEG-TS — was a process doing little
+more than concatenating bytes the daemon could concatenate itself. Since 0.12.0
+[`nativesrc`](../../internal/nativesrc) does that in-process: it fetches the playlist, follows the
+live window, and yields the segments as one continuous packet-aligned TS stream, which is exactly
+what `ingest.Copy` already consumes on the direct path.
+
+Measured on the same 720p source, `ffmpeg -c copy` sat at **27 MB RSS across 3 threads, per
+stream**; natively it is a goroutine and a pipe. It also removes the process spawn and the
+`-probesize` analysis window from every on-demand join and every reconnect.
+
+**What it takes, and what it refuses:**
+
+| Source | Path |
+|--------|------|
+| `http(s)` serving MPEG-TS | native (and already was — this is the direct path) |
+| `http(s)` serving `m3u8` with **TS** segments | **native** |
+| `udp://`, `rtp://` | native |
+| HLS with **fMP4/CMAF** segments | ffmpeg |
+| RTMP / SRT / RTSP | ffmpeg |
+| AES-128 encrypted HLS **source** | ffmpeg |
+| anything it cannot positively identify | ffmpeg |
+
+Refusing loudly is the whole contract. Every refusal returns `ErrUnsupported` **before a single
+byte is published**, so the caller runs ffmpeg and an unsupported source degrades to exactly the
+pipeline it had before — never to garbage on the wire. That is also why a body whose
+`Content-Type` is neither `mp2t` nor `mpegurl` must **prove** it is MPEG-TS (four consecutive sync
+bytes at 188-byte spacing) before it is accepted: IPTV upstreams routinely serve real TS as
+`application/octet-stream`, so the header alone is neither sufficient nor necessary, and an MP4 or
+an HTML error page served with a generic type would otherwise be fanned out as if it were video.
+
+Which path a stream took is in the debug log — `connected native (no ffmpeg child)` or
+`connected via ffmpeg remux`. Choosing between them is
+[`source_backend`](06-configuration.md#the-source-backend).
+
+> The daemon still needs ffmpeg installed: the fallback path, and the admin "send message"
+> overlay, both use it. What changes is how often it is *spawned*.
 
 ### The source connection
 

@@ -22,6 +22,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/nativesrc"
 )
 
 // tailBuffer keeps only the last max bytes written to it — a bounded sink for a
@@ -58,7 +59,28 @@ type Source struct {
 	FfmpegBin string // ffmpeg path; "ffmpeg" if empty
 	Label     string // stream id, for debug logging only (no effect on behaviour)
 	Insecure  bool   // skip upstream TLS certificate verification (see -source-insecure)
+	// Backend selects how a NON-mp2t source becomes MPEG-TS: BackendAuto,
+	// BackendFfmpeg or BackendNative. Empty means BackendAuto. A direct mp2t
+	// source ignores it entirely — that path never needed a converter.
+	Backend string
 }
+
+// How a non-mp2t source is converted. The panel sets this globally through the
+// config file and may override it per stream, so one troublesome channel can be
+// pinned to ffmpeg without changing the node.
+const (
+	// BackendAuto tries the native reader and falls back to ffmpeg for anything
+	// it declines. Strictly safer than ffmpeg-always: a declined source runs the
+	// exact pipeline it ran before.
+	BackendAuto = "auto"
+	// BackendFfmpeg always spawns ffmpeg — the pre-0.12 behaviour, kept as the
+	// kill-switch.
+	BackendFfmpeg = "ffmpeg"
+	// BackendNative refuses to fall back. For finding out what is actually
+	// eligible on a node; not for production, where a declined source means a
+	// dead channel instead of a slightly more expensive one.
+	BackendNative = "native"
+)
 
 func (s Source) ua() string {
 	if s.UserAgent == "" {
@@ -115,8 +137,8 @@ func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 	}
 }
 
-// pullOnce tries each URL once: mp2t is streamed directly, otherwise ffmpeg
-// remuxes it. Returns when the chosen source ends or errors.
+// pullOnce tries each URL once: mp2t is streamed directly, anything else goes
+// through convert(). Returns when the chosen source ends or errors.
 func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize int, publish func([]byte)) error {
 	var lastErr error
 	for _, raw := range src.URLs {
@@ -132,8 +154,7 @@ func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize in
 			return ingest.Copy(body, chunkSize, publish)
 		}
 		body.Close()
-		dlog.Logf("puller", "id=%s connected via ffmpeg remux: %s", src.Label, raw)
-		return runFfmpeg(ctx, src, raw, chunkSize, publish)
+		return convert(ctx, src, raw, chunkSize, publish)
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no source urls")
@@ -191,6 +212,39 @@ func probe(ctx context.Context, c *http.Client, src Source, raw string) (bool, i
 	}
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	return strings.Contains(ct, "video/mp2t"), resp.Body, nil
+}
+
+// convert turns a non-mp2t source into MPEG-TS and feeds it in, natively when
+// the backend allows and the native reader will take the source, else with
+// ffmpeg. The native reader refuses loudly (nativesrc.ErrUnsupported) rather
+// than half-serving, which is what makes the fallback safe: a source it declines
+// gets exactly the ffmpeg pipeline it got before.
+func convert(ctx context.Context, src Source, raw string, chunkSize int, publish func([]byte)) error {
+	if src.Backend == BackendFfmpeg {
+		dlog.Logf("puller", "id=%s connected via ffmpeg remux (backend=ffmpeg): %s", src.Label, raw)
+		return runFfmpeg(ctx, src, raw, chunkSize, publish)
+	}
+
+	rc, err := nativesrc.Open(ctx, raw, nativesrc.Options{
+		UserAgent: src.ua(),
+		Cookie:    src.Cookie,
+		Proxy:     src.Proxy,
+		Insecure:  src.Insecure,
+	})
+	if err == nil {
+		defer rc.Close()
+		dlog.Logf("puller", "id=%s connected native (no ffmpeg child): %s", src.Label, raw)
+		return ingest.Copy(rc, chunkSize, publish)
+	}
+
+	if src.Backend == BackendNative {
+		// The operator asked for native only — surfacing the refusal is the
+		// point, so Run() backs off and retries rather than silently doing the
+		// thing they turned off.
+		return fmt.Errorf("native source declined (backend=native, no fallback): %w", err)
+	}
+	dlog.Logf("puller", "id=%s native declined (%v); falling back to ffmpeg: %s", src.Label, err, raw)
+	return runFfmpeg(ctx, src, raw, chunkSize, publish)
 }
 
 // runFfmpeg remuxes a non-mp2t source to MPEG-TS on stdout and feeds it in.
