@@ -59,6 +59,25 @@ certificate verification, **with no timeout** — the stream is long-lived) and 
 
 This is a port of the `ProxyCommand::getActiveStream` logic from the legacy panel.
 
+### The source connection
+
+All the pulls of one stream share **one** `http.Client`, created when the puller starts and whose
+idle connections are closed when it stops. It used to build a fresh `http.Transport` per probe
+attempt, which meant no connection was ever reused — a full TCP (and TLS) handshake on every
+reconnect — and, worse, each abandoned transport kept whatever it had pooled: a source that ended
+cleanly had its connection returned to that pool where, a zero-value transport having no idle
+timeout, it stayed open **with its reader goroutine** for the life of the process, unreachable
+because the transport itself was garbage. A source reconnecting on the 8 s backoff ceiling leaked
+a socket and two goroutines every 8 s.
+
+The transport also carries real bounds, which a zero-value one does not have: a **dial** timeout,
+a **TLS handshake** timeout, a **response-header** timeout, and an **idle-connection** timeout
+(see `defaults.Pull*`). Without the header timeout a source that accepted the connection and then
+said nothing pinned its puller until the stream was stopped — never erroring, so never trying the
+next URL and never backing off, while the panel saw a "running" stream with no data. The response
+**body** stays unbounded, and there is no `Client.Timeout`, for the obvious reason: it is a live
+stream that should never end.
+
 ### The ffmpeg invocation
 
 When the source is not ready-made mp2t, `runFfmpeg` launches (reproducing the invocation from
@@ -100,11 +119,51 @@ One `Hub` per stream.
 - **A slow subscriber is dropped.** Each subscriber has a buffer of `subQueue = 256`
   chunks. If it overflows (the viewer can't keep up reading) — the subscriber is closed and
   removed. This way one lagging viewer **never stalls the source or the others**.
-- **`Subscribe(prebufMS)`**: under a single mutex it simultaneously takes a snapshot of the history and
-  registers the subscriber. Atomicity matters: the live tail continues exactly where the
-  snapshot ended — **with no gap and no duplication**.
+- **`Subscribe(prebufMS)`**: under a single mutex it simultaneously **captures** the history to send
+  and registers the subscriber. Atomicity matters: the live tail continues exactly where the
+  snapshot ended — **with no gap and no duplication**. The copy itself happens with the lock
+  **released** — see below.
 
-### Guarding against stalled viewers
+#### Why the join copy is not done under the lock
+
+The snapshot a viewer gets on connect is up to the whole ring: **14 MB at a 40 s prebuffer**,
+~3 ms to copy. Doing that under the hub lock stalled the stream's producer for that long on
+*every* join, and serialised a join storm — a channel going live, an EPG event, a restreamer fleet
+reconnecting — into one stall after another.
+
+`SnapshotPin` captures under the lock (the header, which is mutated in place as new PAT/PMT
+arrive, is copied there and then; the GOP byte slices are captured with the lengths they have at
+that instant) and **pins** those buffers. The caller then releases the lock, appends the parts,
+and `Unpin`s. While anything is pinned, `prune` stops **recycling** dropped GOP arrays — it leaves
+them to GC, which the in-flight reader's own slices keep alive for exactly as long as it needs
+them. Without that pin a recycled array gets handed to a new GOP and rewritten mid-copy, and the
+joining viewer receives a splice of two different points in the stream.
+
+Atomicity survives because the capture fixes the content at the moment of registration: the open
+GOP growing afterwards is invisible (the captured length does not move), and every chunk published
+from that point reaches the viewer through its channel instead.
+
+```
+lock held per join:      3.13 ms → 1.30 µs
+192 joins at 40 s:        604 ms → 337 ms
+```
+
+The storm is now bound by **memory bandwidth**, not the lock: 192 joins × 14 MB is 2.7 GB to copy,
+however it is scheduled. The producer's worst-case wait during one is no longer the serialised
+copies (a tight ~77 ms before) but scheduler contention with the copying goroutines (26–81 ms,
+variable). If join storms hurt, the lever is **prebuffer depth**, which the panel sets per viewer —
+not the lock.
+
+> **Why `Publish` still copies.** The copy is made once per chunk and **shared by every
+> subscriber**, so it is already O(1) in audience size — a subscriber holds the buffer in its
+> channel across later publishes, so it cannot be handed the producer's reusable one. Measured, it
+> costs ~2.3 µs per 12 KB chunk, i.e. under 5% of one core at 500 streams pulling simultaneously.
+> Removing it would take either per-stream slab allocation (which parks unused slab tail on every
+> stream — paying RAM, the scarcer resource here, to save CPU that is not scarce) or recycling
+> buffers on a fixed cycle, which races with a dropped subscriber's handler that may still be
+> writing the buffer it already pulled from its channel. It stays.
+
+### Guarding against stalled and idle viewers
 
 Dropping on buffer overflow doesn't catch every case. If a viewer stops
 reading the socket altogether but **doesn't close the connection** (a minimized player, a dropped mobile
@@ -117,6 +176,20 @@ capped by a **deadline** `write_timeout_sec` (default 15 s). A stalled write
 turns into an error, the deferred `detach`/`removeConn` fire, and `fanout_sync`
 can close the `lines_live` row. A healthy realtime viewer accumulates no more than ~1 s of
 lag per second, so the deadline fires only on truly dead connections.
+
+**The other half of the same problem** (fixed in 0.11.3): that deadline can only fire *while
+there are bytes to write*. When a stream goes **off-air** nothing is written at all, so nothing
+ever times out — and a client whose socket is half-open (a dropped mobile link that sent neither
+FIN nor RST) is invisible to the daemon and to nginx alike, since nginx is equally idle. Such a
+viewer sat in the serve loop **forever**, holding its uuid in `/connections` as a ghost
+`fanout_sync` could never clear.
+
+So `serveLive` also bounds a viewer that receives **nothing**: after
+`viewer_idle_timeout_sec` (default 30 s) with no chunk delivered, the viewer is dropped and its
+cleanup runs, exactly as for a stalled write. It is polled on a coarse ticker (a quarter of the
+timeout) rather than a per-chunk timer reset, so the hot path stays a timestamp store. The default
+sits comfortably above a source blip — reconnect backoff tops out at 8 s plus an ffmpeg cold start
+— so a recovering source does not cost its viewers their connections; `0` disables the drop.
 
 ---
 
@@ -184,7 +257,8 @@ How it works now:
   segments never closed;
 - the playlist is rendered **from the index** (`hls_window` most recent segments, a display cap);
   a `<seq>.ts` request **assembles the bytes on the fly** from the ring (`PAT + PMT + the GOPs'
-  data`), encrypting on the way out if the stream has a key;
+  data`), encrypting on the way out if the stream has a key. Since 0.11.3 that assembly happens
+  **once per segment, not once per viewer** — see below;
 - because `seq` is anchored to monotonic GOP ids (not slice positions), it stays **stable** as the
   ring slides. `HLSPlaylist` reserves the single oldest in-ring segment as a **fetch margin**, so
   a listed segment can't age out between the playlist render and the client fetch; a segment whose
@@ -197,6 +271,67 @@ How it works now:
 The playlist is a standard `#EXTM3U` version 3 with `EXT-X-TARGETDURATION`, `EXT-X-MEDIA-SEQUENCE`
 and `#EXTINF` lines (durations from PCR/PTS deltas); the segment URIs are `<seq>.ts`. The `Hub`
 exposes this as `Configure` / `HLSPlaylist` / `HLSSegment`.
+
+### Sources without keyframes
+
+The ring is cut on **`random_access_indicator`**. Some sources never set it. Such a stream used
+to grow a single block to `max_gop_bytes` and then **silently discard every packet after it**:
+pruning needs two blocks, so the ring froze — the stream held `max_gop_bytes` forever, and every
+joining viewer was served that same stale block, captured whenever the cap was first reached,
+ahead of the live tail.
+
+Since 0.11.3 reaching the cap **cuts a new block** instead. The ring then rolls and prunes like
+any other stream, memory is bounded by `prebuffer_max_sec` as usual, and a joiner gets recent
+bytes. Each such cut increments a counter surfaced as `nokf=` in the debug per-stream snapshot —
+a non-zero value is the signal that a source carries no random-access points.
+
+**HLS still yields nothing for these sources, and cannot**: a segment has to begin at a
+random-access point or the player cannot decode it. `nokf=` growing alongside an empty playlist
+is the explanation for "this channel works on live TS but never opens over HLS".
+
+### The playlist cache
+
+The playlist is rendered from the segment index, which changes only when a segment closes or
+ages out — once per `hls_target_sec`. But every HLS viewer polls `index.m3u8` on its own
+schedule, so an audience of a few hundred re-rendered an identical string hundreds of times a
+second, each render holding the hub lock against the producer. The rendered string is now cached
+and invalidated exactly when the segment list changes (a segment closing, segments pruned, or an
+`hls_window` / `hls_target_sec` change).
+
+```
+before: 3225 ns/op   560 B/op   11 allocs/op
+after:     3.7 ns/op   0 B/op    0 allocs/op
+```
+
+### The segment cache
+
+Every viewer of a channel fetches **byte-identical** segments, so assembling one out of the ring
+and running AES over it *per request* was work repeated once per viewer. Measured on a 2.26 MB
+segment: **6.2 ms of CPU and 6.8 MB of garbage, per viewer, per segment** — and an HLS audience
+rolls onto each new segment at the same moment, so the cost arrived as a burst. At a few hundred
+viewers that is a core spent, and hundreds of MB/s of allocation, producing bytes that were
+already computed.
+
+`Stream.hlsSegment` keeps the last `HLSSegCacheEntries` (3) segments **ready to send**, already
+encrypted when the stream has a key. A cache hit is **58 ns and zero allocations**. The first
+requester assembles while the rest **wait on that one result** (a `ready` channel per entry)
+rather than each starting their own — without that single-flight the simultaneous join of an
+audience onto a fresh segment would still let the whole herd through.
+
+The cache is dropped when the key changes (the cached bytes carry the old ciphertext) and when the
+stream is **gated idle**, so a channel nobody watches holds no segment copies on top of its
+already-collapsed ring. A **miss is never cached**: the `seq` may simply not have closed yet, and
+a pinned `nil` would hide the segment once it does exist. The per-viewer
+["send message" overlay](#hls-encryption--hlscrypt) bypasses the cache in both directions — those
+bytes belong to one viewer.
+
+> **What is still done under the hub lock.** Assembling a segment out of the ring (~0.7 ms)
+> happens while the lock is held, because a GOP's buffer is recycled by `prune` the moment it
+> leaves the ring — a reader outside the lock could be copying an array already handed to a new
+> GOP. Encryption, the expensive half, is done outside it. With the cache above this assembly now
+> runs **once per segment per stream** rather than once per viewer, so the producer is held for
+> ~0.7 ms roughly once per `hls_target_sec` — about 0.01% of the time. Lifting it out would mean
+> refcounting GOP buffers in the hottest data structure the daemon has, which is not worth that.
 
 ---
 

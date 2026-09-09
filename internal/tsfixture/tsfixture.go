@@ -66,8 +66,48 @@ func Keyframe(videoPID int, pts int64) []byte {
 	return p
 }
 
+// KeyframePCR is Keyframe plus a PCR in the adaptation field. Without a PCR the
+// ring cannot measure duration, so retention falls back to the byte backstop and
+// a prebuffer request collapses to the current GOP — tests that exercise either
+// need this variant.
+func KeyframePCR(videoPID int, pts, pcr int64) []byte {
+	p := pkt(videoPID, true, 3)
+	p[4] = 7    // adaptation_field_length: flags + 6 PCR bytes
+	p[5] = 0x50 // PCR_flag | random_access_indicator
+	p[6] = byte(pcr >> 25)
+	p[7] = byte(pcr >> 17)
+	p[8] = byte(pcr >> 9)
+	p[9] = byte(pcr >> 1)
+	p[10] = byte(pcr&1) << 7
+	const ps = 12                              // 4 header + 1 length + 7 adaptation
+	p[ps], p[ps+1], p[ps+2] = 0x00, 0x00, 0x01 // PES start code
+	p[ps+3] = 0xE0                             // video stream_id
+	p[ps+6] = 0x80                             // marker bits
+	p[ps+7] = 0x80                             // PTS_DTS_flags = PTS only
+	p[ps+8] = 0x05                             // PES_header_data_length
+	e := EncodePTS(pts)
+	copy(p[ps+9:ps+14], e[:])
+	return p
+}
+
 // Fill builds a non-keyframe video payload packet.
 func Fill(videoPID int) []byte { return pkt(videoPID, false, 1) }
+
+// GenOffset is where FillGen stamps its generation, and where ReadGen reads it.
+const GenOffset = 180
+
+// FillGen is Fill carrying a 16-bit generation number in its payload, so a test
+// can tell which write produced any byte it later reads back — the way to catch a
+// buffer being rewritten underneath a reader.
+func FillGen(videoPID int, gen uint16) []byte {
+	p := pkt(videoPID, false, 1)
+	p[GenOffset] = byte(gen >> 8)
+	p[GenOffset+1] = byte(gen)
+	return p
+}
+
+// ReadGen reads back what FillGen stamped.
+func ReadGen(p []byte) uint16 { return uint16(p[GenOffset])<<8 | uint16(p[GenOffset+1]) }
 
 // EncodePTS is the inverse of the daemon's PTS decoder.
 func EncodePTS(pts int64) [5]byte {

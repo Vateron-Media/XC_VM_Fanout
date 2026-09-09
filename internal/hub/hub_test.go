@@ -164,3 +164,32 @@ func TestSubscribeSnapshotPoolRoundTrip(t *testing.T) {
 	ReleaseSnapshot(nil)
 	ReleaseSnapshot([]byte{})
 }
+
+// TestCloseAll: a stream teardown must release every subscriber at once, so the
+// serveLive goroutines blocked on a hub that will never publish again can exit
+// and let the Stream (hub, ring and all) be collected.
+func TestCloseAll(t *testing.T) {
+	h := New(1<<20, 0)
+	subs := make([]*Sub, 5)
+	for i := range subs {
+		subs[i], _ = h.Subscribe(0)
+	}
+	if got := h.CloseAll(); got != len(subs) {
+		t.Fatalf("CloseAll reported %d subscribers, want %d", got, len(subs))
+	}
+	for i, s := range subs {
+		select {
+		case <-s.Done():
+		default:
+			t.Errorf("subscriber %d not released by CloseAll", i)
+		}
+	}
+	if h.Count() != 0 {
+		t.Errorf("hub still holds %d subscriber(s)", h.Count())
+	}
+	if got := h.CloseAll(); got != 0 { // idempotent
+		t.Errorf("second CloseAll reported %d", got)
+	}
+	// Publishing after a teardown must not panic or block.
+	h.Publish([]byte("x"))
+}

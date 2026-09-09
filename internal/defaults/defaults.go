@@ -44,6 +44,16 @@ const (
 	SubscriberQueue = 256
 )
 
+// HLSSegCacheEntries is how many recently-served HLS segments a stream keeps
+// ready-to-send (assembled from the ring and, when the stream has a key, already
+// AES-encrypted). Every viewer of a channel fetches the SAME segment bytes, so
+// without this each one paid a full re-assembly plus a full AES pass over
+// identical data — the dominant CPU cost of an HLS audience, growing linearly
+// with viewer count. A handful of entries covers the segments a playlist window
+// actually hands out; the cache is dropped when the stream idles or its key
+// changes, so it costs nothing on a channel nobody is watching.
+const HLSSegCacheEntries = 3
+
 // ── Source puller (reconnect + ffmpeg cold start) ──────────────────────────
 
 const (
@@ -60,6 +70,31 @@ const (
 	// presents. Passed to ffmpeg as -probesize / -analyzeduration.
 	PullFfmpegProbeSize       = "1000000"
 	PullFfmpegAnalyzeDuration = "1000000"
+)
+
+// Bounds on the HTTP transport a puller uses to reach a source. The live body is
+// deliberately unbounded — it is a stream that should never end — so these bound
+// only getting to the point where it starts flowing, plus how long an unused
+// pooled connection may sit around.
+const (
+	// PullDialTimeout bounds the TCP connect to a source, PullTLSTimeout its TLS
+	// handshake, and PullHeaderTimeout the wait for response headers once the
+	// request is sent. Without them a source that accepts a connection and then
+	// says nothing pinned its puller until the stream was stopped — never
+	// erroring, so never retrying another URL and never backing off, while the
+	// panel saw a "running" stream that had no data.
+	PullDialTimeout   = 10 * time.Second
+	PullTLSTimeout    = 10 * time.Second
+	PullHeaderTimeout = 15 * time.Second
+
+	// PullIdleConnTimeout expires a pooled keep-alive connection. A zero-value
+	// http.Transport never expires one, so a connection returned to the pool when
+	// a source ended cleanly stayed open — with its reader goroutine — for the
+	// life of the process.
+	PullIdleConnTimeout = 90 * time.Second
+
+	// PullKeepAlive is the TCP keep-alive probe interval on a source connection.
+	PullKeepAlive = 30 * time.Second
 )
 
 // ── TS join / prebuffer ring ───────────────────────────────────────────────
@@ -106,6 +141,21 @@ const (
 	CfgSourceInsecure      = true     // skip upstream TLS verification when pulling HTTPS sources
 	CfgIdleBufferGraceSec  = 30       // no-viewer window before the ring collapses (seconds); 0 = gate off
 	CfgIdleBufferRatio     = 0.5      // fraction of the buffer kept while unwatched (HLS still cut from it)
+	// CfgViewerIdleTimeoutSec bounds how long a live-TS viewer may sit receiving
+	// NOTHING before it is dropped (0 = never). The per-write deadline only fires
+	// while there are bytes to write, so a viewer whose stream went off-air AND
+	// whose socket is half-open (a dropped mobile link that sent no FIN/RST) is
+	// never written to, never times out, and lingers in /connections forever as a
+	// ghost. Comfortably longer than a source blip (reconnect backoff tops out at
+	// PullBackoffMax plus an ffmpeg cold start), so a recovering source does not
+	// cost viewers their connection.
+	CfgViewerIdleTimeoutSec = 30
+	// CfgMemLimitMB is an explicit ceiling (MiB) for the Go soft memory limit,
+	// 0 = derive it from the cgroup/host budget (see MemLimitFraction). The daemon
+	// usually shares a panel box with nginx, MySQL, PHP-FPM and the streams' own
+	// ffmpeg processes, so an operator who knows the split should be able to say
+	// what this process may use instead of it inferring a share of the machine.
+	CfgMemLimitMB = 0
 )
 
 // ── Memory management (soft limit + idle-heap scavenge) ────────────────────
@@ -117,12 +167,21 @@ const (
 // and a periodic scavenge returns idle heap so RSS tracks the working set. Both
 // are O(1) in stream count and need no per-stream tuning.
 const (
-	// MemLimitFraction is the fraction of detected system (or cgroup) memory used
-	// as the runtime soft memory limit (debug.SetMemoryLimit / GOMEMLIMIT). A
+	// MemLimitFraction is the fraction of a CGROUP memory budget used as the
+	// runtime soft memory limit (debug.SetMemoryLimit / GOMEMLIMIT). A cgroup
+	// limit is this process's own budget, so most of it is fairly claimed. A
 	// ceiling, not a reservation: the GC only intensifies as usage nears it, so a
 	// daemon whose working set stays well below never feels it. An explicit
-	// GOMEMLIMIT in the environment overrides this (auto-limit is then skipped).
+	// GOMEMLIMIT in the environment, or mem_limit_mb in the config, overrides this.
 	MemLimitFraction = 0.80
+
+	// MemLimitHostFraction is the fraction used when there is no cgroup limit and
+	// the budget falls back to the box's physical RAM. Deliberately lower than
+	// MemLimitFraction: an XC_VM node runs nginx, MySQL, PHP-FPM and one ffmpeg
+	// per stream alongside this daemon, so 80% of the machine is not ours to take
+	// — claiming it lets the fan-out grow until it starves the very processes
+	// feeding it. Operators who know their split set mem_limit_mb instead.
+	MemLimitHostFraction = 0.50
 
 	// GCPercent is the GC target growth (GOGC): the heap may grow this percent over
 	// the live set before a collection. The default 100 lets the heap reach ~2×
@@ -134,12 +193,22 @@ const (
 	GCPercent = 50
 
 	// MemScavengeInterval is how often the idle-heap sweep runs; MemScavengeIdleMin
-	// is how much freed-but-unreturned heap (HeapIdle−HeapReleased) must be present
-	// before it forces a release, so a quiet daemon does not GC for nothing. The
-	// interval is short so freed pages return to the OS promptly instead of piling
-	// up into a tall sawtooth between sweeps.
+	// is how much freed-but-unreturned heap (heap free − heap released) must be
+	// present before it forces a release, so a quiet daemon does not GC for
+	// nothing. The check itself is cheap — runtime/metrics, which does NOT stop
+	// the world (runtime.ReadMemStats does, and running it every sweep taxed every
+	// stream to answer a question about none of them).
 	MemScavengeInterval = 20 * time.Second
 	MemScavengeIdleMin  = 64 << 20 // 64 MiB
+
+	// MemScavengeMinGap is the floor between two FORCED releases. debug.FreeOSMemory
+	// is a full stop-the-world GC plus a page-return sweep; on a busy daemon the
+	// idle-heap threshold is met almost continuously, so without a floor the
+	// process spends its life in back-to-back full collections and thrashes the
+	// pages it just handed back. A collapse of a stream's ring (the reaper's idle
+	// gate) is real, sizeable garbage and bypasses the floor — that is the event
+	// worth releasing promptly for.
+	MemScavengeMinGap = 2 * time.Minute
 )
 
 // ── /probe off-air prewarm ─────────────────────────────────────────────────

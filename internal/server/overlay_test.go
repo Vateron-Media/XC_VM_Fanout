@@ -72,3 +72,57 @@ func TestSanitizeColor(t *testing.T) {
 		}
 	}
 }
+
+// TestSignalStoreHotPathSkipsLock: serveLive consults the signal store on EVERY
+// chunk it delivers, for every viewer of every stream. With only the mutex, the
+// whole daemon's fan-out funnelled through one lock to ask a question whose
+// answer is almost always "no". The atomic count must track the map exactly, so
+// the fast path is both cheap and correct.
+func TestSignalStoreHotPathSkipsLock(t *testing.T) {
+	s := newSignalStore()
+	if s.n.Load() != 0 {
+		t.Fatal("fresh store must count 0")
+	}
+	if s.peek("nobody") {
+		t.Fatal("peek on an empty store must be false")
+	}
+
+	s.set("a", pendingSignal{text: "x"})
+	s.set("b", pendingSignal{text: "y"})
+	if s.n.Load() != 2 {
+		t.Fatalf("count = %d after two sets, want 2", s.n.Load())
+	}
+	s.set("a", pendingSignal{text: "replaced"}) // overwrite, not a new entry
+	if s.n.Load() != 2 {
+		t.Fatalf("count = %d after overwriting a key, want 2", s.n.Load())
+	}
+	if !s.peek("a") {
+		t.Error("peek must see a queued signal")
+	}
+
+	if _, ok := s.take("a"); !ok {
+		t.Fatal("take must return the queued signal")
+	}
+	if s.n.Load() != 1 {
+		t.Fatalf("count = %d after take, want 1", s.n.Load())
+	}
+
+	// An expired signal is reaped by peek, and the count must follow.
+	s.set("c", pendingSignal{text: "old", expires: time.Now().Add(-time.Second)})
+	if s.n.Load() != 2 {
+		t.Fatalf("count = %d, want 2", s.n.Load())
+	}
+	if s.peek("c") {
+		t.Error("an expired signal must not peek true")
+	}
+	if s.n.Load() != 1 {
+		t.Fatalf("count = %d after an expired signal was reaped, want 1", s.n.Load())
+	}
+
+	if _, ok := s.take("b"); !ok {
+		t.Fatal("take b")
+	}
+	if s.n.Load() != 0 || s.peek("b") {
+		t.Fatalf("drained store must count 0 and peek false (count=%d)", s.n.Load())
+	}
+}

@@ -30,7 +30,16 @@ A stream has two "interest sensors":
 - **`refs`** — a counter of **live-TS viewers** connected right now (`GET /live/<id>`).
   It grows on `attach()`, drops on `detach()`.
 - **`lastAccess`** — the time of the last touch of the stream. Updated by live-TS
-  viewers, by **every HLS request**, and by `probe`.
+  viewers **on attach and on detach**, by **every HLS request**, and by `probe`.
+
+> **Marked on detach as well** (fixed in 0.11.3). `attach()` stamps `lastAccess` on arrival and
+> nothing on the serve path moves it during the session, so if only the attach were marked the
+> stamp would be as old as the session was long — and the instant the last viewer left, the idle
+> window had **already** outrun both `grace_sec` and `idle_buffer_grace_sec`. Both fired on the
+> very next reaper tick, for every session longer than the grace itself, i.e. all of them: a
+> channel change tore down the source ffmpeg and cold-started it seconds later, and the buffer
+> gate fired on nearly every sweep. The grace windows only mean anything when the clock starts
+> when the audience actually **leaves**.
 
 Why two sensors: HLS is **poll-based** (the player periodically hits `index.m3u8` and
 segments), with no active connection between requests — so HLS **does not hold `refs`**.
@@ -71,11 +80,26 @@ The same reaper sweep also **shrinks memory for streams that are fed but unwatch
 `idle_buffer_grace_sec` (30 s by default) has its `tsjoin` ring **collapsed** to
 `prebuffer_max_sec × idle_buffer_ratio` (half by default); the instant a viewer returns it is
 pumped back to the full buffer. HLS keeps being cut from the reduced ring, so an idle HLS
-channel's playlist stays non-empty and openable. After a sweep that gated at least one stream the
-reaper calls `debug.FreeOSMemory()` once, so the freed pages actually return to the OS. Set
-`idle_buffer_grace_sec = 0` to disable the gate. See
+channel's playlist stays non-empty and openable. A sweep that gated at least one stream **signals the memory scavenger**
+(below), which owns the actual release. Set `idle_buffer_grace_sec = 0` to disable the gate. See
 [06, "The idle-buffer gate"](06-configuration.md#the-idle-buffer-gate) and
 [ADR 0001](../adr/0001-single-ts-cache-hls-on-demand.md).
+
+### Returning memory to the OS
+
+The Go runtime frees a collapsed ring to its own heap promptly but hands the **pages** back to the
+OS only lazily, so RSS would sit at its high-water mark for minutes. A background
+**scavenger** watches how much freed-but-unreturned heap the runtime holds (via `runtime/metrics`,
+which — unlike `runtime.ReadMemStats` — does **not** stop the world) and forces a release when it
+exceeds 64 MiB.
+
+Forcing one is `debug.FreeOSMemory()`: a full stop-the-world GC plus a page-return sweep. On a
+busy daemon the threshold is met almost continuously, so releases are **floored two minutes
+apart** — otherwise the process lives in back-to-back collections and thrashes the pages it just
+handed back. A ring collapse is known-real garbage and **bypasses that floor**, so a gated stream's
+memory is returned on the next sweep. (Before 0.11.3 the reaper called `FreeOSMemory()` inline,
+every `grace/2` — 5 s at the default grace — which combined with the `lastAccess` defect above
+kept the daemon in near-continuous full collections.)
 
 > Push/ingest streams are **not subject** to this rule: they have no `cfg`, so `idleStopLocked`
 > exits immediately for them. Their power is determined by the producer (as long as the
