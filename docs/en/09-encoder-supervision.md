@@ -144,14 +144,39 @@ ffmpeg's stderr still lands in `<streams>/<id>.errors`, and the pid still in
 
 ---
 
+## How the panel stays in step
+
+`cron:streams` asks the daemon once per pass which streams it is supervising, then for each
+of those reads `GET /monitor/<id>` and writes what it learns back into `streams_servers`:
+`stream_status`, `pid`, `current_source`, and the codecs, resolution and measured bitrate.
+The daemon has no database access, so this is the only path by which its view reaches the
+panel.
+
+Only fields the daemon could actually determine are written — it reports an unknown as
+unknown, and overwriting a correct value with a blank would be worse than leaving it.
+
+Two places that ask "is anything watching this stream?" now ask the daemon before concluding
+nobody is, because `monitor_pid` names a PHP process and a supervised stream has none:
+
+- `cron:streams` would otherwise start a PHP monitor on every pass, which would immediately
+  stand down again.
+- `admin/live.php` (the on-demand connect path) would otherwise start one and then wait its
+  full three seconds for a `_.monitor` file that never appears — latency paid on the
+  viewer's connect.
+
+If the daemon cannot be reached, both fall back to exactly the old behaviour. That matters:
+treating an unreachable daemon as "supervising nothing" would start a PHP monitor for every
+stream on the node the moment the socket blinked.
+
 ## Known gaps
 
-- **`streams_servers.monitor_pid` changes meaning.** For a supervised stream it becomes the
-  daemon's pid rather than a per-stream monitor's. Anything reconciling on it needs updating.
+- **`streams_servers.monitor_pid` is not written for a supervised stream.** It keeps whatever
+  a previous PHP monitor left there. The two consumers that matter are handled as above, but
+  anything else reading that column directly should treat it as advisory.
 - **Delay streams are excluded** and still run the legacy way.
-- **`GET /monitor/<id>` is not yet consumed by the panel** to update `streams_servers`. The
-  metadata is available and correct; wiring it into the reconcile is outstanding, so codec
-  and resolution columns are still filled by PHP's start-up ffprobe.
+- **Not yet exercised against a real ffmpeg on a real node.** The launcher, process groups,
+  signals and adoption are covered by tests against real processes on Linux, but no live
+  channel has run through this. Stage it before enabling in production.
 
 ---
 
