@@ -58,6 +58,9 @@ func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 		if m.vitals != nil {
 			m.vitals.forget(id)
 		}
+		if m.meta != nil {
+			m.meta.forget(id)
+		}
 		if err := m.sup.Supervise(id, spec); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -71,12 +74,25 @@ func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		// Supervision state plus what the stream turned out to BE. The panel
+		// reconciles streams_servers from this one call, which is what retires
+		// its periodic ffprobe.
+		out := struct {
+			supervisor.State
+			Meta *StreamMeta `json:"meta,omitempty"`
+		}{State: st}
+		if meta, ok := m.StreamMetadata(id); ok {
+			out.Meta = &meta
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(st)
+		_ = json.NewEncoder(w).Encode(out)
 
 	case http.MethodDelete:
 		if m.vitals != nil {
 			m.vitals.forget(id)
+		}
+		if m.meta != nil {
+			m.meta.forget(id)
 		}
 		if m.sup.Release(id) {
 			dlog.Logf("ctl", "id=%s monitor released", id)
@@ -142,6 +158,7 @@ func (m *Manager) serveMonitors(w http.ResponseWriter, _ *http.Request) {
 // that question by polling for a playlist file to appear.
 func (m *Manager) EnableSupervision() {
 	m.vitals = newVitalsSampler()
+	m.meta = newMetaCache()
 	m.sup = supervisor.New(nil, m.streamHasData).WithVitals(m.sample)
 }
 

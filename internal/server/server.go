@@ -70,6 +70,10 @@ type Stream struct {
 	ingestConns map[net.Conn]struct{}
 
 	lastData   atomic.Int64 // UnixNano of the last non-empty Publish (0 = never); off-air signal
+	// publishedBytes counts everything fed into the fan-out, so the stream's
+	// bitrate can be measured by differencing it rather than estimated by
+	// ffprobing a segment. Atomic: it is written on the publish hot path.
+	publishedBytes atomic.Int64
 	lastAccess atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
 
 	connMu sync.Mutex           // guards conns (map + each connStat's refs/since)
@@ -356,6 +360,7 @@ func (s *Stream) stopIngestLocked() {
 func (s *Stream) Publish(chunk []byte) {
 	if len(chunk) > 0 {
 		s.lastData.Store(time.Now().UnixNano())
+		s.publishedBytes.Add(int64(len(chunk)))
 	}
 	s.Hub.Publish(chunk)
 }
@@ -555,6 +560,8 @@ type Manager struct {
 	// vitals turns the hubs' cumulative health counters into the rates the
 	// supervisor judges a running encoder by.
 	vitals *vitalsSampler
+	// meta caches the codec/resolution/bitrate the panel used to ffprobe for.
+	meta *metaCache
 
 	// defaultChunk is the source read size stamped onto a stream at creation
 	// (read under m.mu). sourceInsecure is read off m.mu when registering a pull,
