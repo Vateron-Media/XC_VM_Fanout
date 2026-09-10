@@ -168,6 +168,20 @@ If the daemon cannot be reached, both fall back to exactly the old behaviour. Th
 treating an unreachable daemon as "supervising nothing" would start a PHP monitor for every
 stream on the node the moment the socket blinked.
 
+Three more panel actions had to learn who owns the encoder, because each of them assumed
+PHP did:
+
+- **Stopping a stream** releases supervision *before* killing anything. Killing the encoder
+  first is exactly the event the supervisor exists to react to, so the daemon would start a
+  replacement and the stream would refuse to stop.
+- **The rogue-ffmpeg sweep** is given the daemon's own reported pid. Its allow-list is built
+  from the database pid read at the top of the pass, so an encoder the daemon restarted a
+  moment later would not be on it and the sweep would shoot a healthy stream — logged as
+  having killed a rogue.
+- **Forcing a source** goes through the control socket. The `<id>.force` file it used to
+  write was only ever read by `MonitorCommand`, which stands down for supervised streams, so
+  the request silently did nothing.
+
 ## Known gaps
 
 - **`streams_servers.monitor_pid` is not written for a supervised stream.** It keeps whatever
