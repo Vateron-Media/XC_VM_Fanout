@@ -25,22 +25,24 @@ func serveTS(ct string, body []byte) *httptest.Server {
 func TestProbeClassifiesContentType(t *testing.T) {
 	tsSrv := serveTS("video/mp2t", []byte("x"))
 	defer tsSrv.Close()
-	isTS, body, err := probe(context.Background(), mustClient(t, Source{}), Source{}, tsSrv.URL)
+	resp, err := probe(context.Background(), mustClient(t, Source{}), Source{}, tsSrv.URL)
 	if err != nil {
 		t.Fatalf("probe mp2t: %v", err)
 	}
-	body.Close()
+	isTS := isMP2T(resp)
+	resp.Body.Close()
 	if !isTS {
 		t.Fatal("video/mp2t must be classified as direct TS")
 	}
 
 	otherSrv := serveTS("video/mp4", []byte("x"))
 	defer otherSrv.Close()
-	isTS, body, err = probe(context.Background(), mustClient(t, Source{}), Source{}, otherSrv.URL)
+	resp, err = probe(context.Background(), mustClient(t, Source{}), Source{}, otherSrv.URL)
 	if err != nil {
 		t.Fatalf("probe mp4: %v", err)
 	}
-	body.Close()
+	isTS = isMP2T(resp)
+	resp.Body.Close()
 	if isTS {
 		t.Fatal("video/mp4 must not be classified as direct TS")
 	}
@@ -56,17 +58,18 @@ func TestSourceTLSVerification(t *testing.T) {
 	defer srv.Close()
 
 	// Insecure (the daemon default): the self-signed cert is accepted.
-	isTS, body, err := probe(context.Background(), mustClient(t, Source{Insecure: true}), Source{Insecure: true}, srv.URL)
+	resp, err := probe(context.Background(), mustClient(t, Source{Insecure: true}), Source{Insecure: true}, srv.URL)
 	if err != nil {
 		t.Fatalf("insecure probe of a self-signed TLS source failed: %v", err)
 	}
-	body.Close()
+	isTS := isMP2T(resp)
+	resp.Body.Close()
 	if !isTS {
 		t.Fatal("video/mp2t must classify as direct TS")
 	}
 
 	// Verification on: the self-signed cert must be rejected.
-	if _, _, err := probe(context.Background(), mustClient(t, Source{Insecure: false}), Source{Insecure: false}, srv.URL); err == nil {
+	if _, err := probe(context.Background(), mustClient(t, Source{Insecure: false}), Source{Insecure: false}, srv.URL); err == nil {
 		t.Fatal("secure probe must reject a self-signed certificate")
 	}
 }

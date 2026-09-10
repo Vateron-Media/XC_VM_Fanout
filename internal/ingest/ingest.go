@@ -12,6 +12,13 @@ const PacketSize = 188
 // Copy reads r and calls publish with packet-aligned chunks until r returns an
 // error (io.EOF on a clean end), which it returns. The slice passed to publish
 // is only valid for the duration of the call; publish must copy what it keeps.
+//
+// The read lands DIRECTLY in the carry-over buffer's free tail rather than in a
+// scratch slice that is then appended: this is the daemon's innermost loop —
+// every byte of every stream passes through it — and the append was a second
+// full copy of the whole byte stream for nothing. buf is sized chunkSize+
+// PacketSize and never holds more than PacketSize-1 carried-over bytes, so the
+// tail always has room for a full chunkSize read and the slice never grows.
 func Copy(r io.Reader, chunkSize int, publish func([]byte)) error {
 	if chunkSize < PacketSize {
 		chunkSize = PacketSize
@@ -19,11 +26,10 @@ func Copy(r io.Reader, chunkSize int, publish func([]byte)) error {
 	chunkSize -= chunkSize % PacketSize
 
 	buf := make([]byte, 0, chunkSize+PacketSize)
-	tmp := make([]byte, chunkSize)
 	for {
-		n, err := r.Read(tmp)
+		n, err := r.Read(buf[len(buf):cap(buf)])
 		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+			buf = buf[:len(buf)+n]
 			whole := len(buf) - (len(buf) % PacketSize)
 			if whole > 0 {
 				publish(buf[:whole])

@@ -19,14 +19,18 @@ func EncryptCBC(data, key, iv []byte) []byte {
 		return nil
 	}
 
+	// One buffer, encrypted in place. CryptBlocks permits dst and src to alias
+	// exactly, so the separate plaintext and ciphertext copies this used to make
+	// were a second full segment allocation for nothing: at a few MB per segment,
+	// per stream, every hls_target_sec, that was the dominant garbage on the
+	// encrypted-HLS path.
 	pad := aes.BlockSize - len(data)%aes.BlockSize
-	padded := make([]byte, len(data)+pad)
-	copy(padded, data)
-	for i := len(data); i < len(padded); i++ {
-		padded[i] = byte(pad)
+	buf := make([]byte, len(data)+pad)
+	copy(buf, data)
+	for i := len(data); i < len(buf); i++ {
+		buf[i] = byte(pad)
 	}
 
-	out := make([]byte, len(padded))
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, padded)
-	return out
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(buf, buf)
+	return buf
 }

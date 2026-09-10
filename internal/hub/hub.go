@@ -27,13 +27,21 @@ const subQueue = defaults.SubscriberQueue
 // allocation on every Put.
 var snapPool = sync.Pool{New: func() any { b := make([]byte, 0); return &b }}
 
+// maxPooledSnapshot caps the size of a buffer the pool will keep. The pool is
+// process-wide, so without a cap one high-bitrate stream's full-ring burst (a
+// 40 s prebuffer at 20 Mbit/s is ~100 MB) is handed to, and then held by, every
+// other stream that draws from it — a permanent floor set by the worst case
+// rather than the common one. Anything larger is left to GC; the next join for
+// such a stream simply allocates, which is what it did before pooling existed.
+const maxPooledSnapshot = 16 << 20
+
 func snapGet() []byte { return (*snapPool.Get().(*[]byte))[:0] }
 
 // ReleaseSnapshot returns a join-burst buffer (from Subscribe) to the pool once
 // the caller has finished writing it. Safe to call once with any snapshot slice;
-// a nil/empty-capacity slice is ignored.
+// a nil/empty-capacity slice is ignored, as is one too large to be worth keeping.
 func ReleaseSnapshot(b []byte) {
-	if cap(b) == 0 {
+	if cap(b) == 0 || cap(b) > maxPooledSnapshot {
 		return
 	}
 	b = b[:0]
@@ -166,6 +174,19 @@ func (h *Hub) Configure(prebufMS, hlsTargetMS int64, hlsWindow int) {
 	h.mu.Unlock()
 }
 
+// Flush drops everything the ring holds — every retained GOP, the HLS segment
+// view and the cached playlist. Called when a stream's producer is stopped for
+// good (the reaper's idle-stop): from that moment the retained bytes are not a
+// buffer, they are a frozen picture of whenever the source was last alive, and
+// they would sit resident for as long as the channel stays registered. At the
+// defaults that is ~20 s of video per idle channel, which across a few hundred
+// registered channels was the daemon's largest idle memory term.
+func (h *Hub) Flush() {
+	h.mu.Lock()
+	h.join.Reset()
+	h.mu.Unlock()
+}
+
 // SetGated collapses the ring to the idle fraction (true) or restores the full
 // buffer (false) — the viewer gate. HLS keeps being cut from the ring either way.
 func (h *Hub) SetGated(gated bool) {
@@ -191,12 +212,26 @@ func (h *Hub) HLSPlaylist() string {
 }
 
 // HLSSegment assembles HLS segment seq from the ring, or nil if it is unknown or
-// has aged out. Serialised against the producer.
+// has aged out.
+//
+// Like Subscribe, only the CAPTURE is under the lock: the concatenation that
+// follows is a multi-megabyte copy, and doing it under the hub lock stalled the
+// stream's producer for its duration once per segment. The pin keeps prune from
+// recycling those GOP buffers mid-copy.
 func (h *Hub) HLSSegment(seq int) []byte {
 	h.mu.Lock()
-	b := h.join.HLSSegment(seq)
+	head, parts, ok := h.join.HLSSegmentPin(nil, seq)
 	h.mu.Unlock()
-	return b
+	if !ok {
+		return nil
+	}
+	n := len(head)
+	for _, p := range parts {
+		n += len(p)
+	}
+	out := make([]byte, 0, n)
+	out = append(out, head...)
+	return h.copyPinned(out, parts)
 }
 
 // NoKeyframeCuts reports how many ring blocks were closed because the source

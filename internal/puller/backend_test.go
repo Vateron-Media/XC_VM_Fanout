@@ -60,7 +60,7 @@ func TestBackendAutoPrefersNative(t *testing.T) {
 	var got []byte
 	err := convert(context.Background(),
 		Source{URLs: []string{srv.URL + "/i.m3u8"}, FfmpegBin: bin, Backend: BackendAuto},
-		srv.URL+"/i.m3u8", 12032, func(b []byte) { got = append(got, b...) })
+		srv.URL+"/i.m3u8", nil, 12032, func(b []byte) { got = append(got, b...) })
 	if err != nil && err.Error() != "EOF" {
 		t.Logf("convert returned %v (EOF is the normal end)", err)
 	}
@@ -80,7 +80,7 @@ func TestBackendFfmpegForcesChild(t *testing.T) {
 
 	_ = convert(context.Background(),
 		Source{URLs: []string{srv.URL + "/i.m3u8"}, FfmpegBin: bin, Backend: BackendFfmpeg},
-		srv.URL+"/i.m3u8", 12032, func([]byte) {})
+		srv.URL+"/i.m3u8", nil, 12032, func([]byte) {})
 	if !ran(marker) {
 		t.Error("backend=ffmpeg did not spawn ffmpeg")
 	}
@@ -98,7 +98,7 @@ func TestBackendAutoFallsBackToFfmpeg(t *testing.T) {
 
 	_ = convert(context.Background(),
 		Source{URLs: []string{srv.URL + "/i.m3u8"}, FfmpegBin: bin, Backend: BackendAuto},
-		srv.URL+"/i.m3u8", 12032, func([]byte) {})
+		srv.URL+"/i.m3u8", nil, 12032, func([]byte) {})
 	if !ran(marker) {
 		t.Error("an fMP4 source was not handed to ffmpeg — the fallback is what makes auto safe")
 	}
@@ -116,7 +116,7 @@ func TestBackendNativeDoesNotFallBack(t *testing.T) {
 
 	err := convert(context.Background(),
 		Source{URLs: []string{srv.URL + "/i.m3u8"}, FfmpegBin: bin, Backend: BackendNative},
-		srv.URL+"/i.m3u8", 12032, func([]byte) {})
+		srv.URL+"/i.m3u8", nil, 12032, func([]byte) {})
 	if err == nil {
 		t.Fatal("backend=native silently succeeded on a source the native reader declines")
 	}
