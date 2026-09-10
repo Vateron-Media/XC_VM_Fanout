@@ -1,6 +1,6 @@
 # ADR 0002 — Move the per-stream monitor into the daemon
 
-Status: **proposed** (supersedes the "PHP retains per-stream process monitoring" line in
+Status: **implemented** (M1-M5 landed; off by default, see Rollout) (supersedes the "PHP retains per-stream process monitoring" line in
 XC_VM's `docs/adr/0003-full-daemon-cutover.md`)
 
 Date: 2026-09-10
@@ -123,11 +123,18 @@ behaviour for daemon-pulled streams. The `_.monitor`, `_.progress_check`, `_.dur
 
 **Costs and risks.** The daemon gains the right to spawn processes, which is a real change
 in its threat surface — it must never build a command string itself, only execute the one
-PHP hands it, and the spec endpoint is on the PHP-only control socket. A daemon crash now
-takes ffmpeg with it, so `service`'s keepalive becomes load-bearing for streams and not just
-for delivery; a restart must re-adopt running ffmpeg by pid rather than orphaning it. And
+PHP hands it, and the spec endpoint is on the PHP-only control socket.
+
+A daemon crash does NOT take the encoders with it: they are orphaned, not killed, and M5
+adopts them back rather than either duplicating them or killing them on sight (which would
+turn every daemon upgrade into a node-wide outage). Adoption requires the pid to be alive
+AND its command line to carry the panel-supplied `adopt_match`, because pids are recycled.
+`service`'s keepalive is still what brings the daemon back, but it is no longer the only
+thing standing between a crash and dead channels.
+
 `monitor_pid` in `streams_servers` changes meaning — it becomes the daemon's pid for every
-stream, so anything reconciling on it needs updating.
+supervised stream, so anything reconciling on it needs updating. That is the one piece of
+panel bookkeeping this work does not yet touch.
 
 **Rollback.** The daemon is only asked to supervise a stream when PHP `PUT`s a spec for it.
 If PHP stops doing that, `MonitorCommand` runs exactly as it does today. The cutover is
@@ -142,7 +149,31 @@ therefore per-stream and reversible without a daemon deploy.
 - **M3** — sources: priority backup and forced switch; retire the `.force` file.
 - **M4** — metadata: codecs, resolution and bitrate from the ring; retire the per-segment
   ffprobe. `GET /monitor/<id>` becomes the source PHP reads for `streams_servers`.
-- **M5** — PHP: `MonitorCommand` becomes a thin delegate; re-adoption of running ffmpeg
-  across a daemon restart; remove the retired file IPC.
+- **M5** — re-adoption of running ffmpeg across a daemon restart; the panel-side health
+  policy and supervision reconcile.
 
 Each phase is independently shippable and independently revertible.
+
+## Rollout
+
+Nothing changes until an operator opts in, twice over:
+
+- Per node: the daemon only supervises when `EnableSupervision` has been called.
+- Per install: PHP only hands a stream over when the `daemon_supervise` setting is truthy.
+  It is absent on every existing install, needs no migration, and clearing it is the
+  rollback — `MonitorCommand` then runs exactly as it always did, because its stand-down
+  check asks the daemon rather than assuming, and an unreachable daemon answers no.
+- Per stream: the daemon supervises only what the panel PUTs a spec for, and forms no
+  opinion about output for a spec that carries no `health` block.
+
+## What is deliberately NOT here
+
+- **`buildLive` is not ported.** 211 lines of DB-and-settings-driven string assembly whose
+  inputs are all in tables the daemon cannot read. Reimplementing it in Go would buy nothing
+  but a large surface for silent behavioural drift.
+- **The daemon never composes a command.** It runs the one it is handed. That is the
+  security boundary for the whole feature.
+- **Delay streams are excluded.** They write their own playlist and are still run the legacy
+  way.
+- **Metadata is reported as unknown when it cannot be read**, never guessed, so the panel
+  keeps a correct value rather than having it overwritten by a blank.
