@@ -234,6 +234,16 @@ func (h *Hub) HLSSegment(seq int) []byte {
 	return h.copyPinned(out, parts)
 }
 
+// Counters reports the join state's health counters (audio packets, video access
+// units, and whether the source declares audio at all), for the supervisor's
+// stalled/audio-loss/frame-rate checks. Serialised against the producer.
+func (h *Hub) Counters() (audioPkts, videoFrames int64, hasAudio bool) {
+	h.mu.Lock()
+	a, v, ok := h.join.Counters()
+	h.mu.Unlock()
+	return a, v, ok
+}
+
 // NoKeyframeCuts reports how many ring blocks were closed because the source
 // produced no random-access point within the GOP cap. Non-zero means this source
 // carries no random_access_indicator — which is also why it yields no HLS

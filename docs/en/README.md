@@ -20,6 +20,7 @@ project, read in order: 01 → 02 → then whatever interests you.
 | 06 | [configuration.md](06-configuration.md) | **Parameters and configuration.** The daemon's two input surfaces: the launch-time CLI flags and the panel-editable JSON config file (buffer/HLS/idle tuning, applied live), plus the 0.10.0→0.11.1 flag migration. |
 | 07 | [integration.md](07-integration.md) | **Integration with the XC_VM panel.** How nginx, PHP, `fanout_sync` and binary install work with it. |
 | 08 | [build-release.md](08-build-release.md) | **Build, test, release.** How to build, run the tests, cut a version. |
+| 09 | [encoder-supervision.md](09-encoder-supervision.md) | **Encoder supervision (runbook).** Letting the daemon run and watch stream encoders instead of the panel's per-stream PHP watchdog: turning it on, rolling it back, restarts and adoption, health checks. |
 
 ## Terms in one line
 

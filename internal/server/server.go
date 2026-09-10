@@ -32,6 +32,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/supervisor"
 )
 
 // Operational defaults live in internal/defaults; these aliases keep the local
@@ -69,6 +70,10 @@ type Stream struct {
 	ingestConns map[net.Conn]struct{}
 
 	lastData   atomic.Int64 // UnixNano of the last non-empty Publish (0 = never); off-air signal
+	// publishedBytes counts everything fed into the fan-out, so the stream's
+	// bitrate can be measured by differencing it rather than estimated by
+	// ffprobing a segment. Atomic: it is written on the publish hot path.
+	publishedBytes atomic.Int64
 	lastAccess atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
 
 	connMu sync.Mutex           // guards conns (map + each connStat's refs/since)
@@ -355,6 +360,7 @@ func (s *Stream) stopIngestLocked() {
 func (s *Stream) Publish(chunk []byte) {
 	if len(chunk) > 0 {
 		s.lastData.Store(time.Now().UnixNano())
+		s.publishedBytes.Add(int64(len(chunk)))
 	}
 	s.Hub.Publish(chunk)
 }
@@ -573,6 +579,17 @@ type Manager struct {
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
 	signals   *signalStore // pending per-uuid "send message" overlays
+
+	// sup supervises per-stream encoder processes when the node has taken that
+	// over from the panel watchdog (docs/adr/0002-monitor-in-daemon.md). nil
+	// until EnableSupervision, and a nil one simply makes /monitor report that
+	// this node does not do it — which is what keeps the cutover per-node.
+	sup *supervisor.Supervisor
+	// vitals turns the hubs' cumulative health counters into the rates the
+	// supervisor judges a running encoder by.
+	vitals *vitalsSampler
+	// meta caches the codec/resolution/bitrate the panel used to ffprobe for.
+	meta *metaCache
 
 	// defaultChunk is the source read size stamped onto a stream at creation
 	// (read under m.mu). sourceInsecure is read off m.mu when registering a pull,
@@ -1017,6 +1034,8 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/connections", m.serveConnections)
 	mux.HandleFunc("/rates", m.serveRates)
 	mux.HandleFunc("/signal/", m.serveSignal)
+	mux.HandleFunc("/monitor/", m.serveMonitor)
+	mux.HandleFunc("/monitors", m.serveMonitors)
 	return mux
 }
 

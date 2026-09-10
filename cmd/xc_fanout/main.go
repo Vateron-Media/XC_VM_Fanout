@@ -117,10 +117,17 @@ func main() {
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
 	mgr.SetOverlay(*ffmpeg, *font)                                                           // admin "send message" drawtext overlay (no font ⇒ disabled)
+	// Encoder supervision, when this node is configured for it. This is the only
+	// place it is turned on, and it still does nothing on its own — a stream is
+	// supervised only once the panel hands it over.
+	if cfg.Supervise {
+		mgr.EnableSupervision()
+		log.Printf("monitor: encoder supervision enabled (streams are handed over by the panel)")
+	}
 	mgr.StartReaper(ctx)                                                                     // idle-stop sweep for control-managed streams (TS + HLS)
 	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS
-	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds chunk=%dB maxgop=%dB insecure=%v backend=%s overlay=%v",
-		*sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ViewerIdleTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, cfg.SourceBackend, *font != "")
+	dlog.Logf("boot", "config: supervise=%v sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds chunk=%dB maxgop=%dB insecure=%v backend=%s overlay=%v",
+		cfg.Supervise, *sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ViewerIdleTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, cfg.SourceBackend, *font != "")
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
 
 	if *configPath != "" {
@@ -168,6 +175,15 @@ func main() {
 	}
 
 	<-ctx.Done()
+
+	// Stop watching the encoders but LEAVE THEM RUNNING. They are orphaned, not
+	// killed, and the next daemon adopts them (internal/supervisor/adopt.go), so a
+	// restart or an upgrade costs the viewers nothing. Killing them here would take
+	// every channel on this node off air for the length of the restart.
+	if n := mgr.DetachSupervision(); n > 0 {
+		log.Printf("monitor: detached %d encoder(s), left running for the next daemon to adopt", n)
+	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = clientSrv.Shutdown(shutdownCtx)
