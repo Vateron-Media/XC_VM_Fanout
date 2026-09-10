@@ -111,6 +111,14 @@ type Spec struct {
 	LogPath string `json:"log_path"`
 	// ServerID is stamped into those events (the panel's SERVER_ID).
 	ServerID int `json:"server_id"`
+
+	// AdoptMatch lets the daemon resume watching an encoder that outlived a
+	// daemon restart instead of starting a second one alongside it: the pid in
+	// PIDPath is adopted when it is alive AND its command line contains this
+	// string. The panel supplies it because it knows the paths that identify
+	// this stream's encoder; empty disables adoption entirely, which is the
+	// safe default. See adopt.go.
+	AdoptMatch string `json:"adopt_match,omitempty"`
 }
 
 // normalise fills in the defaults the panel would otherwise have to repeat and
@@ -152,6 +160,9 @@ type State struct {
 	Failures   int    `json:"failures"`
 	UptimeMS   int64  `json:"uptime_ms"`
 	GaveUp     bool   `json:"gave_up"`
+	// Adopted means this encoder was inherited from a previous daemon life
+	// rather than started by this one.
+	Adopted bool `json:"adopted"`
 	LastError  string `json:"last_error"`
 }
 
@@ -184,6 +195,8 @@ type Supervisor struct {
 	hasData func(id string) bool // "did bytes actually arrive for this stream?"
 	vitals  VitalsFunc           // what the output looks like right now
 	probe   Prober               // is a source reachable, without starting it
+	find    ProcessFinder        // is this pid alive, and what is it running
+	killPID func(pid int)        // end an adopted (non-child) process
 	now     func() time.Time
 	sleep   func(context.Context, time.Duration) bool
 
@@ -212,6 +225,8 @@ func New(launch Launcher, hasData func(id string) bool) *Supervisor {
 		sleep:      sleepCtx,
 		healthTick: 5 * time.Second,
 		probe:      shellProber,
+		find:       findProcess,
+		killPID:    killProcess,
 	}
 }
 
@@ -268,6 +283,9 @@ type stream struct {
 	srcIdx          int
 	forced          int
 	backupCheckedAt time.Time
+
+	// adopted records that the RUNNING encoder was inherited, not started here.
+	adopted bool
 	source  string
 	started time.Time
 	running bool
@@ -369,6 +387,7 @@ func (st *stream) state() State {
 		Restarts:   st.starts,
 		Failures:   st.fails,
 		GaveUp:     st.gaveUp,
+		Adopted:    st.adopted,
 		LastError:  st.lastErr,
 	}
 	if st.running && !st.started.IsZero() {
@@ -562,6 +581,25 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	spec := st.spec_()
 
+	// An encoder that outlived a previous daemon is resumed rather than
+	// duplicated. Launching alongside it would put two encoders on one source,
+	// and killing it on sight would take the channel off air for the length of
+	// every daemon restart.
+	if pid, ok := adoptable(spec, st.sup.find); ok {
+		dlog.Logf("monitor", "id=%s adopting encoder pid=%d that outlived the daemon", st.id, pid)
+		proc := &adoptedProcess{
+			pid:   pid,
+			find:  st.sup.find,
+			sleep: st.sup.sleep,
+			kill:  st.sup.killPID,
+			done:  make(chan struct{}),
+		}
+		st.markAdopted(true)
+		st.markStarted(proc, src.Label)
+		return proc, nil
+	}
+	st.markAdopted(false)
+
 	proc, err := st.sup.launch(ctx, src.Cmd, spec.ErrorsPath)
 	if err != nil {
 		return nil, fmt.Errorf("launch: %w", err)
@@ -708,6 +746,12 @@ func (st *stream) sourceIndex() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.srcIdx
+}
+
+func (st *stream) markAdopted(v bool) {
+	st.mu.Lock()
+	st.adopted = v
+	st.mu.Unlock()
 }
 
 func (st *stream) startTime() time.Time {

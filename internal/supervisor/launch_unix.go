@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -122,4 +124,40 @@ func shellProber(ctx context.Context, cmd string) bool {
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return c.Run() == nil
+}
+
+// findProcess reports a pid's command line and whether it is alive.
+//
+// Liveness is signal 0, which the kernel answers without delivering anything.
+// The command line comes from /proc/<pid>/cmdline, whose arguments are
+// NUL-separated; they are joined with spaces so a caller can match a substring
+// against it. Both are needed together: a live pid alone proves nothing, because
+// pids are recycled and the number in a stale pid file may belong to anything by
+// the time the daemon comes back.
+func findProcess(pid int) (string, bool) {
+	if pid <= 0 {
+		return "", false
+	}
+	// Signal 0 checks for existence and permission without touching the process.
+	if err := syscall.Kill(pid, 0); err != nil {
+		return "", false
+	}
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+	if err != nil {
+		// Alive but unreadable (a different user, or no procfs). Report it alive
+		// with no command line, so an AdoptMatch can never spuriously match.
+		return "", true
+	}
+	return strings.ReplaceAll(strings.TrimRight(string(b), "\x00"), "\x00", " "), true
+}
+
+// killProcess ends an adopted encoder and the group it leads. An adopted process
+// is not our child, so there is nothing to reap afterwards.
+func killProcess(pid int) {
+	if pid <= 0 {
+		return
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
 }

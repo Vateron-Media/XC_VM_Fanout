@@ -19,3 +19,10 @@ func shellLauncher(context.Context, string, string) (Process, error) {
 // every source unreachable is the safe answer here: it means the priority
 // switch never fires, not that a working stream is moved onto a dead feed.
 func shellProber(context.Context, string) bool { return false }
+
+// findProcess and killProcess are Unix-only, like the launcher. Reporting every
+// pid dead is the safe answer: adoption simply never happens, so nothing is
+// mistakenly inherited on a platform where the daemon does not run anyway.
+func findProcess(int) (string, bool) { return "", false }
+
+func killProcess(int) {}
