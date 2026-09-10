@@ -142,24 +142,64 @@ func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize int, publish func([]byte)) error {
 	var lastErr error
 	for _, raw := range src.URLs {
-		isTS, body, err := probe(ctx, client, src, raw)
+		// A scheme an HTTP GET cannot speak must not be probed with one. Every
+		// udp://, rtp:// and file:// source used to fail here with "unsupported
+		// protocol scheme", be counted as a probe failure and be skipped, so the
+		// native reader's support for them (and ffmpeg's) was unreachable through
+		// the daemon no matter what the operator configured.
+		if nativeOnlyScheme(raw) {
+			dlog.Logf("puller", "id=%s non-http source, skipping probe: %s", src.Label, raw)
+			return convert(ctx, src, raw, nil, chunkSize, publish)
+		}
+		resp, err := probe(ctx, client, src, raw)
 		if err != nil {
 			dlog.Logf("puller", "id=%s probe failed: %s: %v", src.Label, raw, err)
 			lastErr = err
 			continue
 		}
-		if isTS {
+		if isMP2T(resp) {
+			// Bound a stall: without this a source that goes half-open (stops
+			// sending but never closes the socket) blocked ingest.Copy's Read
+			// forever. No error means no reconnect, so the channel was silently
+			// dead while the panel still saw a running stream with a live puller.
+			body := nativesrc.WrapIdleTimeout(resp.Body, nativesrc.DefaultSourceIdleTimeout)
 			defer body.Close()
 			dlog.Logf("puller", "id=%s connected direct mpegts: %s", src.Label, raw)
 			return ingest.Copy(body, chunkSize, publish)
 		}
-		body.Close()
-		return convert(ctx, src, raw, chunkSize, publish)
+		// Hand the OPEN response to convert rather than closing it and fetching
+		// the same URL a second time. See nativesrc.AdoptHTTP.
+		return convert(ctx, src, raw, resp, chunkSize, publish)
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no source urls")
 	}
 	return lastErr
+}
+
+// nativeOnlyScheme reports whether raw names a source that must bypass the HTTP
+// probe. It mirrors nativesrc.Open's own dispatch, deliberately: anything else,
+// a malformed URL included, keeps going through probe, so a bad entry is still
+// skipped in favour of the next URL instead of being handed to a converter.
+func nativeOnlyScheme(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "./") || strings.HasPrefix(raw, "../") {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "udp", "rtp", "file":
+		return true
+	}
+	return false
+}
+
+// isMP2T reports whether a response is served as MPEG-TS.
+func isMP2T(resp *http.Response) bool {
+	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "video/mp2t")
 }
 
 func httpClient(src Source) (*http.Client, error) {
@@ -191,12 +231,14 @@ func httpClient(src Source) (*http.Client, error) {
 	return &http.Client{Transport: tr}, nil // no client timeout: this is a long-lived stream
 }
 
-// probe opens the URL and reports whether it is served as MPEG-TS. On success
-// the returned body is left open for the caller to stream or close.
-func probe(ctx context.Context, c *http.Client, src Source, raw string) (bool, io.ReadCloser, error) {
+// probe opens the URL. On success the whole response, headers AND an unread,
+// still-open body, is returned for the caller to classify (isMP2T), stream, or
+// hand to nativesrc.AdoptHTTP. Returning the response rather than just the body
+// is what lets a non-mp2t source be adopted instead of re-fetched.
+func probe(ctx context.Context, c *http.Client, src Source, raw string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return false, nil, err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", src.ua())
 	if src.Cookie != "" {
@@ -204,14 +246,13 @@ func probe(ctx context.Context, c *http.Client, src Source, raw string) (bool, i
 	}
 	resp, err := c.Do(req)
 	if err != nil {
-		return false, nil, err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return false, nil, fmt.Errorf("%s: HTTP %d", raw, resp.StatusCode)
+		return nil, fmt.Errorf("%s: HTTP %d", raw, resp.StatusCode)
 	}
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	return strings.Contains(ct, "video/mp2t"), resp.Body, nil
+	return resp, nil
 }
 
 // convert turns a non-mp2t source into MPEG-TS and feeds it in, natively when
@@ -219,18 +260,33 @@ func probe(ctx context.Context, c *http.Client, src Source, raw string) (bool, i
 // ffmpeg. The native reader refuses loudly (nativesrc.ErrUnsupported) rather
 // than half-serving, which is what makes the fallback safe: a source it declines
 // gets exactly the ffmpeg pipeline it got before.
-func convert(ctx context.Context, src Source, raw string, chunkSize int, publish func([]byte)) error {
-	if src.Backend == BackendFfmpeg {
-		dlog.Logf("puller", "id=%s connected via ffmpeg remux (backend=ffmpeg): %s", src.Label, raw)
-		return runFfmpeg(ctx, src, raw, chunkSize, publish)
-	}
-
-	rc, err := nativesrc.Open(ctx, raw, nativesrc.Options{
+//
+// resp, when non-nil, is an already-open response for raw that convert takes
+// ownership of: the native reader adopts it instead of fetching the URL a second
+// time, and every path that does not use it closes it.
+func convert(ctx context.Context, src Source, raw string, resp *http.Response, chunkSize int, publish func([]byte)) error {
+	opt := nativesrc.Options{
 		UserAgent: src.ua(),
 		Cookie:    src.Cookie,
 		Proxy:     src.Proxy,
 		Insecure:  src.Insecure,
-	})
+	}
+
+	if src.Backend == BackendFfmpeg {
+		closeBody(resp)
+		dlog.Logf("puller", "id=%s connected via ffmpeg remux (backend=ffmpeg): %s", src.Label, raw)
+		return runFfmpeg(ctx, src, raw, chunkSize, publish)
+	}
+
+	// AdoptHTTP closes the body itself on every refusal, so the ffmpeg fallback
+	// below never leaks it.
+	var rc io.ReadCloser
+	var err error
+	if resp != nil {
+		rc, err = nativesrc.AdoptHTTP(ctx, resp, opt)
+	} else {
+		rc, err = nativesrc.Open(ctx, raw, opt)
+	}
 	if err == nil {
 		defer rc.Close()
 		dlog.Logf("puller", "id=%s connected native (no ffmpeg child): %s", src.Label, raw)
@@ -245,6 +301,13 @@ func convert(ctx context.Context, src Source, raw string, chunkSize int, publish
 	}
 	dlog.Logf("puller", "id=%s native declined (%v); falling back to ffmpeg: %s", src.Label, err, raw)
 	return runFfmpeg(ctx, src, raw, chunkSize, publish)
+}
+
+// closeBody discards a response the chosen path will not read.
+func closeBody(resp *http.Response) {
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 }
 
 // runFfmpeg remuxes a non-mp2t source to MPEG-TS on stdout and feeds it in.

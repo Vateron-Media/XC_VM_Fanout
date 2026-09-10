@@ -151,15 +151,6 @@ func (s *State) recompute() {
 	}
 }
 
-// SetRing live-reconfigures the buffer depth (ms). Caller (Hub) serialises access.
-func (s *State) SetRing(maxPrebufMS int64) {
-	if maxPrebufMS < 0 {
-		maxPrebufMS = 0
-	}
-	s.prebufMS = maxPrebufMS
-	s.recompute()
-}
-
 // SetGated collapses the ring to the idle fraction (true) or restores it to the
 // full buffer (false). HLS keeps cutting either way. Caller (Hub) serialises.
 func (s *State) SetGated(gated bool) {
@@ -427,35 +418,69 @@ func (s *State) HLSPlaylist() string {
 
 // HLSSegment assembles segment seq from the ring on demand: latest PAT + PMT
 // followed by the bytes of the GOPs in the segment's [startID..endID] range.
-// Returns nil if seq is unknown or its GOPs have aged out. Caller serialises.
+// Returns nil if seq is unknown or its GOPs have aged out.
+//
+// This concatenates inline, so a caller holding a lock holds it for the whole
+// multi-megabyte copy. Hub uses the two-phase HLSSegmentPin/Unpin below instead,
+// to copy with the lock released. Caller serialises access.
 func (s *State) HLSSegment(seq int) []byte {
+	head, parts, ok := s.HLSSegmentPin(nil, seq)
+	if !ok {
+		return nil
+	}
+	n := len(head)
+	for _, p := range parts {
+		n += len(p)
+	}
+	out := make([]byte, 0, n)
+	out = append(out, head...)
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	s.Unpin()
+	return out
+}
+
+// HLSSegmentPin is HLSSegment split the way SnapshotPin splits a join snapshot:
+// it returns the header (latest PAT + PMT, copied here because they are mutated
+// in place) plus the segment's GOP byte slices, and PINS them so the caller can
+// release its lock, concatenate at leisure, and then Unpin.
+//
+// Assembling under the lock meant a multi-megabyte copy out of the ring with the
+// stream's producer blocked behind it, once per segment per stream. The pin
+// machinery to avoid that already existed for the join burst; this just uses it.
+// ok=false means the segment is unknown or has aged out, and NOTHING is pinned.
+func (s *State) HLSSegmentPin(dst []byte, seq int) ([]byte, [][]byte, bool) {
 	for i := range s.segs {
 		if s.segs[i].seq != seq {
 			continue
 		}
 		sg := s.segs[i]
-		n := len(s.lastPAT) + len(s.lastPMT)
-		got := false
-		for j := range s.gops {
-			if s.gops[j].id >= sg.startID && s.gops[j].id <= sg.endID {
-				n += len(s.gops[j].data)
-				got = true
-			}
+		// The segment's FIRST GOP must still be in the ring. Accepting it whenever
+		// ANY of its GOPs survived served a segment that starts mid-range — no
+		// keyframe at the head, and shorter than its own #EXTINF — every time the
+		// ring pruned past startID but not yet past endID, which is the steady
+		// state at the tail of a tight (gated) ring. A player gets a decode error
+		// from that, where a 404 just makes it skip. gops is id-ascending, so one
+		// comparison against the oldest settles it.
+		if len(s.gops) == 0 || s.gops[0].id > sg.startID {
+			return nil, nil, false // aged out between playlist render and fetch
 		}
-		if !got {
-			return nil // aged out between playlist render and fetch
-		}
-		out := make([]byte, 0, n)
-		out = append(out, s.lastPAT...)
+		out := append(dst[:0], s.lastPAT...)
 		out = append(out, s.lastPMT...)
+		parts := make([][]byte, 0, len(s.gops))
 		for j := range s.gops {
 			if s.gops[j].id >= sg.startID && s.gops[j].id <= sg.endID {
-				out = append(out, s.gops[j].data...)
+				parts = append(parts, s.gops[j].data)
 			}
 		}
-		return out
+		if len(parts) == 0 {
+			return nil, nil, false
+		}
+		s.pins++
+		return out, parts, true
 	}
-	return nil
+	return nil, nil, false
 }
 
 // Snapshot returns the bytes a new subscriber should receive before the live
@@ -531,6 +556,25 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 	}
 	s.pins++
 	return out, parts
+}
+
+// Reset drops the entire cache: every retained GOP, the HLS segment view and the
+// rendered playlist. Used when a stream's producer stops for good (the reaper's
+// idle-stop), where the bytes still in the ring are not a buffer any more — they
+// are a frozen snapshot of whenever the source was last alive, worth nothing to a
+// future viewer and, at ~idle_buffer_ratio × prebuffer_max_sec of video per
+// registered channel, the daemon's largest idle memory term by a wide margin.
+//
+// The GOP arrays go to GC rather than onto the free list: releasing the memory is
+// the entire point, so recycling a few of them would defeat it. PAT/PMT are kept
+// (two packets) so a restarted puller still has program info before its first
+// keyframe. Caller (Hub) serialises access.
+func (s *State) Reset() {
+	s.gops = nil
+	s.segs = nil
+	s.freeBufs = nil
+	s.segStartID, s.segStartPTS = -1, -1
+	s.plCache, s.plValid = "", false
 }
 
 // Unpin releases a SnapshotPin, letting prune recycle dropped GOP buffers again.

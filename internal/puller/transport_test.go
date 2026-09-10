@@ -62,18 +62,18 @@ func TestProbeReusesConnection(t *testing.T) {
 
 	c := mustClient(t, Source{})
 	for i := 0; i < 5; i++ {
-		_, body, err := probe(context.Background(), c, Source{}, srv.URL)
+		resp, err := probe(context.Background(), c, Source{}, srv.URL)
 		if err != nil {
 			t.Fatalf("probe %d: %v", i, err)
 		}
 		// Drain to EOF and close, as the direct-mpegts path does when a source ends.
 		buf := make([]byte, 32)
 		for {
-			if _, err := body.Read(buf); err != nil {
+			if _, err := resp.Body.Read(buf); err != nil {
 				break
 			}
 		}
-		body.Close()
+		resp.Body.Close()
 	}
 
 	mu.Lock()

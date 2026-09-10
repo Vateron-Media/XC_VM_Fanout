@@ -31,6 +31,24 @@ func newPullClient(opt Options) *http.Client {
 // well above any legitimate HLS segment.
 const maxHLSSegmentBytes = 64 << 20
 
+// maxPlaylistBytes caps a manifest read. Playlists are small; anything at this
+// size is a misbehaving upstream, not a live window.
+const maxPlaylistBytes = 4 << 20
+
+// maxRetainedSegBuf is the largest segment staging buffer a puller will hold on
+// to between segments. Comfortably above any real segment (a 16 Mbps feed at a
+// 6 s target is ~12 MB) and far below maxHLSSegmentBytes, so reuse covers the
+// normal case without one outlier pinning 64 MiB per stream.
+const maxRetainedSegBuf = 16 << 20
+
+// maxHLSConsecutiveFails is how many consecutive failures of one KIND (segment
+// fetches, or manifest fetch/parse) close the pipe so the puller backs off and
+// rotates to the next source URL. The two kinds are counted separately: a
+// manifest that keeps arriving fine must not reset the segment counter (a window
+// of two segments would then never reach the threshold, and a source serving an
+// intact playlist of dead segments would retry forever), and vice versa.
+const maxHLSConsecutiveFails = 5
+
 // OpenHLSPull returns an io.ReadCloser that yields concatenated MPEG-TS
 // bytes from a live HLS manifest. It supports the common case for IPTV
 // live feeds: a `.m3u8` master or media playlist whose segments are
@@ -63,41 +81,62 @@ func OpenHLSPull(ctx context.Context, rawURL string, opt Options) (io.ReadCloser
 	// of letting them turn into a closed-pipe surprise mid-stream.
 	body, finalURL, err := hlsFetch(ctx, u, opt, client)
 	if err != nil {
+		client.CloseIdleConnections()
 		return nil, err
 	}
-	pl, perr := parseHLSPlaylist(body, finalURL)
+	return startHLSPull(ctx, finalURL, opt, client, body)
+}
+
+// openHLSPullWith starts the pull from a manifest the CALLER already fetched,
+// with base the URL it was actually served from (after redirects). It exists so
+// the source-dispatch path can hand over the playlist it read while sniffing the
+// body, instead of closing that response and fetching the same URL again.
+func openHLSPullWith(ctx context.Context, base *url.URL, opt Options, manifest []byte) (io.ReadCloser, error) {
+	return startHLSPull(ctx, base, opt, newPullClient(opt), manifest)
+}
+
+// startHLSPull classifies a media/master playlist and, if it is one this package
+// will take, spawns the puller goroutine behind a pipe. On every refusal it
+// drains the client's pool before returning: the caller falls back to ffmpeg and
+// will never touch this client again.
+func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.Client, manifest []byte) (io.ReadCloser, error) {
+	refuse := func(err error) (io.ReadCloser, error) {
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	pl, perr := parseHLSPlaylist(manifest, base)
 	if perr != nil {
-		return nil, fmt.Errorf("%w: parse manifest: %v", ErrUnsupportedSource, perr)
+		return refuse(fmt.Errorf("%w: parse manifest: %v", ErrUnsupportedSource, perr))
 	}
 	if pl.IsMaster {
 		// Master playlist → pick the highest bandwidth variant whose
 		// URI parses, fetch that, and use it as the media playlist.
-		variant := pickVariant(pl, finalURL)
+		variant := pickVariant(pl)
 		if variant == nil {
-			return nil, fmt.Errorf("%w: master playlist has no usable variant", ErrUnsupportedSource)
+			return refuse(fmt.Errorf("%w: master playlist has no usable variant", ErrUnsupportedSource))
 		}
-		body, finalURL, err = hlsFetch(ctx, variant, opt, client)
+		body, finalURL, err := hlsFetch(ctx, variant, opt, client)
 		if err != nil {
-			return nil, err
+			return refuse(err)
 		}
-		pl, perr = parseHLSPlaylist(body, finalURL)
+		base = finalURL
+		pl, perr = parseHLSPlaylist(body, base)
 		if perr != nil {
-			return nil, fmt.Errorf("%w: parse media: %v", ErrUnsupportedSource, perr)
+			return refuse(fmt.Errorf("%w: parse media: %v", ErrUnsupportedSource, perr))
 		}
 		if pl.IsMaster {
-			return nil, fmt.Errorf("%w: master pointed at another master", ErrUnsupportedSource)
+			return refuse(fmt.Errorf("%w: master pointed at another master", ErrUnsupportedSource))
 		}
 	}
 	if pl.HasFMP4 {
-		// Distinct sentinel so the caller can dispatch to
-		// MirrorHLSFMP4 instead of falling all the way to ffmpeg —
-		// the pass-through mirror handles fMP4 sources natively.
-		return nil, ErrHLSIsFMP4
+		// Distinct sentinel so the caller can tell "this upstream is fMP4" apart
+		// from a generic refusal — it is worth seeing in a log.
+		return refuse(ErrHLSIsFMP4)
 	}
 	pr, pw := io.Pipe()
 	go (&hlsPuller{
 		ctx:    ctx,
-		base:   finalURL,
+		base:   base,
 		client: client,
 		opt:    opt,
 		seen:   map[string]bool{},
@@ -113,12 +152,30 @@ type hlsPuller struct {
 	opt    Options
 	seen   map[string]bool
 	pw     *io.PipeWriter
+
+	// segBuf stages one segment body at a time. run() is the only goroutine that
+	// touches it and pw.Write blocks until the consumer has drained what it was
+	// handed, so the buffer is free again by the next iteration. Allocating it per
+	// segment instead meant a multi-megabyte allocation (two, when the upstream
+	// sends no Content-Length and io.Copy has to grow) per segment per stream —
+	// pure garbage on the ingest hot path.
+	segBuf bytes.Buffer
 }
 
 func (p *hlsPuller) run(initial *hlsPlaylist) {
 	defer p.pw.Close()
+	// This client is ours alone and nothing can reach it once this goroutine
+	// returns, so drain its pool on the way out. A connection left in it would
+	// stay open, with its reader goroutine, until IdleConnTimeout expired it 90s
+	// later: one stranded socket per reconnect on a flapping source.
+	defer p.client.CloseIdleConnections()
+
 	pl := initial
-	consecutiveFails := 0
+	// Segment failures and manifest failures are counted SEPARATELY. A shared
+	// counter that any success reset meant a source serving a perfectly valid
+	// playlist of dead segments could never trip it whenever the live window held
+	// fewer segments than the threshold: each manifest poll wiped the tally.
+	segFails, manifestFails := 0, 0
 	for {
 		// First pass: enqueue any new segments from the current pl.
 		for _, seg := range pl.Segments {
@@ -130,9 +187,9 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 				continue
 			}
 			if err := p.streamSegment(seg.URI); err != nil {
-				consecutiveFails++
-				if consecutiveFails >= 5 {
-					p.pw.CloseWithError(fmt.Errorf("hls pull: %d consecutive segment failures: %w", consecutiveFails, err))
+				segFails++
+				if segFails >= maxHLSConsecutiveFails {
+					p.pw.CloseWithError(fmt.Errorf("hls pull: %d consecutive segment failures: %w", segFails, err))
 					return
 				}
 				continue
@@ -141,7 +198,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			// failure is retried on the next manifest poll instead of being
 			// permanently skipped by retainSeenInWindow.
 			p.seen[uri] = true
-			consecutiveFails = 0
+			segFails = 0
 		}
 		if pl.Endlist {
 			return // VOD: source-side ended.
@@ -163,8 +220,8 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 		}
 		body, _, err := hlsFetch(p.ctx, p.base, p.opt, p.client)
 		if err != nil {
-			consecutiveFails++
-			if consecutiveFails >= 5 {
+			manifestFails++
+			if manifestFails >= maxHLSConsecutiveFails {
 				p.pw.CloseWithError(fmt.Errorf("hls pull: manifest unreachable: %w", err))
 				return
 			}
@@ -172,9 +229,19 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 		}
 		next, perr := parseHLSPlaylist(body, p.base)
 		if perr != nil {
-			consecutiveFails++
+			// This used to increment and loop with no threshold check, so a
+			// permanently unparseable manifest span forever at the poll cadence:
+			// the pipe never closed, so the puller never errored, so it never
+			// backed off and never rotated to the next source URL. A silently
+			// dead channel that looked healthy from the outside.
+			manifestFails++
+			if manifestFails >= maxHLSConsecutiveFails {
+				p.pw.CloseWithError(fmt.Errorf("hls pull: manifest unparseable %d polls running: %w", manifestFails, perr))
+				return
+			}
 			continue
 		}
+		manifestFails = 0
 		// Bound the de-dup map to the live window: a live HLS window only
 		// slides forward, so a URI that has rolled out of the manifest can
 		// never reappear. Forgetting evicted URIs keeps `seen` from growing
@@ -223,18 +290,25 @@ func (p *hlsPuller) streamSegment(u *url.URL) error {
 	// hitting the cap means a runaway/hostile upstream, so treat it as an
 	// error (fail + fail-over) rather than emitting a truncated mid-packet
 	// blob as a "successful" segment — matching the fMP4 mirror path.
-	var buf bytes.Buffer
-	if cl := resp.ContentLength; cl > 0 && cl <= maxHLSSegmentBytes {
-		buf.Grow(int(cl))
+	p.segBuf.Reset()
+	// Reuse keeps the buffer at the high-water mark of the segments seen so far,
+	// which is the point — but one freak oversized segment must not pin that much
+	// for the life of the stream, so drop the buffer when it has grown past
+	// anything a real segment justifies.
+	if p.segBuf.Cap() > maxRetainedSegBuf {
+		p.segBuf = bytes.Buffer{}
 	}
-	n, err := io.Copy(&buf, io.LimitReader(resp.Body, maxHLSSegmentBytes))
+	if cl := resp.ContentLength; cl > 0 && cl <= maxHLSSegmentBytes {
+		p.segBuf.Grow(int(cl))
+	}
+	n, err := io.Copy(&p.segBuf, io.LimitReader(resp.Body, maxHLSSegmentBytes))
 	if err != nil {
 		return err
 	}
 	if n >= maxHLSSegmentBytes {
 		return fmt.Errorf("segment %s: exceeds %d-byte cap (runaway upstream)", u.Redacted(), maxHLSSegmentBytes)
 	}
-	_, err = p.pw.Write(buf.Bytes())
+	_, err = p.pw.Write(p.segBuf.Bytes())
 	return err
 }
 
@@ -255,7 +329,7 @@ func hlsFetch(ctx context.Context, u *url.URL, opt Options, c *http.Client) ([]b
 	if resp.StatusCode/100 != 2 {
 		return nil, nil, fmt.Errorf("playlist %s: http %d", u.Redacted(), resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20)) // 4 MiB cap; playlists are small
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistBytes))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -293,7 +367,9 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 		return nil, fmt.Errorf("empty body")
 	}
 	pl := &hlsPlaylist{}
-	sc := bufio.NewScanner(strings.NewReader(string(body)))
+	// bytes.NewReader, not strings.NewReader(string(body)): the conversion copied
+	// the entire manifest on every poll of every native-HLS stream, for nothing.
+	sc := bufio.NewScanner(bytes.NewReader(body))
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	var pendingDur float64
 	var pendingBW int
@@ -360,7 +436,7 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 	return pl, nil
 }
 
-func pickVariant(pl *hlsPlaylist, base *url.URL) *url.URL {
+func pickVariant(pl *hlsPlaylist) *url.URL {
 	var best *url.URL
 	bestBW := -1
 	for _, v := range pl.Variants {
@@ -431,17 +507,4 @@ func resolveURI(base *url.URL, raw string) (*url.URL, error) {
 func atoiSafe(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))
 	return n
-}
-
-func cloneHeader(h http.Header) http.Header {
-	if h == nil {
-		return http.Header{}
-	}
-	out := make(http.Header, len(h))
-	for k, v := range h {
-		cp := make([]string, len(v))
-		copy(cp, v)
-		out[k] = cp
-	}
-	return out
 }

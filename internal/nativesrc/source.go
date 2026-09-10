@@ -13,7 +13,7 @@
 //   - http(s) serving MPEG-TS  → streamed through unchanged
 //   - http(s) serving m3u8     → segments pulled and concatenated (live or VOD)
 //   - udp:// and rtp://        → read straight off the socket
-//   - fMP4/CMAF HLS            → ErrUnsupported (caller falls back to ffmpeg)
+//   - fMP4/CMAF HLS            → ErrHLSIsFMP4 (caller falls back to ffmpeg)
 //   - anything else            → ErrUnsupported
 //
 // Refusing loudly is the whole contract: the caller runs ffmpeg for whatever
@@ -37,103 +37,34 @@ import (
 	"time"
 )
 
-// DefaultSourceIdleTimeout bounds how long a native source read may stall
-// with NO bytes before we treat it as a network stall (half-open connection)
-// and close it so the read errors out → the supervisor reconnects. Mirrors
-// the ffmpeg path's -rw_timeout (8s). A reconnect must only ever be driven by
-// the SOURCE dropping / stalling — never by output (segment) staleness while
-// bytes are still flowing.
+// DefaultSourceIdleTimeout bounds how long a source read may stall with NO bytes
+// before we treat it as a network stall (a half-open connection) and close it so
+// the read errors out and the puller reconnects. Mirrors the ffmpeg path's
+// -rw_timeout (8s). A live source that delivers nothing for eight seconds is not
+// slow, it is gone; the cost of being wrong is one reconnect, which viewers ride
+// out on the buffer they already have.
 const DefaultSourceIdleTimeout = 8 * time.Second
 
-// idleTimeoutReader closes the wrapped source if no Read makes progress
-// within `idle`. A live source that goes half-open (stops sending bytes but
-// never closes the socket) would otherwise block the read forever; closing it
-// turns the stall into a read error the caller can act on (reconnect).
-// ErrSourceRateFloor wraps the read error produced when the rate-floor
-// watchdog closes a source for sustained-low throughput, so the supervisor
-// (and channel_health_events) can tell a rate-floor failover apart from a
-// generic source drop / stall. errors.Is(err, ErrSourceRateFloor) is true on
-// the read error the closed source returns.
-var ErrSourceRateFloor = errors.New("remux: source below rate floor")
-
+// idleTimeoutReader closes the wrapped source if no Read makes progress within
+// `idle`. A live source that goes half-open — stops sending bytes but never
+// closes the socket, the classic dropped upstream — would otherwise block the
+// read forever: no error, so no reconnect, so a channel that is silently dead
+// until something downstream happens to notice.
 type idleTimeoutReader struct {
-	rc    io.ReadCloser
-	idle  time.Duration
-	last  atomic.Int64 // unixnano of last byte received
-	total atomic.Int64 // cumulative bytes read (for the rate floor)
-	// Rate floor (opt-in, all zero = disabled): close the source when the read
-	// throughput stays below the EFFECTIVE floor for `grace` consecutive
-	// `window`s. The floor is max(minBps, ratio×baseline):
-	//   - minBps  : an ABSOLUTE bits/s floor (a source below it is ~dead).
-	//   - ratio   : a RELATIVE floor vs the source's OWN self-calibrated healthy
-	//               baseline (peak-hold with slow decay), so "dropped to a
-	//               fraction of what it was delivering" trips without needing a
-	//               trustworthy external nominal (ffprobe on live TS only sees
-	//               the audio PID). The relative half arms only after a short
-	//               warmup so startup ramp-up never trips it.
-	// This catches a source that keeps trickling bytes (idle/no-bytes check
-	// never fires) but delivers a fraction of a real feed — a token URL that
-	// throttles or reconnect-churns. Closing turns it into an ErrSourceRateFloor
-	// read error the supervisor acts on via the SAME failover path as a stall.
-	// LONG window + multi-window grace are deliberate so a transient dip never
-	// churns a healthy channel (the historical SIC/TVI failover-loop came from
-	// an aggressive PREFLIGHT probe, not this).
-	minBps  int64
-	ratio   float64
-	window  time.Duration
-	grace   int
-	publish *atomic.Int64 // optional: latest measured window bitrate (bps), for the heartbeat
-	tripped atomic.Bool   // set when the rate floor (not idle) closed the source
-	done    chan struct{}
-	once    sync.Once
-}
-
-// RateFloorOpts configures the sustained-low-throughput watchdog. All fields
-// optional: MinBPS<=0 and Ratio<=0 disable the floor; a non-nil Publish still
-// measures and exports the window bitrate (so the heartbeat gets a real rate
-// even when no floor is armed); Window<=0 disables both the floor and Publish.
-type RateFloorOpts struct {
-	MinBPS  int64         // absolute bits/s floor (0 = off)
-	Ratio   float64       // relative floor vs self-calibrated baseline, 0<r<1 (0 = off)
-	Window  time.Duration // measurement window
-	Grace   int           // consecutive low windows before closing
-	Publish *atomic.Int64 // optional sink for the latest measured window bitrate (bps)
+	rc   io.ReadCloser
+	idle time.Duration
+	last atomic.Int64 // unixnano of the last byte received
+	done chan struct{}
+	once sync.Once
 }
 
 // WrapIdleTimeout wraps rc so a no-bytes stall longer than idle becomes a read
-// error. idle <= 0 (or nil rc) returns rc unchanged.
+// error. idle <= 0 (or a nil rc) returns rc unchanged.
 func WrapIdleTimeout(rc io.ReadCloser, idle time.Duration) io.ReadCloser {
-	return WrapIdleTimeoutWithRateFloorOpts(rc, idle, RateFloorOpts{})
-}
-
-// WrapIdleTimeoutWithRateFloor is the legacy absolute-only entrypoint kept for
-// callers that don't measure/relative-floor (origin). Equivalent to Opts with
-// only MinBPS/Window/Grace set.
-func WrapIdleTimeoutWithRateFloor(rc io.ReadCloser, idle time.Duration, minBps int64, window time.Duration, grace int) io.ReadCloser {
-	return WrapIdleTimeoutWithRateFloorOpts(rc, idle, RateFloorOpts{MinBPS: minBps, Window: window, Grace: grace})
-}
-
-// WrapIdleTimeoutWithRateFloorOpts wraps rc with the idle watchdog plus the
-// configurable rate floor / measurement in o. Returns rc unchanged when there
-// is nothing to do (nil rc, or no idle AND no window to measure on).
-func WrapIdleTimeoutWithRateFloorOpts(rc io.ReadCloser, idle time.Duration, o RateFloorOpts) io.ReadCloser {
-	measuring := o.Window > 0 && (o.MinBPS > 0 || (o.Ratio > 0 && o.Ratio < 1) || o.Publish != nil)
-	if rc == nil || (idle <= 0 && !measuring) {
+	if rc == nil || idle <= 0 {
 		return rc
 	}
-	grace := o.Grace
-	if grace < 1 {
-		grace = 1
-	}
-	ratio := o.Ratio
-	if ratio <= 0 || ratio >= 1 {
-		ratio = 0
-	}
-	r := &idleTimeoutReader{
-		rc: rc, idle: idle,
-		minBps: o.MinBPS, ratio: ratio, window: o.Window, grace: grace, publish: o.Publish,
-		done: make(chan struct{}),
-	}
+	r := &idleTimeoutReader{rc: rc, idle: idle, done: make(chan struct{})}
 	r.last.Store(time.Now().UnixNano())
 	go r.watch()
 	return r
@@ -141,73 +72,19 @@ func WrapIdleTimeoutWithRateFloorOpts(rc io.ReadCloser, idle time.Duration, o Ra
 
 func (r *idleTimeoutReader) watch() {
 	tick := r.idle / 3
-	if r.idle <= 0 || tick < time.Second {
+	if tick < time.Second {
 		tick = time.Second
 	}
 	t := time.NewTicker(tick)
 	defer t.Stop()
-	measuring := r.window > 0 && (r.minBps > 0 || r.ratio > 0 || r.publish != nil)
-	winDeadline := time.Now().Add(r.window)
-	winStart := r.total.Load()
-	lowCount := 0
-	windowsSeen := 0
-	var baseline int64 // self-calibrated healthy rate: peak-hold w/ slow decay
-	// Relative floor only arms after warmup windows so a stream still ramping
-	// up / filling its first buffers never trips it. The absolute floor is NOT
-	// warmup-gated (its multi-window grace already covers a slow start).
-	const warmupWindows = 2
 	for {
 		select {
 		case <-r.done:
 			return
 		case <-t.C:
-			if r.idle > 0 && time.Since(time.Unix(0, r.last.Load())) > r.idle {
-				_ = r.rc.Close() // unblock a stuck Read → it returns an error
+			if time.Since(time.Unix(0, r.last.Load())) > r.idle {
+				_ = r.rc.Close() // unblock a stuck Read: it returns an error
 				return
-			}
-			if measuring && !time.Now().Before(winDeadline) {
-				delta := r.total.Load() - winStart
-				secs := int64(r.window / time.Second)
-				if secs < 1 {
-					secs = 1
-				}
-				windowBps := (delta * 8) / secs
-				if r.publish != nil {
-					r.publish.Store(windowBps) // export measured rate for the heartbeat
-				}
-				windowsSeen++
-				// Peak-hold with slow decay (×0.95/window): a transient burst
-				// can't permanently inflate the baseline, and a sustained drop
-				// lets it decay so windowBps eventually falls below ratio×baseline.
-				// Only accumulate AFTER warmup so a startup burst (HLS-pull
-				// concatenating a buffered segment window, TCP catch-up after
-				// connect) never seeds an inflated baseline that would then false-
-				// trip healthy steady-state windows.
-				if windowsSeen > warmupWindows {
-					if decayed := baseline - baseline/20; windowBps > decayed {
-						baseline = windowBps
-					} else {
-						baseline = decayed
-					}
-				}
-				floor := r.minBps
-				if r.ratio > 0 && windowsSeen > warmupWindows && baseline > 0 {
-					if rel := int64(float64(baseline) * r.ratio); rel > floor {
-						floor = rel
-					}
-				}
-				if floor > 0 && windowBps < floor {
-					lowCount++
-					if lowCount >= r.grace {
-						r.tripped.Store(true)
-						_ = r.rc.Close() // sustained thin source → ErrSourceRateFloor → failover
-						return
-					}
-				} else {
-					lowCount = 0
-				}
-				winStart = r.total.Load()
-				winDeadline = time.Now().Add(r.window)
 			}
 		}
 	}
@@ -217,17 +94,6 @@ func (r *idleTimeoutReader) Read(p []byte) (int, error) {
 	n, err := r.rc.Read(p)
 	if n > 0 {
 		r.last.Store(time.Now().UnixNano())
-		r.total.Add(int64(n))
-	}
-	// When the rate-floor watchdog closed the source, surface a distinguishable
-	// error so the supervisor labels the failover (vs a generic stall/drop).
-	// %v (not %w) on the underlying error is deliberate: if the close races and
-	// the blocked Read returns io.EOF, %w would make the trip satisfy
-	// errors.Is(io.EOF) and the TS readers (which check io.EOF first) would treat
-	// it as a CLEAN stream end — silently dropping the trip. %v keeps the
-	// ErrSourceRateFloor chain but not the io.EOF chain, so it's always a failure.
-	if err != nil && r.tripped.Load() {
-		return n, fmt.Errorf("%w: %v", ErrSourceRateFloor, err)
 	}
 	return n, err
 }
@@ -237,23 +103,18 @@ func (r *idleTimeoutReader) Close() error {
 	return r.rc.Close()
 }
 
-// ErrUnsupportedSource is returned by OpenSource when the URL scheme
-// or content-type isn't something the native remuxer can read. The
-// caller falls back to ffmpeg.
+// ErrUnsupportedSource is returned by Open when the URL scheme or content-type
+// isn't something the native reader can take. The caller falls back to ffmpeg.
 var ErrUnsupportedSource = errors.New("remux: unsupported source")
 
-// OpenSource returns a streaming io.ReadCloser of MPEG-TS bytes for
-// the given URL. Supported schemes today:
+// Open returns a streaming io.ReadCloser of MPEG-TS bytes for the given URL:
 //
-//	http(s):// — direct MPEG-TS streamed body (Content-Type starting
-//	             with "video/mp2t" or path ending .ts). HLS playlists
-//	             return ErrUnsupportedSource — use ffmpeg for those.
-//	udp:// / rtp:// — pulls multicast MPEG-TS off the network. Local
-//	             dev only; ops typically run a relay in front.
-//	file:// or bare path — read from disk.
+//	http(s):// — an MPEG-TS body (by content-type, or by sniffing the sync
+//	             bytes), or an m3u8 playlist whose segments are MPEG-TS.
+//	udp:// / rtp:// — pulls MPEG-TS off the socket (multicast or unicast).
+//	file:// or a bare path — read from disk.
 //
-// The returned reader honours ctx — Close() during read aborts the
-// transfer. Headers are applied to HTTP requests only.
+// The returned reader honours ctx: Close() during a read aborts the transfer.
 func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
@@ -271,11 +132,10 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 	case "file":
 		return os.Open(u.Path)
 	case "http", "https":
-		// HLS playlists are routed through the pull client, which
-		// returns a pipe whose reader yields concatenated MPEG-TS
-		// bytes from the live segment window. m3u8 served with an
-		// arbitrary path extension is still classified by the
-		// content-type sniff in openHTTP.
+		// HLS playlists are routed through the pull client, which returns a pipe
+		// whose reader yields concatenated MPEG-TS bytes from the live segment
+		// window. An m3u8 served under an arbitrary path extension is still
+		// classified by the sniff in AdoptHTTP.
 		if strings.HasSuffix(strings.ToLower(u.Path), ".m3u8") {
 			return OpenHLSPull(ctx, u.String(), opt)
 		}
@@ -296,44 +156,117 @@ func newStreamClient(opt Options) *http.Client {
 	return &http.Client{Transport: opt.transport(8 * time.Second)}
 }
 
+// clientBoundReadCloser ties a per-request http.Client's connection pool to the
+// lifetime of the body it produced.
+//
+// Building a client inline and letting it fall out of scope leaves the transport
+// unreachable but not idle: when the body closes, its connection is handed back
+// to that orphaned pool, where it stays open — with its reader goroutine — until
+// IdleConnTimeout expires it 90s later. A source reconnecting on the puller's
+// backoff stranded a socket and its goroutines on every attempt. This is the same
+// leak internal/puller documents fixing for its own client, reintroduced here by
+// the per-open client; closing the body now drains its pool with it.
+type clientBoundReadCloser struct {
+	io.ReadCloser
+	client *http.Client
+}
+
+func (c *clientBoundReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.client.CloseIdleConnections()
+	return err
+}
+
 func openHTTP(ctx context.Context, u *url.URL, opt Options) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	opt.apply(req)
-	resp, err := newStreamClient(opt).Do(req)
+	client := newStreamClient(opt)
+	resp, err := client.Do(req)
 	if err != nil {
+		client.CloseIdleConnections()
 		return nil, err
 	}
+	rc, err := AdoptHTTP(ctx, resp, opt)
+	if err != nil {
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	return &clientBoundReadCloser{ReadCloser: rc, client: client}, nil
+}
+
+// AdoptHTTP takes ownership of an ALREADY-OPEN response and yields MPEG-TS bytes
+// from it, or an error (having closed the body). It is the classification half of
+// openHTTP, exported so a caller that has already fetched the URL can hand the
+// response straight over instead of discarding it and fetching again.
+//
+// internal/puller does exactly that: it probes every source URL with a GET to
+// read the content-type, and used to close that body and let this package open a
+// second connection to the same URL — two round trips per connect, the first
+// one's connection unusable for the pool because it was closed undrained. The
+// caller keeps ownership of the http.Client the response came from; only the body
+// transfers.
+func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCloser, error) {
 	if resp.StatusCode/100 != 2 {
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: http %d", ErrUnsupportedSource, resp.StatusCode)
 	}
+	final := resp.Request.URL // honour redirects when resolving segment URIs
+
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	// Late HLS detection: server may have served a playlist despite
-	// the URL not ending .m3u8. Close the body and re-route through
-	// the pull client.
-	if strings.Contains(ct, "mpegurl") {
+	switch {
+	case strings.Contains(ct, "mpegurl"):
+		return adoptHLS(ctx, final, opt, nil, resp.Body)
+	case strings.Contains(ct, "mp2t"):
+		return WrapIdleTimeout(resp.Body, DefaultSourceIdleTimeout), nil
+	}
+
+	// Anything else has to PROVE what it is before we hand it on. Upstream this
+	// returned the body unchecked, which was safe there because a TS demuxer sat
+	// behind it; here the bytes go straight to viewers, so an MP4 (or an HTML
+	// error page) served with a generic content-type would be fanned out as if it
+	// were video. Sniff instead of trusting the header — IPTV upstreams routinely
+	// serve real TS, and the odd playlist, as application/octet-stream, so the
+	// header alone is neither sufficient nor necessary.
+	head := make([]byte, tsSyncProbePackets*tsPacketSize)
+	n, err := io.ReadFull(resp.Body, head)
+	head = head[:n]
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		_ = resp.Body.Close()
-		return OpenHLSPull(ctx, u.String(), opt)
+		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, redact(final), err)
 	}
-	if strings.Contains(ct, "mp2t") {
-		return resp.Body, nil
+	switch {
+	case looksLikeTS(head):
+		body := &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), resp.Body), c: resp.Body}
+		return WrapIdleTimeout(body, DefaultSourceIdleTimeout), nil
+	case looksLikePlaylist(head):
+		return adoptHLS(ctx, final, opt, head, resp.Body)
 	}
-	// Anything else has to PROVE it is MPEG-TS before we hand it on. Upstream
-	// this returned the body unchecked, which was safe there because a TS
-	// demuxer sat behind it; here the bytes go straight to viewers, so an MP4
-	// (or an HTML error page) served with a generic content-type would be
-	// fanned out as if it were video. Sniff instead of trusting the header —
-	// IPTV upstreams routinely serve real TS as application/octet-stream, so
-	// the header alone is neither sufficient nor necessary.
-	head, err := peekTS(resp.Body)
+	_ = resp.Body.Close()
+	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrUnsupportedSource, redact(final))
+}
+
+// adoptHLS finishes reading a playlist whose first bytes have already been
+// consumed and hands the manifest to the HLS puller, so it is not fetched a
+// second time. Always closes body.
+func adoptHLS(ctx context.Context, base *url.URL, opt Options, head []byte, body io.ReadCloser) (io.ReadCloser, error) {
+	defer body.Close()
+	rest, err := io.ReadAll(io.LimitReader(body, maxPlaylistBytes-int64(len(head))))
 	if err != nil {
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%w: %s: %v", ErrUnsupportedSource, u.Redacted(), err)
+		return nil, fmt.Errorf("%w: %s: read playlist: %v", ErrUnsupportedSource, redact(base), err)
 	}
-	return &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), resp.Body), c: resp.Body}, nil
+	manifest := make([]byte, 0, len(head)+len(rest))
+	manifest = append(append(manifest, head...), rest...)
+	return openHLSPullWith(ctx, base, opt, manifest)
+}
+
+func redact(u *url.URL) string {
+	if u == nil {
+		return "source"
+	}
+	return u.Redacted()
 }
 
 // tsSyncProbePackets is how many consecutive packet boundaries must carry the
@@ -341,28 +274,29 @@ func openHTTP(ctx context.Context, u *url.URL, opt Options) (io.ReadCloser, erro
 // at exactly 188-byte spacing is the format.
 const tsSyncProbePackets = 4
 
-// peekTS reads enough of a body to confirm it is MPEG-TS and returns what it
-// consumed, so the caller can replay those bytes to the real reader.
-func peekTS(r io.Reader) ([]byte, error) {
-	head := make([]byte, tsSyncProbePackets*tsPacketSize)
-	n, err := io.ReadFull(r, head)
-	head = head[:n]
-	if err != nil && err != io.ErrUnexpectedEOF {
-		return nil, fmt.Errorf("read: %w", err)
-	}
-	if n < tsPacketSize {
-		return nil, fmt.Errorf("only %d bytes, not an mpegts stream", n)
-	}
-	for off := 0; off+1 <= n; off += tsPacketSize {
-		if head[off] != 0x47 {
-			return nil, fmt.Errorf("no mpegts sync byte at offset %d (0x%02x)", off, head[off])
-		}
-	}
-	return head, nil
-}
-
 // tsPacketSize is the MPEG-TS packet length.
 const tsPacketSize = 188
+
+// looksLikeTS reports whether head carries the sync byte at every 188-byte
+// boundary it covers, over at least one whole packet.
+func looksLikeTS(head []byte) bool {
+	if len(head) < tsPacketSize {
+		return false
+	}
+	for off := 0; off < len(head); off += tsPacketSize {
+		if head[off] != 0x47 {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikePlaylist reports whether head opens an m3u8, tolerating a UTF-8 BOM
+// and leading whitespace. An upstream that serves playlists as text/plain or
+// octet-stream would otherwise be bounced to ffmpeg for no reason.
+func looksLikePlaylist(head []byte) bool {
+	return bytes.HasPrefix(bytes.TrimLeft(head, "\xef\xbb\xbf \t\r\n"), []byte("#EXTM3U"))
+}
 
 // prefixedReadCloser replays already-consumed bytes ahead of the live body while
 // still closing the underlying connection.
@@ -400,7 +334,7 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 	// TS packets per UDP datagram. The demuxer reads in 188-byte
 	// chunks anyway, so we just hand back the raw conn wrapped in a
 	// ReadCloser that respects ctx cancellation.
-	r := &udpReader{conn: conn, ctx: ctx}
+	r := &udpReader{conn: conn, ctx: ctx, done: make(chan struct{})}
 	go r.watch()
 	return r, nil
 }
@@ -421,6 +355,13 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 type udpReader struct {
 	conn *net.UDPConn
 	ctx  context.Context
+
+	// done releases the ctx watcher when this reader closes. Without it the
+	// watcher blocked on ctx.Done() for the whole STREAM's lifetime rather than
+	// this reader's, so every reconnect of a udp source stranded a goroutine and
+	// this reader's 64 KiB staging buffer until the stream itself was torn down.
+	done chan struct{}
+	once sync.Once
 
 	buf []byte // staging for one whole datagram
 	off int    // next unread byte in buf
@@ -468,8 +409,16 @@ func (r *udpReader) Read(p []byte) (int, error) {
 	r.off += c
 	return c, nil
 }
-func (r *udpReader) Close() error { return r.conn.Close() }
+
+func (r *udpReader) Close() error {
+	r.once.Do(func() { close(r.done) })
+	return r.conn.Close()
+}
+
 func (r *udpReader) watch() {
-	<-r.ctx.Done()
-	_ = r.conn.Close()
+	select {
+	case <-r.ctx.Done():
+		_ = r.conn.Close()
+	case <-r.done:
+	}
 }
