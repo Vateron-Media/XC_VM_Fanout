@@ -438,6 +438,15 @@ func (s *Stream) touch() {
 	s.mu.Unlock()
 }
 
+// restoreBuffer pumps a gated ring back to the full prebuffer + HLS view. It is
+// ensureBufferedLocked's locking wrapper, for the one caller that needs the ring
+// restored before it takes a join snapshot.
+func (s *Stream) restoreBuffer() {
+	s.mu.Lock()
+	s.ensureBufferedLocked()
+	s.mu.Unlock()
+}
+
 // ensureBufferedLocked pumps the ring back to the full prebuffer + HLS view if
 // the stream was gated down to the idle floor. Called when a viewer returns (TS
 // attach or HLS touch) so the audience gets the configured buffer depth again —
@@ -452,15 +461,34 @@ func (s *Stream) ensureBufferedLocked() {
 }
 
 // idleStopLocked stops the puller when it is control-managed, has no live
-// viewers, and hasn't been accessed within the grace window. Caller holds s.mu.
-func (s *Stream) idleStopLocked(now time.Time) {
+// viewers, and hasn't been accessed within the grace window, and releases the
+// ring it leaves behind. Reports whether it did, so the reaper can tell the
+// memory scavenger there is known-real garbage to hand back. Caller holds s.mu.
+func (s *Stream) idleStopLocked(now time.Time) bool {
 	if !s.running || s.cfg == nil || s.refs > 0 {
-		return
+		return false
 	}
 	if idle := now.Sub(time.Unix(0, s.lastAccess.Load())); idle >= s.grace {
 		dlog.Logf("reaper", "id=%s idle-stop (no viewers, idle %s ≥ grace %s)", s.id, idle.Round(time.Second), s.grace)
 		s.stopLocked()
+		// The puller is gone, so nothing will prune this ring again: whatever it
+		// holds is frozen at the moment the source stopped and stays resident for
+		// as long as the channel is registered. That was the daemon's biggest idle
+		// memory term — ~idle_buffer_ratio × prebuffer_max_sec of video per idle
+		// channel, forever. Release it; a viewer returning restarts the puller and
+		// the ring refills, exactly as it does for a channel that was never started.
+		//
+		// The trade is that HLS 404s for the first couple of segments after an
+		// idle-stop instead of offering a playlist of minutes-old segments — which
+		// is the cold-start behaviour anyway, and better than handing a player
+		// stale video it will then have to resync out of.
+		if s.Hub != nil { // a bare Stream (tests) has no hub to flush
+			s.Hub.Flush()
+		}
+		s.dropSegCache()
+		return true
 	}
+	return false
 }
 
 // gateIdleBufferLocked collapses an unwatched stream's ring to the idle floor
@@ -699,25 +727,29 @@ func (m *Manager) StartReaper(ctx context.Context) {
 					streams = append(streams, st)
 				}
 				m.mu.Unlock()
-				gated := false
+				freed := false
 				for _, st := range streams {
 					st.mu.Lock()
-					st.idleStopLocked(now)
+					// Either can release a sizeable ring: an idle-stop drops the whole
+					// thing, a gate collapses it to the idle floor.
+					if st.idleStopLocked(now) {
+						freed = true
+					}
 					if st.gateIdleBufferLocked(now) {
-						gated = true
+						freed = true
 					}
 					st.mu.Unlock()
 				}
-				// A gate collapsed at least one ring: the dropped GOP bytes are now
-				// GC garbage, but Go hands freed pages back to the OS only lazily,
-				// so RSS would sit flat for minutes. Hand that fact to the memory
+				// At least one ring was released: the dropped GOP bytes are now GC
+				// garbage, but Go hands freed pages back to the OS only lazily, so
+				// RSS would sit flat for minutes. Hand that fact to the memory
 				// scavenger rather than forcing a full stop-the-world GC here: this
 				// sweep runs every grace/2 (5 s at the default grace), and calling
 				// FreeOSMemory from it put the daemon in near-continuous full
 				// collections, re-faulting the pages it had just returned. The
 				// scavenger owns the release, and this flag lets it skip its rate
 				// floor because the garbage is known-real.
-				if gated {
+				if freed {
 					m.gatedSinceScavenge.Store(true)
 				}
 			}
@@ -1246,6 +1278,14 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// the ring (maxPrebufMS).
 	prebufMS := m.resolvePrebufMS(r.URL.Query().Get("prebuffer"))
 
+	// Restore a gated ring BEFORE capturing the join burst, so this viewer's own
+	// snapshot is drawn from the full buffer rather than the idle floor. attach()
+	// would do it too, but only after Subscribe had already copied.
+	st.restoreBuffer()
+
+	// Subscribe FIRST, then attach: registering the subscriber before the puller
+	// starts is what guarantees no published chunk falls between the snapshot and
+	// the live tail.
 	sub, snap := st.Hub.Subscribe(prebufMS)
 	defer st.Hub.Unsubscribe(sub)
 	st.attach()
@@ -1315,19 +1355,17 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// mobile link that sent no FIN nor RST) is never noticed by anyone — not by us,
 	// and not by nginx, which is equally idle. That connection sat in the select
 	// below forever, holding its uuid in /connections as a ghost the reconciler
-	// could never clear. Polled on a coarse ticker rather than a per-chunk timer
-	// reset: quarter-timeout precision is plenty, and the hot path stays a
-	// timestamp store.
+	// could never clear. A single timer, re-armed for the remainder when it finds
+	// a chunk has landed since it was set — so the hot path stays a timestamp
+	// store, the drop fires exactly at the timeout, and a healthy viewer costs one
+	// wakeup per timeout instead of the four the old approximating ticker spent.
 	var idleC <-chan time.Time
+	var idleTimer *time.Timer
 	idleTimeout := time.Duration(m.viewerIdleNS.Load())
 	if idleTimeout > 0 {
-		tick := idleTimeout / 4
-		if tick <= 0 {
-			tick = idleTimeout // never hand NewTicker a zero interval
-		}
-		tk := time.NewTicker(tick)
-		defer tk.Stop()
-		idleC = tk.C
+		idleTimer = time.NewTimer(idleTimeout)
+		defer idleTimer.Stop()
+		idleC = idleTimer.C
 	}
 	lastChunk := time.Now()
 
@@ -1339,7 +1377,6 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		snapErr = write(snap)
 	}
 	hub.ReleaseSnapshot(snap)
-	snap = nil
 	if snapErr != nil {
 		reason = writeFailReason(snapErr)
 		return
@@ -1369,7 +1406,13 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case now := <-idleC:
-			if now.Sub(lastChunk) < idleTimeout {
+			// A chunk may have landed since the timer was armed; re-arm for the
+			// remainder rather than polling at four times the rate to approximate
+			// it. One timer per viewer either way, but a healthy viewer now wakes
+			// once per timeout instead of four times, and the drop fires exactly at
+			// the timeout rather than up to a quarter of it late.
+			if left := idleTimeout - now.Sub(lastChunk); left > 0 {
+				idleTimer.Reset(left)
 				continue
 			}
 			reason = "no data for " + idleTimeout.String() + " (source off-air; dropped)"
