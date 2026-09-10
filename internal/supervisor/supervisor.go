@@ -79,6 +79,11 @@ type Policy struct {
 type Spec struct {
 	Sources []Source `json:"sources"`
 	Policy  Policy   `json:"policy"`
+	// Health is the watchdog policy applied while the encoder runs. Omitted or
+	// zero means the process is supervised and nothing about its OUTPUT is
+	// judged, which is the safe default for a stream whose panel settings have
+	// not been mapped over yet.
+	Health Health `json:"health"`
 
 	// PIDPath is the panel's `<streams>/<id>_.pid`. The daemon keeps writing it
 	// because ProcessManager::isStreamRunning and stopStream still read it, so a
@@ -143,7 +148,10 @@ type Process interface {
 	// Pid is the process id to publish (to the panel's pid file, and to anything
 	// still reconciling on it).
 	Pid() int
-	// Wait blocks until the process exits and reports why.
+	// Wait blocks until the process exits and reports why. It MUST be safe to
+	// call more than once and MUST return the same answer each time: the watch
+	// loop waits on the process, and a health verdict then kills it and waits
+	// again to reap it. A one-shot Wait deadlocks the second caller.
 	Wait() error
 	// Kill ends it, and must be safe to call after it has already exited.
 	Kill()
@@ -160,8 +168,14 @@ type Supervisor struct {
 
 	launch  Launcher
 	hasData func(id string) bool // "did bytes actually arrive for this stream?"
+	vitals  VitalsFunc           // what the output looks like right now
 	now     func() time.Time
 	sleep   func(context.Context, time.Duration) bool
+
+	// healthTick is how often a running stream is judged. A minute is the
+	// coarsest it may be: the panel's scheduled auto-restart matches on HH:MM, so
+	// a slower tick would step over the minute it is meant to fire in.
+	healthTick time.Duration
 }
 
 // New returns a Supervisor. hasData is how a start is confirmed — the daemon
@@ -176,12 +190,21 @@ func New(launch Launcher, hasData func(id string) bool) *Supervisor {
 		hasData = func(string) bool { return true }
 	}
 	return &Supervisor{
-		procs:   make(map[string]*stream),
-		launch:  launch,
-		hasData: hasData,
-		now:     time.Now,
-		sleep:   sleepCtx,
+		procs:      make(map[string]*stream),
+		launch:     launch,
+		hasData:    hasData,
+		now:        time.Now,
+		sleep:      sleepCtx,
+		healthTick: 5 * time.Second,
 	}
+}
+
+// WithVitals supplies the stream-health source the watch loop judges against.
+// Without it the supervisor still starts, watches and restarts encoders — it
+// just cannot see whether the output is any good, so every Health rule is inert.
+func (s *Supervisor) WithVitals(v VitalsFunc) *Supervisor {
+	s.vitals = v
+	return s
 }
 
 // sleepCtx waits for d, or returns false as soon as ctx is done.
@@ -208,6 +231,13 @@ type stream struct {
 	spec    Spec
 	proc    Process
 	pid     int
+	// autoRestartAt is when the scheduled restart last fired. The schedule
+	// matches on HH:MM, so without this it keeps matching for the rest of that
+	// minute and the stream restarts in a tight loop until the clock moves on.
+	// (MonitorCommand.php has the same shape and only escaped it because its
+	// restart path was slow enough to usually leave the minute — luck, not
+	// design, and the daemon restarts far too quickly to rely on it.)
+	autoRestartAt time.Time
 	source  string
 	started time.Time
 	running bool
@@ -375,18 +405,81 @@ func (st *stream) run(ctx context.Context) {
 		}
 		dlog.Logf("monitor", "id=%s started pid=%d source=%q", st.id, proc.Pid(), src.Label)
 
-		// Watch. Wait returns when the encoder exits, for any reason.
-		waitErr := proc.Wait()
-		st.markStopped(waitErr)
+		// Watch until the encoder exits or a health rule condemns it.
+		verdict := st.watch(ctx, proc)
+		st.markStopped(nil)
 
 		if ctx.Err() != nil {
 			return // we ended it (Release / shutdown), not a fault
 		}
-		st.emit(EventStreamFailed, src.Label)
-		dlog.Logf("monitor", "id=%s process exited (%v); restarting", st.id, waitErr)
+		if verdict.failed() {
+			// Condemned rather than crashed: kill it before restarting, or the
+			// old encoder keeps running and two of them fight over the source.
+			proc.Kill()
+			proc.Wait()
+			st.note(verdict.reason, 0)
+			st.emit(verdict.event, src.Label)
+			dlog.Logf("monitor", "id=%s unhealthy: %s (%s); restarting", st.id, verdict.reason, verdict.event)
+		} else {
+			st.emit(EventStreamFailed, src.Label)
+			dlog.Logf("monitor", "id=%s process exited; restarting", st.id)
+		}
 
 		if !st.sup.sleep(ctx, time.Duration(st.policy().StreamFailSleepSec)*time.Second) {
 			return
+		}
+	}
+}
+
+// watch blocks until the encoder exits on its own (a zero verdict) or a health
+// rule fires (a verdict naming it). It is the daemon-side replacement for the
+// inner monitoring loop of MonitorCommand.php — the same conditions, judged
+// against bytes the daemon has already parsed instead of against ffprobe runs,
+// playlist hashes and a progress file on disk.
+func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
+	exited := make(chan error, 1)
+	go func() { exited <- proc.Wait() }()
+
+	health := st.spec_().Health
+	base := &fpsBaseline{}
+	startedAt := st.startTime()
+	sup := st.sup
+
+	// Nothing to judge: just wait for the process.
+	if sup.vitals == nil {
+		select {
+		case <-exited:
+		case <-ctx.Done():
+		}
+		return healthVerdict{}
+	}
+
+	tick := time.NewTicker(sup.healthTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-exited:
+			return healthVerdict{}
+		case <-ctx.Done():
+			return healthVerdict{}
+		case <-tick.C:
+		}
+
+		now := sup.now()
+
+		// The scheduled restart is not a fault, but it is a restart, and the
+		// panel logs it as its own action. Once per window: see autoRestartAt.
+		if health.AutoRestart.due(now) && !st.autoRestartedIn(now) {
+			st.markAutoRestart(now)
+			return healthVerdict{event: EventAutoRestart, reason: "scheduled auto-restart"}
+		}
+
+		v, ok := sup.vitals(st.id)
+		if !ok {
+			continue // the stream is not registered with the daemon (yet)
+		}
+		if verdict := health.check(now, startedAt, v, base); verdict.failed() {
+			return verdict
 		}
 	}
 }
@@ -429,9 +522,9 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 		}
 
 		if st.sup.hasData(st.id) {
-			// Hand the already-running Wait to the caller rather than calling
-			// Wait twice, which most implementations do not allow.
-			return &waitedProcess{Process: proc, wait: exited}, nil
+			// Hand the already-running Wait to the caller rather than starting a
+			// second one on the underlying process.
+			return newWaitedProcess(proc, exited), nil
 		}
 		if !st.sup.now().Before(deadline) {
 			proc.Kill()
@@ -447,14 +540,34 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	}
 }
 
-// waitedProcess adapts a process whose Wait is already in flight, so the restart
-// loop can wait on it exactly once more.
+// waitedProcess adapts a process whose Wait is already in flight (started during
+// the confirmation window) so later callers can still wait on it.
+//
+// The result is latched: the channel carries exactly one value, and both the
+// watch loop and the post-kill reap wait on this. Reading the channel directly
+// would let the first caller consume the only value and leave the second blocked
+// forever — which is precisely the deadlock this shape exists to prevent.
 type waitedProcess struct {
 	Process
 	wait chan error
+
+	once sync.Once
+	done chan struct{}
+	err  error
 }
 
-func (w *waitedProcess) Wait() error { return <-w.wait }
+func newWaitedProcess(p Process, wait chan error) *waitedProcess {
+	return &waitedProcess{Process: p, wait: wait, done: make(chan struct{})}
+}
+
+func (w *waitedProcess) Wait() error {
+	w.once.Do(func() {
+		w.err = <-w.wait
+		close(w.done)
+	})
+	<-w.done
+	return w.err
+}
 
 // ── state helpers ──────────────────────────────────────────────────────────
 
@@ -496,9 +609,35 @@ func (st *stream) markStopped(err error) {
 	st.mu.Unlock()
 }
 
+// autoRestartedIn reports whether the scheduled restart has already fired in the
+// same minute as now — the granularity the panel's schedule is expressed at.
+func (st *stream) autoRestartedIn(now time.Time) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return !st.autoRestartAt.IsZero() && st.autoRestartAt.Truncate(time.Minute).Equal(now.Truncate(time.Minute))
+}
+
+func (st *stream) markAutoRestart(now time.Time) {
+	st.mu.Lock()
+	st.autoRestartAt = now
+	st.mu.Unlock()
+}
+
+func (st *stream) startTime() time.Time {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.started
+}
+
+// note records why something happened. fails <= 0 leaves the failure tally
+// alone, so a health verdict can explain itself without resetting the
+// consecutive-start-failure count that stop_failures is counting.
 func (st *stream) note(msg string, fails int) {
 	st.mu.Lock()
-	st.lastErr, st.fails = msg, fails
+	st.lastErr = msg
+	if fails > 0 {
+		st.fails = fails
+	}
 	st.mu.Unlock()
 }
 

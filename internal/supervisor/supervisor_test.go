@@ -80,7 +80,12 @@ func newHarness(t *testing.T) *harness {
 		p := newFakeProcess(nextPid)
 		h.procs = append(h.procs, p)
 		h.mu.Unlock()
-		h.spawned <- p
+		// Never block the supervisor: a test that stops draining this must not
+		// wedge the loop it is testing.
+		select {
+		case h.spawned <- p:
+		default:
+		}
 		return p, nil
 	}, func(string) bool {
 		h.mu.Lock()

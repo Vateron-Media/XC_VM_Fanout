@@ -42,6 +42,12 @@ func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad spec: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		// A re-PUT restarts the encoder, so drop any sampled counters first:
+		// the new process starts its own, and differencing across the boundary
+		// would read as a frame-rate collapse.
+		if m.vitals != nil {
+			m.vitals.forget(id)
+		}
 		if err := m.sup.Supervise(id, spec); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -59,6 +65,9 @@ func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(st)
 
 	case http.MethodDelete:
+		if m.vitals != nil {
+			m.vitals.forget(id)
+		}
 		if m.sup.Release(id) {
 			dlog.Logf("ctl", "id=%s monitor released", id)
 		}
@@ -90,7 +99,8 @@ func (m *Manager) serveMonitors(w http.ResponseWriter, _ *http.Request) {
 // bytes, which is this manager's own liveness mark: the panel could only answer
 // that question by polling for a playlist file to appear.
 func (m *Manager) EnableSupervision() {
-	m.sup = supervisor.New(nil, m.streamHasData)
+	m.vitals = newVitalsSampler()
+	m.sup = supervisor.New(nil, m.streamHasData).WithVitals(m.sample)
 }
 
 // streamHasData reports whether a registered stream has ever published a

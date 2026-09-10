@@ -63,6 +63,14 @@ type State struct {
 	lastPMT  []byte // one 188-byte PMT packet, or nil
 	pmtPID   int    // PID carrying the PMT, or -1 if unknown
 	videoPID int    // PID carrying the video ES (for HLS segment PTS), or -1
+	audioPID int    // PID carrying the audio ES, or -1 when the source has none
+
+	// audioPkts and videoFrames feed the supervisor's health checks: "has audio
+	// stopped while video keeps flowing" and "has the frame rate collapsed". Both
+	// are counters the caller samples and differences, rather than state kept
+	// here, so this package stays a parser and the policy lives with the watchdog.
+	audioPkts   int64
+	videoFrames int64
 	gops     []gop  // oldest→newest; the last element is the open (current) GOP
 	lastPCR  int64  // most recent PCR base seen (90 kHz), or -1
 	maxGOP   int    // cap on a single GOP's length (bytes) — memory guard
@@ -120,7 +128,7 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
@@ -213,6 +221,22 @@ func (s *State) Update(chunk []byte) {
 		}
 		pid := (int(pkt[1]&0x1f) << 8) | int(pkt[2])
 		pusi := pkt[1]&0x40 != 0
+
+		// Health counters. A payload-unit-start on the video PID begins a new
+		// access unit, which is close enough to "a frame" for a rate that is only
+		// ever compared against this same stream's own baseline.
+		if pusi {
+			switch pid {
+			case s.audioPID:
+				if s.audioPID >= 0 {
+					s.audioPkts++
+				}
+			case s.videoPID:
+				if s.videoPID >= 0 {
+					s.videoFrames++
+				}
+			}
+		}
 		afc := (pkt[3] >> 4) & 0x3
 		hasAdaptation := afc == 2 || afc == 3
 
@@ -237,6 +261,9 @@ func (s *State) Update(chunk []byte) {
 			s.lastPMT = cloneInto(s.lastPMT, pkt)
 			if v := parseVideoPID(pkt); v >= 0 {
 				s.videoPID = v
+			}
+			if a := parseAudioPID(pkt); a >= 0 {
+				s.audioPID = a
 			}
 		}
 
@@ -632,6 +659,49 @@ func payloadOffset(pkt []byte) int {
 	default: // payload only
 		return 4
 	}
+}
+
+// Counters reports the health counters: audio packets and video access units
+// seen since this State was created, and whether the source declares an audio
+// stream at all. hasAudio distinguishes "audio has stopped" from "there was
+// never any audio", which decides whether silence is a fault worth a restart.
+// Caller (Hub) serialises access.
+func (s *State) Counters() (audioPkts, videoFrames int64, hasAudio bool) {
+	return s.audioPkts, s.videoFrames, s.audioPID >= 0
+}
+
+// parseAudioPID reads the first audio elementary-stream PID out of a PMT packet,
+// or -1. Mirrors parseVideoPID; the two differ only in the stream types they
+// accept.
+func parseAudioPID(pkt []byte) int {
+	ps := payloadOffset(pkt)
+	if ps < 0 || ps >= len(pkt) {
+		return -1
+	}
+	p := ps + 1 + int(pkt[ps]) // skip pointer_field
+	if p+12 > len(pkt) {
+		return -1
+	}
+	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
+	es := p + 12 + pil
+	for es+5 <= len(pkt) {
+		if isAudioStreamType(pkt[es]) {
+			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2])
+		}
+		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
+	}
+	return -1
+}
+
+// isAudioStreamType covers the audio codecs an IPTV source realistically
+// carries: MPEG-1/2 audio, AAC (ADTS and LATM), AC-3 and E-AC-3 — including the
+// 0x06 private-stream form the latter two are usually signalled as in DVB.
+func isAudioStreamType(t byte) bool {
+	switch t {
+	case 0x03, 0x04, 0x0f, 0x11, 0x81, 0x87:
+		return true
+	}
+	return false
 }
 
 // parseVideoPID reads the first video elementary-stream PID out of a PMT packet,

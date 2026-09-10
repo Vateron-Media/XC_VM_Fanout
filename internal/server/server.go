@@ -552,6 +552,9 @@ type Manager struct {
 	// until EnableSupervision, and a nil one simply makes /monitor report that
 	// this node does not do it — which is what keeps the cutover per-node.
 	sup *supervisor.Supervisor
+	// vitals turns the hubs' cumulative health counters into the rates the
+	// supervisor judges a running encoder by.
+	vitals *vitalsSampler
 
 	// defaultChunk is the source read size stamped onto a stream at creation
 	// (read under m.mu). sourceInsecure is read off m.mu when registering a pull,
