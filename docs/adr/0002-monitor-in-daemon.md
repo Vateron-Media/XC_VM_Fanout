@@ -1,7 +1,9 @@
 # ADR 0002 — Move the per-stream monitor into the daemon
 
-Status: **implemented** (M1-M5 landed; off by default, see Rollout) (supersedes the "PHP retains per-stream process monitoring" line in
-XC_VM's `docs/adr/0003-full-daemon-cutover.md`)
+Status: **implemented** — M1–M5 landed, off by default (see Rollout).
+
+Supersedes the "PHP retains per-stream process monitoring" line in XC_VM's
+`docs/adr/0003-full-daemon-cutover.md`.
 
 Date: 2026-09-10
 
