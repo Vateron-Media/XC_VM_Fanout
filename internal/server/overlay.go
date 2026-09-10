@@ -170,7 +170,13 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
 		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-i", "pipe:0",
-		"-filter_complex", filter,
+		// -vf, not -filter_complex: an unlabeled filtergraph input used to bind
+		// itself to the first video stream, but ffmpeg 7 refuses to resolve it
+		// alongside -map 0 ("Cannot find a matching stream for unlabeled input pad")
+		// and the whole re-encode fails — which, being best-effort, showed up as the
+		// signal silently doing nothing. -vf applies to the mapped video stream on
+		// every ffmpeg version, and -map 0 keeps audio/subs flowing as before.
+		"-vf", filter,
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
 		"-acodec", "copy", "-scodec", "copy",
 		"-mpegts_flags", "+initial_discontinuity",
@@ -219,7 +225,7 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 	cmd := exec.CommandContext(ctx, m.ffmpegBin,
 		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-fflags", "+genpts", "-i", "pipe:0",
-		"-filter_complex", filter,
+		"-vf", filter, // see overlaySegment: -filter_complex cannot bind under ffmpeg 7
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
 		"-acodec", "copy", "-scodec", "copy",
 		"-mpegts_flags", "+initial_discontinuity",

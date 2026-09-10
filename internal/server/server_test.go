@@ -403,3 +403,42 @@ func TestServeLiveStreamsSnapshotThenTail(t *testing.T) {
 		t.Fatal("live tail must be TS-aligned")
 	}
 }
+
+// TestSourceBackendAppliedToRegistrations: the node-wide backend reaches a
+// registered source, and a per-stream value overrides it so one troublesome
+// channel can be pinned without changing the node.
+func TestSourceBackendAppliedToRegistrations(t *testing.T) {
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m.sourceBackend.Store(puller.BackendNative)
+
+	m.Register("node-wide", puller.Source{URLs: []string{"http://x/a.m3u8"}}, 0)
+	st := m.Get("node-wide")
+	st.mu.Lock()
+	got := st.cfg.Backend
+	st.mu.Unlock()
+	if got != puller.BackendNative {
+		t.Errorf("node-wide backend = %q, want %q", got, puller.BackendNative)
+	}
+
+	m.Register("pinned", puller.Source{URLs: []string{"http://x/b.m3u8"}, Backend: puller.BackendFfmpeg}, 0)
+	st = m.Get("pinned")
+	st.mu.Lock()
+	got = st.cfg.Backend
+	st.mu.Unlock()
+	if got != puller.BackendFfmpeg {
+		t.Errorf("pinned backend = %q, want the per-stream %q", got, puller.BackendFfmpeg)
+	}
+}
+
+// TestNormalizeBackendRejectsTypos: an unknown per-stream value must read as
+// "unset" so the stream takes the node-wide setting, not so it pins nothing.
+func TestNormalizeBackendRejectsTypos(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"auto", "auto"}, {"ffmpeg", "ffmpeg"}, {"native", "native"},
+		{"", ""}, {"FFmpeg", ""}, {"ffmpg", ""},
+	} {
+		if got := normalizeBackend(c.in); got != c.want {
+			t.Errorf("normalizeBackend(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

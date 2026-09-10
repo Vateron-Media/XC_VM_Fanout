@@ -551,7 +551,8 @@ type Manager struct {
 	// so it is atomic. Both are retunable live via ApplyConfig (new streams/pulls
 	// pick up the change).
 	defaultChunk   int
-	sourceInsecure atomic.Bool // default for puller.Source.Insecure on registered sources
+	sourceInsecure atomic.Bool  // default for puller.Source.Insecure on registered sources
+	sourceBackend  atomic.Value // string: how a non-mp2t source becomes MPEG-TS
 }
 
 // SetSourceInsecure sets whether pull sources skip upstream TLS verification
@@ -594,6 +595,7 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 	m.hlsWindow.Store(int64(hlsWindow))
 	m.writeTimeout.Store(int64(defaultWriteTimeout))
 	m.sourceInsecure.Store(true)
+	m.sourceBackend.Store(defaults.CfgSourceBackend)
 	m.idleBufferGraceNS.Store(int64(time.Duration(defaults.CfgIdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(defaults.CfgIdleBufferRatio))
 	m.viewerIdleNS.Store(int64(time.Duration(defaults.CfgViewerIdleTimeoutSec) * time.Second))
@@ -633,6 +635,7 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	m.hlsWindow.Store(int64(v.HLSWindow))
 	m.writeTimeout.Store(int64(time.Duration(v.WriteTimeoutSec) * time.Second))
 	m.sourceInsecure.Store(v.SourceInsecure)
+	m.sourceBackend.Store(v.SourceBackend)
 	m.idleBufferGraceNS.Store(int64(time.Duration(v.IdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(v.IdleBufferRatio))
 	m.viewerIdleNS.Store(int64(time.Duration(v.ViewerIdleTimeoutSec) * time.Second))
@@ -862,10 +865,22 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 	return st
 }
 
-// Register sets a stream's pull config (control API).
+// Register sets a stream's pull config (control API). The node-wide source
+// backend applies unless the registration pinned one for this stream.
 func (m *Manager) Register(id string, src puller.Source, chunk int) {
 	src.Insecure = m.sourceInsecure.Load()
+	if src.Backend == "" {
+		src.Backend = m.backend()
+	}
 	m.GetOrCreate(id).setConfig(src, chunk)
+}
+
+// backend returns the node-wide source backend.
+func (m *Manager) backend() string {
+	if v, ok := m.sourceBackend.Load().(string); ok && v != "" {
+		return v
+	}
+	return defaults.CfgSourceBackend
 }
 
 // RunPinned feeds a stream for the whole process lifetime (launch/test mode,
@@ -876,6 +891,9 @@ func (m *Manager) Register(id string, src puller.Source, chunk int) {
 // SIGTERM) stops the puller and clears running.
 func (m *Manager) RunPinned(ctx context.Context, id string, src puller.Source, chunk int) {
 	src.Insecure = m.sourceInsecure.Load()
+	if src.Backend == "" {
+		src.Backend = m.backend()
+	}
 	src.Label = id
 	st := m.GetOrCreate(id)
 	st.mu.Lock()
@@ -1153,6 +1171,22 @@ type streamConfig struct {
 	Chunk  int      `json:"chunk"`
 	Key    string   `json:"key"` // hex AES-128 key for encrypted HLS (optional)
 	IV     string   `json:"iv"`  // hex AES-128-CBC IV
+	// Backend pins how THIS stream's non-mp2t source is converted, overriding
+	// source_backend from the config file: "auto", "ffmpeg" or "native". Empty
+	// (the usual case) takes the node-wide setting, so the panel only has to
+	// send it for a channel that needs pinning.
+	Backend string `json:"backend"`
+}
+
+// normalizeBackend keeps an unknown per-stream backend from pinning a channel to
+// something that does not exist: it falls through to the node-wide setting,
+// exactly as an omitted field does. A typo must never take a channel off air.
+func normalizeBackend(b string) string {
+	switch b {
+	case puller.BackendAuto, puller.BackendFfmpeg, puller.BackendNative:
+		return b
+	}
+	return ""
 }
 
 func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
@@ -1174,6 +1208,7 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 			Proxy:     c.Proxy,
 			Cookie:    c.Cookie,
 			FfmpegBin: c.Ffmpeg,
+			Backend:   normalizeBackend(c.Backend),
 		}, c.Chunk)
 		m.GetOrCreate(id).setEnc(c.Key, c.IV)
 		w.WriteHeader(http.StatusNoContent)

@@ -150,6 +150,19 @@ const (
 	// PullBackoffMax plus an ffmpeg cold start), so a recovering source does not
 	// cost viewers their connection.
 	CfgViewerIdleTimeoutSec = 30
+	// CfgSourceBackend picks how a non-mp2t source is turned into MPEG-TS:
+	//
+	//	"auto"   — native where the source allows it, ffmpeg otherwise
+	//	"ffmpeg" — always ffmpeg (the pre-0.12 behaviour, and the kill-switch)
+	//	"native" — native only; a source the native reader will not take FAILS
+	//	           rather than falling back. For testing what is actually
+	//	           eligible on a given node — not for production.
+	//
+	// "auto" is the default because the fallback makes it strictly safer than
+	// ffmpeg-always: anything the native reader declines runs exactly the
+	// pipeline it ran before, while the common IPTV case (HLS with TS segments)
+	// stops costing a child process per stream.
+	CfgSourceBackend = "auto"
 	// CfgMemLimitMB is an explicit ceiling (MiB) for the Go soft memory limit,
 	// 0 = derive it from the cgroup/host budget (see MemLimitFraction). The daemon
 	// usually shares a panel box with nginx, MySQL, PHP-FPM and the streams' own

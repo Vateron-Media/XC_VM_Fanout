@@ -70,7 +70,7 @@ Two supporting details make the gate observable and correct in production:
   garbage, but Go returns freed pages to the OS only lazily (the background
   scavenger paces itself), so RSS would sit flat for minutes and the win would be
   invisible. A sweep that gated at least one stream therefore forces the release.
-  *Amended in 0.11.3:* the reaper **signals** the memory scavenger instead of
+  *Amended in 0.11.4:* the reaper **signals** the memory scavenger instead of
   calling `debug.FreeOSMemory()` inline. That call is a full stop-the-world GC plus
   a page-return sweep, and the reaper runs every `grace/2` (5 s at the default
   grace) — which, together with a `lastAccess` defect that made streams gate the

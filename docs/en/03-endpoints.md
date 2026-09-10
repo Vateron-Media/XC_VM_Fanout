@@ -121,7 +121,8 @@ Registers a source that the daemon will pull **itself**. The body is JSON:
   "ffmpeg": "/usr/bin/ffmpeg",
   "chunk":  12032,
   "key":    "<hex 16 bytes, optional>",
-  "iv":     "<hex 16 bytes, optional>"
+  "iv":     "<hex 16 bytes, optional>",
+  "backend": "auto | ffmpeg | native (optional)"
 }
 ```
 
@@ -132,6 +133,7 @@ Registers a source that the daemon will pull **itself**. The body is JSON:
 | `proxy` | no | HTTP proxy `host:port`. |
 | `cookie` | no | Value of the `Cookie` header. |
 | `ffmpeg` | no | Path to ffmpeg (for remuxing non-mp2t sources). |
+| `backend` | no | Pins how **this** stream's non-mp2t source is converted, overriding `source_backend`: `auto`, `ffmpeg` or `native`. Omitted (the usual case) takes the node-wide setting — so send it only for a channel that needs pinning. An unknown value is ignored rather than honoured, so a typo can never take a channel off air. See [The source backend](06-configuration.md#the-source-backend). |
 | `chunk` | no | Ingest read size (aligned down to 188). |
 | `key`, `iv` | no | Hex, 16 bytes each — enable HLS encryption. TS fan-out is always plain. |
 
@@ -166,7 +168,7 @@ Clears the config, stops the puller, closes the ingest listener **and every prod
 it**, **drops the viewers still attached**, and removes the stream from the registry.
 **Response:** `204`.
 
-> **Why the teardown is that thorough** (0.11.3). Removing the stream from the registry makes its
+> **Why the teardown is that thorough** (0.11.4). Removing the stream from the registry makes its
 > viewers invisible to [`/connections`](#get-connections--viewer-reconciliation), so `fanout_sync`
 > closes their `lines_live` rows — while their handler goroutines would sit forever on a hub that
 > will never publish again, pinning the stream, its hub and its whole ring as an unreachable
@@ -286,6 +288,12 @@ Both consumers pass `?vc=<codec>` (the source video codec, forwarded by `live.ph
 re-encode keeps the stream's codec; absent → `h264`. Requires the daemon to have been started with
 `-ffmpeg` **and** `-font` pointing at a `drawtext`-capable ffmpeg — without them the signal is a
 no-op. **Response:** `204 No Content` once queued (`400` on empty message, `405` on non-POST).
+
+> **Fixed in 0.11.4:** the re-encode passed the `drawtext` graph as `-filter_complex` with an
+> unlabeled input pad. ffmpeg 7 refuses to resolve that alongside `-map 0` ("Cannot find a matching
+> stream for unlabeled input pad"), so the encode failed — and because the overlay is best-effort,
+> the failure surfaced as the signal doing **nothing at all** on any ffmpeg 7 host, with the plain
+> segment served instead. It is now passed as `-vf`, which binds on every version.
 
 ---
 

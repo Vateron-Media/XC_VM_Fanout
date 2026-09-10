@@ -32,7 +32,7 @@ A stream has two "interest sensors":
 - **`lastAccess`** — the time of the last touch of the stream. Updated by live-TS
   viewers **on attach and on detach**, by **every HLS request**, and by `probe`.
 
-> **Marked on detach as well** (fixed in 0.11.3). `attach()` stamps `lastAccess` on arrival and
+> **Marked on detach as well** (fixed in 0.11.4). `attach()` stamps `lastAccess` on arrival and
 > nothing on the serve path moves it during the session, so if only the attach were marked the
 > stamp would be as old as the session was long — and the instant the last viewer left, the idle
 > window had **already** outrun both `grace_sec` and `idle_buffer_grace_sec`. Both fired on the
@@ -97,7 +97,7 @@ Forcing one is `debug.FreeOSMemory()`: a full stop-the-world GC plus a page-retu
 busy daemon the threshold is met almost continuously, so releases are **floored two minutes
 apart** — otherwise the process lives in back-to-back collections and thrashes the pages it just
 handed back. A ring collapse is known-real garbage and **bypasses that floor**, so a gated stream's
-memory is returned on the next sweep. (Before 0.11.3 the reaper called `FreeOSMemory()` inline,
+memory is returned on the next sweep. (Before 0.11.4 the reaper called `FreeOSMemory()` inline,
 every `grace/2` — 5 s at the default grace — which combined with the `lastAccess` defect above
 kept the daemon in near-continuous full collections.)
 
