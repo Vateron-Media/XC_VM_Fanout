@@ -14,3 +14,8 @@ import (
 func shellLauncher(context.Context, string, string) (Process, error) {
 	return nil, errors.New("supervisor: launching encoders is only supported on unix")
 }
+
+// shellProber is Unix-only for the same reason as shellLauncher. Reporting
+// every source unreachable is the safe answer here: it means the priority
+// switch never fires, not that a working stream is moved onto a dead feed.
+func shellProber(context.Context, string) bool { return false }

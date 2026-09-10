@@ -103,3 +103,23 @@ func (p *execProcess) Kill() {
 		_ = p.cmd.Process.Kill()
 	}
 }
+
+// shellProber runs a source-reachability probe and reports whether it
+// succeeded. The command is the panel's own ffprobe invocation, carrying that
+// stream's fetch arguments; a zero exit means the source answered with something
+// ffprobe could read.
+//
+// Bounded twice over: by probeTimeout here and by ctx, so a hung probe can never
+// stall the health loop that called it. Output is discarded — the only question
+// being asked is whether the source is there.
+func shellProber(ctx context.Context, cmd string) bool {
+	if cmd == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return c.Run() == nil
+}

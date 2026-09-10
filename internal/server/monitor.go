@@ -26,7 +26,17 @@ import (
 // is whatever can already reach the control socket.
 func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/monitor/")
-	if id == "" || strings.Contains(id, "/") {
+	// "<id>/source" is the forced-source sub-resource; anything else with a
+	// slash in it is not a stream id.
+	if rest, sub, hasSub := strings.Cut(id, "/"); hasSub {
+		if sub != "source" {
+			http.NotFound(w, r)
+			return
+		}
+		m.serveMonitorSource(w, r, rest)
+		return
+	}
+	if id == "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -76,6 +86,38 @@ func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// serveMonitorSource forces a stream onto a specific source (POST
+// /monitor/<id>/source with {"index": N}). It replaces the panel's
+// `<signals>/<id>.force` file, which MonitorCommand.php polled for on every
+// pass: a control call is immediate, cannot be half-written, and reports back
+// whether the index was even valid.
+//
+// The switch is a restart on the chosen source, so it is deliberately explicit
+// rather than something a health check would ever decide on its own.
+func (m *Manager) serveMonitorSource(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if m.sup == nil {
+		http.Error(w, "supervision not enabled on this node", http.StatusNotImplemented)
+		return
+	}
+	var body struct {
+		Index int `json:"index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := m.sup.ForceSource(id, body.Index); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	dlog.Logf("ctl", "id=%s forced onto source %d", id, body.Index)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // serveMonitors lists the streams this node is supervising, so the panel can

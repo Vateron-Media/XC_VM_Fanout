@@ -114,6 +114,12 @@ type VitalsFunc func(id string) (Vitals, bool)
 type healthVerdict struct {
 	event  string
 	reason string
+	// switchSource asks for the restart to happen on a DIFFERENT source, and
+	// switchTo says which. A bool rather than a sentinel index because zero is a
+	// perfectly valid source, and the zero VALUE of this struct has to keep
+	// meaning "nothing is wrong".
+	switchSource bool
+	switchTo     int
 }
 
 func (v healthVerdict) failed() bool { return v.event != "" }

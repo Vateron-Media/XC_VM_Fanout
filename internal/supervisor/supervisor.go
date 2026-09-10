@@ -52,6 +52,10 @@ const (
 type Source struct {
 	Label string `json:"label"`
 	Cmd   string `json:"cmd"`
+	// ProbeCmd tests whether this source is reachable WITHOUT starting it, for
+	// the priority-backup check. Optional: a source without one is never
+	// switched TO speculatively, only used when the list is walked on failure.
+	ProbeCmd string `json:"probe_cmd,omitempty"`
 }
 
 // Policy carries the panel settings the restart loop obeys. The names mirror the
@@ -73,6 +77,15 @@ type Policy struct {
 	// "wait for the .m3u8 to appear, up to N checks" loop: the daemon does not
 	// need a file to appear, it can see whether bytes arrived.
 	StartTimeoutSec int `json:"start_timeout_sec"`
+	// PriorityBackupSec is how often to check whether a higher-priority source
+	// has come back, so a stream running on a backup returns to its preferred
+	// feed (0 = off). The panel's `priority_backup`, whose interval was 300s.
+	//
+	// It also decides what a failed start falls back to: with priority backup on
+	// the list stays in priority order and a retry starts from the top; without
+	// it the retry rotates past the source that just failed. See
+	// selectNextOnFailure, and StreamProcess::rotateSourcesPastCurrent.
+	PriorityBackupSec int `json:"priority_backup_sec"`
 }
 
 // Spec is what PHP PUTs to /monitor/<id> to hand a stream over.
@@ -134,6 +147,7 @@ type State struct {
 	Running    bool   `json:"running"`
 	PID        int    `json:"pid"`
 	Source     string `json:"source"`
+	SourceIdx  int    `json:"source_idx"`
 	Restarts   int    `json:"restarts"`
 	Failures   int    `json:"failures"`
 	UptimeMS   int64  `json:"uptime_ms"`
@@ -169,6 +183,7 @@ type Supervisor struct {
 	launch  Launcher
 	hasData func(id string) bool // "did bytes actually arrive for this stream?"
 	vitals  VitalsFunc           // what the output looks like right now
+	probe   Prober               // is a source reachable, without starting it
 	now     func() time.Time
 	sleep   func(context.Context, time.Duration) bool
 
@@ -196,6 +211,7 @@ func New(launch Launcher, hasData func(id string) bool) *Supervisor {
 		now:        time.Now,
 		sleep:      sleepCtx,
 		healthTick: 5 * time.Second,
+		probe:      shellProber,
 	}
 }
 
@@ -204,6 +220,14 @@ func New(launch Launcher, hasData func(id string) bool) *Supervisor {
 // just cannot see whether the output is any good, so every Health rule is inert.
 func (s *Supervisor) WithVitals(v VitalsFunc) *Supervisor {
 	s.vitals = v
+	return s
+}
+
+// WithProber supplies the source-reachability check the priority-backup switch
+// needs. Without one, a stream never leaves a working source speculatively — it
+// still fails over when a start fails, which needs no probe.
+func (s *Supervisor) WithProber(p Prober) *Supervisor {
+	s.probe = p
 	return s
 }
 
@@ -238,6 +262,12 @@ type stream struct {
 	// restart path was slow enough to usually leave the minute — luck, not
 	// design, and the daemon restarts far too quickly to rely on it.)
 	autoRestartAt time.Time
+
+	// srcIdx is the source the next start uses; forced is a queued switch from
+	// ForceSource (-1 = none); backupCheckedAt paces the priority-backup probe.
+	srcIdx          int
+	forced          int
+	backupCheckedAt time.Time
 	source  string
 	started time.Time
 	running bool
@@ -264,7 +294,9 @@ func (s *Supervisor) Supervise(id string, spec Spec) error {
 		s.mu.Lock()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	st := &stream{id: id, sup: s, cancel: cancel, done: make(chan struct{}), spec: spec}
+	// forced starts at -1: zero is a valid source index, so it cannot double as
+	// "nothing queued".
+	st := &stream{id: id, sup: s, cancel: cancel, done: make(chan struct{}), spec: spec, forced: -1}
 	s.procs[id] = st
 	s.mu.Unlock()
 
@@ -333,6 +365,7 @@ func (st *stream) state() State {
 		Running:    st.running,
 		PID:        st.pid,
 		Source:     st.source,
+		SourceIdx:  st.srcIdx,
 		Restarts:   st.starts,
 		Failures:   st.fails,
 		GaveUp:     st.gaveUp,
@@ -377,6 +410,9 @@ func (st *stream) run(ctx context.Context) {
 			consecutiveFails++
 			st.note(err.Error(), consecutiveFails)
 			st.emit(EventStreamStartFail, src.Label)
+			// Try a different feed next time rather than hammering the one that
+			// just failed — which of them depends on the priority-backup mode.
+			st.advanceAfterFailure()
 			dlog.Logf("monitor", "id=%s start failed (%d): %v", st.id, consecutiveFails, err)
 
 			pol := st.policy()
@@ -418,8 +454,18 @@ func (st *stream) run(ctx context.Context) {
 			proc.Kill()
 			proc.Wait()
 			st.note(verdict.reason, 0)
-			st.emit(verdict.event, src.Label)
-			dlog.Logf("monitor", "id=%s unhealthy: %s (%s); restarting", st.id, verdict.reason, verdict.event)
+			// A source switch is logged against the source being switched TO,
+			// which is what the panel records in current_source; every other
+			// verdict is about the source that just failed.
+			logSource := src.Label
+			if verdict.switchSource {
+				if next, ok := st.sourceAt(verdict.switchTo); ok {
+					logSource = next.Label
+				}
+				st.switchTo(verdict.switchTo)
+			}
+			st.emit(verdict.event, logSource)
+			dlog.Logf("monitor", "id=%s %s: %s; restarting", st.id, verdict.event, verdict.reason)
 		} else {
 			st.emit(EventStreamFailed, src.Label)
 			dlog.Logf("monitor", "id=%s process exited; restarting", st.id)
@@ -472,6 +518,30 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 		if health.AutoRestart.due(now) && !st.autoRestartedIn(now) {
 			st.markAutoRestart(now)
 			return healthVerdict{event: EventAutoRestart, reason: "scheduled auto-restart"}
+		}
+
+		// An operator asked for a specific source: that outranks everything,
+		// including whether the current one looks healthy.
+		if idx := st.takeForced(); idx >= 0 {
+			return healthVerdict{
+				event:        EventForceSource,
+				reason:       fmt.Sprintf("forced switch to source %d", idx),
+				switchSource: true,
+				switchTo:     idx,
+			}
+		}
+
+		// Running on a backup: has the preferred feed come back?
+		if st.dueForBackupCheck(now) {
+			spec := st.spec_()
+			if idx := backupSwitch(ctx, sup.probe, spec.Sources, st.sourceIndex()); idx >= 0 {
+				return healthVerdict{
+					event:        EventPrioritySwitch,
+					reason:       fmt.Sprintf("higher-priority source %d is reachable again", idx),
+					switchSource: true,
+					switchTo:     idx,
+				}
+			}
 		}
 
 		v, ok := sup.vitals(st.id)
@@ -583,13 +653,14 @@ func (st *stream) policy() Policy {
 	return st.spec.Policy
 }
 
-// currentSource is the source to start. M1 always uses the first; the list and
-// this indirection exist so the priority-backup and forced-switch phases have
-// somewhere to land without a spec change.
+// currentSource is the source the next start should use.
 func (st *stream) currentSource() Source {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.spec.Sources[0]
+	if st.srcIdx < 0 || st.srcIdx >= len(st.spec.Sources) {
+		st.srcIdx = 0
+	}
+	return st.spec.Sources[st.srcIdx]
 }
 
 func (st *stream) markStarted(p Process, label string) {
@@ -621,6 +692,22 @@ func (st *stream) markAutoRestart(now time.Time) {
 	st.mu.Lock()
 	st.autoRestartAt = now
 	st.mu.Unlock()
+}
+
+// sourceAt returns source idx, if it exists.
+func (st *stream) sourceAt(idx int) (Source, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if idx < 0 || idx >= len(st.spec.Sources) {
+		return Source{}, false
+	}
+	return st.spec.Sources[idx], true
+}
+
+func (st *stream) sourceIndex() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.srcIdx
 }
 
 func (st *stream) startTime() time.Time {
