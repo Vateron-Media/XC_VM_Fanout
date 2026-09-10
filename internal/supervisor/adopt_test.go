@@ -237,3 +237,73 @@ func TestReleaseKillsAnAdoptedEncoder(t *testing.T) {
 	}
 	t.Fatal("releasing a stream left its adopted encoder running")
 }
+
+// TestDetachLeavesTheEncoderRunning is the behaviour that makes adoption worth
+// having, and the one that is easiest to break by reflex.
+//
+// A daemon shutdown must NOT stop the encoders. They are left orphaned so the
+// next daemon adopts them, which is what keeps every channel on the node on air
+// across a restart or an upgrade. Killing them here — the obvious thing to do in
+// a shutdown path — would turn a routine daemon upgrade into a node-wide outage.
+func TestDetachLeavesTheEncoderRunning(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(t)
+	h.setData(true)
+	w := newWorld()
+	h.sup.find = w.find
+	h.sup.killPID = w.kill
+
+	spec := baseSpec(dir)
+	if err := h.sup.Supervise("5", spec); err != nil {
+		t.Fatal(err)
+	}
+	proc := h.nextProcess(t)
+	waitFor(t, "start", func() bool { return h.sup.State("5").Running })
+
+	killed := make(chan struct{})
+	var once sync.Once
+	proc.kill = func() { once.Do(func() { close(killed) }) }
+
+	if n := h.sup.DetachAll(); n != 1 {
+		t.Fatalf("DetachAll reported %d streams, want 1", n)
+	}
+
+	select {
+	case <-killed:
+		t.Fatal("shutdown killed the encoder; the next daemon has nothing to adopt and the channel is off air")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if st := h.sup.State("5"); st.Supervised {
+		t.Error("detached stream still reports as supervised")
+	}
+	// The pid file must survive: it is how the next daemon finds the survivor.
+	if _, err := os.Stat(spec.PIDPath); err != nil {
+		t.Errorf("detach removed the pid file (%v); adoption reads it to find the encoder", err)
+	}
+}
+
+// TestReleaseStillKills: detach is for shutdown, but an explicit DELETE of a
+// stream must genuinely stop its encoder — otherwise unregistering a channel
+// leaves an unsupervised ffmpeg holding the source forever.
+func TestReleaseStillKills(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(t)
+	h.setData(true)
+	if err := h.sup.Supervise("5", baseSpec(dir)); err != nil {
+		t.Fatal(err)
+	}
+	proc := h.nextProcess(t)
+	waitFor(t, "start", func() bool { return h.sup.State("5").Running })
+
+	killed := make(chan struct{})
+	var once sync.Once
+	proc.kill = func() { once.Do(func() { close(killed) }) }
+
+	h.sup.Release("5")
+	select {
+	case <-killed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Release did not stop the encoder")
+	}
+}

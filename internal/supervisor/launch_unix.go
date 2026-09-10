@@ -35,7 +35,15 @@ func shellLauncher(ctx context.Context, cmdline, stderrPath string) (Process, er
 	if cmdline == "" {
 		return nil, errors.New("empty command")
 	}
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "exec "+cmdline)
+	// exec.Command, NOT exec.CommandContext. CommandContext kills the process
+	// when ctx is cancelled, and this ctx dies with the supervisor -- so a daemon
+	// shutdown would take every encoder on the node with it, and the survivor
+	// adoption in adopt.go could never fire on the case it exists for: a planned
+	// daemon upgrade. The encoder is killed explicitly (Kill, from Release or a
+	// health verdict) and is otherwise left alone, so stopping the daemon leaves
+	// the channels on air for the next one to adopt.
+	_ = ctx
+	cmd := exec.Command("/bin/sh", "-c", "exec "+cmdline)
 
 	// Give the encoder its own process group, so a kill can take down anything
 	// it spawned rather than leaving strays behind holding the source open.

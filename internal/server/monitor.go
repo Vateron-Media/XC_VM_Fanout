@@ -169,9 +169,16 @@ func (m *Manager) streamHasData(id string) bool {
 	return st != nil && st.lastData.Load() != 0
 }
 
-// StopSupervision kills every supervised encoder; for daemon shutdown.
-func (m *Manager) StopSupervision() {
-	if m.sup != nil {
-		m.sup.ReleaseAll()
+// DetachSupervision stops watching every supervised stream but leaves its
+// encoder running, for a daemon shutdown or upgrade.
+//
+// Deliberately not a kill: the next daemon adopts these processes (see
+// supervisor/adopt.go), so a restart costs the viewers nothing. Killing them
+// here would turn every daemon upgrade into a node-wide outage, which is
+// precisely what adoption was built to avoid.
+func (m *Manager) DetachSupervision() int {
+	if m.sup == nil {
+		return 0
 	}
+	return m.sup.DetachAll()
 }

@@ -57,6 +57,13 @@ type Values struct {
 	// where possible, ffmpeg otherwise), "ffmpeg" (always), or "native" (no
 	// fallback — testing only).
 	SourceBackend string `json:"source_backend"`
+	// Supervise lets this node run and watch stream encoders on the panel's
+	// behalf, replacing its per-stream PHP watchdog (docs/adr/0002). Off by
+	// default: with it off the /monitor endpoints report that this node does not
+	// do it, and the panel keeps running its own monitors. Enabling it changes
+	// nothing on its own — a stream is only supervised once the panel hands it
+	// over — so this is the node-level half of a two-sided opt-in.
+	Supervise bool `json:"supervise"`
 }
 
 // Defaults is the built-in fallback (see defaults.Cfg*): what the daemon writes
@@ -78,6 +85,7 @@ func Defaults() Values {
 		ViewerIdleTimeoutSec: defaults.CfgViewerIdleTimeoutSec,
 		MemLimitMB:           defaults.CfgMemLimitMB,
 		SourceBackend:        defaults.CfgSourceBackend,
+		Supervise:            defaults.CfgSupervise,
 	}
 }
 
@@ -100,6 +108,7 @@ type file struct {
 	ViewerIdleTimeoutSec *int    `json:"viewer_idle_timeout_sec"`
 	MemLimitMB           *int    `json:"mem_limit_mb"`
 	SourceBackend        *string `json:"source_backend"`
+	Supervise            *bool   `json:"supervise"`
 }
 
 // Load reads path, returns the resolved (defaults-overlaid, clamped) values, and
@@ -188,6 +197,10 @@ func Load(path string) (Values, bool, error) {
 		v.SourceBackend = *f.SourceBackend
 	}
 	overlay(f.SourceBackend != nil)
+	if f.Supervise != nil {
+		v.Supervise = *f.Supervise
+	}
+	overlay(f.Supervise != nil)
 
 	v.clamp()
 

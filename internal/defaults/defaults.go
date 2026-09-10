@@ -163,6 +163,11 @@ const (
 	// pipeline it ran before, while the common IPTV case (HLS with TS segments)
 	// stops costing a child process per stream.
 	CfgSourceBackend = "auto"
+	// CfgSupervise: whether this node runs and watches stream encoders for the
+	// panel (docs/adr/0002-monitor-in-daemon.md). Off, because taking over a
+	// node's encoders is an operator decision, not a default — and because the
+	// panel must be configured to hand them over for it to do anything at all.
+	CfgSupervise = false
 	// CfgMemLimitMB is an explicit ceiling (MiB) for the Go soft memory limit,
 	// 0 = derive it from the cgroup/host budget (see MemLimitFraction). The daemon
 	// usually shares a panel box with nginx, MySQL, PHP-FPM and the streams' own

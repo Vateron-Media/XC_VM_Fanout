@@ -338,7 +338,30 @@ func (s *Supervisor) Release(id string) bool {
 	return true
 }
 
-// ReleaseAll stops every supervised stream; for daemon shutdown.
+// DetachAll stops watching every stream WITHOUT stopping its encoder, for a
+// daemon shutdown or upgrade.
+//
+// This is the counterpart to adoption and the reason it is worth having. Killing
+// the encoders on the way out would take every channel on the node off air for
+// the length of a restart; leaving them running means the next daemon adopts
+// them and the viewers never notice. The pid files are left in place because
+// that is how the next daemon finds them.
+func (s *Supervisor) DetachAll() int {
+	s.mu.Lock()
+	all := make([]*stream, 0, len(s.procs))
+	for _, st := range s.procs {
+		all = append(all, st)
+	}
+	s.procs = make(map[string]*stream)
+	s.mu.Unlock()
+	for _, st := range all {
+		st.detach()
+	}
+	return len(all)
+}
+
+// ReleaseAll stops every supervised stream AND kills its encoder. For tests and
+// explicit teardown; a shutdown wants DetachAll.
 func (s *Supervisor) ReleaseAll() {
 	s.mu.Lock()
 	all := make([]*stream, 0, len(s.procs))
@@ -394,6 +417,13 @@ func (st *stream) state() State {
 		out.UptimeMS = st.sup.now().Sub(st.started).Milliseconds()
 	}
 	return out
+}
+
+// detach stops the watch loop and leaves the encoder running. The pid file stays
+// too: it is what the next daemon reads to find the survivor.
+func (st *stream) detach() {
+	st.cancel()
+	<-st.done
 }
 
 // stop cancels the loop, kills the process and waits for the loop to finish, so
