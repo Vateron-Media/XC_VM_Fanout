@@ -32,6 +32,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/supervisor"
 )
 
 // Operational defaults live in internal/defaults; these aliases keep the local
@@ -546,6 +547,12 @@ type Manager struct {
 	fontPath  string       // font file for the overlay text
 	signals   *signalStore // pending per-uuid "send message" overlays
 
+	// sup supervises per-stream encoder processes when the node has taken that
+	// over from the panel watchdog (docs/adr/0002-monitor-in-daemon.md). nil
+	// until EnableSupervision, and a nil one simply makes /monitor report that
+	// this node does not do it — which is what keeps the cutover per-node.
+	sup *supervisor.Supervisor
+
 	// defaultChunk is the source read size stamped onto a stream at creation
 	// (read under m.mu). sourceInsecure is read off m.mu when registering a pull,
 	// so it is atomic. Both are retunable live via ApplyConfig (new streams/pulls
@@ -985,6 +992,8 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/connections", m.serveConnections)
 	mux.HandleFunc("/rates", m.serveRates)
 	mux.HandleFunc("/signal/", m.serveSignal)
+	mux.HandleFunc("/monitor/", m.serveMonitor)
+	mux.HandleFunc("/monitors", m.serveMonitors)
 	return mux
 }
 
