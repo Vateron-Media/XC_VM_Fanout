@@ -29,7 +29,8 @@ are fixed for the lifetime of the process.
 | `-config-interval` | `60` | Seconds between config-file reloads. The file is re-read only when its mtime changes. |
 | `-ffmpeg` | `ffmpeg` | Path to the ffmpeg binary (for remuxing non-mp2t sources, and for the "send message" `drawtext` overlay). Must be a build that has the `drawtext` filter for the overlay to work. |
 | `-font` | `""` (overlay off) | Path to a `.ttf` font for the "send message" overlay. Empty, or an ffmpeg without `drawtext`, disables the overlay (signals become no-ops). |
-| `-debug` | `false` | Verbose debug log: narrate stream/puller/viewer/HLS/ingest activity plus a periodic per-stream state snapshot. Also enabled by `XC_FANOUT_DEBUG=1`. See ["Debug mode"](#debug-mode) below. |
+| `-debug` | `false` | Verbose debug log: narrate stream/puller/viewer/HLS/ingest/monitor activity plus a periodic per-stream state snapshot. Also enabled by `XC_FANOUT_DEBUG=1`. See ["Debug mode"](#debug-mode) below. |
+| `-debug-cats` | (all) | Limit the debug log to these categories, comma-separated (`puller,monitor`). Also settable as `XC_FANOUT_DEBUG=puller,monitor`. |
 | `-debug-stats` | `5` | Seconds between the periodic per-stream state snapshots in debug mode (`0` disables just the snapshot; the event log stays on). |
 | `-version` | — | Print the version and exit. |
 
@@ -106,7 +107,8 @@ never push the daemon into a pathological state.
 | `idle_buffer_grace_sec` | `30` | `0…3600` | No-viewer window before the ring collapses (`0` = the idle gate is off). See [The idle-buffer gate](#the-idle-buffer-gate). |
 | `idle_buffer_ratio` | `0.5` | `0.1…1` | Fraction of the buffer kept while a stream is unwatched. HLS is still cut from the reduced ring, so the channel stays openable. |
 | `viewer_idle_timeout_sec` | `30` | `0`, or `5…3600` | Drop a live-TS viewer that has received **nothing** for this long (`0` = never). This is what bounds a ghost on an off-air stream — `write_timeout_sec` can only fire while there are bytes to write. See [Guarding against stalled and idle viewers](04-internals.md#guarding-against-stalled-viewers). |
-| `source_backend` | `auto` | `auto`, `ffmpeg`, `native` | How a **non-mp2t** source becomes MPEG-TS. See [The source backend](#the-source-backend). An unknown value falls back to `auto`. |
+| `source_backend` | `auto` | `auto`, `ffmpeg`, `native` | How a **non-mp2t** source becomes MPEG-TS. The panel reads the same setting to choose what its supervised streams run. See [The source backend](#the-source-backend). Matched case-insensitively; an unknown value falls back to `auto`. |
+| `supervise` | `false` | `true`, `false` | Accept live streams the panel hands over for [encoder supervision](09-encoder-supervision.md). Written by the panel from its **Fanout Encoder Supervision** setting and applied live: turning it off stops new hand-overs (`PUT /monitor/<id>` answers `501`) but leaves streams already supervised running. |
 | `mem_limit_mb` | `0` (auto) | `0…1 TiB` | Explicit ceiling (MiB) for the Go soft memory limit. `0` derives it from the cgroup limit, else a share of the box's RAM. See [The memory budget](#the-memory-budget). |
 
 A minimal file the daemon writes on a fresh node:
@@ -194,15 +196,31 @@ setting. Everything else — an HLS playlist, a udp feed — has to be converted
 |-------|-----------|
 | `auto` (default) | Convert **in-process** where [`nativesrc`](04-internals.md#native-conversion--nativesrc) can, **ffmpeg** for everything it declines. |
 | `ffmpeg` | Always spawn ffmpeg. The pre-0.12 behaviour, kept as the kill-switch. |
-| `native` | Native only — a source the native reader declines **fails** instead of falling back. For finding out what is actually eligible on a node; **not for production**, where a declined source means a dead channel rather than a slightly more expensive one. |
+| `native` | Native only — a source the native reader declines **fails** instead of falling back. A declined source is then a dead channel rather than a slightly more expensive one, so this is for a node whose sources are known to be eligible. |
 
 `auto` is the default because the fallback makes it strictly safer than `ffmpeg`: anything the
 native reader will not take runs exactly the pipeline it ran before, while the common case (HLS
 with TS segments) stops costing a child process per stream. The win is one fewer ~27 MB process
 per proxy stream, plus no process spawn on each on-demand join.
 
-Applied live on a config reload, and it takes effect on the **next** pull — a stream already
-connected keeps the path it started on until it reconnects.
+**The panel uses the same three meanings for its own streams.** With supervision on, a copy-only
+live stream is produced by the [native remuxer](09-encoder-supervision.md#the-native-remuxer)
+(`xc_fanout remux`) instead of ffmpeg under `auto` and `native`; `auto` also gives it the panel's
+ffmpeg command as a fallback for sources the remuxer cannot read, `native` does not, and `ffmpeg`
+keeps ffmpeg. The panel builds whichever command it chose; the daemon never picks one itself.
+
+The value is matched case-insensitively and trimmed, so `Native` and `" native"` work. Anything
+that names no backend at all falls back to `auto`.
+
+Applied live on a config reload, and it takes effect on the **next** pull: a stream already
+connected keeps the path it started on, and picks the new one up when its puller next starts.
+
+> **This was broken before 0.13.** The backend was stamped onto each stream when the panel
+> registered it, so a reload reached the node setting and stopped there — every already-known
+> stream kept its old backend indefinitely, across idle-stops and restarts, until the panel
+> happened to re-register it. An operator switching a node to `native` saw nothing change and had
+> no way to find out why. It is now resolved when the puller starts, which is what this paragraph
+> always claimed.
 
 **Per-stream override.** `PUT /streams/<id>` accepts a
 [`backend`](03-endpoints.md#put--post-streamsid--register-a-pull-source) field that pins one
@@ -306,24 +324,45 @@ Debug mode narrates every interesting event, each line tagged `[dbg <category>]`
 |----------|-----------------|
 | `boot` | Version, pid, and the resolved configuration at startup. |
 | `stream` | Stream created; puller starting/stopping (with the current viewer refcount). |
-| `puller` | Source pull start, which URL was chosen and how (direct mpegts vs ffmpeg remux), probe failures, clean source ends, reconnect backoff, and stop. |
+| `puller` | Source pull start, each probe's HTTP status and content-type, which URL was chosen and **how** (direct mpegts / native / ffmpeg, and whether ffmpeg was pinned or a fallback), probe failures, clean source ends, reconnect backoff, and stop. |
+| `monitor` | Encoder supervision: handover, start/restart with the pid, health verdicts, source switches, adoption of a survivor — plus, on each `-debug-stats` tick, one line per supervised stream reporting its producer (`cmd` / `fallback` / `adopted`), uptime, and the watchdog's own `tick_age` with what it last measured against which armed thresholds. A stale `tick_age` means the watch loop is stuck, which a silent healthy node looks exactly like otherwise. |
 | `viewer` | Live-TS attach, and a single detach line per viewer with the **cause** — client closed, dropped as too slow (hub buffer full), or write stalled past `write_timeout_sec` — plus session duration and KB delivered. |
 | `hls` | Segments served (seq + size), and anomalies: playlist requested while still warming up / off-air, or a segment that rolled out of the window. |
 | `ingest` | Push-fed listener up, producer connect/disconnect. |
 | `ctl` | Control-API actions: register/unregister, probe prewarm and its result. |
 | `signal` | "Send message" overlay queued and applied. |
 | `reaper` | Idle-stop of a control-managed stream after the grace window, and idle-buffer gating (ring collapse / restore). |
-| `stats` | A periodic per-stream snapshot (every `-debug-stats` seconds): `running`, `ingest`, viewer `refs`, hub `subs`, tracked `conns`, `data_age` (a growing `data_age` on a running stream is the **off-air** signal) and `nokf` (ring blocks cut on the byte cap for want of a keyframe — non-zero means this source carries no random-access points, and so can never produce HLS segments). |
+| `stats` | A periodic per-stream snapshot (every `-debug-stats` seconds): `mode`, `running`, `route`, viewer `refs`, hub `subs`, tracked `conns`, `data_age` (a growing `data_age` on a running stream is the **off-air** signal) and `nokf` (ring blocks cut on the byte cap for want of a keyframe — non-zero means this source carries no random-access points, and so can never produce HLS segments). |
+
+Two fields in the `stats` line answer the questions that used to need source-reading:
+
+- **`mode`** — how the stream is fed, and therefore which rules apply to it at all:
+  `pull` (the daemon fetches it), `ingest` (**push-fed** by a producer — ffmpeg's tee or the
+  native remuxer — so it has no puller and `source_backend` does not reach it), or `idle`
+  (registered, nothing running).
+- **`route`** — `<configured>/<actual>`: the backend this stream was told to use, and the path it
+  actually took (`direct-mp2t`, `native`, `ffmpeg-pinned`, `ffmpeg-fallback`). They differ
+  whenever the native reader declines a source, which is exactly what "the node is set to native
+  and is still spawning ffmpeg" looks like from the outside. A push-fed stream shows `n/a`.
 
 ```bash
 # Full debug, per-stream snapshot every 2 s
 xc_fanout -sock … -ctl … -debug -debug-stats 2
 
+# Just the two subsystems you are actually chasing
+xc_fanout -sock … -ctl … -debug-cats puller,monitor
+
 # Same via the environment (handy for systemd drop-ins)
 XC_FANOUT_DEBUG=1 xc_fanout -sock … -ctl …
+XC_FANOUT_DEBUG=monitor xc_fanout -sock … -ctl …
 ```
+
+Selecting categories matters once a node carries hundreds of channels: the full narration is more
+than anyone can read, and the subsystem in question is buried in the other 499 streams' chatter.
+`-debug-cats` wins over the environment, which wins over `-debug`, so a systemd drop-in asking for
+one category is not silently widened by a `-debug` someone left on the command line.
 
 When debug is off, the instrumentation costs a single atomic load per call site and
 formats nothing, so it is safe to leave the calls in the hot paths (per-chunk
-publish, per-viewer write). Filter the output by category with `grep`, e.g.
+publish, per-viewer write). Output can also be filtered after the fact with `grep`, e.g.
 `journalctl -u xc_fanout | grep '\[dbg viewer'` to watch only viewer churn.
