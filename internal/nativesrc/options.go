@@ -2,7 +2,7 @@ package nativesrc
 
 import (
 	"crypto/tls"
-	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -46,8 +46,16 @@ var ErrUnsupported = ErrUnsupportedSource
 // ErrHLSIsFMP4 marks an HLS source whose segments are fragmented MP4 rather than
 // MPEG-TS. Repackaging those to TS needs a real demuxer, so it is a refusal here
 // — but a distinct one, because it says something specific about the upstream
-// and is worth seeing in a log rather than a generic "unsupported".
-var ErrHLSIsFMP4 = errors.New("nativesrc: hls source carries fmp4 segments")
+// and is worth seeing in a log rather than a generic "unsupported". A format
+// refusal (IsFormat).
+var ErrHLSIsFMP4 = fmt.Errorf("%w: hls source carries fmp4 segments", ErrFormat)
+
+// ErrHLSEncrypted marks an HLS source whose segments are encrypted
+// (#EXT-X-KEY with a METHOD other than NONE). This package passes segment bytes
+// through unread, so an encrypted segment would reach viewers as ciphertext —
+// noise with a valid-looking content type. ffmpeg decrypts AES-128 HLS, so this
+// is a format refusal (IsFormat) that the fallback can serve.
+var ErrHLSEncrypted = fmt.Errorf("%w: hls segments are encrypted", ErrFormat)
 
 // transport builds the shared transport shape. dialWait separates the two
 // callers: a bounded fetch can afford to wait a little longer to connect than a

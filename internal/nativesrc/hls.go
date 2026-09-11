@@ -113,7 +113,7 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		// URI parses, fetch that, and use it as the media playlist.
 		variant := pickVariant(pl)
 		if variant == nil {
-			return refuse(fmt.Errorf("%w: master playlist has no usable variant", ErrUnsupportedSource))
+			return refuse(fmt.Errorf("%w: master playlist has no usable variant", ErrFormat))
 		}
 		body, finalURL, err := hlsFetch(ctx, variant, opt, client)
 		if err != nil {
@@ -128,10 +128,8 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 			return refuse(fmt.Errorf("%w: master pointed at another master", ErrUnsupportedSource))
 		}
 	}
-	if pl.HasFMP4 {
-		// Distinct sentinel so the caller can tell "this upstream is fMP4" apart
-		// from a generic refusal — it is worth seeing in a log.
-		return refuse(ErrHLSIsFMP4)
+	if err := servable(pl); err != nil {
+		return refuse(err)
 	}
 	pr, pw := io.Pipe()
 	go (&hlsPuller{
@@ -242,6 +240,14 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			continue
 		}
 		manifestFails = 0
+		// A live playlist can change flavour under us — a provider switching a
+		// channel to fMP4, or turning on encryption. Passing the new segments
+		// through would put ciphertext or MP4 boxes on the wire, so end the pull
+		// with the same refusal a fresh open would give.
+		if err := servable(next); err != nil {
+			p.pw.CloseWithError(fmt.Errorf("hls pull: playlist changed: %w", err))
+			return
+		}
 		// Bound the de-dup map to the live window: a live HLS window only
 		// slides forward, so a URI that has rolled out of the manifest can
 		// never reappear. Forgetting evicted URIs keeps `seen` from growing
@@ -250,6 +256,19 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 		p.seen = retainSeenInWindow(p.seen, next)
 		pl = next
 	}
+}
+
+// servable reports why a media playlist cannot be passed through, or nil.
+func servable(pl *hlsPlaylist) error {
+	switch {
+	case pl.HasFMP4:
+		// Distinct sentinel so the caller can tell "this upstream is fMP4" apart
+		// from a generic refusal — it is worth seeing in a log.
+		return ErrHLSIsFMP4
+	case pl.Encrypted:
+		return ErrHLSEncrypted
+	}
+	return nil
 }
 
 // retainSeenInWindow rebuilds the segment de-dup set to only the URIs still
@@ -345,6 +364,7 @@ func hlsFetch(ctx context.Context, u *url.URL, opt Options, c *http.Client) ([]b
 type hlsPlaylist struct {
 	IsMaster       bool
 	HasFMP4        bool
+	Encrypted      bool // an #EXT-X-KEY with a METHOD other than NONE
 	Endlist        bool
 	TargetDuration int      // seconds
 	MapURI         *url.URL // EXT-X-MAP target (fMP4 init)
@@ -386,6 +406,14 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 			pl.TargetDuration = atoiSafe(line[len("#EXT-X-TARGETDURATION:"):])
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.Endlist = true
+		case strings.HasPrefix(line, "#EXT-X-KEY:"):
+			// METHOD=NONE switches encryption back off for what follows; any
+			// other method (AES-128, SAMPLE-AES…) means ciphertext segments.
+			for _, kv := range splitAttrs(strings.TrimPrefix(line, "#EXT-X-KEY:")) {
+				if m, ok := strings.CutPrefix(kv, "METHOD="); ok && !strings.EqualFold(strings.Trim(m, `"`), "NONE") {
+					pl.Encrypted = true
+				}
+			}
 		case strings.HasPrefix(line, "#EXT-X-MAP:"):
 			pl.HasFMP4 = true
 			for _, kv := range splitAttrs(strings.TrimPrefix(line, "#EXT-X-MAP:")) {
