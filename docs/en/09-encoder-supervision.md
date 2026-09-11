@@ -227,11 +227,19 @@ carries on without restarting.
 ### Which streams run it
 
 Only with supervision on, and [`source_backend`](06-configuration.md#the-source-backend) `auto` or
-`native` — `ffmpeg` keeps ffmpeg for everything. A stream runs it when it is a live stream with
-none of: a transcode profile, a custom ffmpeg command, a custom map, RTMP output, an external push
-from this server, "generate timestamps", "read native", or a forced input audio codec. Each of its
-sources is judged on its own: `http(s)`, `udp` and `rtp` run the remuxer; anything else (RTMP,
-SRT, a local file, a `yt-dlp` platform) gets ffmpeg.
+`native` — `ffmpeg` keeps ffmpeg for everything. A stream runs it when it is a **Live Stream**
+(`streams_types.type_key` = `live`; radio stations and created channels are ffmpeg's) with none of:
+a transcode profile, a custom ffmpeg command, a custom map, RTMP output, an external push from this
+server, or a forced input audio codec. Each of its sources is judged on its own: `http(s)`, `udp`
+and `rtp` run the remuxer; anything else (RTMP, SRT, a local file, a `yt-dlp` platform) gets ffmpeg.
+
+"Generate PTS" (`-fflags +genpts -async 1`) and "Read Native" (`-re`) do **not** send a stream to
+ffmpeg, although the remuxer does neither: both default to 1 for every row in `streams`, so they
+say nothing about the channel, and refusing them would mean the native backend never runs at all.
+`-re` paces a file-ish input, which a passthrough of a live source does by itself; genpts only
+synthesises timestamps the source failed to send, and a source broken enough for that has no usable
+video clock either — which ends the run with exit 3 and, in `auto`, hands it to ffmpeg. A channel
+that genuinely needs the repair belongs on the ffmpeg backend.
 
 ### When it cannot read a source
 
