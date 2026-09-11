@@ -106,9 +106,11 @@ const (
 	// BackendFfmpeg always spawns ffmpeg — the pre-0.12 behaviour, kept as the
 	// kill-switch.
 	BackendFfmpeg = "ffmpeg"
-	// BackendNative refuses to fall back. For finding out what is actually
-	// eligible on a node; not for production, where a declined source means a
-	// dead channel instead of a slightly more expensive one.
+	// BackendNative refuses to fall back: a source the native reader declines
+	// fails instead of growing an ffmpeg child. The panel applies the same
+	// meaning to its own streams — on a native node they are produced by
+	// `xc_fanout remux` with no ffmpeg fallback — so a declined source there is
+	// a dead channel rather than a slightly more expensive one.
 	BackendNative = "native"
 )
 

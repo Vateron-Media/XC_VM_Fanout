@@ -11,6 +11,9 @@
 //     source; the puller starts on the first viewer and stops after the last leaves.
 //
 // -id/-source and -id/-in remain for isolated testing (feed one stream at launch).
+//
+// `xc_fanout remux -i <url> … <playlist>` is a separate mode: the native remuxer
+// the panel runs, under this daemon's supervisor, in place of a copy-only ffmpeg.
 package main
 
 import (
@@ -42,6 +45,13 @@ import (
 var version = "dev"
 
 func main() {
+	// `xc_fanout remux …` is the native remuxer the panel runs in place of a
+	// copy-only ffmpeg (see internal/remux). It is a separate process with its
+	// own flags, dispatched before the daemon's are parsed.
+	if len(os.Args) > 1 && os.Args[1] == "remux" {
+		os.Exit(runRemux(os.Args[2:]))
+	}
+
 	sock := flag.String("sock", "/home/xc_vm/bin/xc_fanout/sockets/http.sock", "client unix socket (nginx-facing)")
 	ctl := flag.String("ctl", "", "control unix socket (PHP-only), e.g. /home/xc_vm/bin/xc_fanout/sockets/control.sock; empty = no control API")
 	ingestDir := flag.String("ingestdir", "", "dir for per-stream push-fed ingest sockets (non-proxy tee); empty = <sock dir>/ingest")
