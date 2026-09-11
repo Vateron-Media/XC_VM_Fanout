@@ -49,6 +49,34 @@ func PMT(pmtPID, videoPID int) []byte {
 	return p
 }
 
+// PMTType is PMT with the video stream_type chosen by the caller (0x1b H.264,
+// 0x24 HEVC, 0x02 MPEG-2 …), for tests that depend on how the ES is read.
+func PMTType(pmtPID, videoPID int, streamType byte) []byte {
+	p := PMT(pmtPID, videoPID)
+	p[17] = streamType
+	return p
+}
+
+// PESStart builds the first packet of a video PES WITHOUT random_access_indicator,
+// its elementary stream beginning with an Annex-B start code followed by es —
+// the NAL header byte(s) (or MPEG-2 start code value) the frame opens with. It
+// is what a source looks like that flags nothing and must be read to find its
+// keyframes.
+func PESStart(videoPID int, pts int64, es ...byte) []byte {
+	p := pkt(videoPID, true, 1)
+	const ps = 4
+	p[ps], p[ps+1], p[ps+2] = 0x00, 0x00, 0x01 // PES start code
+	p[ps+3] = 0xE0                             // video stream_id
+	p[ps+6] = 0x80                             // marker bits
+	p[ps+7] = 0x80                             // PTS_DTS_flags = PTS only
+	p[ps+8] = 0x05                             // PES_header_data_length
+	e := EncodePTS(pts)
+	copy(p[ps+9:ps+14], e[:])
+	body := append([]byte{0x00, 0x00, 0x00, 0x01}, es...)
+	copy(p[ps+14:], body)
+	return p
+}
+
 // Keyframe builds a video packet marked as a random-access point, carrying a PES
 // header with the given 33-bit PTS (90 kHz units).
 func Keyframe(videoPID int, pts int64) []byte {
@@ -57,10 +85,10 @@ func Keyframe(videoPID int, pts int64) []byte {
 	p[5] = 0x40 // random_access_indicator
 	const ps = 6
 	p[ps], p[ps+1], p[ps+2] = 0x00, 0x00, 0x01 // PES start code
-	p[ps+3] = 0xE0                              // video stream_id
-	p[ps+6] = 0x80                              // marker bits
-	p[ps+7] = 0x80                              // PTS_DTS_flags = PTS only
-	p[ps+8] = 0x05                              // PES_header_data_length
+	p[ps+3] = 0xE0                             // video stream_id
+	p[ps+6] = 0x80                             // marker bits
+	p[ps+7] = 0x80                             // PTS_DTS_flags = PTS only
+	p[ps+8] = 0x05                             // PES_header_data_length
 	e := EncodePTS(pts)
 	copy(p[ps+9:ps+14], e[:])
 	return p

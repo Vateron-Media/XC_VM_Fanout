@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tspes"
 )
 
 // PacketSize is the fixed MPEG-TS packet length.
@@ -64,6 +65,10 @@ type State struct {
 	pmtPID   int    // PID carrying the PMT, or -1 if unknown
 	videoPID int    // PID carrying the video ES (for HLS segment PTS), or -1
 	audioPID int    // PID carrying the audio ES, or -1 when the source has none
+	// videoType is the PMT stream_type of videoPID. It decides whether a PES
+	// start on that PID can be recognised as a keyframe from its own bytes when
+	// the source sets no random_access_indicator (see tspes.StartsKeyframe).
+	videoType byte
 
 	// audioPkts and videoFrames feed the supervisor's health checks: "has audio
 	// stopped while video keeps flowing" and "has the frame rate collapsed". Both
@@ -71,11 +76,11 @@ type State struct {
 	// here, so this package stays a parser and the policy lives with the watchdog.
 	audioPkts   int64
 	videoFrames int64
-	gops     []gop  // oldest→newest; the last element is the open (current) GOP
-	lastPCR  int64  // most recent PCR base seen (90 kHz), or -1
-	maxGOP   int    // cap on a single GOP's length (bytes) — memory guard
-	ring90   int64  // history retained, in 90 kHz ticks (0 = current GOP only)
-	maxRing  int    // absolute byte ceiling for the whole ring — memory backstop
+	gops        []gop // oldest→newest; the last element is the open (current) GOP
+	lastPCR     int64 // most recent PCR base seen (90 kHz), or -1
+	maxGOP      int   // cap on a single GOP's length (bytes) — memory guard
+	ring90      int64 // history retained, in 90 kHz ticks (0 = current GOP only)
+	maxRing     int   // absolute byte ceiling for the whole ring — memory backstop
 
 	// pins counts snapshots currently copying out of the ring. While non-zero,
 	// prune must not RECYCLE a dropped GOP's array (it leaves it to GC instead):
@@ -241,6 +246,14 @@ func (s *State) Update(chunk []byte) {
 				keyframe = true
 			}
 		}
+		// No random_access_indicator: look at the video PES itself. This is the
+		// case the native remuxer brings in — ffmpeg's muxer always flagged its
+		// keyframes, but a source passed through byte-for-byte carries only what
+		// its own encoder set, and some set nothing. Without this such a stream
+		// cut no HLS segments at all.
+		if !keyframe && pusi && s.videoPID >= 0 && pid == s.videoPID && tspes.StartsKeyframe(pkt, s.videoType) {
+			keyframe = true
+		}
 
 		switch {
 		case pid == 0 && pusi:
@@ -250,8 +263,8 @@ func (s *State) Update(chunk []byte) {
 			}
 		case s.pmtPID >= 0 && pid == s.pmtPID:
 			s.lastPMT = cloneInto(s.lastPMT, pkt)
-			if v := parseVideoPID(pkt); v >= 0 {
-				s.videoPID = v
+			if v, t := parseVideoPID(pkt); v >= 0 {
+				s.videoPID, s.videoType = v, t
 			}
 			if a := parseAudioPID(pkt); a >= 0 {
 				s.audioPID = a
@@ -749,25 +762,26 @@ func isAudioStreamType(t byte) bool {
 }
 
 // parseVideoPID reads the first video elementary-stream PID out of a PMT packet,
-// or -1. Used to locate the PES that carries the HLS segment clock (PTS).
-func parseVideoPID(pkt []byte) int {
+// with its stream_type, or -1. Used to locate the PES that carries the HLS
+// segment clock (PTS), and to know how to read a keyframe off that PES.
+func parseVideoPID(pkt []byte) (int, byte) {
 	ps := payloadOffset(pkt)
 	if ps < 0 || ps >= len(pkt) {
-		return -1
+		return -1, 0
 	}
 	p := ps + 1 + int(pkt[ps]) // skip pointer_field
 	if p+12 > len(pkt) {
-		return -1
+		return -1, 0
 	}
 	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
 	es := p + 12 + pil
 	for es+5 <= len(pkt) {
 		if isVideoStreamType(pkt[es]) {
-			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2])
+			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2]), pkt[es]
 		}
 		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
 	}
-	return -1
+	return -1, 0
 }
 
 func isVideoStreamType(t byte) bool {
