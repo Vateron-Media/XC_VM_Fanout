@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package tsjoin tracks the MPEG-TS state a new subscriber needs to start
 // decoding cleanly mid-stream: the latest PAT + PMT, plus a keyframe-aligned
 // ring of recent packets.

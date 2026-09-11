@@ -1,5 +1,9 @@
 //go:build integration
 
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package integration exercises a real xc_fanout process end-to-end against the
 // fake `origin` source, one scenario per test. Each test spawns its own daemon
 // with the flags the scenario needs (grace, write-timeout, launch mode, …),

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package tsseg cuts a live MPEG-TS byte stream into HLS .ts segments on disk,
 // copying the source packets verbatim — `ffmpeg -c copy -f hls
 // -hls_segment_type mpegts`, in process.

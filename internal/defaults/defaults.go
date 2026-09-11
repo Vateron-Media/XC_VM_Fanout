@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package defaults is the single home for the daemon's operational tuning
 // constants — the values that used to live as inline literals or per-package
 // consts scattered across the tree. Collecting them here means an operator can

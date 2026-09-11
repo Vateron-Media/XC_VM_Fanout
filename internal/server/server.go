@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package server exposes the fan-out hubs and in-memory HLS over HTTP, owns the
 // id→Stream registry, and drives per-stream on-demand lifecycle (start the
 // source puller on the first viewer, stop it after the last one leaves).

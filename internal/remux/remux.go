@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package remux is `xc_fanout remux`: the native replacement for the ffmpeg
 // process XC_VM runs for a copy-only live stream.
 //

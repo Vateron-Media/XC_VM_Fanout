@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package ingest copies an MPEG-TS byte stream into a publish callback in
 // 188-byte-aligned chunks. Bytes that do not yet complete a packet are held
 // over until the next read, so the join parser downstream always sees whole

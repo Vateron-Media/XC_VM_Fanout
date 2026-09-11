@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package nativesrc acquires a live source and yields MPEG-TS bytes, in-process,
 // for the sources that need no transcoding — replacing the per-stream ffmpeg
 // remux child for the common IPTV case.
