@@ -105,6 +105,7 @@ Only the **PHP panel** talks to this surface.
 | `DELETE /ingest/<id>` | Tear down a push stream. |
 | `GET /probe/<id>?wait=<ms>` | Warm up the source and wait for data. |
 | `GET /connections` | All uuids of active live-TS viewers. |
+| `DELETE /connections/<uuid>` | Disconnect a live-TS viewer (panel kick / connection-limit eviction). |
 | `GET /rates` | Per-viewer average delivery rate (KB/s), keyed by uuid. |
 | `POST /signal/<uuid>` | Queue a one-shot admin "send message" text overlay for one viewer. |
 
@@ -228,6 +229,21 @@ The `fanout_sync` daemon reconciles this set against the `lines_live` rows and c
 no longer appears here — because under X-Accel PHP cannot see a viewer disconnect on its own.
 
 **Response:** `200`, `Content-Type: application/json`, body — for example `["uuid-1","uuid-2"]`.
+
+### `DELETE /connections/<uuid>` — disconnect a viewer
+
+Ends every live-TS connection carrying `<uuid>` (the `?c=` value), on whichever stream it is
+attached to. The handler is [`serveDropConnection`](../../internal/server/server.go).
+
+Under X-Accel the PHP worker that admitted a viewer returns at hand-off, so the panel cannot
+kill a process to end the session the way it did on the legacy byte path. It calls this instead
+when a line exceeds `max_connections` (the oldest connection is evicted), when an admin kills a
+connection, and from `fanout_sync` for a viewer whose `lines_live` row is gone. The viewer then
+reconnects through `live.php`, where its expired token and the line's limits apply again.
+
+**Response:** `204` when the uuid was connected, `404` when it was not (already gone, or served by
+another node), `405` for any method but `DELETE`. Advertised as `drop_connection` in
+`GET /monitors/state` → `features`.
 
 ### `GET /rates` — per-viewer transfer telemetry
 

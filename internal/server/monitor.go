@@ -200,7 +200,10 @@ func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
 // argument and tries to start a second daemon, which fails on the sockets the
 // running one holds, and the stream never starts. One capability list costs
 // nothing and removes a whole class of half-upgraded-node failure.
-var Features = []string{"remux"}
+//
+// "drop_connection": DELETE /connections/<uuid> ends a live-TS viewer (the
+// panel's kick and connection-limit eviction).
+var Features = []string{"remux", "drop_connection"}
 
 // EnableSupervision gives the manager an encoder supervisor. Streams are only
 // supervised once the panel PUTs a spec for one, so enabling this changes
