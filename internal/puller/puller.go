@@ -59,10 +59,40 @@ type Source struct {
 	FfmpegBin string // ffmpeg path; "ffmpeg" if empty
 	Label     string // stream id, for debug logging only (no effect on behaviour)
 	Insecure  bool   // skip upstream TLS certificate verification (see -source-insecure)
+	// Headers are extra request headers as raw "Key: value" lines, for an
+	// upstream that needs more than a User-Agent and a Cookie to answer. A
+	// source fetched without the headers it was configured with is a DIFFERENT
+	// source — it may 403, or serve something else entirely — so these travel
+	// down every path: the probe, the native reader and the ffmpeg child.
+	Headers []string
 	// Backend selects how a NON-mp2t source becomes MPEG-TS: BackendAuto,
 	// BackendFfmpeg or BackendNative. Empty means BackendAuto. A direct mp2t
 	// source ignores it entirely — that path never needed a converter.
 	Backend string
+	// OnPath, when set, is called with a short label for the route each connect
+	// attempt settles on (see the Path* constants). It is how the daemon can
+	// report whether a stream is ACTUALLY running native or on ffmpeg, rather
+	// than only what was configured — the question the source backend setting
+	// exists to answer and which nothing else can answer after the fact.
+	// Called from the pull goroutine; keep it cheap and non-blocking.
+	OnPath func(path string)
+}
+
+// The routes a connect attempt can settle on, as reported through
+// Source.OnPath. Short and stable: they show up in the debug snapshot and in
+// GET /streams/<id>, and operators compare them against the configured backend.
+const (
+	PathDirectMP2T = "direct-mp2t"     // served as video/mp2t; no converter involved
+	PathNative     = "native"          // converted in-process by nativesrc
+	PathFfmpegPin  = "ffmpeg-pinned"   // backend=ffmpeg, native never tried
+	PathFfmpegBack = "ffmpeg-fallback" // native declined the source; ffmpeg took it
+)
+
+// reportPath tells the owner which route this attempt took, if it is listening.
+func (s Source) reportPath(p string) {
+	if s.OnPath != nil {
+		s.OnPath(p)
+	}
 }
 
 // How a non-mp2t source is converted. The panel sets this globally through the
@@ -157,7 +187,9 @@ func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize in
 			lastErr = err
 			continue
 		}
+		dlog.Logf("puller", "id=%s probe %s: HTTP %d content-type=%q", src.Label, raw, resp.StatusCode, resp.Header.Get("Content-Type"))
 		if isMP2T(resp) {
+			src.reportPath(PathDirectMP2T)
 			// Bound a stall: without this a source that goes half-open (stops
 			// sending but never closes the socket) blocked ingest.Copy's Read
 			// forever. No error means no reconnect, so the channel was silently
@@ -195,6 +227,20 @@ func nativeOnlyScheme(raw string) bool {
 		return true
 	}
 	return false
+}
+
+// applyHeaders stamps raw "Key: value" lines onto a request. A line without a
+// colon, or with an empty name, is skipped rather than guessed at: a malformed
+// entry in a panel's per-stream settings must not become a malformed request.
+func applyHeaders(req *http.Request, lines []string) {
+	for _, line := range lines {
+		name, value, ok := strings.Cut(line, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		req.Header.Set(name, strings.TrimSpace(value))
+	}
 }
 
 // isMP2T reports whether a response is served as MPEG-TS.
@@ -244,6 +290,7 @@ func probe(ctx context.Context, c *http.Client, src Source, raw string) (*http.R
 	if src.Cookie != "" {
 		req.Header.Set("Cookie", src.Cookie)
 	}
+	applyHeaders(req, src.Headers)
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
@@ -270,10 +317,12 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 		Cookie:    src.Cookie,
 		Proxy:     src.Proxy,
 		Insecure:  src.Insecure,
+		Headers:   src.Headers,
 	}
 
 	if src.Backend == BackendFfmpeg {
 		closeBody(resp)
+		src.reportPath(PathFfmpegPin)
 		dlog.Logf("puller", "id=%s connected via ffmpeg remux (backend=ffmpeg): %s", src.Label, raw)
 		return runFfmpeg(ctx, src, raw, chunkSize, publish)
 	}
@@ -289,6 +338,7 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 	}
 	if err == nil {
 		defer rc.Close()
+		src.reportPath(PathNative)
 		dlog.Logf("puller", "id=%s connected native (no ffmpeg child): %s", src.Label, raw)
 		return ingest.Copy(rc, chunkSize, publish)
 	}
@@ -299,6 +349,7 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 		// thing they turned off.
 		return fmt.Errorf("native source declined (backend=native, no fallback): %w", err)
 	}
+	src.reportPath(PathFfmpegBack)
 	dlog.Logf("puller", "id=%s native declined (%v); falling back to ffmpeg: %s", src.Label, err, raw)
 	return runFfmpeg(ctx, src, raw, chunkSize, publish)
 }
@@ -308,6 +359,25 @@ func closeBody(resp *http.Response) {
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
+}
+
+// ffmpegHeaderBlock folds the cookie and any extra headers into the single
+// CRLF-terminated block ffmpeg's -headers option expects, or "" when there is
+// nothing to send.
+func ffmpegHeaderBlock(src Source) string {
+	var b strings.Builder
+	if src.Cookie != "" {
+		b.WriteString("Cookie: " + src.Cookie + "\r\n")
+	}
+	for _, line := range src.Headers {
+		name, value, ok := strings.Cut(line, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		b.WriteString(name + ": " + strings.TrimSpace(value) + "\r\n")
+	}
+	return b.String()
 }
 
 // runFfmpeg remuxes a non-mp2t source to MPEG-TS on stdout and feeds it in.
@@ -332,8 +402,12 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 		"-probesize", defaults.PullFfmpegProbeSize, "-analyzeduration", defaults.PullFfmpegAnalyzeDuration,
 		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
 	}
-	if src.Cookie != "" {
-		args = append(args, "-headers", "Cookie: "+src.Cookie+"\r\n")
+	// ffmpeg takes ONE -headers value, so the cookie and any extra headers have
+	// to be folded into a single CRLF-separated block. Passing -headers twice
+	// silently keeps only the last, which would drop whichever the panel cared
+	// about more.
+	if hdr := ffmpegHeaderBlock(src); hdr != "" {
+		args = append(args, "-headers", hdr)
 	}
 	if src.Proxy != "" {
 		args = append(args, "-http_proxy", "http://"+src.Proxy)

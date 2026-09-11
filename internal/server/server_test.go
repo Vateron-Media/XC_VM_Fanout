@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/config"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
 )
@@ -404,6 +405,26 @@ func TestServeLiveStreamsSnapshotThenTail(t *testing.T) {
 	}
 }
 
+// startedBackend runs a stream's start path and reports the backend the puller
+// was actually handed. It reaches through startLocked rather than reading the
+// stored config because the RESOLUTION is the thing under test: what a stream
+// was registered with and what it pulls with are deliberately not the same.
+func startedBackend(t *testing.T, m *Manager, id string) string {
+	t.Helper()
+	st := m.Get(id)
+	if st == nil {
+		t.Fatalf("stream %s was not registered", id)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.startLocked()
+	if st.cancel != nil {
+		defer st.cancel()
+	}
+	st.running = false
+	return st.resolvedBackend()
+}
+
 // TestSourceBackendAppliedToRegistrations: the node-wide backend reaches a
 // registered source, and a per-stream value overrides it so one troublesome
 // channel can be pinned without changing the node.
@@ -412,21 +433,56 @@ func TestSourceBackendAppliedToRegistrations(t *testing.T) {
 	m.sourceBackend.Store(puller.BackendNative)
 
 	m.Register("node-wide", puller.Source{URLs: []string{"http://x/a.m3u8"}}, 0)
-	st := m.Get("node-wide")
-	st.mu.Lock()
-	got := st.cfg.Backend
-	st.mu.Unlock()
-	if got != puller.BackendNative {
+	if got := startedBackend(t, m, "node-wide"); got != puller.BackendNative {
 		t.Errorf("node-wide backend = %q, want %q", got, puller.BackendNative)
 	}
 
 	m.Register("pinned", puller.Source{URLs: []string{"http://x/b.m3u8"}, Backend: puller.BackendFfmpeg}, 0)
-	st = m.Get("pinned")
-	st.mu.Lock()
-	got = st.cfg.Backend
-	st.mu.Unlock()
-	if got != puller.BackendFfmpeg {
+	if got := startedBackend(t, m, "pinned"); got != puller.BackendFfmpeg {
 		t.Errorf("pinned backend = %q, want the per-stream %q", got, puller.BackendFfmpeg)
+	}
+}
+
+// TestSourceBackendReloadReachesRegisteredStreams is the regression this whole
+// split exists for. An operator switching the node to native watched nothing
+// happen: the backend was stamped into each stream at registration, so every
+// stream already known to the daemon went on using the old value indefinitely —
+// across idle-stops and restarts — until the panel happened to re-register it.
+// The documented contract was always "applied live, takes effect on the next
+// pull".
+func TestSourceBackendReloadReachesRegisteredStreams(t *testing.T) {
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m.sourceBackend.Store(puller.BackendFfmpeg)
+	m.Register("s", puller.Source{URLs: []string{"http://x/a.m3u8"}}, 0)
+
+	if got := startedBackend(t, m, "s"); got != puller.BackendFfmpeg {
+		t.Fatalf("backend before the reload = %q, want %q", got, puller.BackendFfmpeg)
+	}
+
+	// The operator edits the config file; the poll applies it. No re-register.
+	v := config.Defaults()
+	v.SourceBackend = puller.BackendNative
+	m.ApplyConfig(v)
+
+	if got := startedBackend(t, m, "s"); got != puller.BackendNative {
+		t.Errorf("backend after the reload = %q, want %q — the change never reached the stream", got, puller.BackendNative)
+	}
+}
+
+// TestPinnedBackendSurvivesNodeReload: a stream the panel pinned must keep its
+// pin across a node-wide change, or the per-stream override would silently
+// last only until the next config reload.
+func TestPinnedBackendSurvivesNodeReload(t *testing.T) {
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m.sourceBackend.Store(puller.BackendAuto)
+	m.Register("p", puller.Source{URLs: []string{"http://x/a.m3u8"}, Backend: puller.BackendFfmpeg}, 0)
+
+	v := config.Defaults()
+	v.SourceBackend = puller.BackendNative
+	m.ApplyConfig(v)
+
+	if got := startedBackend(t, m, "p"); got != puller.BackendFfmpeg {
+		t.Errorf("pinned backend = %q after a node reload, want the pin %q", got, puller.BackendFfmpeg)
 	}
 }
 

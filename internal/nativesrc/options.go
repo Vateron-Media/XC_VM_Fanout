@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,10 @@ type Options struct {
 	Cookie    string // value of the Cookie header, if any
 	Proxy     string // "host:port" HTTP proxy, optional
 	Insecure  bool   // skip upstream TLS certificate verification
+	// Headers are extra request headers as raw "Key: value" lines. They apply
+	// to every fetch this package makes for the source — the playlist AND each
+	// segment — because an upstream that gates on a header gates on all of it.
+	Headers []string
 }
 
 // Timeouts. Bounded fetches (playlists, segments) get a whole-request deadline;
@@ -75,5 +80,17 @@ func (o Options) apply(req *http.Request) {
 	}
 	if o.Cookie != "" && req.Header.Get("Cookie") == "" {
 		req.Header.Set("Cookie", o.Cookie)
+	}
+	// Configured headers are set last and unconditionally: they are the most
+	// specific thing anyone said about this source, so they win over the
+	// defaults above rather than being skipped because a default got there
+	// first. A line without a colon is skipped, not guessed at.
+	for _, line := range o.Headers {
+		name, value, ok := strings.Cut(line, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		req.Header.Set(name, strings.TrimSpace(value))
 	}
 }

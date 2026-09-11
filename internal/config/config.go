@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 )
@@ -252,6 +253,14 @@ func (v *Values) clamp() {
 	v.MemLimitMB = clampInt(v.MemLimitMB, 0, 1<<20)
 	// An unknown backend falls back to the safe default rather than throwing:
 	// a typo in the panel must never stop streams from being pulled.
+	//
+	// Case and surrounding space are normalised before that judgement. "Native"
+	// and " native" are not typos an operator can see — they look right in the
+	// file and in the panel — but an exact-match test silently demoted them to
+	// the default, which then behaved almost but not quite like what was asked
+	// for. That is the worst kind of wrong: no error, no log, and a setting that
+	// reads as honoured.
+	v.SourceBackend = strings.ToLower(strings.TrimSpace(v.SourceBackend))
 	switch v.SourceBackend {
 	case "auto", "ffmpeg", "native":
 	default:

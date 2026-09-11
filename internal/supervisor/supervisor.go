@@ -23,7 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,8 +164,8 @@ type State struct {
 	GaveUp     bool   `json:"gave_up"`
 	// Adopted means this encoder was inherited from a previous daemon life
 	// rather than started by this one.
-	Adopted bool `json:"adopted"`
-	LastError  string `json:"last_error"`
+	Adopted   bool   `json:"adopted"`
+	LastError string `json:"last_error"`
 }
 
 // Process is a running encoder. It exists so the restart loop can be tested
@@ -266,10 +268,10 @@ type stream struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu      sync.Mutex
-	spec    Spec
-	proc    Process
-	pid     int
+	mu   sync.Mutex
+	spec Spec
+	proc Process
+	pid  int
 	// autoRestartAt is when the scheduled restart last fired. The schedule
 	// matches on HH:MM, so without this it keeps matching for the rest of that
 	// minute and the stream restarts in a tight loop until the clock moves on.
@@ -277,6 +279,15 @@ type stream struct {
 	// restart path was slow enough to usually leave the minute — luck, not
 	// design, and the daemon restarts far too quickly to rely on it.)
 	autoRestartAt time.Time
+
+	// lastTick/lastVitals/fpsPeak are the most recent health judgement's INPUTS,
+	// kept so the debug snapshot can report what the watchdog is actually
+	// seeing. Without them the monitor is only visible when it acts, so "is it
+	// running at all, and what does it think?" has no answer short of waiting
+	// for a restart.
+	lastTick   time.Time
+	lastVitals Vitals
+	fpsPeak    float64
 
 	// srcIdx is the source the next start uses; forced is a queued switch from
 	// ForceSource (-1 = none); backupCheckedAt paces the priority-backup probe.
@@ -597,10 +608,99 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 		if !ok {
 			continue // the stream is not registered with the daemon (yet)
 		}
+		st.recordTick(now, v, base.peak)
 		if verdict := health.check(now, startedAt, v, base); verdict.failed() {
 			return verdict
 		}
 	}
+}
+
+// recordTick stores what the watchdog just measured, for DebugLines.
+func (st *stream) recordTick(now time.Time, v Vitals, peak float64) {
+	st.mu.Lock()
+	st.lastTick, st.lastVitals, st.fpsPeak = now, v, peak
+	st.mu.Unlock()
+}
+
+// DebugLines narrates every supervised stream: how it is being produced, and
+// what the watchdog is measuring against which rules.
+//
+// This exists because supervision is otherwise only visible when it ACTS. A
+// healthy node logs nothing, which is indistinguishable from a watchdog that
+// has silently stopped ticking — and the two call for opposite responses. The
+// tick age is the load-bearing field: a stale one says the loop is stuck, not
+// that the stream is fine.
+func (s *Supervisor) DebugLines() []string {
+	s.mu.Lock()
+	all := make([]*stream, 0, len(s.procs))
+	for _, st := range s.procs {
+		all = append(all, st)
+	}
+	s.mu.Unlock()
+
+	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
+	out := make([]string, 0, len(all))
+	for _, st := range all {
+		out = append(out, st.debugLine(s.now()))
+	}
+	return out
+}
+
+func (st *stream) debugLine(now time.Time) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	producer := "encoder"
+	if st.adopted {
+		producer = "adopted"
+	}
+	uptime := "-"
+	if st.running && !st.started.IsZero() {
+		uptime = now.Sub(st.started).Round(time.Second).String()
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "id=%s producer=%s running=%v pid=%d src=%d:%q up=%s starts=%d fails=%d",
+		st.id, producer, st.running, st.pid, st.srcIdx, st.source, uptime, st.starts, st.fails)
+	if st.gaveUp {
+		b.WriteString(" GAVE_UP")
+	}
+	if st.lastErr != "" {
+		fmt.Fprintf(&b, " last_err=%q", st.lastErr)
+	}
+
+	if st.lastTick.IsZero() {
+		b.WriteString(" | watchdog: no tick yet")
+		return b.String()
+	}
+	h := st.spec.Health
+	fmt.Fprintf(&b, " | tick_age=%s", now.Sub(st.lastTick).Round(time.Second))
+	fmt.Fprintf(&b, " data_age=%s/%s", since(now, st.lastVitals.LastData), limitOrOff(h.StallSec))
+	fmt.Fprintf(&b, " audio_age=%s/%s", since(now, st.lastVitals.LastAudio), limitOrOff(h.AudioLossSec))
+	if h.FPSThreshold > 0 {
+		fmt.Fprintf(&b, " fps=%.1f/%.1f×%.0f%%", st.lastVitals.FPS, st.fpsPeak, h.FPSThreshold*100)
+	} else {
+		fmt.Fprintf(&b, " fps=%.1f/off", st.lastVitals.FPS)
+	}
+	return b.String()
+}
+
+// since renders an age, or "never" for a zero timestamp — which is NOT the same
+// as a long age: a stream that never had audio has none to lose.
+func since(now, t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return now.Sub(t).Round(time.Second).String()
+}
+
+// limitOrOff renders a threshold in seconds, or "off" for a disabled check, so
+// a line shows which rules are actually armed.
+func limitOrOff(sec int) string {
+	if sec <= 0 {
+		return "off"
+	}
+	return strconv.Itoa(sec) + "s"
 }
 
 // startOnce launches the encoder and confirms it actually began producing. A

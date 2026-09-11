@@ -104,13 +104,20 @@ func TestBackendAutoFallsBackToFfmpeg(t *testing.T) {
 	}
 }
 
-// TestBackendNativeDoesNotFallBack: backend=native must surface the refusal
-// instead of quietly doing the thing the operator switched off.
-func TestBackendNativeDoesNotFallBack(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// fmp4Playlist serves an HLS source whose segments are fragmented MP4 — the
+// canonical thing the native reader refuses.
+func fmp4Playlist(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\ns0.m4s\n"))
 	}))
+}
+
+// TestBackendNativeDoesNotFallBack: backend=native must surface the refusal
+// instead of quietly doing the thing the operator switched off.
+func TestBackendNativeDoesNotFallBack(t *testing.T) {
+	srv := fmp4Playlist(t)
 	defer srv.Close()
 	bin, marker := markerFfmpeg(t)
 
