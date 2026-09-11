@@ -48,11 +48,25 @@ func TestShellLauncherPidIsTheEncoderNotTheShell(t *testing.T) {
 	}
 	defer proc.Kill()
 
-	cmdline, alive := findProcess(proc.Pid())
+	// Until the shell's own `exec` lands, /proc/<pid>/cmdline is the shell's
+	// ("/bin/sh -c exec sleep 30") or reads empty mid-execve. Give it a moment,
+	// and require argv[0] to BE sleep: the shell's line contains the word too,
+	// so a substring test cannot tell the two apart.
+	var (
+		cmdline string
+		alive   bool
+	)
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		cmdline, alive = findProcess(proc.Pid())
+		if !alive || strings.HasPrefix(cmdline, "sleep") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !alive {
 		t.Fatal("the launched process is not alive")
 	}
-	if !strings.Contains(cmdline, "sleep") {
+	if !strings.HasPrefix(cmdline, "sleep") {
 		t.Errorf("pid %d is running %q, want the command itself — `exec` did not replace the shell",
 			proc.Pid(), cmdline)
 	}
