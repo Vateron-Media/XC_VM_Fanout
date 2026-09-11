@@ -48,12 +48,19 @@ const (
 // in `streams_servers.current_source`) and the command that serves it.
 //
 // Cmd is a shell command line, because that is what StreamProcess::buildLive
-// produces and re-deriving it here is exactly what this design avoids. It must
-// arrive WITHOUT buildLive's trailing redirect-and-background tail: the daemon
+// (ffmpeg) and StreamProcess::buildNativeLive (`xc_fanout remux`) produce and
+// re-deriving it here is exactly what this design avoids. It must arrive
+// WITHOUT buildLive's trailing redirect-and-background tail: the daemon
 // supervises the process, so it needs to be its parent and to reap it itself.
 type Source struct {
 	Label string `json:"label"`
 	Cmd   string `json:"cmd"`
+	// FallbackCmd is run in Cmd's place once Cmd has exited ExitUnsupported —
+	// the same source, through a pipeline that can take it. The panel sets it
+	// when Cmd is the native remuxer and the node's source backend allows an
+	// ffmpeg fallback ("auto"); it is empty everywhere else, and then an
+	// ExitUnsupported is an ordinary failure. The daemon never derives one.
+	FallbackCmd string `json:"fallback_cmd,omitempty"`
 	// ProbeCmd tests whether this source is reachable WITHOUT starting it, for
 	// the priority-backup check. Optional: a source without one is never
 	// switched TO speculatively, only used when the list is walked on failure.
@@ -153,20 +160,42 @@ func (s *Spec) valid() error {
 // State is the answer to GET /monitor/<id>: what PHP needs to reconcile
 // `streams_servers` without owning the process any more.
 type State struct {
-	Supervised bool   `json:"supervised"`
-	Running    bool   `json:"running"`
-	PID        int    `json:"pid"`
-	Source     string `json:"source"`
-	SourceIdx  int    `json:"source_idx"`
-	Restarts   int    `json:"restarts"`
-	Failures   int    `json:"failures"`
-	UptimeMS   int64  `json:"uptime_ms"`
-	GaveUp     bool   `json:"gave_up"`
+	Supervised bool `json:"supervised"`
+	Running    bool `json:"running"`
+	// Confirmed means the running producer has actually delivered bytes to
+	// this daemon — the start was confirmed, not merely launched. Running
+	// without Confirmed is a start in progress: the panel's "starting" state.
+	Confirmed bool   `json:"confirmed"`
+	PID       int    `json:"pid"`
+	Source    string `json:"source"`
+	SourceIdx int    `json:"source_idx"`
+	Restarts  int    `json:"restarts"`
+	Failures  int    `json:"failures"`
+	UptimeMS  int64  `json:"uptime_ms"`
+	GaveUp    bool   `json:"gave_up"`
 	// Adopted means this encoder was inherited from a previous daemon life
 	// rather than started by this one.
-	Adopted   bool   `json:"adopted"`
+	Adopted bool `json:"adopted"`
+	// Fallback means the running process is the current source's FallbackCmd:
+	// its Cmd declared it could not serve the source (ExitUnsupported).
+	Fallback  bool   `json:"fallback"`
 	LastError string `json:"last_error"`
+	// DaemonPID is this daemon's own pid. The panel records it as the stream's
+	// monitor_pid — the daemon is the monitor now — so its "is anything
+	// watching this stream?" bookkeeping has a live process to point at.
+	DaemonPID int `json:"daemon_pid"`
 }
+
+// ExitUnsupported is the exit status by which a command declares that it cannot
+// serve its source AT ALL — as opposed to failing to reach it. `xc_fanout remux`
+// exits with it for a source its native reader does not take (fMP4 HLS, RTMP…),
+// and within a second or two of starting, so the decision costs no start timeout.
+//
+// It is the one exit status the supervisor reads, and only when the source has a
+// FallbackCmd: that source switches to the fallback for the rest of this spec's
+// life, without the failure counting towards stop_failures. Any other exit is an
+// ordinary failure and walks the source list as before.
+const ExitUnsupported = 3
 
 // Process is a running encoder. It exists so the restart loop can be tested
 // without spawning anything: the real implementation wraps exec.Cmd, and tests
@@ -297,13 +326,22 @@ type stream struct {
 
 	// adopted records that the RUNNING encoder was inherited, not started here.
 	adopted bool
-	source  string
-	started time.Time
-	running bool
-	gaveUp  bool
-	fails   int
-	starts  int
-	lastErr string
+	// fallback holds the source indexes whose Cmd exited ExitUnsupported and
+	// which now run their FallbackCmd; usingFallback says the RUNNING process is
+	// one of those. Sticky for the life of the spec: a source that could not be
+	// served natively once will not start being servable on a retry, and
+	// re-trying it on every restart would add a failed start to each of them.
+	fallback      map[int]bool
+	usingFallback bool
+	// confirmed: the running producer's start was confirmed by data arriving.
+	confirmed bool
+	source    string
+	started   time.Time
+	running   bool
+	gaveUp    bool
+	fails     int
+	starts    int
+	lastErr   string
 }
 
 // Supervise takes over (or re-takes) a stream. Re-supervising a stream that is
@@ -415,6 +453,7 @@ func (st *stream) state() State {
 	out := State{
 		Supervised: true,
 		Running:    st.running,
+		Confirmed:  st.running && st.confirmed,
 		PID:        st.pid,
 		Source:     st.source,
 		SourceIdx:  st.srcIdx,
@@ -422,7 +461,9 @@ func (st *stream) state() State {
 		Failures:   st.fails,
 		GaveUp:     st.gaveUp,
 		Adopted:    st.adopted,
+		Fallback:   st.usingFallback,
 		LastError:  st.lastErr,
+		DaemonPID:  os.Getpid(),
 	}
 	if st.running && !st.started.IsZero() {
 		out.UptimeMS = st.sup.now().Sub(st.started).Milliseconds()
@@ -467,6 +508,13 @@ func (st *stream) run(ctx context.Context) {
 
 		proc, err := st.startOnce(ctx, src)
 		if err != nil {
+			// The command could not serve this source at all, and the panel gave
+			// it a fallback: that is a choice of pipeline, not a failed start, so
+			// it neither counts towards stop_failures nor waits out the fail sleep.
+			if errors.Is(err, errUnsupported) && st.switchToFallback(src) {
+				dlog.Logf("monitor", "id=%s %v; switching source %q to its fallback command", st.id, err, src.Label)
+				continue
+			}
 			consecutiveFails++
 			st.note(err.Error(), consecutiveFails)
 			st.emit(EventStreamStartFail, src.Label)
@@ -493,6 +541,7 @@ func (st *stream) run(ctx context.Context) {
 		}
 
 		consecutiveFails = 0
+		st.markConfirmed()
 		if first {
 			st.emit(EventStreamStart, src.Label)
 			first = false
@@ -527,6 +576,13 @@ func (st *stream) run(ctx context.Context) {
 			st.emit(verdict.event, logSource)
 			dlog.Logf("monitor", "id=%s %s: %s; restarting", st.id, verdict.event, verdict.reason)
 		} else {
+			// Exited on its own. A remuxer can only discover some sources are not
+			// servable once it is reading them (an HLS that turns fMP4 mid-life);
+			// it says so the same way it does at startup.
+			if isUnsupportedExit(proc.Wait()) && st.switchToFallback(src) {
+				dlog.Logf("monitor", "id=%s source %q became unservable by its command; switching to its fallback", st.id, src.Label)
+				continue
+			}
 			st.emit(EventStreamFailed, src.Label)
 			dlog.Logf("monitor", "id=%s process exited; restarting", st.id)
 		}
@@ -615,6 +671,52 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 	}
 }
 
+// errUnsupported marks a start that failed because the command exited
+// ExitUnsupported: it cannot serve this source, as distinct from not reaching it.
+var errUnsupported = errors.New("command cannot serve this source")
+
+// isUnsupportedExit reports whether a process's exit error carries
+// ExitUnsupported. exec.ExitError exposes the status through ExitCode, and so
+// may a test Process's error.
+func isUnsupportedExit(err error) bool {
+	var ec interface{ ExitCode() int }
+	return errors.As(err, &ec) && ec.ExitCode() == ExitUnsupported
+}
+
+// commandFor picks what to run for src: its FallbackCmd once its Cmd has
+// declared the source unservable, otherwise its Cmd. Reports which it chose.
+func (st *stream) commandFor(src Source) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if src.FallbackCmd != "" && st.fallback[st.srcIdx] {
+		return src.FallbackCmd, true
+	}
+	return src.Cmd, false
+}
+
+// switchToFallback moves the current source onto its FallbackCmd, reporting
+// false when there is nothing to switch to — no fallback, or already on it — in
+// which case the caller treats the exit as the ordinary failure it then is.
+func (st *stream) switchToFallback(src Source) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if src.FallbackCmd == "" || st.fallback[st.srcIdx] {
+		return false
+	}
+	if st.fallback == nil {
+		st.fallback = make(map[int]bool)
+	}
+	st.fallback[st.srcIdx] = true
+	return true
+}
+
+// markFallback records whether the RUNNING process is a fallback command.
+func (st *stream) markFallback(v bool) {
+	st.mu.Lock()
+	st.usingFallback = v
+	st.mu.Unlock()
+}
+
 // recordTick stores what the watchdog just measured, for DebugLines.
 func (st *stream) recordTick(now time.Time, v Vitals, peak float64) {
 	st.mu.Lock()
@@ -650,9 +752,12 @@ func (st *stream) debugLine(now time.Time) string {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	producer := "encoder"
-	if st.adopted {
+	producer := "cmd"
+	switch {
+	case st.adopted:
 		producer = "adopted"
+	case st.usingFallback:
+		producer = "fallback"
 	}
 	uptime := "-"
 	if st.running && !st.started.IsZero() {
@@ -725,15 +830,18 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 			done:  make(chan struct{}),
 		}
 		st.markAdopted(true)
+		st.markFallback(false)
 		st.markStarted(proc, src.Label)
 		return proc, nil
 	}
 	st.markAdopted(false)
 
-	proc, err := st.sup.launch(ctx, src.Cmd, spec.ErrorsPath)
+	cmd, fallback := st.commandFor(src)
+	proc, err := st.sup.launch(ctx, cmd, spec.ErrorsPath)
 	if err != nil {
 		return nil, fmt.Errorf("launch: %w", err)
 	}
+	st.markFallback(fallback)
 
 	// Publish the pid BEFORE announcing the state. PHP polls GET /monitor/<id>
 	// and then reads <streams>/<id>_.pid; announcing "running" first leaves a
@@ -752,6 +860,9 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 		select {
 		case werr := <-exited:
 			st.markStopped(werr)
+			if isUnsupportedExit(werr) {
+				return nil, fmt.Errorf("%w (exited during startup: %v)", errUnsupported, werr)
+			}
 			return nil, fmt.Errorf("exited during startup: %v", werr)
 		case <-ctx.Done():
 			proc.Kill()
@@ -834,14 +945,21 @@ func (st *stream) currentSource() Source {
 func (st *stream) markStarted(p Process, label string) {
 	st.mu.Lock()
 	st.proc, st.pid, st.source = p, p.Pid(), label
-	st.started, st.running = st.sup.now(), true
+	st.started, st.running, st.confirmed = st.sup.now(), true, false
 	st.starts++
+	st.mu.Unlock()
+}
+
+// markConfirmed records that the running producer's start was confirmed.
+func (st *stream) markConfirmed() {
+	st.mu.Lock()
+	st.confirmed = true
 	st.mu.Unlock()
 }
 
 func (st *stream) markStopped(err error) {
 	st.mu.Lock()
-	st.running, st.proc, st.pid = false, nil, 0
+	st.running, st.proc, st.pid, st.confirmed = false, nil, 0, false
 	if err != nil {
 		st.lastErr = err.Error()
 	}

@@ -127,13 +127,11 @@ func main() {
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
 	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
-	// Encoder supervision, when this node is configured for it. This is the only
-	// place it is turned on, and it still does nothing on its own — a stream is
-	// supervised only once the panel hands it over.
-	if cfg.Supervise {
-		mgr.EnableSupervision()
-		log.Printf("monitor: encoder supervision enabled (streams are handed over by the panel)")
-	}
+	// Encoder supervision is always wired, and does nothing on its own: a stream
+	// is supervised only once the panel hands it over, and the daemon accepts a
+	// hand-over only while config.json says `supervise: true` — a live setting,
+	// so the panel can turn it on without a daemon restart dropping every viewer.
+	mgr.EnableSupervision()
 	mgr.StartReaper(ctx)                                                                     // idle-stop sweep for control-managed streams (TS + HLS)
 	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS
 	dlog.Logf("boot", "config: supervise=%v sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds chunk=%dB maxgop=%dB insecure=%v backend=%s overlay=%v",
@@ -265,8 +263,8 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 			current = &v
 			mgr.ApplyConfig(v)
 			applyMemLimit(v.MemLimitMB)
-			dlog.Logf("config", "applied %s: prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds backend=%s",
-				path, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec, v.ViewerIdleTimeoutSec, v.SourceBackend)
+			dlog.Logf("config", "applied %s: supervise=%v prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds backend=%s",
+				path, v.Supervise, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec, v.ViewerIdleTimeoutSec, v.SourceBackend)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
@@ -47,6 +48,12 @@ func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
+		// Not accepting hand-overs is a 501, the same answer as a node with no
+		// supervisor at all: the panel reads it as "run it yourself".
+		if !m.superviseOn.Load() {
+			http.Error(w, "supervision not enabled on this node", http.StatusNotImplemented)
+			return
+		}
 		var spec supervisor.Spec
 		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
 			http.Error(w, "bad spec: "+err.Error(), http.StatusBadRequest)
@@ -77,15 +84,8 @@ func (m *Manager) serveMonitor(w http.ResponseWriter, r *http.Request) {
 		// Supervision state plus what the stream turned out to BE. The panel
 		// reconciles streams_servers from this one call, which is what retires
 		// its periodic ffprobe.
-		out := struct {
-			supervisor.State
-			Meta *StreamMeta `json:"meta,omitempty"`
-		}{State: st}
-		if meta, ok := m.StreamMetadata(id); ok {
-			out.Meta = &meta
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
+		_ = json.NewEncoder(w).Encode(m.monitorState(id, st))
 
 	case http.MethodDelete:
 		if m.vitals != nil {
@@ -146,6 +146,45 @@ func (m *Manager) serveMonitors(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ids)
+}
+
+// monitorStateView is GET /monitor/<id>'s body: supervision state plus the
+// stream's measured metadata, when there is any.
+type monitorStateView struct {
+	supervisor.State
+	Meta *StreamMeta `json:"meta,omitempty"`
+}
+
+func (m *Manager) monitorState(id string, st supervisor.State) monitorStateView {
+	out := monitorStateView{State: st}
+	if meta, ok := m.StreamMetadata(id); ok {
+		out.Meta = &meta
+	}
+	return out
+}
+
+// serveMonitorStates is every supervised stream's GET /monitor/<id> in one
+// response, keyed by id. The panel reconciles streams_servers from it on a
+// short cadence; one call per stream per pass would be hundreds of round trips
+// on a large node to learn, mostly, that nothing changed. `accepting` says
+// whether a new hand-over would be taken right now, and `daemon_pid` is what the
+// panel records as a supervised stream's monitor_pid — known before it hands one
+// over, so the row can say "watched" before the daemon starts anything.
+func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
+	out := struct {
+		Accepting bool                        `json:"accepting"`
+		DaemonPID int                         `json:"daemon_pid"`
+		Streams   map[string]monitorStateView `json:"streams"`
+	}{Accepting: m.sup != nil && m.superviseOn.Load(), DaemonPID: os.Getpid(), Streams: map[string]monitorStateView{}}
+	if m.sup != nil {
+		for _, id := range m.sup.IDs() {
+			if st := m.sup.State(id); st.Supervised {
+				out.Streams[id] = m.monitorState(id, st)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // EnableSupervision gives the manager an encoder supervisor. Streams are only

@@ -665,6 +665,11 @@ type Manager struct {
 	// until EnableSupervision, and a nil one simply makes /monitor report that
 	// this node does not do it — which is what keeps the cutover per-node.
 	sup *supervisor.Supervisor
+	// superviseOn is config.json's `supervise`: whether a NEW hand-over is
+	// accepted. Streams already supervised stay supervised when it goes off —
+	// the panel releases them as it stops or restarts each one — because
+	// dropping them here would kill every encoder on the node at once.
+	superviseOn atomic.Bool
 	// vitals turns the hubs' cumulative health counters into the rates the
 	// supervisor judges a running encoder by.
 	vitals *vitalsSampler
@@ -761,6 +766,7 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	m.writeTimeout.Store(int64(time.Duration(v.WriteTimeoutSec) * time.Second))
 	m.sourceInsecure.Store(v.SourceInsecure)
 	m.sourceBackend.Store(v.SourceBackend)
+	m.superviseOn.Store(v.Supervise)
 	m.idleBufferGraceNS.Store(int64(time.Duration(v.IdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(v.IdleBufferRatio))
 	m.viewerIdleNS.Store(int64(time.Duration(v.ViewerIdleTimeoutSec) * time.Second))
@@ -1145,6 +1151,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/signal/", m.serveSignal)
 	mux.HandleFunc("/monitor/", m.serveMonitor)
 	mux.HandleFunc("/monitors", m.serveMonitors)
+	mux.HandleFunc("/monitors/state", m.serveMonitorStates)
 	return mux
 }
 
