@@ -40,6 +40,11 @@ type gop struct {
 	data []byte
 	pcr  int64 // PCR base at open (90 kHz), or -1 — drives ring retention
 	pts  int64 // HLS clock at open: the keyframe's PES PTS, or the PCR fallback, or -1
+	// video reports that this block opens on a VIDEO random-access point, i.e. a
+	// decoder handed these bytes starts producing pictures. A block opened by the
+	// maxGOP cut (a source with no detectable keyframes) or by the pre-roll before
+	// the first one does not, and a join must not begin there — see snapshotStart.
+	video bool
 }
 
 // ptsWrap is the 33-bit PTS/PCR modulus; a duration delta that comes out negative
@@ -236,24 +241,35 @@ func (s *State) Update(chunk []byte) {
 		afc := (pkt[3] >> 4) & 0x3
 		hasAdaptation := afc == 2 || afc == 3
 
-		keyframe := false
+		// A random-access point opens a new block. It must be a VIDEO one when the
+		// stream has video: random_access_indicator is set on the AUDIO PID too (by
+		// ffmpeg's own muxer among others, since every audio frame is a random
+		// access point), and a block opened there starts with audio packets and a
+		// video slice mid-GOP. A viewer joining on it gets pictures referencing an
+		// SPS/PPS it never received — "non-existing PPS 0 referenced", a black
+		// picture until the next real keyframe — and with no prebuffer configured
+		// (only the open block is kept) that was EVERY join. A source with no video
+		// at all (radio) keeps the plain random-access rule.
+		rap := false
 		if hasAdaptation && pkt[4] > 0 {
 			flags := pkt[5]
 			if flags&0x10 != 0 { // PCR_flag: refresh the stream clock
 				s.lastPCR = readPCR(pkt)
 			}
 			if flags&0x40 != 0 { // random_access_indicator
-				keyframe = true
+				rap = true
 			}
 		}
+		onVideo := s.videoPID >= 0 && pid == s.videoPID
 		// No random_access_indicator: look at the video PES itself. This is the
 		// case the native remuxer brings in — ffmpeg's muxer always flagged its
 		// keyframes, but a source passed through byte-for-byte carries only what
 		// its own encoder set, and some set nothing. Without this such a stream
 		// cut no HLS segments at all.
-		if !keyframe && pusi && s.videoPID >= 0 && pid == s.videoPID && tspes.StartsKeyframe(pkt, s.videoType) {
-			keyframe = true
+		if !rap && pusi && onVideo && tspes.StartsKeyframe(pkt, s.videoType) {
+			rap = true
 		}
+		keyframe := rap && (onVideo || s.videoPID < 0)
 
 		switch {
 		case pid == 0 && pusi:
@@ -292,7 +308,7 @@ func (s *State) Update(chunk []byte) {
 					s.hlsOnKeyframe(id, pts)
 				}
 			}
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts, video: onVideo})
 			s.prune()
 		case len(s.gops) > 0 && len(s.gops[len(s.gops)-1].data)+PacketSize <= s.maxGOP:
 			g := &s.gops[len(s.gops)-1]
@@ -587,6 +603,8 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 		}
 	}
 
+	start = s.snapshotStart(start)
+
 	out := append(dst[:0], s.lastPAT...)
 	out = append(out, s.lastPMT...)
 
@@ -596,6 +614,29 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 	}
 	s.pins++
 	return out, parts
+}
+
+// snapshotStart moves a join's first block to one a decoder can start on: the
+// earliest video random-access block at or after it, else — when the ring holds
+// none after it — the newest one before it, which costs the joiner a little more
+// buffer but hands it a picture. A stream with no video block at all (radio, or a
+// source whose keyframes cannot be recognised, where the blocks are maxGOP cuts)
+// is left alone: there is nothing better to start on.
+func (s *State) snapshotStart(start int) int {
+	if start < 0 || start >= len(s.gops) {
+		return start
+	}
+	for i := start; i < len(s.gops); i++ {
+		if s.gops[i].video {
+			return i
+		}
+	}
+	for i := start - 1; i >= 0; i-- {
+		if s.gops[i].video {
+			return i
+		}
+	}
+	return start
 }
 
 // Reset drops the entire cache: every retained GOP, the HLS segment view and the
