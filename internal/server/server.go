@@ -32,6 +32,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/supervisor"
 )
 
 // Operational defaults live in internal/defaults; these aliases keep the local
@@ -49,14 +50,24 @@ type Stream struct {
 
 	mgr *Manager // owning manager, for the viewer-gated buffer restore/gate
 
-	mu       sync.Mutex
-	cfg      *puller.Source // nil = externally fed (launch mode / ingest); set = daemon pulls
-	chunk    int
-	grace    time.Duration
-	running  bool
-	cancel   context.CancelFunc
-	refs     int  // live TS viewers currently connected
-	buffered bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
+	mu  sync.Mutex
+	cfg *puller.Source // nil = externally fed (launch mode / ingest); set = daemon pulls
+	// pinnedBackend is the backend the PANEL chose for this one stream, or ""
+	// when it left the choice to the node. Kept apart from cfg.Backend, which
+	// carries the RESOLVED value handed to the puller, so a node-wide change can
+	// never be mistaken for a pin (or a pin overwritten by one).
+	pinnedBackend string
+	// lastBackend is the backend the puller was actually handed the last time
+	// this stream started. Configured-vs-effective is exactly the distinction
+	// an operator needs when a backend change appears not to have landed, and
+	// nothing else records it.
+	lastBackend string
+	chunk       int
+	grace       time.Duration
+	running     bool
+	cancel      context.CancelFunc
+	refs        int  // live TS viewers currently connected
+	buffered    bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
 
 	ingestLn   net.Listener // non-nil = push-fed: the producer (ffmpeg tee) connects here
 	ingestSock string       // path of the ingest listener socket (for cleanup)
@@ -68,8 +79,16 @@ type Stream struct {
 	ingestMu    sync.Mutex
 	ingestConns map[net.Conn]struct{}
 
-	lastData   atomic.Int64 // UnixNano of the last non-empty Publish (0 = never); off-air signal
-	lastAccess atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
+	// sourcePath is the route the puller last settled on (puller.Path*), written
+	// from the pull goroutine and read by the snapshot, so it is atomic.
+	sourcePath atomic.Value
+
+	lastData atomic.Int64 // UnixNano of the last non-empty Publish (0 = never); off-air signal
+	// publishedBytes counts everything fed into the fan-out, so the stream's
+	// bitrate can be measured by differencing it rather than estimated by
+	// ffprobing a segment. Atomic: it is written on the publish hot path.
+	publishedBytes atomic.Int64
+	lastAccess     atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
 
 	connMu sync.Mutex           // guards conns (map + each connStat's refs/since)
 	conns  map[string]*connStat // active live-TS viewer uuids (from the ?c= param)
@@ -355,6 +374,7 @@ func (s *Stream) stopIngestLocked() {
 func (s *Stream) Publish(chunk []byte) {
 	if len(chunk) > 0 {
 		s.lastData.Store(time.Now().UnixNano())
+		s.publishedBytes.Add(int64(len(chunk)))
 	}
 	s.Hub.Publish(chunk)
 }
@@ -384,8 +404,74 @@ func (s *Stream) startLocked() {
 	s.running = true
 	cfg, chunk := *s.cfg, s.chunk
 	cfg.Label = s.id
+
+	// Resolve the node-wide knobs HERE, at the moment the pull starts, rather
+	// than carrying whatever they were when the panel registered this stream.
+	//
+	// They used to be stamped into s.cfg by Register, which meant a config
+	// reload reached m.sourceBackend and stopped: every already-registered
+	// stream went on using the value it was registered with, across idle-stops
+	// and restarts, until the panel happened to re-register it. An operator who
+	// switched the node to native watched nothing change and had no way to see
+	// why. The documented contract was always this one — "applied live, takes
+	// effect on the next pull" — so make the code mean it.
+	//
+	// A per-stream backend pinned by the panel is still a pin: an empty
+	// cfg.Backend is what "inherit the node" looks like, and only that inherits.
+	if s.mgr != nil {
+		if s.pinnedBackend == "" {
+			cfg.Backend = s.mgr.backend()
+		}
+		cfg.Insecure = s.mgr.sourceInsecure.Load()
+	}
+	s.lastBackend = cfg.Backend
+	// Record the route each attempt actually takes, so the snapshot can report
+	// what a stream IS doing rather than only what it was told to do. "native is
+	// configured but every stream is on ffmpeg" is otherwise invisible.
+	cfg.OnPath = s.setSourcePath
 	dlog.Logf("stream", "id=%s puller starting (refs=%d)", s.id, s.refs)
 	go puller.Run(ctx, cfg, chunk, s.Publish)
+}
+
+// resolvedBackend reports the backend the puller was handed on the last start,
+// which is not necessarily the one this stream was registered with. Caller
+// holds s.mu.
+func (s *Stream) resolvedBackend() string { return s.lastBackend }
+
+// orDash renders an unset value as "-" so a snapshot column never collapses and
+// leaves the fields after it misaligned.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// setSourcePath records the route the puller settled on for this stream. Called
+// from the pull goroutine on every connect, so it takes no lock of its own.
+func (s *Stream) setSourcePath(p string) { s.sourcePath.Store(p) }
+
+// sourcePathOf reports the last route the puller took, or "" if it has not
+// connected yet.
+func (s *Stream) sourcePathOf() string {
+	if v, ok := s.sourcePath.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// mode describes how this stream is fed, for the debug snapshot. The three are
+// genuinely different lifecycles, and telling them apart is the first step in
+// almost every question about a stream — not least because the source backend
+// applies to exactly one of them. Caller holds s.mu.
+func (s *Stream) modeLocked() string {
+	switch {
+	case s.ingestLn != nil:
+		return "ingest" // push-fed by a producer; no puller, no source backend
+	case s.cfg != nil:
+		return "pull"
+	}
+	return "idle"
 }
 
 func (s *Stream) stopLocked() {
@@ -574,6 +660,22 @@ type Manager struct {
 	fontPath  string       // font file for the overlay text
 	signals   *signalStore // pending per-uuid "send message" overlays
 
+	// sup supervises per-stream encoder processes when the node has taken that
+	// over from the panel watchdog (docs/adr/0002-monitor-in-daemon.md). nil
+	// until EnableSupervision, and a nil one simply makes /monitor report that
+	// this node does not do it — which is what keeps the cutover per-node.
+	sup *supervisor.Supervisor
+	// superviseOn is config.json's `supervise`: whether a NEW hand-over is
+	// accepted. Streams already supervised stay supervised when it goes off —
+	// the panel releases them as it stops or restarts each one — because
+	// dropping them here would kill every encoder on the node at once.
+	superviseOn atomic.Bool
+	// vitals turns the hubs' cumulative health counters into the rates the
+	// supervisor judges a running encoder by.
+	vitals *vitalsSampler
+	// meta caches the codec/resolution/bitrate the panel used to ffprobe for.
+	meta *metaCache
+
 	// defaultChunk is the source read size stamped onto a stream at creation
 	// (read under m.mu). sourceInsecure is read off m.mu when registering a pull,
 	// so it is atomic. Both are retunable live via ApplyConfig (new streams/pulls
@@ -664,6 +766,7 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	m.writeTimeout.Store(int64(time.Duration(v.WriteTimeoutSec) * time.Second))
 	m.sourceInsecure.Store(v.SourceInsecure)
 	m.sourceBackend.Store(v.SourceBackend)
+	m.superviseOn.Store(v.Supervise)
 	m.idleBufferGraceNS.Store(int64(time.Duration(v.IdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(v.IdleBufferRatio))
 	m.viewerIdleNS.Store(int64(time.Duration(v.ViewerIdleTimeoutSec) * time.Second))
@@ -839,13 +942,26 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 					streams = append(streams, st)
 				}
 				m.mu.Unlock()
+				// Supervision first: it is a different question from "what are
+				// the streams doing", and on a node that supervises nothing the
+				// single line saying so is itself the answer.
+				if m.sup != nil && dlog.OnCat("monitor") {
+					lines := m.sup.DebugLines()
+					if len(lines) == 0 {
+						dlog.Logf("monitor", "supervising no streams")
+					}
+					for _, l := range lines {
+						dlog.Logf("monitor", "%s", l)
+					}
+				}
 				if len(streams) == 0 {
 					dlog.Logf("stats", "no streams registered")
 					continue
 				}
 				for _, st := range streams {
 					st.mu.Lock()
-					running, refs, ingesting := st.running, st.refs, st.ingestLn != nil
+					running, refs := st.running, st.refs
+					mode, backend := st.modeLocked(), st.lastBackend
 					st.mu.Unlock()
 					st.connMu.Lock()
 					conns := len(st.conns)
@@ -854,11 +970,21 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 					if ld := st.lastData.Load(); ld != 0 {
 						dataAge = time.Since(time.Unix(0, ld)).Round(time.Millisecond).String()
 					}
+					// route is "<configured>/<actual>". They differ whenever the
+					// native reader declines a source, which is the single most
+					// useful thing to know on a node set to native that is still
+					// spawning ffmpeg children — and it is invisible otherwise.
+					// A push-fed stream has neither: the source backend does not
+					// reach it, which is worth saying rather than leaving blank.
+					route := "n/a"
+					if mode != "ingest" {
+						route = orDash(backend) + "/" + orDash(st.sourcePathOf())
+					}
 					// nokf > 0 means the source carries no random_access_indicator: the
 					// ring is being cut on the byte cap instead of on keyframes, and
 					// HLS cannot produce segments for it at all.
-					dlog.Logf("stats", "id=%s running=%v ingest=%v refs=%d subs=%d conns=%d data_age=%s nokf=%d",
-						st.id, running, ingesting, refs, st.Hub.Count(), conns, dataAge, st.Hub.NoKeyframeCuts())
+					dlog.Logf("stats", "id=%s mode=%s running=%v route=%s refs=%d subs=%d conns=%d data_age=%s nokf=%d",
+						st.id, mode, running, route, refs, st.Hub.Count(), conns, dataAge, st.Hub.NoKeyframeCuts())
 				}
 			}
 		}
@@ -898,13 +1024,17 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 }
 
 // Register sets a stream's pull config (control API). The node-wide source
-// backend applies unless the registration pinned one for this stream.
+// backend and TLS setting are NOT baked in here — they are resolved when the
+// puller actually starts (see startLocked), so a config reload reaches a stream
+// that was registered before it. What is recorded here is whether the panel
+// pinned a backend for this one stream, which is the only thing registration
+// can know that the start cannot.
 func (m *Manager) Register(id string, src puller.Source, chunk int) {
-	src.Insecure = m.sourceInsecure.Load()
-	if src.Backend == "" {
-		src.Backend = m.backend()
-	}
-	m.GetOrCreate(id).setConfig(src, chunk)
+	st := m.GetOrCreate(id)
+	st.mu.Lock()
+	st.pinnedBackend = src.Backend
+	st.mu.Unlock()
+	st.setConfig(src, chunk)
 }
 
 // backend returns the node-wide source backend.
@@ -928,9 +1058,11 @@ func (m *Manager) RunPinned(ctx context.Context, id string, src puller.Source, c
 	}
 	src.Label = id
 	st := m.GetOrCreate(id)
+	src.OnPath = st.setSourcePath
 	st.mu.Lock()
 	c := src
 	st.cfg = &c
+	st.lastBackend = src.Backend
 	if chunk > 0 {
 		st.chunk = chunk
 	}
@@ -1017,6 +1149,9 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/connections", m.serveConnections)
 	mux.HandleFunc("/rates", m.serveRates)
 	mux.HandleFunc("/signal/", m.serveSignal)
+	mux.HandleFunc("/monitor/", m.serveMonitor)
+	mux.HandleFunc("/monitors", m.serveMonitors)
+	mux.HandleFunc("/monitors/state", m.serveMonitorStates)
 	return mux
 }
 

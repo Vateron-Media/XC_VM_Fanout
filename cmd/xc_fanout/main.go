@@ -11,6 +11,9 @@
 //     source; the puller starts on the first viewer and stops after the last leaves.
 //
 // -id/-source and -id/-in remain for isolated testing (feed one stream at launch).
+//
+// `xc_fanout remux -i <url> … <playlist>` is a separate mode: the native remuxer
+// the panel runs, under this daemon's supervisor, in place of a copy-only ffmpeg.
 package main
 
 import (
@@ -42,6 +45,13 @@ import (
 var version = "dev"
 
 func main() {
+	// `xc_fanout remux …` is the native remuxer the panel runs in place of a
+	// copy-only ffmpeg (see internal/remux). It is a separate process with its
+	// own flags, dispatched before the daemon's are parsed.
+	if len(os.Args) > 1 && os.Args[1] == "remux" {
+		os.Exit(runRemux(os.Args[2:]))
+	}
+
 	sock := flag.String("sock", "/home/xc_vm/bin/xc_fanout/sockets/http.sock", "client unix socket (nginx-facing)")
 	ctl := flag.String("ctl", "", "control unix socket (PHP-only), e.g. /home/xc_vm/bin/xc_fanout/sockets/control.sock; empty = no control API")
 	ingestDir := flag.String("ingestdir", "", "dir for per-stream push-fed ingest sockets (non-proxy tee); empty = <sock dir>/ingest")
@@ -53,7 +63,8 @@ func main() {
 	cookie := flag.String("cookie", "", "source Cookie header")
 	ffmpeg := flag.String("ffmpeg", "ffmpeg", "ffmpeg binary path (for the admin \"send message\" overlay)")
 	font := flag.String("font", "", "font file for the admin \"send message\" drawtext overlay; empty disables the overlay")
-	debug := flag.Bool("debug", false, "verbose debug log: narrate stream/puller/viewer/HLS/ingest activity and periodic per-stream state (also enabled by XC_FANOUT_DEBUG=1)")
+	debug := flag.Bool("debug", false, "verbose debug log: narrate stream/puller/viewer/HLS/ingest/monitor activity and periodic per-stream state (also enabled by XC_FANOUT_DEBUG=1)")
+	debugCats := flag.String("debug-cats", "", "limit the debug log to these categories, comma-separated (e.g. \"puller,monitor\"); empty means every category. Also settable as XC_FANOUT_DEBUG=puller,monitor")
 	statsEvery := flag.Int("debug-stats", 5, "seconds between periodic per-stream state snapshots in debug mode (0 disables the snapshot)")
 	// Operator tuning (prebuffer, HLS window, grace, write timeout, chunk, maxgop,
 	// TLS) is NOT flags any more — the panel never set them. It lives in the JSON
@@ -69,13 +80,22 @@ func main() {
 		return
 	}
 
-	// Debug mode: -debug or XC_FANOUT_DEBUG=1. When on, switch the standard logger
-	// to microsecond timestamps so the timing of events (a slow probe, a stalled
-	// viewer, reconnect backoff) is legible.
-	if *debug || isTruthy(os.Getenv("XC_FANOUT_DEBUG")) {
-		dlog.Enable(true)
+	// Debug mode: -debug/-debug-cats, or XC_FANOUT_DEBUG. When on, switch the
+	// standard logger to microsecond timestamps so the timing of events (a slow
+	// probe, a stalled viewer, reconnect backoff) is legible.
+	//
+	// The environment variable carries either meaning: "1" is every category, as
+	// it always was, and a category list narrows it. That matters on a node with
+	// hundreds of channels, where the full narration is too much to read and the
+	// interesting subsystem is buried in it.
+	if cats := debugSpec(*debug, *debugCats, os.Getenv("XC_FANOUT_DEBUG")); cats != "" {
+		dlog.EnableCats(cats)
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-		dlog.Logf("boot", "debug mode on; version=%s pid=%d", buildVersion(), os.Getpid())
+		if on := dlog.Cats(); len(on) > 0 {
+			dlog.Logf("boot", "debug mode on (categories: %s); version=%s pid=%d", strings.Join(on, ","), buildVersion(), os.Getpid())
+		} else {
+			dlog.Logf("boot", "debug mode on (all categories); version=%s pid=%d", buildVersion(), os.Getpid())
+		}
 	}
 
 	// Tighten GC growth so the heap tracks the working set instead of ballooning
@@ -116,11 +136,16 @@ func main() {
 	}
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
-	mgr.SetOverlay(*ffmpeg, *font)                                                           // admin "send message" drawtext overlay (no font ⇒ disabled)
+	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
+	// Encoder supervision is always wired, and does nothing on its own: a stream
+	// is supervised only once the panel hands it over, and the daemon accepts a
+	// hand-over only while config.json says `supervise: true` — a live setting,
+	// so the panel can turn it on without a daemon restart dropping every viewer.
+	mgr.EnableSupervision()
 	mgr.StartReaper(ctx)                                                                     // idle-stop sweep for control-managed streams (TS + HLS)
 	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS
-	dlog.Logf("boot", "config: sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds chunk=%dB maxgop=%dB insecure=%v backend=%s overlay=%v",
-		*sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ViewerIdleTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, cfg.SourceBackend, *font != "")
+	dlog.Logf("boot", "config: supervise=%v sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds chunk=%dB maxgop=%dB insecure=%v backend=%s overlay=%v",
+		cfg.Supervise, *sock, *ctl, idir, cfg.PrebufferMaxSec, cfg.HLSTargetSec, cfg.HLSWindow, cfg.GraceSec, cfg.WriteTimeoutSec, cfg.ViewerIdleTimeoutSec, cfg.ChunkBytes, cfg.MaxGOPBytes, cfg.SourceInsecure, cfg.SourceBackend, *font != "")
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
 
 	if *configPath != "" {
@@ -168,6 +193,15 @@ func main() {
 	}
 
 	<-ctx.Done()
+
+	// Stop watching the encoders but LEAVE THEM RUNNING. They are orphaned, not
+	// killed, and the next daemon adopts them (internal/supervisor/adopt.go), so a
+	// restart or an upgrade costs the viewers nothing. Killing them here would take
+	// every channel on this node off air for the length of the restart.
+	if n := mgr.DetachSupervision(); n > 0 {
+		log.Printf("monitor: detached %d encoder(s), left running for the next daemon to adopt", n)
+	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = clientSrv.Shutdown(shutdownCtx)
@@ -239,8 +273,8 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 			current = &v
 			mgr.ApplyConfig(v)
 			applyMemLimit(v.MemLimitMB)
-			dlog.Logf("config", "applied %s: prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds backend=%s",
-				path, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec, v.ViewerIdleTimeoutSec, v.SourceBackend)
+			dlog.Logf("config", "applied %s: supervise=%v prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds backend=%s",
+				path, v.Supervise, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec, v.ViewerIdleTimeoutSec, v.SourceBackend)
 		}
 	}
 }
@@ -407,6 +441,39 @@ func physicalMemoryBytes() int64 {
 }
 
 // isTruthy reports whether an env var value means "on" (1/true/yes/on).
+// debugSpec resolves the three ways debug can be asked for into one category
+// spec for dlog.EnableCats, or "" for off.
+//
+// Precedence runs most-specific first: an explicit -debug-cats list, then a
+// category list in the environment, then the plain on/off forms. That way a
+// systemd drop-in carrying XC_FANOUT_DEBUG=puller is not silently widened to
+// everything by a -debug that someone left on the command line.
+func debugSpec(debug bool, cats, env string) string {
+	if s := strings.TrimSpace(cats); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(env); s != "" && !isTruthy(s) {
+		// A non-empty value that is not a boolean is a category list. An
+		// explicitly false one ("0", "off") stays off unless -debug says
+		// otherwise, which is what the flag is for.
+		if !isFalsey(s) {
+			return s
+		}
+	}
+	if debug || isTruthy(env) {
+		return "all"
+	}
+	return ""
+}
+
+func isFalsey(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "0", "false", "no", "off":
+		return true
+	}
+	return false
+}
+
 func isTruthy(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "1", "true", "yes", "on":

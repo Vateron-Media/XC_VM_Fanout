@@ -255,8 +255,13 @@ to exist (`hlsseg`) is gone.
 
 How it works:
 
-- on a `random_access_indicator` (keyframe) a new GOP is opened; between keyframes
-  packets are appended to the current GOP;
+- on a **video** random-access point a new GOP is opened; everything else — including a
+  `random_access_indicator` on another PID — is appended to the current GOP. The indicator is set
+  on the **audio** PID too (ffmpeg's own muxer does it: every audio frame is a random access
+  point), and until 0.13.1 a GOP opened there, so a viewer joining on it received video slices
+  from the middle of a GOP whose SPS/PPS it never got — `non-existing PPS 0 referenced`, a black
+  picture until the next real keyframe, and with `prebuffer=0` (only the current GOP is kept) that
+  was **every** join. A stream with no video at all (radio) keeps the plain random-access rule;
 - `prune()` discards old GOPs: by **duration** (capped at `prebuffer_max_sec`
   seconds, if PCR parses) or by a **byte backstop** (~24 Mbit/s estimate — in
   case PCR can't be read), so that the ring doesn't grow without bound. When the stream is
@@ -264,7 +269,8 @@ How it works:
   ["the idle-buffer gate"](06-configuration.md#the-idle-buffer-gate));
 - **`Snapshot(reqMS)`** collects what is handed to the viewer before the live tail:
   - `reqMS = 0` (or a stream without PCR) → `PAT + PMT + only the current GOP` — the minimal
-    clean join;
+    clean join. The start is always moved to a GOP a decoder can begin on: the first video
+    random-access block at or after it, else the newest one before it;
   - `reqMS > 0` → the ring is rewound to a keyframe ~N seconds back, and the viewer gets
     more history, so that their player starts with an already filled cache.
 
@@ -292,9 +298,9 @@ How it works now:
   segment bytes are stored;
 - a **new segment boundary** is cut at a **video-PID keyframe carrying a PES PTS**, once at least
   `hls_target_sec` have accumulated since the previous boundary (that PTS is the segment clock).
-  A `random_access_indicator` on a *non-video* PID still opens a ring GOP for the clean live join,
-  but it does **not** drive HLS — treating it as a boundary mixed two different 90 kHz offsets and
-  segments never closed;
+  A `random_access_indicator` on a *non-video* PID neither cuts a segment nor opens a ring GOP
+  (see above) — treating it as a boundary mixed two different 90 kHz offsets and segments never
+  closed;
 - the playlist is rendered **from the index** (`hls_window` most recent segments, a display cap);
   a `<seq>.ts` request **assembles the bytes on the fly** from the ring (`PAT + PMT + the GOPs'
   data`), encrypting on the way out if the stream has a key. Since 0.11.4 that assembly happens

@@ -2,10 +2,11 @@ package nativesrc
 
 import (
 	"crypto/tls"
-	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,10 @@ type Options struct {
 	Cookie    string // value of the Cookie header, if any
 	Proxy     string // "host:port" HTTP proxy, optional
 	Insecure  bool   // skip upstream TLS certificate verification
+	// Headers are extra request headers as raw "Key: value" lines. They apply
+	// to every fetch this package makes for the source — the playlist AND each
+	// segment — because an upstream that gates on a header gates on all of it.
+	Headers []string
 }
 
 // Timeouts. Bounded fetches (playlists, segments) get a whole-request deadline;
@@ -41,8 +46,16 @@ var ErrUnsupported = ErrUnsupportedSource
 // ErrHLSIsFMP4 marks an HLS source whose segments are fragmented MP4 rather than
 // MPEG-TS. Repackaging those to TS needs a real demuxer, so it is a refusal here
 // — but a distinct one, because it says something specific about the upstream
-// and is worth seeing in a log rather than a generic "unsupported".
-var ErrHLSIsFMP4 = errors.New("nativesrc: hls source carries fmp4 segments")
+// and is worth seeing in a log rather than a generic "unsupported". A format
+// refusal (IsFormat).
+var ErrHLSIsFMP4 = fmt.Errorf("%w: hls source carries fmp4 segments", ErrFormat)
+
+// ErrHLSEncrypted marks an HLS source whose segments are encrypted
+// (#EXT-X-KEY with a METHOD other than NONE). This package passes segment bytes
+// through unread, so an encrypted segment would reach viewers as ciphertext —
+// noise with a valid-looking content type. ffmpeg decrypts AES-128 HLS, so this
+// is a format refusal (IsFormat) that the fallback can serve.
+var ErrHLSEncrypted = fmt.Errorf("%w: hls segments are encrypted", ErrFormat)
 
 // transport builds the shared transport shape. dialWait separates the two
 // callers: a bounded fetch can afford to wait a little longer to connect than a
@@ -75,5 +88,17 @@ func (o Options) apply(req *http.Request) {
 	}
 	if o.Cookie != "" && req.Header.Get("Cookie") == "" {
 		req.Header.Set("Cookie", o.Cookie)
+	}
+	// Configured headers are set last and unconditionally: they are the most
+	// specific thing anyone said about this source, so they win over the
+	// defaults above rather than being skipped because a default got there
+	// first. A line without a colon is skipped, not guessed at.
+	for _, line := range o.Headers {
+		name, value, ok := strings.Cut(line, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		req.Header.Set(name, strings.TrimSpace(value))
 	}
 }

@@ -200,9 +200,15 @@ func TestSourceBackendBackfillAndClamp(t *testing.T) {
 		t.Error("backfilled file is missing source_backend")
 	}
 
+	// Case and surrounding space are normalised, not rejected. "Native" is not a
+	// typo an operator can see — it looks right in the file and in the panel —
+	// and demoting it to the default produced a setting that read as honoured
+	// while behaving as something else. Only a value that names no backend at
+	// all falls back.
 	for _, c := range []struct{ in, want string }{
 		{"auto", "auto"}, {"ffmpeg", "ffmpeg"}, {"native", "native"},
-		{"", Defaults().SourceBackend}, {"FFMPEG", Defaults().SourceBackend}, {"nonsense", Defaults().SourceBackend},
+		{"FFMPEG", "ffmpeg"}, {"Native", "native"}, {"  native\n", "native"},
+		{"", Defaults().SourceBackend}, {"nonsense", Defaults().SourceBackend},
 	} {
 		v := Defaults()
 		v.SourceBackend = c.in

@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tspes"
 )
 
 // PacketSize is the fixed MPEG-TS packet length.
@@ -39,6 +40,11 @@ type gop struct {
 	data []byte
 	pcr  int64 // PCR base at open (90 kHz), or -1 — drives ring retention
 	pts  int64 // HLS clock at open: the keyframe's PES PTS, or the PCR fallback, or -1
+	// video reports that this block opens on a VIDEO random-access point, i.e. a
+	// decoder handed these bytes starts producing pictures. A block opened by the
+	// maxGOP cut (a source with no detectable keyframes) or by the pre-roll before
+	// the first one does not, and a join must not begin there — see snapshotStart.
+	video bool
 }
 
 // ptsWrap is the 33-bit PTS/PCR modulus; a duration delta that comes out negative
@@ -63,11 +69,23 @@ type State struct {
 	lastPMT  []byte // one 188-byte PMT packet, or nil
 	pmtPID   int    // PID carrying the PMT, or -1 if unknown
 	videoPID int    // PID carrying the video ES (for HLS segment PTS), or -1
-	gops     []gop  // oldest→newest; the last element is the open (current) GOP
-	lastPCR  int64  // most recent PCR base seen (90 kHz), or -1
-	maxGOP   int    // cap on a single GOP's length (bytes) — memory guard
-	ring90   int64  // history retained, in 90 kHz ticks (0 = current GOP only)
-	maxRing  int    // absolute byte ceiling for the whole ring — memory backstop
+	audioPID int    // PID carrying the audio ES, or -1 when the source has none
+	// videoType is the PMT stream_type of videoPID. It decides whether a PES
+	// start on that PID can be recognised as a keyframe from its own bytes when
+	// the source sets no random_access_indicator (see tspes.StartsKeyframe).
+	videoType byte
+
+	// audioPkts and videoFrames feed the supervisor's health checks: "has audio
+	// stopped while video keeps flowing" and "has the frame rate collapsed". Both
+	// are counters the caller samples and differences, rather than state kept
+	// here, so this package stays a parser and the policy lives with the watchdog.
+	audioPkts   int64
+	videoFrames int64
+	gops        []gop // oldest→newest; the last element is the open (current) GOP
+	lastPCR     int64 // most recent PCR base seen (90 kHz), or -1
+	maxGOP      int   // cap on a single GOP's length (bytes) — memory guard
+	ring90      int64 // history retained, in 90 kHz ticks (0 = current GOP only)
+	maxRing     int   // absolute byte ceiling for the whole ring — memory backstop
 
 	// pins counts snapshots currently copying out of the ring. While non-zero,
 	// prune must not RECYCLE a dropped GOP's array (it leaves it to GC instead):
@@ -120,7 +138,7 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
@@ -204,19 +222,54 @@ func (s *State) Update(chunk []byte) {
 		}
 		pid := (int(pkt[1]&0x1f) << 8) | int(pkt[2])
 		pusi := pkt[1]&0x40 != 0
+
+		// Health counters. A payload-unit-start on the video PID begins a new
+		// access unit, which is close enough to "a frame" for a rate that is only
+		// ever compared against this same stream's own baseline.
+		if pusi {
+			switch pid {
+			case s.audioPID:
+				if s.audioPID >= 0 {
+					s.audioPkts++
+				}
+			case s.videoPID:
+				if s.videoPID >= 0 {
+					s.videoFrames++
+				}
+			}
+		}
 		afc := (pkt[3] >> 4) & 0x3
 		hasAdaptation := afc == 2 || afc == 3
 
-		keyframe := false
+		// A random-access point opens a new block. It must be a VIDEO one when the
+		// stream has video: random_access_indicator is set on the AUDIO PID too (by
+		// ffmpeg's own muxer among others, since every audio frame is a random
+		// access point), and a block opened there starts with audio packets and a
+		// video slice mid-GOP. A viewer joining on it gets pictures referencing an
+		// SPS/PPS it never received — "non-existing PPS 0 referenced", a black
+		// picture until the next real keyframe — and with no prebuffer configured
+		// (only the open block is kept) that was EVERY join. A source with no video
+		// at all (radio) keeps the plain random-access rule.
+		rap := false
 		if hasAdaptation && pkt[4] > 0 {
 			flags := pkt[5]
 			if flags&0x10 != 0 { // PCR_flag: refresh the stream clock
 				s.lastPCR = readPCR(pkt)
 			}
 			if flags&0x40 != 0 { // random_access_indicator
-				keyframe = true
+				rap = true
 			}
 		}
+		onVideo := s.videoPID >= 0 && pid == s.videoPID
+		// No random_access_indicator: look at the video PES itself. This is the
+		// case the native remuxer brings in — ffmpeg's muxer always flagged its
+		// keyframes, but a source passed through byte-for-byte carries only what
+		// its own encoder set, and some set nothing. Without this such a stream
+		// cut no HLS segments at all.
+		if !rap && pusi && onVideo && tspes.StartsKeyframe(pkt, s.videoType) {
+			rap = true
+		}
+		keyframe := rap && (onVideo || s.videoPID < 0)
 
 		switch {
 		case pid == 0 && pusi:
@@ -226,8 +279,11 @@ func (s *State) Update(chunk []byte) {
 			}
 		case s.pmtPID >= 0 && pid == s.pmtPID:
 			s.lastPMT = cloneInto(s.lastPMT, pkt)
-			if v := parseVideoPID(pkt); v >= 0 {
-				s.videoPID = v
+			if v, t := parseVideoPID(pkt); v >= 0 {
+				s.videoPID, s.videoType = v, t
+			}
+			if a := parseAudioPID(pkt); a >= 0 {
+				s.audioPID = a
 			}
 		}
 
@@ -252,7 +308,7 @@ func (s *State) Update(chunk []byte) {
 					s.hlsOnKeyframe(id, pts)
 				}
 			}
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts, video: onVideo})
 			s.prune()
 		case len(s.gops) > 0 && len(s.gops[len(s.gops)-1].data)+PacketSize <= s.maxGOP:
 			g := &s.gops[len(s.gops)-1]
@@ -547,6 +603,8 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 		}
 	}
 
+	start = s.snapshotStart(start)
+
 	out := append(dst[:0], s.lastPAT...)
 	out = append(out, s.lastPMT...)
 
@@ -556,6 +614,29 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 	}
 	s.pins++
 	return out, parts
+}
+
+// snapshotStart moves a join's first block to one a decoder can start on: the
+// earliest video random-access block at or after it, else — when the ring holds
+// none after it — the newest one before it, which costs the joiner a little more
+// buffer but hands it a picture. A stream with no video block at all (radio, or a
+// source whose keyframes cannot be recognised, where the blocks are maxGOP cuts)
+// is left alone: there is nothing better to start on.
+func (s *State) snapshotStart(start int) int {
+	if start < 0 || start >= len(s.gops) {
+		return start
+	}
+	for i := start; i < len(s.gops); i++ {
+		if s.gops[i].video {
+			return i
+		}
+	}
+	for i := start - 1; i >= 0; i-- {
+		if s.gops[i].video {
+			return i
+		}
+	}
+	return start
 }
 
 // Reset drops the entire cache: every retained GOP, the HLS segment view and the
@@ -678,9 +759,19 @@ func payloadOffset(pkt []byte) int {
 	}
 }
 
-// parseVideoPID reads the first video elementary-stream PID out of a PMT packet,
-// or -1. Used to locate the PES that carries the HLS segment clock (PTS).
-func parseVideoPID(pkt []byte) int {
+// Counters reports the health counters: audio packets and video access units
+// seen since this State was created, and whether the source declares an audio
+// stream at all. hasAudio distinguishes "audio has stopped" from "there was
+// never any audio", which decides whether silence is a fault worth a restart.
+// Caller (Hub) serialises access.
+func (s *State) Counters() (audioPkts, videoFrames int64, hasAudio bool) {
+	return s.audioPkts, s.videoFrames, s.audioPID >= 0
+}
+
+// parseAudioPID reads the first audio elementary-stream PID out of a PMT packet,
+// or -1. Mirrors parseVideoPID; the two differ only in the stream types they
+// accept.
+func parseAudioPID(pkt []byte) int {
 	ps := payloadOffset(pkt)
 	if ps < 0 || ps >= len(pkt) {
 		return -1
@@ -692,12 +783,46 @@ func parseVideoPID(pkt []byte) int {
 	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
 	es := p + 12 + pil
 	for es+5 <= len(pkt) {
-		if isVideoStreamType(pkt[es]) {
+		if isAudioStreamType(pkt[es]) {
 			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2])
 		}
 		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
 	}
 	return -1
+}
+
+// isAudioStreamType covers the audio codecs an IPTV source realistically
+// carries: MPEG-1/2 audio, AAC (ADTS and LATM), AC-3 and E-AC-3 — including the
+// 0x06 private-stream form the latter two are usually signalled as in DVB.
+func isAudioStreamType(t byte) bool {
+	switch t {
+	case 0x03, 0x04, 0x0f, 0x11, 0x81, 0x87:
+		return true
+	}
+	return false
+}
+
+// parseVideoPID reads the first video elementary-stream PID out of a PMT packet,
+// with its stream_type, or -1. Used to locate the PES that carries the HLS
+// segment clock (PTS), and to know how to read a keyframe off that PES.
+func parseVideoPID(pkt []byte) (int, byte) {
+	ps := payloadOffset(pkt)
+	if ps < 0 || ps >= len(pkt) {
+		return -1, 0
+	}
+	p := ps + 1 + int(pkt[ps]) // skip pointer_field
+	if p+12 > len(pkt) {
+		return -1, 0
+	}
+	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
+	es := p + 12 + pil
+	for es+5 <= len(pkt) {
+		if isVideoStreamType(pkt[es]) {
+			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2]), pkt[es]
+		}
+		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
+	}
+	return -1, 0
 }
 
 func isVideoStreamType(t byte) bool {

@@ -107,6 +107,20 @@ func (r *idleTimeoutReader) Close() error {
 // isn't something the native reader can take. The caller falls back to ffmpeg.
 var ErrUnsupportedSource = errors.New("remux: unsupported source")
 
+// ErrFormat narrows ErrUnsupportedSource to refusals about WHAT the source is —
+// a scheme, a container or a playlist flavour this package does not read — as
+// opposed to whether it could be reached. The difference decides what a caller
+// may conclude: an upstream answering 503 is worth retrying through this same
+// reader, while an fMP4 playlist will be fMP4 on every retry and needs a
+// different pipeline. `xc_fanout remux` exits supervisor.ExitUnsupported for
+// exactly these, which is what moves a stream onto its ffmpeg fallback; it must
+// never do so for a source that is merely down. Matches ErrUnsupportedSource.
+var ErrFormat = fmt.Errorf("%w: format", ErrUnsupportedSource)
+
+// IsFormat reports whether err is a refusal about the source's format (see
+// ErrFormat) rather than about reaching it.
+func IsFormat(err error) bool { return errors.Is(err, ErrFormat) }
+
 // Open returns a streaming io.ReadCloser of MPEG-TS bytes for the given URL:
 //
 //	http(s):// — an MPEG-TS body (by content-type, or by sniffing the sync
@@ -143,7 +157,7 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 	case "udp", "rtp":
 		return openUDP(ctx, u)
 	}
-	return nil, fmt.Errorf("%w: scheme %q", ErrUnsupportedSource, u.Scheme)
+	return nil, fmt.Errorf("%w: scheme %q", ErrFormat, u.Scheme)
 }
 
 // newStreamClient opens a CONTINUOUS live source body. Unlike the pull client it
@@ -245,7 +259,7 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 		return adoptHLS(ctx, final, opt, head, resp.Body)
 	}
 	_ = resp.Body.Close()
-	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrUnsupportedSource, redact(final))
+	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redact(final))
 }
 
 // adoptHLS finishes reading a playlist whose first bytes have already been
