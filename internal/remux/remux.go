@@ -61,6 +61,11 @@ type Config struct {
 	// silent hang. 0 = nativesrc.DefaultSourceIdleTimeout.
 	IdleTimeout time.Duration
 	Logf        func(format string, args ...any) // nil = silent
+	// Notef receives the handful of lines an operator wants in the stream's log
+	// whatever the log level is — what the source turned out to carry, and why
+	// the run ended. The panel points this at <id>.errors, beside the ffmpeg logs
+	// of every other stream. nil = silent.
+	Notef func(format string, args ...any)
 }
 
 // Run reads the source and produces both outputs until ctx is cancelled (nil)
@@ -68,6 +73,9 @@ type Config struct {
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
+	}
+	if cfg.Notef == nil {
+		cfg.Notef = func(string, ...any) {}
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = nativesrc.DefaultSourceIdleTimeout
@@ -101,7 +109,13 @@ func Run(ctx context.Context, cfg Config) error {
 		prog = newProgress(cfg.ProgressPath)
 	}
 
-	err = pump(ctx, src, seg, feed, prog)
+	outputs := []string{fmt.Sprintf("hls, to '%s'", cfg.Seg.Playlist)}
+	if cfg.IngestSock != "" {
+		outputs = append(outputs, fmt.Sprintf("mpegts, to 'unix:%s'", cfg.IngestSock))
+	}
+	insp := newInspector(Redact(cfg.Input), outputs, cfg.Notef, cfg.Notef)
+
+	err = pump(ctx, src, seg, feed, prog, insp)
 	if feed != nil {
 		feed.close()
 	}
@@ -110,7 +124,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 // pump moves packets from the source to the outputs: every packet to the
 // segmenter, and each read's worth of packets to the daemon as one chunk.
-func pump(ctx context.Context, src io.Reader, seg *tsseg.Segmenter, feed *ingestWriter, prog *progress) error {
+func pump(ctx context.Context, src io.Reader, seg *tsseg.Segmenter, feed *ingestWriter, prog *progress, insp *inspector) error {
 	var (
 		al      aligner
 		buf     = make([]byte, 64<<10)
@@ -121,6 +135,9 @@ func pump(ctx context.Context, src io.Reader, seg *tsseg.Segmenter, feed *ingest
 		if n > 0 {
 			var ferr error
 			out := al.push(buf[:n], func(pkt []byte) {
+				if insp != nil {
+					insp.feed(pkt)
+				}
 				if ferr == nil {
 					ferr = seg.Feed(pkt)
 				}
@@ -167,6 +184,16 @@ func classify(ctx context.Context, err error) error {
 		return fmt.Errorf("%w: %v", ErrUnsupported, err)
 	}
 	return err
+}
+
+// Redact keeps source credentials out of the logs the panel shows operators.
+func Redact(raw string) string {
+	if i := strings.Index(raw, "://"); i >= 0 {
+		if at := strings.Index(raw[i+3:], "@"); at >= 0 {
+			return raw[:i+3] + "***@" + raw[i+3+at+1:]
+		}
+	}
+	return raw
 }
 
 // checkScheme refuses up front what nativesrc cannot read, so the fallback is

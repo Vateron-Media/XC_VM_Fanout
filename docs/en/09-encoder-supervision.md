@@ -256,6 +256,35 @@ switching pipelines would not make an unreachable upstream answer.
 | 2 | bad command line |
 | 3 | the source cannot be served natively — run the fallback |
 
+### What it writes to the stream's log
+
+The remuxer's stderr goes where ffmpeg's went, `<streams>/<id>.errors`, and its progress where
+ffmpeg's `-progress` went (so the panel shows speed and frame rate as before). Whatever the
+`-loglevel`, it opens that log with what the source turned out to carry, in ffmpeg's shape:
+
+```
+2026/09/11 10:20:02 [remux] xc_fanout 0.13.1 native remuxer, pid 1468672
+2026/09/11 10:20:02 [remux] Input #0, mpegts, from 'http://***@provider/live/1234.ts':
+  Program 1
+    Stream #0:0[0x100]: Video: h264
+    Stream #0:1[0x101]: Audio: aac
+  Output #0, hls, to '/home/xc_vm/content/streams/42_.m3u8'
+  Output #1, mpegts, to 'unix:/home/xc_vm/bin/xc_fanout/sockets/ingest/42.sock'
+```
+
+Credentials in the source URL are redacted. Below that come the traits that make a byte-for-byte
+copy behave differently from ffmpeg's remux, each said once: a **multi-programme** source (handed
+to the player whole — if the wrong programme plays, put that channel on the ffmpeg backend),
+**scrambled** packets (which no copy can decrypt), a programme with **no audio** or **no video**,
+and a source sending **no PAT/PMT** at all. The panel adds its own line here when it chooses
+ffmpeg for a stream while the native backend is on — `[panel] ffmpeg runs this stream: Generate
+PTS is on` — so the log answers "why is this channel not on the remuxer?" without a support
+ticket.
+
+The command the supervisor was handed is recorded beside the stream's files the way the
+self-launched path records its ffmpeg line: `<streams>/<id>_.fanout` for the remuxer,
+`<streams>/<id>_.ffmpeg` for ffmpeg (in `auto`, both — the second is the fallback).
+
 ### Verifying
 
 ```bash
@@ -265,10 +294,10 @@ pgrep -af 'xc_fanout remux'
 # the channels that fell back to ffmpeg, and why
 curl -s --unix-socket …/control.sock http://localhost/monitors/state | jq '.streams | map_values(.fallback)'
 tail /home/xc_vm/content/streams/<id>.errors
-```
 
-The remuxer writes its errors where ffmpeg's went, `<streams>/<id>.errors`, and its progress
-where ffmpeg's `-progress` went, so the panel shows speed and frame rate as before.
+# which producer the panel chose for a channel
+ls /home/xc_vm/content/streams/<id>_.fanout /home/xc_vm/content/streams/<id>_.ffmpeg
+```
 
 ### A panel newer than the node's binary
 

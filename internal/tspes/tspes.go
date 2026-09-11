@@ -11,6 +11,8 @@
 // network and a corrupt packet must never index past its 188 bytes.
 package tspes
 
+import "fmt"
+
 // PacketSize is the MPEG-TS packet length.
 const PacketSize = 188
 
@@ -233,4 +235,119 @@ func StartsKeyframe(pkt []byte, streamType byte) bool {
 		i = k
 	}
 	return false
+}
+
+// ES is one elementary stream a PMT declares.
+type ES struct {
+	PID  uint16
+	Type byte
+}
+
+// PATPrograms returns the program numbers a PAT packet declares (excluding the
+// NIT's program 0). More than one means the source is a multi-programme
+// transport stream, which a byte-for-byte copy hands to the player whole.
+func PATPrograms(pkt []byte) []uint16 {
+	sec := section(pkt)
+	if len(sec) < 12 || sec[0] != 0x00 {
+		return nil
+	}
+	secLen := int(sec[1]&0x0f)<<8 | int(sec[2])
+	end := 3 + secLen - 4
+	if end > len(sec) {
+		end = len(sec)
+	}
+	var out []uint16
+	for i := 8; i+4 <= end; i += 4 {
+		if prog := uint16(sec[i])<<8 | uint16(sec[i+1]); prog != 0 {
+			out = append(out, prog)
+		}
+	}
+	return out
+}
+
+// ParsePMTStreams lists every elementary stream in a PMT packet, in table order.
+// ParsePMT answers what the segmenter needs; this answers what an operator reading
+// the log needs — the whole programme, video, audio, subtitles and data alike.
+func ParsePMTStreams(pkt []byte) ([]ES, bool) {
+	sec := section(pkt)
+	if len(sec) < 12 || sec[0] != 0x02 {
+		return nil, false
+	}
+	secLen := int(sec[1]&0x0f)<<8 | int(sec[2])
+	progInfoLen := int(sec[10]&0x0f)<<8 | int(sec[11])
+	end := 3 + secLen - 4
+	if end > len(sec) {
+		end = len(sec)
+	}
+	var out []ES
+	for i := 12 + progInfoLen; i+5 <= end; {
+		out = append(out, ES{PID: uint16(sec[i+1]&0x1f)<<8 | uint16(sec[i+2]), Type: sec[i]})
+		i += 5 + int(sec[i+3]&0x0f)<<8 + int(sec[i+4])
+	}
+	return out, len(out) > 0
+}
+
+// Kind classifies a stream_type the way an operator reads it: "Video", "Audio",
+// "Subtitle" or "Data".
+func (e ES) Kind() string {
+	switch {
+	case isVideo(e.Type):
+		return "Video"
+	case isAudio(e.Type):
+		return "Audio"
+	case e.Type == 0x06: // private PES: DVB subtitles/teletext live here
+		return "Data"
+	}
+	return "Data"
+}
+
+func isAudio(t byte) bool {
+	switch t {
+	case 0x03, 0x04, 0x0f, 0x11, 0x1c, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x91:
+		return true
+	}
+	return false
+}
+
+// StreamTypeName is the ffmpeg-ish codec name for a PMT stream_type, for logs.
+func StreamTypeName(t byte) string {
+	switch t {
+	case 0x01:
+		return "mpeg1video"
+	case 0x02:
+		return "mpeg2video"
+	case 0x03:
+		return "mp2"
+	case 0x04:
+		return "mp3"
+	case 0x06:
+		return "private_pes"
+	case 0x0f:
+		return "aac"
+	case 0x10:
+		return "mpeg4"
+	case 0x11:
+		return "aac_latm"
+	case 0x1b:
+		return "h264"
+	case 0x1c:
+		return "aac_raw"
+	case 0x24:
+		return "hevc"
+	case 0x33:
+		return "vvc"
+	case 0x51:
+		return "av1"
+	case 0x81, 0x87:
+		return "ac3"
+	case 0x82:
+		return "dts"
+	case 0x84, 0x85, 0x86:
+		return "eac3"
+	case 0x91:
+		return "ac3_bluray"
+	case 0xea:
+		return "vc1"
+	}
+	return fmt.Sprintf("stream_type_0x%02x", t)
 }

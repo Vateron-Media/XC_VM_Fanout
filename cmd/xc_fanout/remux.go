@@ -89,6 +89,11 @@ func runRemux(args []string) int {
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	logf := func(format string, a ...any) { logger.Printf("[remux] "+format, a...) }
 	quiet := func(string, ...any) {}
+	// notef is what the stream's log gets at ANY level below quiet: the source
+	// summary and how the run ended, a handful of lines per process. The panel
+	// points our stderr at <id>.errors, which is where an operator looks when a
+	// channel misbehaves, and an empty file there answers nothing.
+	notef := logf
 	infof, warnf := quiet, quiet
 	switch strings.ToLower(*loglevel) {
 	case "info", "verbose", "debug":
@@ -122,6 +127,7 @@ func runRemux(args []string) int {
 		ProgressPath: *progressPath,
 		IdleTimeout:  time.Duration(*idle) * time.Second,
 		Logf:         infof,
+		Notef:        notef,
 	}
 
 	// The supervisor ends this process with SIGKILL to its group, but an
@@ -129,17 +135,18 @@ func runRemux(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	infof("starting: %s -> %s", redact(*in), playlist)
+	notef("xc_fanout %s native remuxer, pid %d", buildVersion(), os.Getpid())
+	infof("starting: %s -> %s", remux.Redact(*in), playlist)
 	err := remux.Run(ctx, cfg)
 	switch {
 	case err == nil:
-		infof("stopped")
+		notef("stopped")
 		return 0
 	case errors.Is(err, remux.ErrUnsupported):
-		logf("%v", err)
+		notef("%v; handing this source back to the panel's fallback command", err)
 		return supervisor.ExitUnsupported
 	default:
-		logf("source failed: %v", err)
+		notef("source failed: %v", err)
 		return 1
 	}
 }
@@ -154,14 +161,4 @@ func splitHeaders(v string) []string {
 		}
 	}
 	return out
-}
-
-// redact keeps source credentials out of the log the panel shows operators.
-func redact(raw string) string {
-	if i := strings.Index(raw, "://"); i >= 0 {
-		if at := strings.Index(raw[i+3:], "@"); at >= 0 {
-			return raw[:i+3] + "***@" + raw[i+3+at+1:]
-		}
-	}
-	return raw
 }
