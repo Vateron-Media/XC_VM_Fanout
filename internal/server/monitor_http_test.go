@@ -82,8 +82,9 @@ func TestMonitorStatesIsOneCall(t *testing.T) {
 	}
 	rec := do(h, http.MethodGet, "/monitors/state", "")
 	var body struct {
-		Accepting bool `json:"accepting"`
-		DaemonPID int  `json:"daemon_pid"`
+		Accepting bool     `json:"accepting"`
+		DaemonPID int      `json:"daemon_pid"`
+		Features  []string `json:"features"`
 		Streams   map[string]struct {
 			Supervised bool `json:"supervised"`
 			DaemonPID  int  `json:"daemon_pid"`
@@ -99,5 +100,15 @@ func TestMonitorStatesIsOneCall(t *testing.T) {
 		if !st.Supervised || st.DaemonPID <= 0 {
 			t.Errorf("stream %s: %+v", id, st)
 		}
+	}
+	// The panel reads this to decide whether it may compose a `xc_fanout remux`
+	// command for this daemon; without it a half-upgraded node writes one an
+	// older binary cannot run.
+	var hasRemux bool
+	for _, f := range body.Features {
+		hasRemux = hasRemux || f == "remux"
+	}
+	if !hasRemux {
+		t.Errorf("features = %v, want the native remuxer advertised", body.Features)
 	}
 }

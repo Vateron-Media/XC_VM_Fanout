@@ -174,8 +174,9 @@ func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
 	out := struct {
 		Accepting bool                        `json:"accepting"`
 		DaemonPID int                         `json:"daemon_pid"`
+		Features  []string                    `json:"features"`
 		Streams   map[string]monitorStateView `json:"streams"`
-	}{Accepting: m.sup != nil && m.superviseOn.Load(), DaemonPID: os.Getpid(), Streams: map[string]monitorStateView{}}
+	}{Accepting: m.sup != nil && m.superviseOn.Load(), DaemonPID: os.Getpid(), Features: Features, Streams: map[string]monitorStateView{}}
 	if m.sup != nil {
 		for _, id := range m.sup.IDs() {
 			if st := m.sup.State(id); st.Supervised {
@@ -186,6 +187,16 @@ func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
 }
+
+// Features names what this daemon can be handed, for a panel that may be newer
+// or older than it. The panel composes the producer commands (ADR 0002), so it
+// has to know whether this binary understands them before it writes one: a
+// `xc_fanout remux` line given to a daemon from before the native remuxer is not
+// rejected, it is MISPARSED — the old binary takes "remux" as a positional
+// argument and tries to start a second daemon, which fails on the sockets the
+// running one holds, and the stream never starts. One capability list costs
+// nothing and removes a whole class of half-upgraded-node failure.
+var Features = []string{"remux"}
 
 // EnableSupervision gives the manager an encoder supervisor. Streams are only
 // supervised once the panel PUTs a spec for one, so enabling this changes

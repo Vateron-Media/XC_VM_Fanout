@@ -270,6 +270,21 @@ tail /home/xc_vm/content/streams/<id>.errors
 The remuxer writes its errors where ffmpeg's went, `<streams>/<id>.errors`, and its progress
 where ffmpeg's `-progress` went, so the panel shows speed and frame rate as before.
 
+### A panel newer than the node's binary
+
+`GET /monitors/state` advertises what this daemon can be handed:
+
+```json
+{ "accepting": true, "daemon_pid": 2417, "features": ["remux"], "streams": {} }
+```
+
+The panel composes the producer commands, so it checks this before writing a `xc_fanout remux`
+line: a daemon from before the native remuxer does not reject that command, it misparses it —
+`remux` reads as a positional argument to the daemon's own flag set and the process tries to
+become a second daemon on sockets the running one holds, so the stream never starts. Without
+`remux` in `features`, copy-only streams keep running ffmpeg and the reason is written to
+`<id>.errors`. Update the node's binary and they move over at the next start.
+
 ## Known gaps
 
 - **Excluded, still on the PHP watchdog:** delay streams (their delay worker runs off the
