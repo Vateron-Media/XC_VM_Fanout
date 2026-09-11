@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package integration holds the end-to-end suite for the xc_fanout daemon.
 //
 // The real tests live in files tagged `integration` and are meant to run inside

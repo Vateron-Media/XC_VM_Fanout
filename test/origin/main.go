@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Command origin is a fake live-stream source for exercising the xc_fanout
 // daemon end-to-end. It serves one synthetic "channel" (generated from a short
 // looping sample.ts) in the two shapes the daemon's puller distinguishes:

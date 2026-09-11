@@ -1,5 +1,9 @@
 //go:build unix
 
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 package supervisor
 
 import (

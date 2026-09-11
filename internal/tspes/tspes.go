@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package tspes reads the few things a byte-for-byte MPEG-TS consumer needs out
 // of individual packets: which PIDs carry the program's tables and video, the
 // PCR and PTS clocks, and whether a packet opens a keyframe. It never rewrites a

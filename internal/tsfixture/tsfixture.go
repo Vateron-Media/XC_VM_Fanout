@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package tsfixture builds synthetic, spec-shaped MPEG-TS packets so the parsing
 // and segmentation logic can be unit-tested deterministically, without ffmpeg or
 // captured media.

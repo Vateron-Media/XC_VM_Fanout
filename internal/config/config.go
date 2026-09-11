@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package config is the panel↔daemon tuning bridge, and the daemon's PRIMARY
 // source of operator tuning (the CLI no longer carries these knobs — the panel
 // never set them). An admin edits the values in the panel; the panel writes them

@@ -1,0 +1,31 @@
+XC_VM_Fanout
+Copyright (C) 2026 Vateron Media
+https://github.com/Vateron-Media/XC_VM_Fanout
+
+This program is free software: you may redistribute it and/or modify it under
+the terms of the GNU Affero General Public License, version 3 (see LICENSE),
+together with the additional terms permitted by Section 7 of that license and
+set out in LICENSE-ADDITIONAL-TERMS.md (a separate-process permission, plus
+attribution and fork requirements).
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+XC_VM_Fanout has NO third-party Go module dependencies: it imports only the Go
+standard library. Built with CGO_ENABLED=0, the binary is statically linked and
+contains no C libraries.
+
+  Go standard library
+    Copyright (C) The Go Authors.
+    BSD 3-Clause License — https://go.dev/LICENSE
+
+--------------------------------------------------------------------------------
+Origin of certain source files
+--------------------------------------------------------------------------------
+
+Some files (e.g. internal/nativesrc, internal/tspes, internal/tsseg) note that
+they were ported from the "P2PTV" project's pkg/remux layer. That code was
+written from scratch by the same author for Vateron Media and is owned by
+Vateron Media; it is the copyright holder's own original work, released here
+under AGPL-3.0, and is not third-party code carrying any separate obligation.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Command xc_fanout is the native live-stream fan-out daemon (ADR 0002, P2–P3).
 //
 // One process serves many streams: it pulls each live source once and fans it
@@ -44,6 +48,11 @@ import (
 // version is stamped at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
+// attribution is the notice required by LICENSE-ADDITIONAL-TERMS.md (§7(b)/(c)
+// of the AGPL): printed by -version and at the top of -h, and it must be
+// preserved in modified versions.
+const attribution = "XC_VM_Fanout — Copyright (C) 2026 Vateron Media — https://github.com/Vateron-Media/XC_VM_Fanout — Licensed under AGPL-3.0"
+
 func main() {
 	// `xc_fanout remux …` is the native remuxer the panel runs in place of a
 	// copy-only ffmpeg (see internal/remux). It is a separate process with its
@@ -73,10 +82,17 @@ func main() {
 	configPath := flag.String("config", "/home/xc_vm/bin/xc_fanout/config.json", "operator-tuning JSON (prebuffer_max_sec, hls_target_sec, hls_window, grace_sec, write_timeout_sec, chunk_bytes, max_gop_bytes, source_insecure, source_backend). Self-created with defaults if absent; missing keys backfilled; polled and applied live. Empty disables the file (built-in defaults are used)")
 	configInterval := flag.Int("config-interval", 60, "seconds between config-file reloads (re-read only when the file's mtime changes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, attribution)
+		fmt.Fprintf(out, "\nUsage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(buildVersion())
+		fmt.Println(attribution)
 		return
 	}
 

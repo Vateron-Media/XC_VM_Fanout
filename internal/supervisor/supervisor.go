@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package supervisor owns the lifetime of a stream's encoder process.
 //
 // It is the daemon-side half of XC_VM's per-stream watchdog (the panel's

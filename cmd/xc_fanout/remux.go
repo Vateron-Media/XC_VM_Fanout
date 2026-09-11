@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 package main
 
 import (
@@ -20,7 +24,9 @@ import (
 )
 
 // remuxUsage is printed for -h and for a malformed command line.
-const remuxUsage = `usage: xc_fanout remux -i <url> [options] <playlist.m3u8>
+const remuxUsage = `XC_VM_Fanout — Copyright (C) 2026 Vateron Media — https://github.com/Vateron-Media/XC_VM_Fanout — Licensed under AGPL-3.0
+
+usage: xc_fanout remux -i <url> [options] <playlist.m3u8>
 
 Copy a live MPEG-TS source to on-disk HLS and the daemon's ingest socket, with
 no ffmpeg: the native equivalent of

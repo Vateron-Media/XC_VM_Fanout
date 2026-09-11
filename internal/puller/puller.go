@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package puller acquires a live source and feeds it into a publish callback as
 // MPEG-TS, reconnecting with backoff. It ports the source-selection logic of the
 // legacy ProxyCommand::getActiveStream: a source served as video/mp2t is

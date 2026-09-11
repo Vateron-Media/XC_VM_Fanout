@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
 // Package dlog is the daemon's optional debug log: a thin wrapper over the
 // standard logger that stays silent unless debug mode is enabled (-debug,
 // -debug-cats or XC_FANOUT_DEBUG). When off, every call is a single atomic load
