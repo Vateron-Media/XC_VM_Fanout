@@ -92,7 +92,6 @@ func main() {
 
 	if *showVersion {
 		fmt.Println(buildVersion())
-		fmt.Println(attribution)
 		return
 	}
 
