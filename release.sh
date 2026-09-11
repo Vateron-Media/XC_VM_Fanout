@@ -47,10 +47,6 @@ for T in "${TARGETS[@]}"; do
   fi
 done
 
-# License files travel with every release (LICENSE-ADDITIONAL-TERMS.md §7(b):
-# whoever ships the binary must carry the attribution and notices).
-cp LICENSE LICENSE-ADDITIONAL-TERMS.md NOTICE "$OUT"/
-
-( cd "$OUT" && sha256sum xc_fanout-linux-* LICENSE LICENSE-ADDITIONAL-TERMS.md NOTICE > SHA256SUMS )
+( cd "$OUT" && sha256sum xc_fanout-linux-* > SHA256SUMS )
 echo ">>> done — $OUT (tag as $VERSION and attach these as release assets)"
 ls -la "$OUT"

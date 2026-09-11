@@ -48,6 +48,3 @@ jobs:
           files: |
             dist/xc_fanout-linux-*
             dist/SHA256SUMS
-            dist/LICENSE
-            dist/LICENSE-ADDITIONAL-TERMS.md
-            dist/NOTICE
