@@ -297,6 +297,75 @@ func TestRatesEndpoint(t *testing.T) {
 	}
 }
 
+// openLive attaches a live-TS viewer with connection uuid c and reads its join
+// snapshot, returning the still-open response.
+func openLive(t *testing.T, ctx context.Context, base, id, c string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/live/"+id+"?c="+c, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("live request %s: %v", c, err)
+	}
+	if _, err := io.ReadFull(resp.Body, make([]byte, 3*tsfixture.P)); err != nil {
+		t.Fatalf("reading %s snapshot: %v", c, err)
+	}
+	return resp
+}
+
+// TestDropConnectionEndsLiveViewer covers the panel's kick: DELETE
+// /connections/<uuid> must end that viewer's live-TS session (the PHP worker
+// that admitted it returned at X-Accel hand-off, so nothing else can), leave
+// other viewers alone, and report 404 for a uuid that is not connected.
+func TestDropConnectionEndsLiveViewer(t *testing.T) {
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
+	st := mgr.GetOrCreate("5")
+	feedStream(st)
+	client := httptest.NewServer(mgr.ClientHandler())
+	defer client.Close()
+	ctl := httptest.NewServer(mgr.ControlHandler())
+	defer ctl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	kicked := openLive(t, ctx, client.URL, "5", "uuidKick")
+	defer kicked.Body.Close()
+	kept := openLive(t, ctx, client.URL, "5", "uuidKeep")
+	defer kept.Body.Close()
+
+	if code := ctlRequest(t, ctl.URL, http.MethodDelete, "/connections/uuidKick", ""); code != http.StatusNoContent {
+		t.Fatalf("DELETE a connected uuid: status %d, want 204", code)
+	}
+	if _, err := io.ReadAll(kicked.Body); err != nil {
+		t.Fatalf("kicked viewer must end cleanly, got %v", err)
+	}
+
+	// The other viewer still receives the live tail.
+	st.Publish(tsfixture.Fill(0x101))
+	if _, err := io.ReadFull(kept.Body, make([]byte, tsfixture.P)); err != nil {
+		t.Fatalf("untouched viewer lost its stream: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var got []string
+		getJSON(t, ctl.URL+"/connections", &got)
+		if len(got) == 1 && got[0] == "uuidKeep" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/connections = %v, want only uuidKeep after the kick", got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if code := ctlRequest(t, ctl.URL, http.MethodDelete, "/connections/uuidKick", ""); code != http.StatusNotFound {
+		t.Fatalf("DELETE a uuid no longer connected: status %d, want 404", code)
+	}
+	if code := ctlRequest(t, ctl.URL, http.MethodGet, "/connections/uuidKeep", ""); code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /connections/<uuid>: status %d, want 405", code)
+	}
+}
+
 func getJSON(t *testing.T, url string, v any) {
 	t.Helper()
 	resp, err := http.Get(url)

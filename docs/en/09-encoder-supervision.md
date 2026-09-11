@@ -312,7 +312,7 @@ ls /home/xc_vm/content/streams/<id>_.fanout /home/xc_vm/content/streams/<id>_.ff
 `GET /monitors/state` advertises what this daemon can be handed:
 
 ```json
-{ "accepting": true, "daemon_pid": 2417, "features": ["remux"], "streams": {} }
+{ "accepting": true, "daemon_pid": 2417, "features": ["remux", "drop_connection"], "streams": {} }
 ```
 
 The panel composes the producer commands, so it checks this before writing a `xc_fanout remux`

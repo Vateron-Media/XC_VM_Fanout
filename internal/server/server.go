@@ -208,10 +208,15 @@ func (s *Stream) dropSegCache() {
 // stream's connMu; bytes is atomic so serveLive can account each write on the
 // hot path without taking the lock. Used for both disconnect reconciliation
 // (refs) and per-viewer transfer telemetry (bytes/since → KB/s, P4).
+//
+// kill is closed (once) when the panel drops the uuid — a connection-limit
+// eviction or an admin kick — and every serveLive carrying the uuid returns.
 type connStat struct {
-	refs  int
-	since time.Time
-	bytes atomic.Int64
+	refs     int
+	since    time.Time
+	bytes    atomic.Int64
+	kill     chan struct{}
+	killOnce sync.Once
 }
 
 // addConn records an active live-TS viewer by its connection uuid (passed by
@@ -227,11 +232,25 @@ func (s *Stream) addConn(uuid string) *connStat {
 	}
 	cs := s.conns[uuid]
 	if cs == nil {
-		cs = &connStat{since: time.Now()}
+		cs = &connStat{since: time.Now(), kill: make(chan struct{})}
 		s.conns[uuid] = cs
 	}
 	cs.refs++
 	return cs
+}
+
+// dropConn ends every live-TS connection carrying uuid on this stream by closing
+// its kill channel; each serveLive returns and its deferred removeConn takes the
+// uuid out of the set. Reports whether the uuid was connected here.
+func (s *Stream) dropConn(uuid string) bool {
+	s.connMu.Lock()
+	cs := s.conns[uuid]
+	s.connMu.Unlock()
+	if cs == nil {
+		return false
+	}
+	cs.killOnce.Do(func() { close(cs.kill) })
+	return true
 }
 
 func (s *Stream) removeConn(uuid string) {
@@ -1147,6 +1166,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/ingest/", m.serveIngest)
 	mux.HandleFunc("/probe/", m.serveProbe)
 	mux.HandleFunc("/connections", m.serveConnections)
+	mux.HandleFunc("/connections/", m.serveDropConnection)
 	mux.HandleFunc("/rates", m.serveRates)
 	mux.HandleFunc("/signal/", m.serveSignal)
 	mux.HandleFunc("/monitor/", m.serveMonitor)
@@ -1172,6 +1192,49 @@ func (m *Manager) serveConnections(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(uuids)
+}
+
+// DropConnection disconnects every live-TS viewer carrying uuid, across all
+// streams, and returns how many streams it was connected to.
+func (m *Manager) DropConnection(uuid string) int {
+	m.mu.Lock()
+	streams := make([]*Stream, 0, len(m.streams))
+	for _, st := range m.streams {
+		streams = append(streams, st)
+	}
+	m.mu.Unlock()
+
+	n := 0
+	for _, st := range streams {
+		if st.dropConn(uuid) {
+			n++
+		}
+	}
+	return n
+}
+
+// serveDropConnection is the panel's kick (DELETE /connections/<uuid>): a
+// connection-limit eviction, an admin "kill connection", a banned or expired
+// line. Under X-Accel the PHP worker that admitted the viewer returned long ago,
+// so this is the only way to end a daemon-served session. 204 when the uuid was
+// connected, 404 when it was not (already gone, or served by another node).
+func (m *Manager) serveDropConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	uuid := strings.TrimPrefix(r.URL.Path, "/connections/")
+	if uuid == "" {
+		http.Error(w, "missing uuid", http.StatusBadRequest)
+		return
+	}
+	n := m.DropConnection(uuid)
+	if n == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	dlog.Logf("viewer", "drop uuid=%s streams=%d (panel)", uuid, n)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // serveRates returns { "<uuid>": <avgKBs>, ... } across all streams — each
@@ -1432,9 +1495,11 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	uuid := r.URL.Query().Get("c")
 	codec := r.URL.Query().Get("vc") // video codec, for a possible "send message" overlay
 	var cs *connStat
+	var killC <-chan struct{} // nil (never ready) for a viewer without a uuid
 	if uuid != "" {
 		cs = st.addConn(uuid)
 		defer st.removeConn(uuid)
+		killC = cs.kill
 	}
 
 	// Debug: narrate this viewer's whole live-TS session — attach, then a single
@@ -1554,6 +1619,9 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-sub.Done():
 			reason = "dropped: too slow (hub buffer full)"
+			return
+		case <-killC:
+			reason = "dropped by panel (kick / connection limit)"
 			return
 		case <-r.Context().Done():
 			reason = "client closed"
