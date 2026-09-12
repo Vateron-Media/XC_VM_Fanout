@@ -267,6 +267,43 @@ is live on more than one stream, the higher rate wins.
 
 **Response:** `200`, `Content-Type: application/json`, body — for example `{"uuid-1":512,"uuid-2":498}`.
 
+### `GET /memory` — where the memory is
+
+Read-only. The daemon's memory by what holds it: the per-stream join rings — the dominant term by
+design — against the Go heap as a whole, so an operator whose node runs hot can tell "the rings are
+as big as the config says" from "something else is growing" without a profiler.
+
+```json
+{
+  "streams": 155,
+  "ring_bytes": 2147483648,
+  "heap_in_use_bytes": 2415919104,
+  "heap_goal_bytes": 3623878656,
+  "mapped_bytes": 3865470566,
+  "released_bytes": 402653184,
+  "largest": [
+    { "id": "412", "bytes": 41943040, "seconds": 40, "gops": 21, "viewers": 3, "gated": false }
+  ]
+}
+```
+
+| Field | Meaning |
+|------|-------|
+| `ring_bytes` | Every stream's ring together. |
+| `heap_in_use_bytes` | Heap objects, live and not yet swept. |
+| `heap_goal_bytes` | The size the GC lets the heap reach before collecting (`GOGC`, soft limit). |
+| `mapped_bytes` / `released_bytes` | Memory the runtime holds from the OS, and how much of it is already returned (not resident). |
+| `largest` | The ten biggest rings: bytes, the stream time they span, GOPs, live-TS viewers, and whether the idle gate has collapsed them. |
+
+A ring should span about `prebuffer_max_sec` seconds while watched and `× idle_buffer_ratio`
+while gated. One far bigger than that, at the byte backstop (`prebuffer × 24 Mbit/s`), is a stream
+whose clock the ring cannot read. The heap figures come from `runtime/metrics`, which — unlike
+`runtime.ReadMemStats` — does not stop the world, so this is safe to poll on a busy node:
+
+```bash
+curl -s --unix-socket /home/xc_vm/bin/xc_fanout/sockets/control.sock http://localhost/memory | jq
+```
+
 ### `POST /signal/<uuid>` — admin "send message" overlay
 
 Queues a **one-shot** text banner to be burned onto the video of the single viewer whose

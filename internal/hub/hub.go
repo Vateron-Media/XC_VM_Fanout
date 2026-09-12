@@ -306,6 +306,13 @@ func (h *Hub) CloseAll() int {
 	return n
 }
 
+// RingStats reports the join ring's bytes, span (ms) and GOP count.
+func (h *Hub) RingStats() (bytes int, spanMS int64, gops int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.join.RingStats()
+}
+
 // Count returns the current number of subscribers.
 func (h *Hub) Count() int {
 	h.mu.Lock()

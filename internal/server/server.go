@@ -1176,6 +1176,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/monitor/", m.serveMonitor)
 	mux.HandleFunc("/monitors", m.serveMonitors)
 	mux.HandleFunc("/monitors/state", m.serveMonitorStates)
+	mux.HandleFunc("/memory", m.serveMemory)
 	return mux
 }
 

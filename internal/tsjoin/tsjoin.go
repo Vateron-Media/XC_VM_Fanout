@@ -727,6 +727,19 @@ func (s *State) Reset() {
 	s.plCache, s.plValid = "", false
 }
 
+// RingStats reports what the ring holds: its bytes, how much stream time they
+// span on the ring clock (ms; 0 without one), and its GOP count. For the memory
+// report — the ring is most of the daemon's heap. Caller (Hub) serialises access.
+func (s *State) RingStats() (bytes int, spanMS int64, gops int) {
+	for i := range s.gops {
+		bytes += len(s.gops[i].data)
+	}
+	if n := len(s.gops); n > 1 && s.gops[0].t >= 0 && s.gops[n-1].t >= 0 {
+		spanMS = (s.gops[n-1].t - s.gops[0].t) / pcrHz
+	}
+	return bytes, spanMS, len(s.gops)
+}
+
 // Unpin releases a SnapshotPin, letting prune recycle dropped GOP buffers again.
 // Caller (Hub) serialises access, and must call it exactly once per SnapshotPin.
 func (s *State) Unpin() {
