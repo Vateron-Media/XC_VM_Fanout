@@ -72,7 +72,9 @@ curl --unix-socket /home/xc_vm/bin/xc_fanout/sockets/control.sock http://localho
 ```
 
 A supervised stream answers with `running`, `confirmed` (the running producer has delivered
-bytes — `running` without it is a start in progress), `pid`, `source`, `restarts`,
+bytes **since it was launched** — `running` without it is a start in progress; before 0.13.2 any
+data the stream had ever had confirmed every later start, so a dead source never failed a start and
+the backup was never tried), `pid`, `source`, `restarts`,
 `uptime_ms`, `adopted`, `fallback` (it is running its source's fallback command),
 `last_error`, `daemon_pid`, and a `meta` block carrying the codecs, picture size and
 measured bitrate. A stream this node is not supervising answers `404`.

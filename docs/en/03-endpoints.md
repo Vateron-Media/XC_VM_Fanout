@@ -157,7 +157,7 @@ Returns enough JSON for the PHP authorizer to decide the off-air question:
 |------|-------|
 | `running` | The puller is running. |
 | `refs` | How many live-TS viewers are connected right now. |
-| `has_data` | Whether at least one non-empty chunk of data has arrived. |
+| `has_data` | Whether the stream is on air **now**: data within the viewer idle timeout (`viewer_idle_timeout_sec`, 30 s by default). Before 0.13.2 it meant "has ever had data", so a channel whose source had died still answered on air. |
 | `since_data_ms` | Milliseconds since the last non-empty chunk; `-1` if there has been no data. |
 
 "`running=true` but `has_data=false`, or a large `since_data_ms`" = the source is dead → PHP
@@ -212,7 +212,9 @@ The handler is [`serveProbe`](../../internal/server/server.go).
 
 PHP calls this after registering a proxy source: if there is no data by the time `wait` elapses
 (`has_data=false`), it shows "not on air" instead of letting the viewer hang on a dead
-source. The warmed-up puller keeps running, so the viewer's real connection is
+source. It answers at once only for a stream whose data is flowing (newer than 2 s); otherwise it
+waits for data newer than the probe itself — a channel that once had a picture is not on air for
+that alone. The warmed-up puller keeps running, so the viewer's real connection is
 picked up by it; if no viewer arrives, the reaper stops the puller.
 
 ### `GET /connections` — viewer reconciliation

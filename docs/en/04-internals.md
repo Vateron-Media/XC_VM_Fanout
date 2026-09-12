@@ -92,6 +92,19 @@ bytes at 188-byte spacing) before it is accepted: IPTV upstreams routinely serve
 `application/octet-stream`, so the header alone is neither sufficient nor necessary, and an MP4 or
 an HTML error page served with a generic type would otherwise be fanned out as if it were video.
 
+**How it reads them** (the same reader serves the daemon's pull path and the native remuxer):
+
+- A **live** HLS playlist is joined **three segments from its end**, as ffmpeg's demuxer does
+  (`live_start_index -3`); a VOD playlist (`#EXT-X-ENDLIST`) plays from its start. Before 0.13.2 the
+  whole window went into the pipeline at download speed, and again on every reconnect.
+- A stalled source is closed so the pull reconnects or fails over, but the bound is the source's
+  own: a live HLS source is silent for a whole segment between bursts, so its bound is **three
+  target durations** (never under 8 s), which also catches a playlist that stopped updating. A flat
+  8 s closed every source with longer segments between two healthy ones. The ffmpeg path is bounded
+  too, and a silent ffmpeg is ended rather than left holding the stream.
+- `rtp://` datagrams have their RTP header stripped (RFC 3550: CSRCs, extension, padding); it used
+  to reach the stream and misalign it by 12 bytes per datagram.
+
 Which path a stream took is in the debug log — `connected native (no ffmpeg child)` or
 `connected via ffmpeg remux`. Choosing between them is
 [`source_backend`](06-configuration.md#the-source-backend).
@@ -183,19 +196,25 @@ Atomicity survives because the capture fixes the content at the moment of regist
 GOP growing afterwards is invisible (the captured length does not move), and every chunk published
 from that point reaches the viewer through its channel instead.
 
-**Since 0.13.2 the burst is not copied at all.** `Subscribe` returns a `Burst` — the header, plus
-the pinned GOP slices themselves — and `serveLive` writes them to the socket one GOP at a time
-(each with its own write deadline, like every chunk of the live tail) and then releases the pin.
-The copy had bought nothing the pin did not already provide, and it was the daemon's largest
-transient: every join allocated up to the whole client prebuffer (the panel's `client_prebuffer`
-defaults to **30 s** — ~30 MB of an 8 Mbit/s channel; buffers over 16 MB were not even pooled) and
-held it for as long as the viewer took to drain it. Measured on 30 channels at 6.6 Mbit/s, 90
-viewers joining with `prebuffer=30`:
+**Since 0.13.2 a live-TS viewer catches up through the ring instead.** `Subscribe` (above) is
+still the primitive, but `serveLive` no longer registers the viewer and queues the live tail behind
+its history. `Hub.Join` places a **cursor** at the start of the viewer's prebuffer and registers
+nothing; `Hub.CatchUp` then hands it the ring's bytes from that cursor in pinned runs of 1 MB, and
+subscribes it to the live tail **in the same critical section in which a run reaches the edge** —
+so the tail continues exactly where the history ends, the same no-gap, no-duplicate guarantee.
 
-```
-heap after the storm:   2,669 MB → 1,440 MB peak
-retained afterwards:    +1,650 MB (join copies) → +0 (only the ungated rings)
-```
+Two earlier shapes each failed at scale. Copying the burst per viewer allocated up to the whole
+client prebuffer on every join (the panel's `client_prebuffer` defaults to **30 s** — ~30 MB of an
+8 Mbit/s channel) and held it while the viewer drained it: 90 viewers joining with `prebuffer=30`
+across 30 channels grew the heap by 2 GB in five seconds. Writing the pinned burst without a copy
+fixed that, but left the live tail queuing behind the history in the subscriber's 256-chunk queue
+(~5 s of a 4.7 Mbit/s stream) — so every viewer whose link could not take a 30 s burst within ~5 s
+(anything under ~30 Mbit/s) was dropped as "too slow" and reconnected into another burst; and a
+queue sized to the burst instead let each stalled viewer pin that much stream (a 200-channel stress
+run reached a 5–7 GB heap on 2–3 GB of rings). Reading the ring forward needs neither: the history
+is already there, once, for everyone. A viewer on any link faster than the stream catches up with
+the fixed queue; one slower than the stream falls off the ring's tail and is let go; and a pin
+lasts one run, never a whole burst.
 
 ```
 lock held per join:      3.13 ms → 1.30 µs
@@ -300,9 +319,11 @@ the ring grew to its byte backstop — `prebuffer × 24 Mbit/s`, **120 MB at the
 pre-splice GOP had been pushed out. A source carrying a second, unrelated PCR on another PID flipped
 the sign constantly and never pruned at all.
 
-Since 0.13.2 each GOP is stamped by `ringClock()`: it advances by the PCR step when that step is
-plausible (0–60 s), unwraps the 33-bit rollover, and across anything else carries on at the last
-good cadence — so the window stays a window. And once the PMT's declared **PCR PID** has shown a
+Since 0.13.2 each GOP is stamped by `ringClock()`: a **forward** step advances it by the PCR
+difference, whatever its size (a slow keyframe-less source's blocks can each span minutes, and a
+forward splice only makes the ring prune sooner); the 33-bit rollover is unwrapped; and any other
+**backwards** step — a restart, a failover — advances it by the last plausible cadence (0–60 s),
+so the window stays a window. And once the PMT's declared **PCR PID** has shown a
 PCR, only that PID drives the clock. Measured on real ffmpeg output across a producer restart, a
 20 s window held:
 
@@ -357,7 +378,12 @@ How it works now:
   ["the idle-buffer gate"](06-configuration.md#the-idle-buffer-gate).
 
 The playlist is a standard `#EXTM3U` version 3 with `EXT-X-TARGETDURATION`, `EXT-X-MEDIA-SEQUENCE`
-and `#EXTINF` lines (durations from PCR/PTS deltas); the segment URIs are `<seq>.ts`. The `Hub`
+and `#EXTINF` lines (durations from video PTS deltas); the segment URIs are `<seq>.ts`. A PTS step
+backwards that is not the 33-bit wrap, or a forward jump beyond 60 s, is a timeline change — a
+producer restart, a failover, a splice: the open segment ends there, timed on the ring clock, and
+the next one is marked `#EXT-X-DISCONTINUITY`, with discontinuities that leave the playlist counted
+in `#EXT-X-DISCONTINUITY-SEQUENCE`. (Before 0.13.2 such a step was read as the wrap and closed a
+segment of ~26 hours — `#EXT-X-TARGETDURATION:94410` after a single restart.) The `Hub`
 exposes this as `Configure` / `HLSPlaylist` / `HLSSegment`.
 
 ### Sources without keyframes
