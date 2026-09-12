@@ -5,6 +5,7 @@
 package server
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -71,4 +72,32 @@ func TestSourceEditReachesAWatchedChannel(t *testing.T) {
 	b.URLs = []string{origin.URL + "/b.ts"}
 	m.Register("7", b, 0) // the operator edits the source
 	waitFor("the edited source to be pulled while the channel is watched", func() bool { return count("/b.ts") >= 1 })
+}
+
+// TestProducerAcceptedAsTheListenerStopsIsRefused: Accept can hand back a
+// connection just before the ingest listener is closed. It used to be added to
+// the connection set after stopIngestLocked had emptied it — a producer feeding
+// a stream nothing could reach or stop. A connection from a stopped listener's
+// generation is refused.
+func TestProducerAcceptedAsTheListenerStopsIsRefused(t *testing.T) {
+	st := NewManager(1<<20, 0, 2, 6, time.Second).GetOrCreate("3")
+	st.ingestMu.Lock()
+	st.ingestGen++
+	gen := st.ingestGen // the listener that accepts...
+	st.ingestMu.Unlock()
+
+	st.closeIngestConns() // ...is stopped before the accept goroutine gets to add it
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	if st.addIngestConn(a, gen) {
+		t.Fatal("a producer accepted by a stopped listener was admitted")
+	}
+	st.ingestMu.Lock()
+	n := len(st.ingestConns)
+	st.ingestMu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d producer(s) tracked after the listener stopped", n)
+	}
 }

@@ -84,6 +84,12 @@ type Stream struct {
 	// ring is unreachable and never freed.
 	ingestMu    sync.Mutex
 	ingestConns map[net.Conn]struct{}
+	// ingestGen names the current listener. A connection is admitted only by
+	// the generation that accepted it: Accept can hand one back just before
+	// the listener is closed, and without this it was added to the map after
+	// closeIngestConns had emptied it — a producer feeding a stream nothing
+	// could reach any more.
+	ingestGen int
 
 	// sourcePath is the route the puller last settled on (puller.Path*), written
 	// from the pull goroutine and read by the snapshot, so it is atomic.
@@ -334,14 +340,21 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 	s.ingestLn = ln
 	s.ingestSock = sockPath
 	ch := s.chunk
+	s.ingestMu.Lock()
+	s.ingestGen++
+	gen := s.ingestGen
+	s.ingestMu.Unlock()
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return // listener closed (stopIngestLocked)
 			}
+			if !s.addIngestConn(conn, gen) {
+				_ = conn.Close() // accepted just as the listener was stopped
+				continue
+			}
 			dlog.Logf("ingest", "id=%s producer connected on %s", s.id, sockPath)
-			s.addIngestConn(conn)
 			go func(c net.Conn) {
 				defer s.removeIngestConn(c)
 				defer c.Close()
@@ -353,13 +366,19 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 	return nil
 }
 
-func (s *Stream) addIngestConn(c net.Conn) {
+// addIngestConn admits a producer accepted by listener generation gen, and
+// reports false — the caller closes it — when that listener has since stopped.
+func (s *Stream) addIngestConn(c net.Conn, gen int) bool {
 	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if gen != s.ingestGen {
+		return false
+	}
 	if s.ingestConns == nil {
 		s.ingestConns = make(map[net.Conn]struct{})
 	}
 	s.ingestConns[c] = struct{}{}
-	s.ingestMu.Unlock()
+	return true
 }
 
 func (s *Stream) removeIngestConn(c net.Conn) {
@@ -372,6 +391,7 @@ func (s *Stream) removeIngestConn(c net.Conn) {
 // it is safe to call with s.mu held (the accept path never takes s.mu).
 func (s *Stream) closeIngestConns() int {
 	s.ingestMu.Lock()
+	s.ingestGen++ // whatever the old listener is still handing back is refused
 	n := len(s.ingestConns)
 	for c := range s.ingestConns {
 		_ = c.Close()
