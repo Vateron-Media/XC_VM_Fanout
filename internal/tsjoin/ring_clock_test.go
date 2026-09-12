@@ -5,6 +5,8 @@
 package tsjoin
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
@@ -133,5 +135,83 @@ func TestRingClockAdvancesOnLongKeyframelessBlocks(t *testing.T) {
 	}
 	if n := len(s.gops); n > 2 {
 		t.Fatalf("%d 90-second blocks retained in a 10 s window, want the newest one or two", n)
+	}
+}
+
+// TestHLSMarksARestartAsADiscontinuity: a producer restart starts its PTS over.
+// The in-RAM HLS read every backwards step as the 33-bit wrap and closed a
+// segment of ~26 hours — #EXTINF and #EXT-X-TARGETDURATION of ~95000 s, players
+// broken until it left the window. The segment must end at the restart with a
+// sane duration, and the next one must say the timeline jumped.
+func TestHLSMarksARestartAsADiscontinuity(t *testing.T) {
+	s := New(1<<24, 60000)
+	s.Configure(60000, 6000, 6) // 6 s segments, 6 listed
+	s.Update(tsfixture.PAT(0x100))
+	s.Update(tsfixture.PMT(0x100, 0x101))
+	gop := func(t90 int64) {
+		s.Update(tsfixture.KeyframePCR(0x101, t90, t90))
+		for i := 0; i < 20; i++ {
+			s.Update(tsfixture.Fill(0x101))
+		}
+	}
+	for g := int64(0); g < 20; g++ { // 40 s at a high clock
+		gop(1000*90000 + g*2*90000)
+	}
+	for g := int64(1); g <= 30; g++ { // restarted: the clock starts over
+		gop(g * 2 * 90000)
+	}
+
+	pl := s.HLSPlaylist()
+	var maxDur float64
+	for _, l := range strings.Split(pl, "\n") {
+		if strings.HasPrefix(l, "#EXTINF:") {
+			v, _ := strconv.ParseFloat(strings.TrimSuffix(strings.TrimPrefix(l, "#EXTINF:"), ","), 64)
+			if v > maxDur {
+				maxDur = v
+			}
+		}
+	}
+	if maxDur > 12 {
+		t.Fatalf("a %0.fs segment after a producer restart, want at most a couple of GOPs past the 6 s target:\n%s", maxDur, pl)
+	}
+
+	// The restart's segment has left the 6-segment window by now; the
+	// discontinuity must be counted, as the spec requires.
+	if !strings.Contains(pl, "#EXT-X-DISCONTINUITY-SEQUENCE:1") {
+		t.Fatalf("the restart's discontinuity is not counted once it left the window:\n%s", pl)
+	}
+
+	// And while it was in the window, it was marked.
+	found := false
+	for _, sg := range s.segs {
+		found = found || sg.disc
+	}
+	if !found && s.discDropped == 0 {
+		t.Fatal("no segment was marked as following the restart")
+	}
+}
+
+// TestHLSListsTheDiscontinuityWhileInWindow: right after a restart the playlist
+// carries #EXT-X-DISCONTINUITY before the first segment on the new timeline.
+func TestHLSListsTheDiscontinuityWhileInWindow(t *testing.T) {
+	s := New(1<<24, 60000)
+	s.Configure(60000, 6000, 6)
+	s.Update(tsfixture.PAT(0x100))
+	s.Update(tsfixture.PMT(0x100, 0x101))
+	gop := func(t90 int64) {
+		s.Update(tsfixture.KeyframePCR(0x101, t90, t90))
+		for i := 0; i < 20; i++ {
+			s.Update(tsfixture.Fill(0x101))
+		}
+	}
+	for g := int64(0); g < 20; g++ {
+		gop(1000*90000 + g*2*90000)
+	}
+	for g := int64(1); g <= 8; g++ {
+		gop(g * 2 * 90000)
+	}
+	pl := s.HLSPlaylist()
+	if !strings.Contains(pl, "#EXT-X-DISCONTINUITY\n") {
+		t.Fatalf("no #EXT-X-DISCONTINUITY right after a producer restart:\n%s", pl)
 	}
 }

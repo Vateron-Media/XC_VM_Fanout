@@ -67,6 +67,10 @@ type hlsSeg struct {
 	startID int64
 	endID   int64
 	durMS   int64
+	// disc: the stream's timeline jumped just before this segment (a producer
+	// restart, a failover, a splice) — the playlist marks it
+	// #EXT-X-DISCONTINUITY so a player resets its clock instead of stalling.
+	disc bool
 }
 
 // State accumulates join information from a packet-aligned byte stream.
@@ -130,6 +134,9 @@ type State struct {
 	nextSeq     int      // next HLS media sequence number
 	segStartID  int64    // open segment's first GOP id, or -1 = none open
 	segStartPTS int64    // open segment's start HLS clock (90 kHz)
+	segStartT   int64    // open segment's start on the ring clock, or -1
+	segDisc     bool     // the open segment starts after a timeline jump
+	discDropped int      // discontinuities in segments pruned out of s.segs
 
 	// plCache is the last rendered playlist, valid until the segment list changes.
 	// Every HLS viewer polls index.m3u8 on its own schedule, so an audience of a few
@@ -328,14 +335,15 @@ func (s *State) Update(chunk []byte) {
 			// it just does not drive HLS. gop.pts is the video PTS, else -1.
 			id := s.nextGOPID
 			s.nextGOPID++
+			t := s.ringClock()
 			pts := int64(-1)
 			if s.videoPID >= 0 && pid == s.videoPID {
 				if p, ok := parsePTS(pkt); ok {
 					pts = p
-					s.hlsOnKeyframe(id, pts)
+					s.hlsOnKeyframe(id, pts, t)
 				}
 			}
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: s.ringClock(), pts: pts, video: onVideo})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: t, pts: pts, video: onVideo})
 			s.prune()
 		case len(s.gops) > 0 && len(s.gops[len(s.gops)-1].data)+PacketSize <= s.maxGOP:
 			g := &s.gops[len(s.gops)-1]
@@ -472,31 +480,59 @@ func (s *State) prune() {
 // keyframe opens the next one. Called before the new GOP is appended, so
 // s.gops[last] is the closing segment's final GOP. No-op unless the HLS view is
 // enabled and PCR timing is available.
-func (s *State) hlsOnKeyframe(newID, newPTS int64) {
+func (s *State) hlsOnKeyframe(newID, newPTS, newT int64) {
 	if s.hlsTargetMS <= 0 {
 		return
 	}
 	if s.segStartID < 0 {
-		s.segStartID, s.segStartPTS = newID, newPTS
+		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
 		return
 	}
 	if newPTS < 0 || s.segStartPTS < 0 {
 		return // cannot measure duration without a clock on both ends
 	}
 	d := newPTS - s.segStartPTS
-	if d < 0 {
+	switch {
+	case d >= 0 && d <= maxCadence:
+		// time moved on by a plausible amount: the segment clock
+	case d < 0 && d+ptsWrap <= maxWrap:
 		d += ptsWrap // straddled the 33-bit wrap
+	default:
+		// The timeline jumped: a producer restart starts its PTS over, a
+		// failover lands on another clock, a splice skips ahead. Adding 2^33 to
+		// every backwards step read a restart as the wrap and closed a segment of
+		// ~26 hours — #EXTINF and #EXT-X-TARGETDURATION of ~95000 s, and players
+		// broken until it left the window. The open segment ends here instead (a
+		// segment must not span two timelines), timed on the ring clock, which is
+		// monotonic by construction; the next one is marked a discontinuity.
+		dur := int64(-1)
+		if newT >= 0 && s.segStartT >= 0 {
+			dur = (newT - s.segStartT) / pcrHz
+		}
+		if dur <= 0 {
+			dur = s.hlsTargetMS
+		}
+		s.closeSegment(newID, dur)
+		s.segDisc = true
+		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+		return
 	}
 	if d >= s.hlsTargetMS*pcrHz {
-		endID := s.segStartID
-		if n := len(s.gops); n > 0 {
-			endID = s.gops[n-1].id
-		}
-		s.segs = append(s.segs, hlsSeg{seq: s.nextSeq, startID: s.segStartID, endID: endID, durMS: d / pcrHz})
-		s.nextSeq++
-		s.plValid = false
-		s.segStartID, s.segStartPTS = newID, newPTS
+		s.closeSegment(newID, d/pcrHz)
+		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
 	}
+}
+
+// closeSegment ends the open segment at the GOP before newID, lasting durMS.
+func (s *State) closeSegment(newID, durMS int64) {
+	endID := s.segStartID
+	if n := len(s.gops); n > 0 {
+		endID = s.gops[n-1].id
+	}
+	s.segs = append(s.segs, hlsSeg{seq: s.nextSeq, startID: s.segStartID, endID: endID, durMS: durMS, disc: s.segDisc})
+	s.segDisc = false
+	s.nextSeq++
+	s.plValid = false
 }
 
 // hlsPrune drops segments whose GOPs have fully aged out of the ring, so the
@@ -511,6 +547,11 @@ func (s *State) hlsPrune() {
 		drop++
 	}
 	if drop > 0 {
+		for _, sg := range s.segs[:drop] {
+			if sg.disc {
+				s.discDropped++
+			}
+		}
 		s.segs = append(s.segs[:0], s.segs[drop:]...)
 		s.plValid = false
 	}
@@ -538,6 +579,15 @@ func (s *State) HLSPlaylist() string {
 		start = len(avail) - s.hlsWindow
 	}
 	win := avail[start:]
+	// Discontinuities before the window — pruned, or in the reserved margin —
+	// set #EXT-X-DISCONTINUITY-SEQUENCE, as the HLS spec requires once a
+	// segment carrying one has left the playlist.
+	discSeq := s.discDropped
+	for _, sg := range s.segs[:len(s.segs)-len(win)] {
+		if sg.disc {
+			discSeq++
+		}
+	}
 	maxDur := 0.0
 	for _, sg := range win {
 		if d := float64(sg.durMS) / 1000.0; d > maxDur {
@@ -548,7 +598,13 @@ func (s *State) HLSPlaylist() string {
 	b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(maxDur)))
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", win[0].seq)
+	if discSeq > 0 {
+		fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
+	}
 	for _, sg := range win {
+		if sg.disc {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%d.ts\n", float64(sg.durMS)/1000.0, sg.seq)
 	}
 	s.plCache, s.plValid = b.String(), true
@@ -823,10 +879,18 @@ func (s *State) snapshotStart(start int) int {
 // (two packets) so a restarted puller still has program info before its first
 // keyframe. Caller (Hub) serialises access.
 func (s *State) Reset() {
+	for _, sg := range s.segs {
+		if sg.disc {
+			s.discDropped++
+		}
+	}
 	s.gops = nil
 	s.segs = nil
 	s.freeBufs = nil
-	s.segStartID, s.segStartPTS = -1, -1
+	s.segStartID, s.segStartPTS, s.segStartT = -1, -1, -1
+	// Whatever the producer sends next follows a gap: its first segment is a
+	// discontinuity to anyone who saw the ones before.
+	s.segDisc = s.nextSeq > 0
 	s.plCache, s.plValid = "", false
 }
 
