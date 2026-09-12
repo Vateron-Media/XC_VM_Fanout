@@ -364,7 +364,7 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 	// TS packets per UDP datagram. The demuxer reads in 188-byte
 	// chunks anyway, so we just hand back the raw conn wrapped in a
 	// ReadCloser that respects ctx cancellation.
-	r := &udpReader{conn: conn, ctx: ctx, done: make(chan struct{})}
+	r := &udpReader{conn: conn, ctx: ctx, done: make(chan struct{}), rtp: strings.EqualFold(u.Scheme, "rtp")}
 	go r.watch()
 	return r, nil
 }
@@ -397,6 +397,9 @@ type udpReader struct {
 	off int    // next unread byte in buf
 	n   int    // bytes held in buf
 	err error  // deferred error, reported after buffered bytes drain
+	// rtp: each datagram carries an RTP header ahead of its MPEG-TS packets,
+	// which is stripped — see rtpPayload.
+	rtp bool
 }
 
 // maxUDPDatagram is the largest payload a single UDP datagram can carry.
@@ -426,6 +429,15 @@ func (r *udpReader) Read(p []byte) (int, error) {
 	_ = r.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	n, err := r.conn.Read(r.buf)
 	r.off, r.n = 0, n
+	if n > 0 && r.rtp {
+		r.off, r.n = rtpPayload(r.buf[:n])
+		if r.off >= r.n {
+			if err != nil {
+				return 0, err
+			}
+			return 0, nil // a datagram with no payload (a bare RTP header)
+		}
+	}
 	if n <= 0 {
 		r.n = 0
 		return 0, err
@@ -438,6 +450,31 @@ func (r *udpReader) Read(p []byte) (int, error) {
 	c := copy(p, r.buf[r.off:r.n])
 	r.off += c
 	return c, nil
+}
+
+// rtpPayload returns the bounds of the MPEG-TS payload in one RTP datagram
+// (RFC 3550): past the fixed 12-byte header, its CSRC list, and a header
+// extension if the X bit is set, and short of any padding the P bit declares.
+// rtp:// was accepted natively but handed through with the header on, which
+// shifted the stream by 12 bytes per datagram: on the pull path, which trusts
+// 188-byte alignment, nearly every packet was then dropped. A datagram that is
+// not RTP version 2 is passed through whole.
+func rtpPayload(d []byte) (start, end int) {
+	if len(d) < 12 || d[0]>>6 != 2 {
+		return 0, len(d)
+	}
+	start = 12 + 4*int(d[0]&0x0f)
+	if d[0]&0x10 != 0 && start+4 <= len(d) { // header extension
+		start += 4 + 4*(int(d[start+2])<<8|int(d[start+3]))
+	}
+	end = len(d)
+	if d[0]&0x20 != 0 && end > 0 { // padding: the last byte counts it
+		end -= int(d[end-1])
+	}
+	if start > end {
+		return end, end
+	}
+	return start, end
 }
 
 func (r *udpReader) Close() error {
