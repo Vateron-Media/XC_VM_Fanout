@@ -640,11 +640,34 @@ func (s *Stream) status() streamStatus {
 	running, refs := s.running, s.refs
 	s.mu.Unlock()
 	ld := s.lastData.Load()
-	st := streamStatus{Running: running, Refs: refs, HasData: ld != 0, SinceDataMs: -1}
+	st := streamStatus{Running: running, Refs: refs, HasData: s.onAir(), SinceDataMs: -1}
 	if ld != 0 {
 		st.SinceDataMs = time.Since(time.Unix(0, ld)).Milliseconds()
 	}
 	return st
+}
+
+// onAir reports whether the stream has published recently enough to count as
+// on air: within the viewer idle timeout — the same silence that would drop a
+// viewer — or DataFreshFallback when that timeout is off.
+//
+// has_data used to mean "has EVER had data". The panel reads nothing else (its
+// probe and isStreamFed both check has_data alone), and the Stream outlives its
+// producers, so a channel whose source died an hour ago still answered "on
+// air": the viewer was handed a dead stream and dropped for silence 30 s later,
+// instead of getting the not-on-air page.
+func (s *Stream) onAir() bool {
+	ld := s.lastData.Load()
+	if ld == 0 {
+		return false
+	}
+	window := defaults.DataFreshFallback
+	if s.mgr != nil {
+		if v := time.Duration(s.mgr.viewerIdleNS.Load()); v > 0 {
+			window = v
+		}
+	}
+	return time.Since(time.Unix(0, ld)) < window
 }
 
 // Manager holds the live streams keyed by id.
@@ -1361,12 +1384,19 @@ func (m *Manager) serveProbe(w http.ResponseWriter, r *http.Request) {
 
 	st.touch() // start the puller (pull-fed) + bump lastAccess
 	dlog.Logf("ctl", "id=%s probe: prewarming, waiting up to %dms for data", id, waitMs)
-	deadline := time.Now().Add(time.Duration(waitMs) * time.Millisecond)
-	for st.lastData.Load() == 0 && time.Now().Before(deadline) {
+	// Wait for data that is actually flowing: newer than ProbeFlowing, which a
+	// fed stream always has. Waiting only while the stream had NEVER had data
+	// returned at once for any channel that once had a picture — including one
+	// whose source has since died.
+	start := time.Now()
+	flowing := func() bool { return st.lastData.Load() >= start.Add(-defaults.ProbeFlowing).UnixNano() }
+	deadline := start.Add(time.Duration(waitMs) * time.Millisecond)
+	for !flowing() && time.Now().Before(deadline) {
 		time.Sleep(defaults.ProbePollInterval)
 	}
 
 	status := st.status()
+	status.HasData = flowing()
 	dlog.Logf("ctl", "id=%s probe result: has_data=%v since_data_ms=%d", id, status.HasData, status.SinceDataMs)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
