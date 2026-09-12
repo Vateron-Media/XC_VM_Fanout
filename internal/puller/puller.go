@@ -481,7 +481,12 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 	if ctx.Err() != nil {
 		return copyErr // we cancelled it (stream stop/shutdown) — not a fault
 	}
-	if waitErr != nil {
+	// A context.Canceled from Wait is our own doing, not an ffmpeg fault: ccancel()
+	// above always fires before Wait, and when ffmpeg ends cleanly (exit 0) at the
+	// same instant, Cmd.Wait races its watchdog and can report that cancel instead
+	// of the clean exit. A real ffmpeg failure surfaces as a non-zero *ExitError,
+	// never as context.Canceled, so it is still caught below.
+	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 		if tail := stderr.String(); tail != "" {
 			dlog.Logf("puller", "id=%s ffmpeg exited (%v): %s", src.Label, waitErr, tail)
 		} else {
