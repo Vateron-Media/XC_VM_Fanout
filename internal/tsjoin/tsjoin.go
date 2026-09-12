@@ -368,26 +368,35 @@ func (s *State) Update(chunk []byte) {
 	}
 }
 
-// maxClockStep is the largest PCR advance between two block opens taken at face
-// value. Blocks are a GOP or a maxGOP cut — seconds, not minutes — so a step
-// beyond this is a splice, not time passing.
-const maxClockStep = 60 * 90000
+// maxCadence bounds the step ringClock remembers as the stream's cadence — what
+// it advances by across a discontinuity. A GOP is seconds; a longer step (a
+// maxGOP cut on a slow source with no detectable keyframes, or a forward splice)
+// still counts as time passing, it just is not a cadence to repeat.
+const maxCadence = 60 * 90000
+
+// maxWrap is how far past the 33-bit rollover a backwards step may land and
+// still be read as the wrap rather than a reset.
+const maxWrap = 10 * 60 * 90000
 
 // ringClock stamps a new block with the ring's own clock: the PCR, made monotonic.
 //
 // Retention used to subtract raw PCRs — newest minus oldest — and the PCR is not
 // monotonic. It restarts near zero with every producer restart (a fresh ffmpeg
 // starts its own clock), jumps with a source failover, and wraps at 2^33 every
-// 26.5 hours. Across any of those the difference goes NEGATIVE, which the prune
+// 26.5 hours. Across any of those the difference went NEGATIVE, which the prune
 // read as "still inside the window" — so it stopped dropping anything, and the
 // ring grew to its byte backstop (prebuffer × 24 Mbit/s: 120 MB at the default
 // 40 s, whatever the stream's bitrate) and sat there until every pre-splice block
 // had been pushed out. On a node restarting producers or carrying a source with
 // two interleaved PCR clocks, that was most of the daemon's memory.
 //
-// Here the clock advances by the PCR step when the step is plausible, unwraps the
-// 33-bit rollover, and across anything else keeps going at the last good cadence
-// — so the window stays a window. -1 until the stream has shown a PCR.
+// Here a FORWARD step is taken as time passing, whatever its size: a slow
+// source's long block must advance the clock (capping it froze the clock on
+// keyframe-less radio, whose maxGOP-cut blocks each span minutes), and a forward
+// splice can only make the ring prune sooner, never grow. A backwards step that
+// is the 33-bit wrap is unwrapped. Any other backwards step — a restart, a
+// failover — advances by the last plausible cadence, so the window stays a
+// window. -1 until the stream has shown a PCR.
 func (s *State) ringClock() int64 {
 	if s.lastPCR < 0 {
 		return -1
@@ -397,13 +406,18 @@ func (s *State) ringClock() int64 {
 		return 0
 	}
 	d := s.lastPCR - s.clockPCR
-	if d < 0 && d+ptsWrap <= maxClockStep {
+	switch {
+	case d >= 0:
+		if d > 0 && d <= maxCadence {
+			s.clockStep = d
+		}
+	case d+ptsWrap <= maxWrap:
 		d += ptsWrap // the 33-bit PCR wrap
-	}
-	if d < 0 || d > maxClockStep {
-		d = s.clockStep // discontinuity: carry on at the last known cadence
-	} else {
-		s.clockStep = d
+		if d <= maxCadence {
+			s.clockStep = d
+		}
+	default:
+		d = s.clockStep // a discontinuity: carry on at the last known cadence
 	}
 	s.clockPCR = s.lastPCR
 	s.clockT += d

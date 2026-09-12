@@ -111,3 +111,27 @@ func countKeyframes(ts []byte) int {
 	}
 	return n
 }
+
+// TestRingClockAdvancesOnLongKeyframelessBlocks: a slow source with no
+// detectable keyframes (radio, say) has its blocks cut at maxGOP, and below
+// ~1.4 Mbit/s each one spans more than a minute. Capping the clock's forward
+// step froze it there — every block got the same time, nothing was pruned, and
+// the ring grew to its byte backstop, hours of 128 kbit/s audio sent whole as
+// every join burst.
+func TestRingClockAdvancesOnLongKeyframelessBlocks(t *testing.T) {
+	const perBlock = 50
+	s := New(PacketSize*perBlock, 10000) // maxGOP: a block every 50 packets
+	s.Configure(10000, 0, 0)
+	s.Update(tsfixture.PAT(0x100))
+	s.Update(tsfixture.PMTType(0x100, 0x101, 0x0f)) // AAC only: no video, no keyframes
+	pcr := int64(0)
+	for b := 0; b < 20; b++ {
+		for i := 0; i < perBlock; i++ {
+			pcr += 90 * 90000 / perBlock // 90 s of audio per block
+			s.Update(pcrPacket(0x101, pcr))
+		}
+	}
+	if n := len(s.gops); n > 2 {
+		t.Fatalf("%d 90-second blocks retained in a 10 s window, want the newest one or two", n)
+	}
+}
