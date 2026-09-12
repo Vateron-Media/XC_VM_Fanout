@@ -242,6 +242,13 @@ const (
 	ProbeDefaultWaitMS = 5000
 	ProbeMaxWaitMS     = 30000
 	ProbePollInterval  = 50 * time.Millisecond
+	// ProbeFlowing is how recent a stream's last data must be for /probe to
+	// answer at once, without waiting for new data: a stream this fresh is
+	// flowing, not merely a channel that once had a picture.
+	ProbeFlowing = 2 * time.Second
+	// DataFreshFallback is how recent a stream's data must be for has_data when
+	// the viewer idle timeout is disabled — the window a stream counts as on air.
+	DataFreshFallback = 30 * time.Second
 )
 
 // ── Admin "send message" drawtext overlay ──────────────────────────────────

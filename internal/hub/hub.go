@@ -21,35 +21,59 @@ import (
 // dropped (number of pending chunks).
 const subQueue = defaults.SubscriberQueue
 
-// snapPool recycles the join-burst buffer a viewer receives on connect. That
-// burst is a contiguous copy of up to the whole prebuffer ring (tens of MB at a
-// deep prebuffer); allocating one per connect is the biggest transient on the hot
-// path and, under many concurrent joins, drives the process heap high-water mark
-// that the runtime then holds resident. Pooling caps the live buffers at the
-// concurrent-join count and lets them be reused; sync.Pool still releases idle
-// ones to GC, so nothing is pinned. Buffers are stored by pointer to avoid an
-// allocation on every Put.
-var snapPool = sync.Pool{New: func() any { b := make([]byte, 0); return &b }}
+// Burst is a viewer's join burst: the tables, then keyframe-aligned history.
+//
+// It is NOT a copy of that history. Parts are the ring's own GOP buffers, pinned
+// so that prune cannot recycle them into new GOPs while the viewer is being
+// written — the caller writes them straight to its socket and then Releases the
+// pin. The burst used to be copied into one contiguous buffer per join: up to
+// the whole client prebuffer (30 s by the panel's default, ~30 MB of an 8 Mbit/s
+// channel), allocated on every connect and held for as long as the viewer took
+// to drain it. A zap storm across a node's channels made that the daemon's
+// largest memory term — 90 joins across 30 channels grew the heap by 2 GB in
+// five seconds — and the copy bought nothing the pin did not already provide.
+//
+// Head is a private copy: PAT and PMT are mutated in place as new ones arrive.
+type Burst struct {
+	Head  []byte
+	Parts [][]byte
 
-// maxPooledSnapshot caps the size of a buffer the pool will keep. The pool is
-// process-wide, so without a cap one high-bitrate stream's full-ring burst (a
-// 40 s prebuffer at 20 Mbit/s is ~100 MB) is handed to, and then held by, every
-// other stream that draws from it — a permanent floor set by the worst case
-// rather than the common one. Anything larger is left to GC; the next join for
-// such a stream simply allocates, which is what it did before pooling existed.
-const maxPooledSnapshot = 16 << 20
+	h    *Hub
+	once sync.Once
+}
 
-func snapGet() []byte { return (*snapPool.Get().(*[]byte))[:0] }
-
-// ReleaseSnapshot returns a join-burst buffer (from Subscribe) to the pool once
-// the caller has finished writing it. Safe to call once with any snapshot slice;
-// a nil/empty-capacity slice is ignored, as is one too large to be worth keeping.
-func ReleaseSnapshot(b []byte) {
-	if cap(b) == 0 || cap(b) > maxPooledSnapshot {
-		return
+// Len is the burst's size in bytes.
+func (b *Burst) Len() int {
+	n := len(b.Head)
+	for _, p := range b.Parts {
+		n += len(p)
 	}
-	b = b[:0]
-	snapPool.Put(&b)
+	return n
+}
+
+// Bytes returns the burst as one contiguous copy — for callers that need a
+// single buffer (tests); a viewer writes Head and Parts instead.
+func (b *Burst) Bytes() []byte {
+	out := make([]byte, 0, b.Len())
+	out = append(out, b.Head...)
+	for _, p := range b.Parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
+// Release unpins the burst's GOP buffers, letting the ring recycle them again.
+// Call it once the burst has been written or abandoned; the Parts must not be
+// read afterwards. Safe to call more than once.
+func (b *Burst) Release() {
+	b.once.Do(func() {
+		if b.h == nil {
+			return
+		}
+		b.h.mu.Lock()
+		b.h.join.Unpin()
+		b.h.mu.Unlock()
+	})
 }
 
 // Sub is a single subscriber's delivery channel.
@@ -117,30 +141,67 @@ func (h *Hub) Publish(chunk []byte) {
 }
 
 // Subscribe registers a new subscriber and returns it together with the join
-// snapshot the caller must send before draining Sub.C(). prebufMS is how many
-// milliseconds of prebuffer the subscriber wants (0 = current GOP only).
-// Registering the subscriber and capturing the snapshot happen under the same
-// lock, so the live tail continues exactly where the snapshot ends — no gap, no
-// duplication. The returned snapshot is drawn from a pool; the caller SHOULD
-// ReleaseSnapshot it once written so the buffer can be reused.
+// burst the caller must write before draining Sub.C(), and then Release. prebufMS
+// is how many milliseconds of prebuffer the subscriber wants (0 = current GOP
+// only). Registering the subscriber and capturing the burst happen under the same
+// lock, so the live tail continues exactly where the burst ends — no gap, no
+// duplication.
 //
-// Only the CAPTURE is under the lock. The copy that follows is the expensive
-// part — up to the whole ring, ~5 ms for a 40 s / 14 MB prebuffer — and running
-// it under the lock stalled the stream's producer for that long on every join,
-// serialising a join storm (a channel going live, an EPG event) into a stall
-// proportional to the number of joiners. The capture pins the GOP buffers so
-// prune cannot recycle them mid-copy; everything published from the moment of
-// registration reaches this subscriber through its channel instead, so releasing
-// the lock early costs no atomicity.
-func (h *Hub) Subscribe(prebufMS int64) (*Sub, []byte) {
-	buf := snapGet()
+// Only the capture is under the lock, and nothing is copied at all: the burst's
+// GOP buffers are pinned, which is what lets the caller write them — for as long
+// as a slow viewer takes — with the lock released and the producer running.
+// Everything published from the moment of registration reaches this subscriber
+// through its channel instead.
+func (h *Hub) Subscribe(prebufMS int64) (*Sub, *Burst) {
 	h.mu.Lock()
-	head, parts := h.join.SnapshotPin(buf, prebufMS)
+	head, parts := h.join.SnapshotPin(nil, prebufMS)
 	s := &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()
 
-	return s, h.copyPinned(head, parts)
+	return s, &Burst{Head: head, Parts: parts, h: h}
+}
+
+// Join begins a viewer's join WITHOUT subscribing it: the header to write first
+// (PAT/PMT) and a cursor at the start of its prebufMS of history. The viewer then
+// takes that history with CatchUp, straight out of the ring, and is subscribed to
+// the live tail only when it reaches the edge.
+//
+// Subscribing at once and queuing the live tail behind the history is what
+// Subscribe does, and it forces a choice: a queue short enough to be cheap
+// (256 chunks, ~5 s of a 4.7 Mbit/s stream) drops every viewer whose link cannot
+// take a 30 s burst within that — anything under ~30 Mbit/s, which reconnects
+// into another burst — and one long enough to hold the burst lets each stalled
+// viewer pin up to that much stream in memory. Reading the ring forward needs
+// neither: the history is already there, once, for everyone.
+func (h *Hub) Join(prebufMS int64) ([]byte, tsjoin.Cursor) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.join.JoinStart(nil, prebufMS)
+}
+
+// CatchUp returns the next run (about max bytes) of a joining viewer's history
+// from c, pinned in a Burst the caller writes and Releases, and the cursor after
+// it. When that run reaches the live edge the viewer is subscribed in the same
+// critical section (sub != nil), so the live tail continues exactly where the
+// run ends — no gap, no duplication. behind reports that c has left the ring: a
+// viewer slower than the stream, which can never catch up and should be let go.
+func (h *Hub) CatchUp(c tsjoin.Cursor, max int) (burst *Burst, next tsjoin.Cursor, sub *Sub, behind bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	parts, next, atEnd, behind := h.join.ReadFrom(c, max)
+	if behind {
+		return &Burst{}, c, nil, true
+	}
+	burst = &Burst{Parts: parts}
+	if len(parts) > 0 {
+		burst.h = h // pinned: Release unpins
+	}
+	if atEnd {
+		sub = &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
+		h.subs[sub] = struct{}{}
+	}
+	return burst, next, sub, false
 }
 
 // Snapshot returns a fresh clean-entry snapshot (PAT/PMT + keyframe, optionally
@@ -285,6 +346,13 @@ func (h *Hub) CloseAll() int {
 	}
 	h.mu.Unlock()
 	return n
+}
+
+// RingStats reports the join ring's bytes, span (ms) and GOP count.
+func (h *Hub) RingStats() (bytes int, spanMS int64, gops int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.join.RingStats()
 }
 
 // Count returns the current number of subscribers.

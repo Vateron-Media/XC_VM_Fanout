@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -138,5 +139,59 @@ func TestMemoryScavengerRateFloor(t *testing.T) {
 	}
 	if m.gatedSinceScavenge.Load() {
 		t.Error("a ring collapse did not trigger a release: the gate must bypass the rate floor")
+	}
+}
+
+// TestRingCollapseReleasesEvenBelowTheThreshold: the GOPs a gate drops are
+// garbage, not the swept free heap the threshold measures, and on a steady
+// ingest no GC comes along to sweep them — so the threshold is never met on
+// their account. A collapse must force the release anyway, or the collapsed
+// ring stays resident: 30 channels' rings held 513 MB while the heap sat at 1.9 GB.
+func TestRingCollapseReleasesEvenBelowTheThreshold(t *testing.T) {
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A threshold no heap can reach: only the gate may cause a release.
+	m.startMemoryScavenger(ctx, 10*time.Millisecond, 1<<62, 0)
+
+	m.gatedSinceScavenge.Store(true)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && m.gatedSinceScavenge.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if m.gatedSinceScavenge.Load() {
+		t.Fatal("a ring collapse did not trigger a release while the swept-free heap was under the threshold")
+	}
+}
+
+// TestReRegisteringWithTheSameKeyKeepsTheCache: the panel re-registers a stream
+// on every request it serves, HLS playlist polls included. Dropping the segment
+// cache each time left it empty, so every segment was re-assembled and
+// re-encrypted per viewer; only a change of key makes cached segments stale.
+func TestReRegisteringWithTheSameKeyKeepsTheCache(t *testing.T) {
+	mgr := NewManager(1<<20, 20000, 2, 6, time.Second)
+	st := mgr.GetOrCreate("5")
+	key, iv := strings.Repeat("ab", 16), strings.Repeat("cd", 16)
+	st.setEnc(key, iv)
+	feedStream(st)
+	if st.hlsSegment(0) == nil {
+		t.Fatal("no segment to cache")
+	}
+	cached := func() int {
+		st.segMu.Lock()
+		defer st.segMu.Unlock()
+		return len(st.segCache)
+	}
+	if cached() == 0 {
+		t.Fatal("the segment was not cached")
+	}
+	st.setEnc(key, iv) // the next playlist poll
+	if cached() == 0 {
+		t.Fatal("re-registering with the same key dropped the segment cache")
+	}
+	st.setEnc(strings.Repeat("ef", 16), iv) // a real key change
+	if cached() != 0 {
+		t.Fatal("a new key left segments encrypted with the old one in the cache")
 	}
 }

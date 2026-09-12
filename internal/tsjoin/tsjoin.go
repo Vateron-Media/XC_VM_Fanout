@@ -42,8 +42,11 @@ const pcrHz = 90
 type gop struct {
 	id   int64
 	data []byte
-	pcr  int64 // PCR base at open (90 kHz), or -1 — drives ring retention
-	pts  int64 // HLS clock at open: the keyframe's PES PTS, or the PCR fallback, or -1
+	// t is the ring clock at open (90 kHz), or -1 before the stream has shown a
+	// PCR — see ringClock. It drives retention and the prebuffer walk-back, and it
+	// only ever moves forward, which the raw PCR does not.
+	t   int64
+	pts int64 // HLS clock at open: the keyframe's PES PTS, or the PCR fallback, or -1
 	// video reports that this block opens on a VIDEO random-access point, i.e. a
 	// decoder handed these bytes starts producing pictures. A block opened by the
 	// maxGOP cut (a source with no detectable keyframes) or by the pre-roll before
@@ -64,6 +67,10 @@ type hlsSeg struct {
 	startID int64
 	endID   int64
 	durMS   int64
+	// disc: the stream's timeline jumped just before this segment (a producer
+	// restart, a failover, a splice) — the playlist marks it
+	// #EXT-X-DISCONTINUITY so a player resets its clock instead of stalling.
+	disc bool
 }
 
 // State accumulates join information from a packet-aligned byte stream.
@@ -87,9 +94,21 @@ type State struct {
 	videoFrames int64
 	gops        []gop // oldest→newest; the last element is the open (current) GOP
 	lastPCR     int64 // most recent PCR base seen (90 kHz), or -1
-	maxGOP      int   // cap on a single GOP's length (bytes) — memory guard
-	ring90      int64 // history retained, in 90 kHz ticks (0 = current GOP only)
-	maxRing     int   // absolute byte ceiling for the whole ring — memory backstop
+	// pcrPID is the PMT's PCR_PID, or -1. Once a PCR has been seen on it, only
+	// that PID drives the clock: a source carrying a second, unrelated PCR (another
+	// programme, a passthrough of a muxer that stamps several PIDs) would otherwise
+	// interleave two clocks, and the ring's duration would be noise.
+	pcrPID   int
+	pcrOnPID bool
+	// The ring clock (ringClock): the PCR it last advanced from, the monotonic
+	// time it has reached, and the last plausible step, reused across a
+	// discontinuity.
+	clockPCR  int64
+	clockT    int64
+	clockStep int64
+	maxGOP    int   // cap on a single GOP's length (bytes) — memory guard
+	ring90    int64 // history retained, in 90 kHz ticks (0 = current GOP only)
+	maxRing   int   // absolute byte ceiling for the whole ring — memory backstop
 
 	// pins counts snapshots currently copying out of the ring. While non-zero,
 	// prune must not RECYCLE a dropped GOP's array (it leaves it to GC instead):
@@ -115,6 +134,9 @@ type State struct {
 	nextSeq     int      // next HLS media sequence number
 	segStartID  int64    // open segment's first GOP id, or -1 = none open
 	segStartPTS int64    // open segment's start HLS clock (90 kHz)
+	segStartT   int64    // open segment's start on the ring clock, or -1
+	segDisc     bool     // the open segment starts after a timeline jump
+	discDropped int      // discontinuities in segments pruned out of s.segs
 
 	// plCache is the last rendered playlist, valid until the segment list changes.
 	// Every HLS viewer polls index.m3u8 on its own schedule, so an audience of a few
@@ -142,7 +164,7 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
@@ -257,7 +279,12 @@ func (s *State) Update(chunk []byte) {
 		rap := false
 		if hasAdaptation && pkt[4] > 0 {
 			flags := pkt[5]
-			if flags&0x10 != 0 { // PCR_flag: refresh the stream clock
+			// PCR_flag: refresh the stream clock — from the programme's own PCR
+			// PID once that has shown one, from any PID until then.
+			if flags&0x10 != 0 && (pid == s.pcrPID || !s.pcrOnPID) {
+				if pid == s.pcrPID {
+					s.pcrOnPID = true
+				}
 				s.lastPCR = readPCR(pkt)
 			}
 			if flags&0x40 != 0 { // random_access_indicator
@@ -286,6 +313,9 @@ func (s *State) Update(chunk []byte) {
 			if v, t := parseVideoPID(pkt); v >= 0 {
 				s.videoPID, s.videoType = v, t
 			}
+			if m, ok := tspes.ParsePMT(pkt); ok && int(m.PCRPID) != s.pcrPID {
+				s.pcrPID, s.pcrOnPID = int(m.PCRPID), false
+			}
 			if a := parseAudioPID(pkt); a >= 0 {
 				s.audioPID = a
 			}
@@ -305,14 +335,15 @@ func (s *State) Update(chunk []byte) {
 			// it just does not drive HLS. gop.pts is the video PTS, else -1.
 			id := s.nextGOPID
 			s.nextGOPID++
+			t := s.ringClock()
 			pts := int64(-1)
 			if s.videoPID >= 0 && pid == s.videoPID {
 				if p, ok := parsePTS(pkt); ok {
 					pts = p
-					s.hlsOnKeyframe(id, pts)
+					s.hlsOnKeyframe(id, pts, t)
 				}
 			}
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts, video: onVideo})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: t, pts: pts, video: onVideo})
 			s.prune()
 		case len(s.gops) > 0 && len(s.gops[len(s.gops)-1].data)+PacketSize <= s.maxGOP:
 			g := &s.gops[len(s.gops)-1]
@@ -339,10 +370,66 @@ func (s *State) Update(chunk []byte) {
 			}
 			id := s.nextGOPID
 			s.nextGOPID++
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: -1})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: s.ringClock(), pts: -1})
 			s.prune()
 		}
 	}
+}
+
+// maxCadence bounds the step ringClock remembers as the stream's cadence — what
+// it advances by across a discontinuity. A GOP is seconds; a longer step (a
+// maxGOP cut on a slow source with no detectable keyframes, or a forward splice)
+// still counts as time passing, it just is not a cadence to repeat.
+const maxCadence = 60 * 90000
+
+// maxWrap is how far past the 33-bit rollover a backwards step may land and
+// still be read as the wrap rather than a reset.
+const maxWrap = 10 * 60 * 90000
+
+// ringClock stamps a new block with the ring's own clock: the PCR, made monotonic.
+//
+// Retention used to subtract raw PCRs — newest minus oldest — and the PCR is not
+// monotonic. It restarts near zero with every producer restart (a fresh ffmpeg
+// starts its own clock), jumps with a source failover, and wraps at 2^33 every
+// 26.5 hours. Across any of those the difference went NEGATIVE, which the prune
+// read as "still inside the window" — so it stopped dropping anything, and the
+// ring grew to its byte backstop (prebuffer × 24 Mbit/s: 120 MB at the default
+// 40 s, whatever the stream's bitrate) and sat there until every pre-splice block
+// had been pushed out. On a node restarting producers or carrying a source with
+// two interleaved PCR clocks, that was most of the daemon's memory.
+//
+// Here a FORWARD step is taken as time passing, whatever its size: a slow
+// source's long block must advance the clock (capping it froze the clock on
+// keyframe-less radio, whose maxGOP-cut blocks each span minutes), and a forward
+// splice can only make the ring prune sooner, never grow. A backwards step that
+// is the 33-bit wrap is unwrapped. Any other backwards step — a restart, a
+// failover — advances by the last plausible cadence, so the window stays a
+// window. -1 until the stream has shown a PCR.
+func (s *State) ringClock() int64 {
+	if s.lastPCR < 0 {
+		return -1
+	}
+	if s.clockPCR < 0 {
+		s.clockPCR, s.clockT = s.lastPCR, 0
+		return 0
+	}
+	d := s.lastPCR - s.clockPCR
+	switch {
+	case d >= 0:
+		if d > 0 && d <= maxCadence {
+			s.clockStep = d
+		}
+	case d+ptsWrap <= maxWrap:
+		d += ptsWrap // the 33-bit PCR wrap
+		if d <= maxCadence {
+			s.clockStep = d
+		}
+	default:
+		d = s.clockStep // a discontinuity: carry on at the last known cadence
+	}
+	s.clockPCR = s.lastPCR
+	s.clockT += d
+	return s.clockT
 }
 
 // prune drops the oldest GOPs once the ring exceeds the configured duration
@@ -358,11 +445,11 @@ func (s *State) prune() {
 		}
 		return
 	}
-	// Duration-based prune (needs valid PCR on both ends).
-	if newest := s.gops[len(s.gops)-1].pcr; newest >= 0 {
+	// Duration-based prune, on the ring clock (needs one on both ends).
+	if newest := s.gops[len(s.gops)-1].t; newest >= 0 {
 		drop := 0
 		for drop < len(s.gops)-1 {
-			if p := s.gops[drop].pcr; p >= 0 && newest-p <= s.ring90 {
+			if p := s.gops[drop].t; p >= 0 && newest-p <= s.ring90 {
 				break
 			}
 			drop++
@@ -393,31 +480,59 @@ func (s *State) prune() {
 // keyframe opens the next one. Called before the new GOP is appended, so
 // s.gops[last] is the closing segment's final GOP. No-op unless the HLS view is
 // enabled and PCR timing is available.
-func (s *State) hlsOnKeyframe(newID, newPTS int64) {
+func (s *State) hlsOnKeyframe(newID, newPTS, newT int64) {
 	if s.hlsTargetMS <= 0 {
 		return
 	}
 	if s.segStartID < 0 {
-		s.segStartID, s.segStartPTS = newID, newPTS
+		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
 		return
 	}
 	if newPTS < 0 || s.segStartPTS < 0 {
 		return // cannot measure duration without a clock on both ends
 	}
 	d := newPTS - s.segStartPTS
-	if d < 0 {
+	switch {
+	case d >= 0 && d <= maxCadence:
+		// time moved on by a plausible amount: the segment clock
+	case d < 0 && d+ptsWrap <= maxWrap:
 		d += ptsWrap // straddled the 33-bit wrap
+	default:
+		// The timeline jumped: a producer restart starts its PTS over, a
+		// failover lands on another clock, a splice skips ahead. Adding 2^33 to
+		// every backwards step read a restart as the wrap and closed a segment of
+		// ~26 hours — #EXTINF and #EXT-X-TARGETDURATION of ~95000 s, and players
+		// broken until it left the window. The open segment ends here instead (a
+		// segment must not span two timelines), timed on the ring clock, which is
+		// monotonic by construction; the next one is marked a discontinuity.
+		dur := int64(-1)
+		if newT >= 0 && s.segStartT >= 0 {
+			dur = (newT - s.segStartT) / pcrHz
+		}
+		if dur <= 0 {
+			dur = s.hlsTargetMS
+		}
+		s.closeSegment(newID, dur)
+		s.segDisc = true
+		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+		return
 	}
 	if d >= s.hlsTargetMS*pcrHz {
-		endID := s.segStartID
-		if n := len(s.gops); n > 0 {
-			endID = s.gops[n-1].id
-		}
-		s.segs = append(s.segs, hlsSeg{seq: s.nextSeq, startID: s.segStartID, endID: endID, durMS: d / pcrHz})
-		s.nextSeq++
-		s.plValid = false
-		s.segStartID, s.segStartPTS = newID, newPTS
+		s.closeSegment(newID, d/pcrHz)
+		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
 	}
+}
+
+// closeSegment ends the open segment at the GOP before newID, lasting durMS.
+func (s *State) closeSegment(newID, durMS int64) {
+	endID := s.segStartID
+	if n := len(s.gops); n > 0 {
+		endID = s.gops[n-1].id
+	}
+	s.segs = append(s.segs, hlsSeg{seq: s.nextSeq, startID: s.segStartID, endID: endID, durMS: durMS, disc: s.segDisc})
+	s.segDisc = false
+	s.nextSeq++
+	s.plValid = false
 }
 
 // hlsPrune drops segments whose GOPs have fully aged out of the ring, so the
@@ -432,6 +547,11 @@ func (s *State) hlsPrune() {
 		drop++
 	}
 	if drop > 0 {
+		for _, sg := range s.segs[:drop] {
+			if sg.disc {
+				s.discDropped++
+			}
+		}
 		s.segs = append(s.segs[:0], s.segs[drop:]...)
 		s.plValid = false
 	}
@@ -459,6 +579,15 @@ func (s *State) HLSPlaylist() string {
 		start = len(avail) - s.hlsWindow
 	}
 	win := avail[start:]
+	// Discontinuities before the window — pruned, or in the reserved margin —
+	// set #EXT-X-DISCONTINUITY-SEQUENCE, as the HLS spec requires once a
+	// segment carrying one has left the playlist.
+	discSeq := s.discDropped
+	for _, sg := range s.segs[:len(s.segs)-len(win)] {
+		if sg.disc {
+			discSeq++
+		}
+	}
 	maxDur := 0.0
 	for _, sg := range win {
 		if d := float64(sg.durMS) / 1000.0; d > maxDur {
@@ -469,7 +598,13 @@ func (s *State) HLSPlaylist() string {
 	b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(maxDur)))
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", win[0].seq)
+	if discSeq > 0 {
+		fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
+	}
 	for _, sg := range win {
+		if sg.disc {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%d.ts\n", float64(sg.durMS)/1000.0, sg.seq)
 	}
 	s.plCache, s.plValid = b.String(), true
@@ -589,25 +724,7 @@ func (s *State) SnapshotInto(dst []byte, reqMS int64) []byte {
 // published after that point reaches the viewer through its channel, everything
 // before it is in these bytes, with no gap and no duplication.
 func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
-	start := len(s.gops) - 1
-	if start < 0 {
-		start = 0
-	}
-	if reqMS > 0 && len(s.gops) > 0 {
-		if newest := s.gops[len(s.gops)-1].pcr; newest >= 0 {
-			req := reqMS * pcrHz
-			i := len(s.gops) - 1
-			for i > 0 {
-				if p := s.gops[i-1].pcr; p < 0 || newest-p > req {
-					break
-				}
-				i--
-			}
-			start = i
-		}
-	}
-
-	start = s.snapshotStart(start)
+	start := s.joinIndex(reqMS)
 
 	out := append(dst[:0], s.lastPAT...)
 	out = append(out, s.lastPMT...)
@@ -618,6 +735,113 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 	}
 	s.pins++
 	return out, parts
+}
+
+// joinIndex is the ring index a join with a reqMS prebuffer starts at: that far
+// back on the ring clock (0 or no clock: the current block), then moved to a
+// block a decoder can begin on.
+func (s *State) joinIndex(reqMS int64) int {
+	start := len(s.gops) - 1
+	if start < 0 {
+		start = 0
+	}
+	if reqMS > 0 && len(s.gops) > 0 {
+		if newest := s.gops[len(s.gops)-1].t; newest >= 0 {
+			req := reqMS * pcrHz
+			i := len(s.gops) - 1
+			for i > 0 {
+				if p := s.gops[i-1].t; p < 0 || newest-p > req {
+					break
+				}
+				i--
+			}
+			start = i
+		}
+	}
+	return s.snapshotStart(start)
+}
+
+// Cursor is a joining viewer's place in the ring: the block it is in, and how
+// many of that block's bytes it has already been written.
+type Cursor struct {
+	GOP int64
+	Off int
+}
+
+// JoinStart begins a join: the header a viewer is written first (latest PAT and
+// PMT, copied — they are mutated in place) and the cursor its history starts
+// at. Nothing is pinned and nothing registered; the viewer catches up with
+// ReadFrom. Caller (Hub) serialises access.
+func (s *State) JoinStart(dst []byte, reqMS int64) ([]byte, Cursor) {
+	head := append(dst[:0], s.lastPAT...)
+	head = append(head, s.lastPMT...)
+	if len(s.gops) == 0 {
+		return head, Cursor{GOP: s.nextGOPID} // nothing retained yet: start at the edge
+	}
+	return head, Cursor{GOP: s.gops[s.joinIndex(reqMS)].id}
+}
+
+// ReadFrom returns the ring's bytes from c onwards — about max of them, cut on
+// a packet boundary — and the cursor after them, PINNED (the caller writes them
+// with the lock released, then Unpins; nothing is pinned when parts is empty).
+// atEnd reports that they reach the live edge: everything the ring holds. behind
+// reports that c's block has left the ring — the reader fell further behind than
+// the ring reaches.
+//
+// This is how a viewer takes its join history without a copy AND without a
+// queue: it reads the ring forward in runs until it is at the edge, and only
+// then subscribes to the live tail. The live tail used to queue behind the whole
+// burst instead, and a queue short enough to be cheap dropped every viewer whose
+// link could not take a 30 s burst in ~5 s. Caller (Hub) serialises access.
+func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool) {
+	if len(s.gops) == 0 {
+		return nil, c, true, false
+	}
+	first := s.gops[0].id
+	if c.GOP < first {
+		return nil, c, false, true
+	}
+	i := int(c.GOP - first) // ids are consecutive: blocks are appended in order and pruned from the front
+	if i >= len(s.gops) {
+		return nil, c, true, false
+	}
+	if max < PacketSize {
+		max = PacketSize
+	}
+	n := 0
+	next = c
+	for ; i < len(s.gops); i++ {
+		g := s.gops[i]
+		off := 0
+		if g.id == c.GOP {
+			off = c.Off
+		}
+		if off > len(g.data) {
+			off = len(g.data)
+		}
+		rem := g.data[off:]
+		if n+len(rem) > max {
+			take := (max - n) / PacketSize * PacketSize
+			if take > 0 {
+				parts = append(parts, rem[:take])
+				n += take
+			}
+			next = Cursor{GOP: g.id, Off: off + take}
+			if len(parts) > 0 {
+				s.pins++
+			}
+			return parts, next, false, false
+		}
+		if len(rem) > 0 {
+			parts = append(parts, rem)
+			n += len(rem)
+		}
+		next = Cursor{GOP: g.id, Off: len(g.data)}
+	}
+	if len(parts) > 0 {
+		s.pins++
+	}
+	return parts, next, true, false
 }
 
 // snapshotStart moves a join's first block to one a decoder can start on: the
@@ -655,11 +879,32 @@ func (s *State) snapshotStart(start int) int {
 // (two packets) so a restarted puller still has program info before its first
 // keyframe. Caller (Hub) serialises access.
 func (s *State) Reset() {
+	for _, sg := range s.segs {
+		if sg.disc {
+			s.discDropped++
+		}
+	}
 	s.gops = nil
 	s.segs = nil
 	s.freeBufs = nil
-	s.segStartID, s.segStartPTS = -1, -1
+	s.segStartID, s.segStartPTS, s.segStartT = -1, -1, -1
+	// Whatever the producer sends next follows a gap: its first segment is a
+	// discontinuity to anyone who saw the ones before.
+	s.segDisc = s.nextSeq > 0
 	s.plCache, s.plValid = "", false
+}
+
+// RingStats reports what the ring holds: its bytes, how much stream time they
+// span on the ring clock (ms; 0 without one), and its GOP count. For the memory
+// report — the ring is most of the daemon's heap. Caller (Hub) serialises access.
+func (s *State) RingStats() (bytes int, spanMS int64, gops int) {
+	for i := range s.gops {
+		bytes += len(s.gops[i].data)
+	}
+	if n := len(s.gops); n > 1 && s.gops[0].t >= 0 && s.gops[n-1].t >= 0 {
+		spanMS = (s.gops[n-1].t - s.gops[0].t) / pcrHz
+	}
+	return bytes, spanMS, len(s.gops)
 }
 
 // Unpin releases a SnapshotPin, letting prune recycle dropped GOP buffers again.

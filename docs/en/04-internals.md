@@ -92,6 +92,19 @@ bytes at 188-byte spacing) before it is accepted: IPTV upstreams routinely serve
 `application/octet-stream`, so the header alone is neither sufficient nor necessary, and an MP4 or
 an HTML error page served with a generic type would otherwise be fanned out as if it were video.
 
+**How it reads them** (the same reader serves the daemon's pull path and the native remuxer):
+
+- A **live** HLS playlist is joined **three segments from its end**, as ffmpeg's demuxer does
+  (`live_start_index -3`); a VOD playlist (`#EXT-X-ENDLIST`) plays from its start. Before 0.13.2 the
+  whole window went into the pipeline at download speed, and again on every reconnect.
+- A stalled source is closed so the pull reconnects or fails over, but the bound is the source's
+  own: a live HLS source is silent for a whole segment between bursts, so its bound is **three
+  target durations** (never under 8 s), which also catches a playlist that stopped updating. A flat
+  8 s closed every source with longer segments between two healthy ones. The ffmpeg path is bounded
+  too, and a silent ffmpeg is ended rather than left holding the stream.
+- `rtp://` datagrams have their RTP header stripped (RFC 3550: CSRCs, extension, padding); it used
+  to reach the stream and misalign it by 12 bytes per datagram.
+
 Which path a stream took is in the debug log — `connected native (no ffmpeg child)` or
 `connected via ffmpeg remux`. Choosing between them is
 [`source_backend`](06-configuration.md#the-source-backend).
@@ -161,10 +174,10 @@ One `Hub` per stream.
   removed. This way one lagging viewer **never stalls the source or the others**.
 - **`Subscribe(prebufMS)`**: under a single mutex it simultaneously **captures** the history to send
   and registers the subscriber. Atomicity matters: the live tail continues exactly where the
-  snapshot ended — **with no gap and no duplication**. The copy itself happens with the lock
-  **released** — see below.
+  snapshot ended — **with no gap and no duplication**. Nothing is copied: the viewer is written
+  straight out of the ring's pinned GOP buffers, with the lock **released** — see below.
 
-#### Why the join copy is not done under the lock
+#### Why the join burst is neither copied nor written under the lock
 
 The snapshot a viewer gets on connect is up to the whole ring: **14 MB at a 40 s prebuffer**,
 ~3 ms to copy. Doing that under the hub lock stalled the stream's producer for that long on
@@ -182,6 +195,26 @@ joining viewer receives a splice of two different points in the stream.
 Atomicity survives because the capture fixes the content at the moment of registration: the open
 GOP growing afterwards is invisible (the captured length does not move), and every chunk published
 from that point reaches the viewer through its channel instead.
+
+**Since 0.13.2 a live-TS viewer catches up through the ring instead.** `Subscribe` (above) is
+still the primitive, but `serveLive` no longer registers the viewer and queues the live tail behind
+its history. `Hub.Join` places a **cursor** at the start of the viewer's prebuffer and registers
+nothing; `Hub.CatchUp` then hands it the ring's bytes from that cursor in pinned runs of 1 MB, and
+subscribes it to the live tail **in the same critical section in which a run reaches the edge** —
+so the tail continues exactly where the history ends, the same no-gap, no-duplicate guarantee.
+
+Two earlier shapes each failed at scale. Copying the burst per viewer allocated up to the whole
+client prebuffer on every join (the panel's `client_prebuffer` defaults to **30 s** — ~30 MB of an
+8 Mbit/s channel) and held it while the viewer drained it: 90 viewers joining with `prebuffer=30`
+across 30 channels grew the heap by 2 GB in five seconds. Writing the pinned burst without a copy
+fixed that, but left the live tail queuing behind the history in the subscriber's 256-chunk queue
+(~5 s of a 4.7 Mbit/s stream) — so every viewer whose link could not take a 30 s burst within ~5 s
+(anything under ~30 Mbit/s) was dropped as "too slow" and reconnected into another burst; and a
+queue sized to the burst instead let each stalled viewer pin that much stream (a 200-channel stress
+run reached a 5–7 GB heap on 2–3 GB of rings). Reading the ring forward needs neither: the history
+is already there, once, for everyone. A viewer on any link faster than the stream catches up with
+the fixed queue; one slower than the stream falls off the ring's tail and is let go; and a pin
+lasts one run, never a whole burst.
 
 ```
 lock held per join:      3.13 ms → 1.30 µs
@@ -245,7 +278,8 @@ a new viewer needs to start:
 
 - the last **PAT** and the last **PMT** (the PMT PID is computed from the PAT);
 - a **ring of GOPs** — blocks "from one keyframe to the next keyframe", each tagged
-  with a **monotonic id** and a time from the PCR clock (90 kHz).
+  with a **monotonic id** and a time on the **ring clock**: the PCR (90 kHz), made monotonic —
+  see below.
 
 Since **0.11.1** this ring is the daemon's **single per-stream buffer**: it serves the live-TS
 clean join and prebuffer, *and* HLS is derived from it (see
@@ -262,7 +296,7 @@ How it works:
   from the middle of a GOP whose SPS/PPS it never got — `non-existing PPS 0 referenced`, a black
   picture until the next real keyframe, and with `prebuffer=0` (only the current GOP is kept) that
   was **every** join. A stream with no video at all (radio) keeps the plain random-access rule;
-- `prune()` discards old GOPs: by **duration** (capped at `prebuffer_max_sec`
+- `prune()` discards old GOPs: by **duration** on the ring clock (capped at `prebuffer_max_sec`
   seconds, if PCR parses) or by a **byte backstop** (~24 Mbit/s estimate — in
   case PCR can't be read), so that the ring doesn't grow without bound. When the stream is
   **idle** the ring is collapsed to `prebuffer_max_sec × idle_buffer_ratio` (see
@@ -273,6 +307,35 @@ How it works:
     random-access block at or after it, else the newest one before it;
   - `reqMS > 0` → the ring is rewound to a keyframe ~N seconds back, and the viewer gets
     more history, so that their player starts with an already filled cache.
+
+#### The ring clock
+
+Retention used to subtract raw PCRs — newest minus oldest — and **the PCR is not monotonic**. It
+starts over near zero with every producer restart (a fresh ffmpeg starts its own clock), jumps with
+a source failover, and wraps at 2³³ every 26.5 hours. Across any of those the difference went
+**negative**, which `prune` read as "still inside the window", so it stopped dropping anything:
+the ring grew to its byte backstop — `prebuffer × 24 Mbit/s`, **120 MB at the default 40 s**
+(60 MB when idle-gated) whatever the stream's real bitrate — and stayed there until every
+pre-splice GOP had been pushed out. A source carrying a second, unrelated PCR on another PID flipped
+the sign constantly and never pruned at all.
+
+Since 0.13.2 each GOP is stamped by `ringClock()`: a **forward** step advances it by the PCR
+difference, whatever its size (a slow keyframe-less source's blocks can each span minutes, and a
+forward splice only makes the ring prune sooner); the 33-bit rollover is unwrapped; and any other
+**backwards** step — a restart, a failover — advances it by the last plausible cadence (0–60 s),
+so the window stays a window. And once the PMT's declared **PCR PID** has shown a
+PCR, only that PID drives the clock. Measured on real ffmpeg output across a producer restart, a
+20 s window held:
+
+```
+before:  35 GOPs (~70 s of video)
+after:   11 GOPs (20.0 s)
+```
+
+On a daemon with 30 supervised channels, restarting every producer once took the heap from 602 MB
+to 1,963 MB and kept it there for minutes; at 155 channels that is the difference between a node
+at a few GB and one at 9 GB. `GET /memory` on the control socket shows each ring's bytes and span,
+so an operator can see this directly — see [03. HTTP endpoints](03-endpoints.md#get-memory--where-the-memory-is).
 
 This reproduces `client_prebuffer` from the legacy `live.php`, which the transfer via X-Accel
 otherwise bypasses. The prebuffer depth is the **panel's** call: it passes the chosen value in
@@ -315,7 +378,12 @@ How it works now:
   ["the idle-buffer gate"](06-configuration.md#the-idle-buffer-gate).
 
 The playlist is a standard `#EXTM3U` version 3 with `EXT-X-TARGETDURATION`, `EXT-X-MEDIA-SEQUENCE`
-and `#EXTINF` lines (durations from PCR/PTS deltas); the segment URIs are `<seq>.ts`. The `Hub`
+and `#EXTINF` lines (durations from video PTS deltas); the segment URIs are `<seq>.ts`. A PTS step
+backwards that is not the 33-bit wrap, or a forward jump beyond 60 s, is a timeline change — a
+producer restart, a failover, a splice: the open segment ends there, timed on the ring clock, and
+the next one is marked `#EXT-X-DISCONTINUITY`, with discontinuities that leave the playlist counted
+in `#EXT-X-DISCONTINUITY-SEQUENCE`. (Before 0.13.2 such a step was read as the wrap and closed a
+segment of ~26 hours — `#EXT-X-TARGETDURATION:94410` after a single restart.) The `Hub`
 exposes this as `Configure` / `HLSPlaylist` / `HLSSegment`.
 
 ### Sources without keyframes

@@ -28,8 +28,8 @@ func TestRemuxEndToEndProducesPlayableSegments(t *testing.T) {
 	const (
 		streamID   = "900"
 		segTargetS = 2
-		keyframes  = 12  // 12 GOPs, 1s apart
-		fillPerGOP = 40  // padding packets per GOP, so segments have real size
+		keyframes  = 12 // 12 GOPs, 1s apart
+		fillPerGOP = 40 // padding packets per GOP, so segments have real size
 	)
 
 	m := NewManager(1<<20, 30000, segTargetS, 6, time.Second)
@@ -183,11 +183,32 @@ func readJoinBurst(t *testing.T, url string) []byte {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("live TS returned %d", resp.StatusCode)
 	}
-	// One read is enough: the join burst is written as a single chunk before the
-	// live tail begins.
-	buf := make([]byte, 1<<20)
-	n, _ := resp.Body.Read(buf)
-	return buf[:n]
+	// The burst arrives as several writes — the tables, then each GOP, straight
+	// out of the ring — so read until the connection goes quiet rather than
+	// trusting one Read to return all of it.
+	var out []byte
+	buf := make([]byte, 64<<10)
+	for len(out) < 1<<20 {
+		type res struct {
+			n   int
+			err error
+		}
+		ch := make(chan res, 1)
+		go func() {
+			n, err := resp.Body.Read(buf)
+			ch <- res{n, err}
+		}()
+		select {
+		case r := <-ch:
+			out = append(out, buf[:r.n]...)
+			if r.err != nil {
+				return out
+			}
+		case <-time.After(200 * time.Millisecond):
+			return out // quiet: the burst is done, the live tail has not started
+		}
+	}
+	return out
 }
 
 // hasPID reports whether any packet in the buffer is on the given PID.

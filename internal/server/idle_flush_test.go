@@ -96,9 +96,10 @@ func TestIdleStopReleasesTheRing(t *testing.T) {
 	if st.Hub.Count() != 0 {
 		t.Fatal("touch must not subscribe")
 	}
-	sub, snap := st.Hub.Subscribe(0)
+	sub, burst := st.Hub.Subscribe(0)
 	defer st.Hub.Unsubscribe(sub)
-	if len(snap) == 0 {
+	defer burst.Release()
+	if burst.Len() == 0 {
 		t.Error("the ring did not refill after a flush: a joiner got no clean-entry snapshot")
 	}
 }

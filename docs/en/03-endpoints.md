@@ -157,7 +157,7 @@ Returns enough JSON for the PHP authorizer to decide the off-air question:
 |------|-------|
 | `running` | The puller is running. |
 | `refs` | How many live-TS viewers are connected right now. |
-| `has_data` | Whether at least one non-empty chunk of data has arrived. |
+| `has_data` | Whether the stream is on air **now**: data within the viewer idle timeout (`viewer_idle_timeout_sec`, 30 s by default). Before 0.13.2 it meant "has ever had data", so a channel whose source had died still answered on air. |
 | `since_data_ms` | Milliseconds since the last non-empty chunk; `-1` if there has been no data. |
 
 "`running=true` but `has_data=false`, or a large `since_data_ms`" = the source is dead → PHP
@@ -212,7 +212,9 @@ The handler is [`serveProbe`](../../internal/server/server.go).
 
 PHP calls this after registering a proxy source: if there is no data by the time `wait` elapses
 (`has_data=false`), it shows "not on air" instead of letting the viewer hang on a dead
-source. The warmed-up puller keeps running, so the viewer's real connection is
+source. It answers at once only for a stream whose data is flowing (newer than 2 s); otherwise it
+waits for data newer than the probe itself — a channel that once had a picture is not on air for
+that alone. The warmed-up puller keeps running, so the viewer's real connection is
 picked up by it; if no viewer arrives, the reaper stops the puller.
 
 ### `GET /connections` — viewer reconciliation
@@ -266,6 +268,43 @@ is live on more than one stream, the higher rate wins.
 > faster than the live tail is fanned out).
 
 **Response:** `200`, `Content-Type: application/json`, body — for example `{"uuid-1":512,"uuid-2":498}`.
+
+### `GET /memory` — where the memory is
+
+Read-only. The daemon's memory by what holds it: the per-stream join rings — the dominant term by
+design — against the Go heap as a whole, so an operator whose node runs hot can tell "the rings are
+as big as the config says" from "something else is growing" without a profiler.
+
+```json
+{
+  "streams": 155,
+  "ring_bytes": 2147483648,
+  "heap_in_use_bytes": 2415919104,
+  "heap_goal_bytes": 3623878656,
+  "mapped_bytes": 3865470566,
+  "released_bytes": 402653184,
+  "largest": [
+    { "id": "412", "bytes": 41943040, "seconds": 40, "gops": 21, "viewers": 3, "gated": false }
+  ]
+}
+```
+
+| Field | Meaning |
+|------|-------|
+| `ring_bytes` | Every stream's ring together. |
+| `heap_in_use_bytes` | Heap objects, live and not yet swept. |
+| `heap_goal_bytes` | The size the GC lets the heap reach before collecting (`GOGC`, soft limit). |
+| `mapped_bytes` / `released_bytes` | Memory the runtime holds from the OS, and how much of it is already returned (not resident). |
+| `largest` | The ten biggest rings: bytes, the stream time they span, GOPs, live-TS viewers, and whether the idle gate has collapsed them. |
+
+A ring should span about `prebuffer_max_sec` seconds while watched and `× idle_buffer_ratio`
+while gated. One far bigger than that, at the byte backstop (`prebuffer × 24 Mbit/s`), is a stream
+whose clock the ring cannot read. The heap figures come from `runtime/metrics`, which — unlike
+`runtime.ReadMemStats` — does not stop the world, so this is safe to poll on a busy node:
+
+```bash
+curl -s --unix-socket /home/xc_vm/bin/xc_fanout/sockets/control.sock http://localhost/memory | jq
+```
 
 ### `POST /signal/<uuid>` — admin "send message" overlay
 

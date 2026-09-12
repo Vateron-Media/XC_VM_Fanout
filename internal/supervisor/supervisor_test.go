@@ -57,10 +57,11 @@ type harness struct {
 	sup *Supervisor
 
 	mu       sync.Mutex
-	launched []string        // command lines, in order
-	procs    []*fakeProcess  // the processes handed out
-	launchEr []error         // pre-seeded launch failures, consumed in order
-	data     bool            // what hasData reports
+	launched []string       // command lines, in order
+	procs    []*fakeProcess // the processes handed out
+	launchEr []error        // pre-seeded launch failures, consumed in order
+	data     bool           // what hasData reports, whatever the start time
+	dataAt   time.Time      // when set: a data event, confirming only starts launched before it
 	spawned  chan *fakeProcess
 }
 
@@ -91,9 +92,12 @@ func newHarness(t *testing.T) *harness {
 		default:
 		}
 		return p, nil
-	}, func(string) bool {
+	}, func(_ string, since time.Time) bool {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		if !h.dataAt.IsZero() {
+			return h.dataAt.After(since)
+		}
 		return h.data
 	})
 	// Keep the retry sleeps out of the test's wall clock.
@@ -115,6 +119,10 @@ func newHarness(t *testing.T) *harness {
 }
 
 func (h *harness) setData(v bool) { h.mu.Lock(); h.data = v; h.mu.Unlock() }
+
+// dataNow records bytes arriving now: it confirms a start launched before this
+// moment, and no start launched after it.
+func (h *harness) dataNow() { h.mu.Lock(); h.dataAt = time.Now(); h.mu.Unlock() }
 
 func (h *harness) failNextLaunches(errs ...error) {
 	h.mu.Lock()

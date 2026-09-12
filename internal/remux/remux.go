@@ -100,7 +100,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return classify(ctx, err)
 	}
-	src = nativesrc.WrapIdleTimeout(src, cfg.IdleTimeout)
+	src = nativesrc.WrapIdleTimeout(src, nativesrc.IdleBound(src, cfg.IdleTimeout))
 	defer src.Close()
 
 	var feed *ingestWriter

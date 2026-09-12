@@ -12,6 +12,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"runtime/metrics"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +84,12 @@ type Stream struct {
 	// ring is unreachable and never freed.
 	ingestMu    sync.Mutex
 	ingestConns map[net.Conn]struct{}
+	// ingestGen names the current listener. A connection is admitted only by
+	// the generation that accepted it: Accept can hand one back just before
+	// the listener is closed, and without this it was added to the map after
+	// closeIngestConns had emptied it — a producer feeding a stream nothing
+	// could reach any more.
+	ingestGen int
 
 	// sourcePath is the route the puller last settled on (puller.Path*), written
 	// from the pull goroutine and read by the snapshot, so it is atomic.
@@ -128,9 +136,17 @@ func (s *Stream) setEnc(keyHex, ivHex string) {
 		}
 	}
 	s.encMu.Lock()
+	changed := !bytes.Equal(s.hlsKey, k) || !bytes.Equal(s.hlsIV, iv)
 	s.hlsKey, s.hlsIV = k, iv
 	s.encMu.Unlock()
-	s.dropSegCache() // cached segments carry the OLD key's ciphertext
+	// Cached segments carry the OLD key's ciphertext — but only a change of key
+	// makes them stale. The panel re-registers a stream on every request it
+	// serves, HLS playlist polls included, and dropping the cache each time left
+	// the single-flight cache empty: every segment re-assembled and re-encrypted
+	// per viewer.
+	if changed {
+		s.dropSegCache()
+	}
 }
 
 // encryptSegment returns the segment encrypted for HLS when a key is set, else
@@ -324,14 +340,21 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 	s.ingestLn = ln
 	s.ingestSock = sockPath
 	ch := s.chunk
+	s.ingestMu.Lock()
+	s.ingestGen++
+	gen := s.ingestGen
+	s.ingestMu.Unlock()
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return // listener closed (stopIngestLocked)
 			}
+			if !s.addIngestConn(conn, gen) {
+				_ = conn.Close() // accepted just as the listener was stopped
+				continue
+			}
 			dlog.Logf("ingest", "id=%s producer connected on %s", s.id, sockPath)
-			s.addIngestConn(conn)
 			go func(c net.Conn) {
 				defer s.removeIngestConn(c)
 				defer c.Close()
@@ -343,13 +366,19 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 	return nil
 }
 
-func (s *Stream) addIngestConn(c net.Conn) {
+// addIngestConn admits a producer accepted by listener generation gen, and
+// reports false — the caller closes it — when that listener has since stopped.
+func (s *Stream) addIngestConn(c net.Conn, gen int) bool {
 	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if gen != s.ingestGen {
+		return false
+	}
 	if s.ingestConns == nil {
 		s.ingestConns = make(map[net.Conn]struct{})
 	}
 	s.ingestConns[c] = struct{}{}
-	s.ingestMu.Unlock()
+	return true
 }
 
 func (s *Stream) removeIngestConn(c net.Conn) {
@@ -362,6 +391,7 @@ func (s *Stream) removeIngestConn(c net.Conn) {
 // it is safe to call with s.mu held (the accept path never takes s.mu).
 func (s *Stream) closeIngestConns() int {
 	s.ingestMu.Lock()
+	s.ingestGen++ // whatever the old listener is still handing back is refused
 	n := len(s.ingestConns)
 	for c := range s.ingestConns {
 		_ = c.Close()
@@ -407,6 +437,7 @@ func (s *Stream) Publish(chunk []byte) {
 func (s *Stream) setConfig(src puller.Source, chunk int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed := s.cfg != nil && !sameSource(*s.cfg, src)
 	c := src
 	s.cfg = &c
 	if chunk > 0 {
@@ -414,8 +445,25 @@ func (s *Stream) setConfig(src puller.Source, chunk int) {
 	}
 	dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, src.URLs, src.Proxy, s.refs)
 	if s.refs > 0 {
+		// A running puller holds the Source it started with, so an edit made in
+		// the panel (a new URL, a changed user agent) reached a watched channel
+		// only after its audience had been gone for the whole grace period —
+		// never, on a busy one. Restart it when the source really changed; the
+		// panel re-registers on every request, so an identical config must not.
+		if changed && s.running {
+			dlog.Logf("ctl", "id=%s source changed while running: restarting the puller", s.id)
+			s.stopLocked()
+		}
 		s.startLocked()
 	}
+}
+
+// sameSource reports whether two registrations describe the same pull — every
+// field that shapes what is fetched and how.
+func sameSource(a, b puller.Source) bool {
+	return slices.Equal(a.URLs, b.URLs) && a.UserAgent == b.UserAgent && a.Proxy == b.Proxy &&
+		a.Cookie == b.Cookie && a.FfmpegBin == b.FfmpegBin && a.Insecure == b.Insecure &&
+		slices.Equal(a.Headers, b.Headers) && a.Backend == b.Backend
 }
 
 func (s *Stream) startLocked() {
@@ -640,11 +688,34 @@ func (s *Stream) status() streamStatus {
 	running, refs := s.running, s.refs
 	s.mu.Unlock()
 	ld := s.lastData.Load()
-	st := streamStatus{Running: running, Refs: refs, HasData: ld != 0, SinceDataMs: -1}
+	st := streamStatus{Running: running, Refs: refs, HasData: s.onAir(), SinceDataMs: -1}
 	if ld != 0 {
 		st.SinceDataMs = time.Since(time.Unix(0, ld)).Milliseconds()
 	}
 	return st
+}
+
+// onAir reports whether the stream has published recently enough to count as
+// on air: within the viewer idle timeout — the same silence that would drop a
+// viewer — or DataFreshFallback when that timeout is off.
+//
+// has_data used to mean "has EVER had data". The panel reads nothing else (its
+// probe and isStreamFed both check has_data alone), and the Stream outlives its
+// producers, so a channel whose source died an hour ago still answered "on
+// air": the viewer was handed a dead stream and dropped for silence 30 s later,
+// instead of getting the not-on-air page.
+func (s *Stream) onAir() bool {
+	ld := s.lastData.Load()
+	if ld == 0 {
+		return false
+	}
+	window := defaults.DataFreshFallback
+	if s.mgr != nil {
+		if v := time.Duration(s.mgr.viewerIdleNS.Load()); v > 0 {
+			window = v
+		}
+	}
+	return time.Since(time.Unix(0, ld)) < window
 }
 
 // Manager holds the live streams keyed by id.
@@ -925,10 +996,19 @@ func (m *Manager) startMemoryScavenger(ctx context.Context, interval time.Durati
 			case now := <-t.C:
 				metrics.Read(samples)
 				retained := samples[0].Value.Uint64()
-				if retained < threshold {
+				// A ring collapse releases first, threshold or not. heap/free counts
+				// memory a GC has already swept; the GOPs a gate just dropped are not
+				// that yet — they are garbage, and on a steady ingest (GOP buffers
+				// recycled, next to nothing allocated) no GC comes along to sweep
+				// them. This check used to come after the threshold, which such
+				// garbage can never meet, so a collapsed ring's bytes stayed resident
+				// indefinitely: on 30 channels the rings held 513 MB and the heap
+				// 1.9 GB. The forced collection is what turns them into memory the
+				// OS gets back.
+				gated := m.gatedSinceScavenge.Swap(false)
+				if !gated && retained < threshold {
 					continue
 				}
-				gated := m.gatedSinceScavenge.Swap(false)
 				if !gated && !lastRelease.IsZero() && now.Sub(lastRelease) < minGap {
 					continue // rate floor: not worth another full GC yet
 				}
@@ -1176,6 +1256,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/monitor/", m.serveMonitor)
 	mux.HandleFunc("/monitors", m.serveMonitors)
 	mux.HandleFunc("/monitors/state", m.serveMonitorStates)
+	mux.HandleFunc("/memory", m.serveMemory)
 	return mux
 }
 
@@ -1351,12 +1432,19 @@ func (m *Manager) serveProbe(w http.ResponseWriter, r *http.Request) {
 
 	st.touch() // start the puller (pull-fed) + bump lastAccess
 	dlog.Logf("ctl", "id=%s probe: prewarming, waiting up to %dms for data", id, waitMs)
-	deadline := time.Now().Add(time.Duration(waitMs) * time.Millisecond)
-	for st.lastData.Load() == 0 && time.Now().Before(deadline) {
+	// Wait for data that is actually flowing: newer than ProbeFlowing, which a
+	// fed stream always has. Waiting only while the stream had NEVER had data
+	// returned at once for any channel that once had a picture — including one
+	// whose source has since died.
+	start := time.Now()
+	flowing := func() bool { return st.lastData.Load() >= start.Add(-defaults.ProbeFlowing).UnixNano() }
+	deadline := start.Add(time.Duration(waitMs) * time.Millisecond)
+	for !flowing() && time.Now().Before(deadline) {
 		time.Sleep(defaults.ProbePollInterval)
 	}
 
 	status := st.status()
+	status.HasData = flowing()
 	dlog.Logf("ctl", "id=%s probe result: has_data=%v since_data_ms=%d", id, status.HasData, status.SinceDataMs)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
@@ -1463,6 +1551,12 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// joinRunBytes is how much join history a viewer is written per pinned run
+// while it catches up to the live edge: big enough to keep lock round-trips
+// rare, small enough that a slow viewer never holds a pin — which suspends GOP
+// recycling for the whole stream — for more than a moment.
+const joinRunBytes = 1 << 20
+
 func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/live/")
 	st := m.Get(id)
@@ -1485,11 +1579,11 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// would do it too, but only after Subscribe had already copied.
 	st.restoreBuffer()
 
-	// Subscribe FIRST, then attach: registering the subscriber before the puller
-	// starts is what guarantees no published chunk falls between the snapshot and
-	// the live tail.
-	sub, snap := st.Hub.Subscribe(prebufMS)
-	defer st.Hub.Unsubscribe(sub)
+	// Place the join FIRST, then attach: the cursor fixes where this viewer's
+	// history starts before the puller (if it was stopped) begins publishing, and
+	// the catch-up below subscribes it at the live edge with no gap between the
+	// history and the live tail.
+	head, cur := st.Hub.Join(prebufMS)
 	st.attach()
 	defer st.detach()
 
@@ -1573,17 +1667,53 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	}
 	lastChunk := time.Now()
 
-	// Write the join burst, then return its (pooled) buffer at once — the viewer
-	// holds no reference to it past this write, so it can be reused by the next
-	// connect instead of lingering as garbage for the whole session.
-	var snapErr error
-	if len(snap) > 0 {
-		snapErr = write(snap)
+	// Take the join history straight out of the ring — the tables, then the
+	// prebuffer in runs of joinRunBytes, each pinned only while it is written —
+	// and subscribe to the live tail in the same step that reaches the edge.
+	// Nothing of the history is copied per viewer, and nothing queues behind it:
+	// a viewer takes it at its own link speed, and one slower than the stream
+	// falls off the ring's tail and is let go. Between runs, stop the moment the
+	// viewer is kicked or gone.
+	if len(head) > 0 {
+		if err := write(head); err != nil {
+			reason = writeFailReason(err)
+			return
+		}
 	}
-	hub.ReleaseSnapshot(snap)
-	if snapErr != nil {
-		reason = writeFailReason(snapErr)
-		return
+	var sub *hub.Sub
+	for sub == nil {
+		burst, next, s, behind := st.Hub.CatchUp(cur, joinRunBytes)
+		if behind {
+			reason = "dropped: fell behind the ring while taking its prebuffer (link slower than the stream)"
+			return
+		}
+		if s != nil {
+			sub = s
+			defer st.Hub.Unsubscribe(sub)
+		}
+		var werr error
+		for _, p := range burst.Parts {
+			select {
+			case <-killC:
+				burst.Release()
+				reason = "dropped by panel (kick / connection limit)"
+				return
+			case <-r.Context().Done():
+				burst.Release()
+				reason = "client closed (during the join)"
+				return
+			default:
+			}
+			if werr = write(p); werr != nil {
+				break
+			}
+		}
+		burst.Release()
+		if werr != nil {
+			reason = writeFailReason(werr)
+			return
+		}
+		cur = next
 	}
 	lastChunk = time.Now()
 	for {

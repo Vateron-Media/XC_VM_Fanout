@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
@@ -225,13 +226,27 @@ type Launcher func(ctx context.Context, cmdline, stderrPath string) (Process, er
 type Supervisor struct {
 	mu    sync.Mutex
 	procs map[string]*stream
+	// idLocks orders the control operations on one stream (Supervise, Release).
+	// A hand-over stops the old loop with s.mu released — stopping waits for the
+	// loop to unwind — and a second PUT or a Release in that window used to find
+	// the slot empty: the PUT installed a stream the first one then overwrote,
+	// orphaning a loop and its encoder (two feeding one ingest, one nobody could
+	// release), and the Release was silently undone. Per stream, so a cron pass
+	// handing over a whole node does not queue its streams behind one another.
+	idLocks map[string]*sync.Mutex
 
-	launch  Launcher
-	hasData func(id string) bool // "did bytes actually arrive for this stream?"
-	vitals  VitalsFunc           // what the output looks like right now
-	probe   Prober               // is a source reachable, without starting it
-	find    ProcessFinder        // is this pid alive, and what is it running
-	killPID func(pid int)        // end an adopted (non-child) process
+	launch Launcher
+	// hasData reports whether bytes arrived for the stream AFTER since — the
+	// moment this start was launched. "Has this stream ever had data" is not the
+	// question: the daemon's Stream outlives every encoder, so once a channel had
+	// data at all, every later start would be confirmed on its first poll — a
+	// dead source then never counts as a failed start, stop_failures never fires
+	// and the backup source is never tried.
+	hasData func(id string, since time.Time) bool
+	vitals  VitalsFunc    // what the output looks like right now
+	probe   Prober        // is a source reachable, without starting it
+	find    ProcessFinder // is this pid alive, and what is it running
+	killPID func(pid int) // end an adopted (non-child) process
 	now     func() time.Time
 	sleep   func(context.Context, time.Duration) bool
 
@@ -245,15 +260,16 @@ type Supervisor struct {
 // asks its own registry whether the stream has produced bytes, which is the
 // direct form of the question the panel could only answer by polling for a
 // playlist file. A nil hasData treats a live process as started.
-func New(launch Launcher, hasData func(id string) bool) *Supervisor {
+func New(launch Launcher, hasData func(id string, since time.Time) bool) *Supervisor {
 	if launch == nil {
 		launch = shellLauncher
 	}
 	if hasData == nil {
-		hasData = func(string) bool { return true }
+		hasData = func(string, time.Time) bool { return true }
 	}
 	return &Supervisor{
 		procs:      make(map[string]*stream),
+		idLocks:    make(map[string]*sync.Mutex),
 		launch:     launch,
 		hasData:    hasData,
 		now:        time.Now,
@@ -300,6 +316,9 @@ type stream struct {
 	sup    *Supervisor
 	cancel context.CancelFunc
 	done   chan struct{}
+	// killOnExit tells the loop that its cancellation is a stop, not a detach:
+	// it must end its encoder on the way out (see stop).
+	killOnExit atomic.Bool
 
 	mu   sync.Mutex
 	spec Spec
@@ -357,11 +376,15 @@ func (s *Supervisor) Supervise(id string, spec Spec) error {
 		return err
 	}
 
+	l := s.idLock(id)
+	l.Lock()
+	defer l.Unlock()
+
 	s.mu.Lock()
 	if old := s.procs[id]; old != nil {
 		delete(s.procs, id)
 		s.mu.Unlock()
-		old.stop() // outside the lock: stop() waits for the loop to unwind
+		old.stop() // outside s.mu: stop() waits for the loop to unwind
 		s.mu.Lock()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -377,8 +400,24 @@ func (s *Supervisor) Supervise(id string, spec Spec) error {
 	return nil
 }
 
+// idLock is the lock that orders control operations on one stream.
+func (s *Supervisor) idLock(id string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.idLocks[id]
+	if l == nil {
+		l = &sync.Mutex{}
+		s.idLocks[id] = l
+	}
+	return l
+}
+
 // Release stops supervising a stream and kills its process. Idempotent.
 func (s *Supervisor) Release(id string) bool {
+	l := s.idLock(id)
+	l.Lock()
+	defer l.Unlock()
+
 	s.mu.Lock()
 	st := s.procs[id]
 	delete(s.procs, id)
@@ -484,14 +523,17 @@ func (st *stream) detach() {
 
 // stop cancels the loop, kills the process and waits for the loop to finish, so
 // a caller that stops a stream knows nothing of it is still running afterwards.
+//
+// The kill is the LOOP's to make, on its way out: stop only asks for it. Killing
+// from here raced the loop — cancel wakes it, it clears st.proc as it leaves, and
+// a stop that read st.proc a moment later found nothing to kill, while the
+// launcher deliberately does not tie the process to the context (a detach must
+// leave it running). The encoder then outlived its stream: still holding the
+// source, still feeding the ingest, and — on a re-hand-over — running beside
+// the new one, with its pid file already gone so no one would ever adopt it.
 func (st *stream) stop() {
+	st.killOnExit.Store(true)
 	st.cancel()
-	st.mu.Lock()
-	p := st.proc
-	st.mu.Unlock()
-	if p != nil {
-		p.Kill()
-	}
 	<-st.done
 	st.clearPIDFile()
 }
@@ -559,7 +601,13 @@ func (st *stream) run(ctx context.Context) {
 		st.markStopped(nil)
 
 		if ctx.Err() != nil {
-			return // we ended it (Release / shutdown), not a fault
+			// We ended it (Release / shutdown), not a fault. A stop ends the
+			// encoder with it; a detach leaves it for the next daemon to adopt.
+			if st.killOnExit.Load() {
+				proc.Kill()
+				proc.Wait()
+			}
+			return
 		}
 		if verdict.failed() {
 			// Condemned rather than crashed: kill it before restarting, or the
@@ -841,6 +889,7 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	st.markAdopted(false)
 
 	cmd, fallback := st.commandFor(src)
+	launchedAt := st.sup.now()
 	proc, err := st.sup.launch(ctx, cmd, spec.ErrorsPath)
 	if err != nil {
 		return nil, fmt.Errorf("launch: %w", err)
@@ -874,7 +923,7 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 		default:
 		}
 
-		if st.sup.hasData(st.id) {
+		if st.sup.hasData(st.id, launchedAt) {
 			// Hand the already-running Wait to the caller rather than starting a
 			// second one on the underlying process.
 			return newWaitedProcess(proc, exited), nil
