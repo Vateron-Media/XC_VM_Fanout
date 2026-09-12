@@ -90,6 +90,10 @@ type Hub struct {
 	// a parked follower wakes to an ended stream instead of blocking forever.
 	wake   chan struct{}
 	closed bool
+	// armed: Follow has handed the current wake channel to a parked viewer since
+	// the last signal. Only then does Publish close and replace it — re-arming on
+	// every chunk made a channel per Publish on every stream, watched or not.
+	armed bool
 }
 
 // New returns a Hub. maxGOP caps a single GOP (bytes); maxPrebufMS is how many
@@ -122,8 +126,9 @@ func (h *Hub) signalWake() {
 func (h *Hub) Publish(chunk []byte) {
 	h.mu.Lock()
 	h.join.Update(chunk)
-	if len(chunk) > 0 && !h.closed {
+	if len(chunk) > 0 && h.armed && !h.closed {
 		h.signalWake()
+		h.armed = false
 	}
 	h.mu.Unlock()
 }
@@ -161,6 +166,7 @@ func (h *Hub) Follow(c tsjoin.Cursor, max int) (burst *Burst, next tsjoin.Cursor
 	}
 	if atEnd {
 		wake = h.wake // park on this; the next Publish closes it
+		h.armed = true
 	}
 	return burst, next, atEnd, wake, false, false
 }
