@@ -2,24 +2,24 @@
 // XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
 // See LICENSE and LICENSE-ADDITIONAL-TERMS.md
 
-// Package hub fans one producer's MPEG-TS byte stream out to many subscribers.
+// Package hub fans one producer's MPEG-TS byte stream out to many viewers.
 //
-// One Hub per live stream. The producer calls Publish; each subscriber gets a
-// clean join snapshot (PAT/PMT + current GOP) followed by the live tail. A
-// subscriber that cannot keep up (its buffer fills) is dropped so it can never
-// stall the producer or the other subscribers.
+// One Hub per live stream. The producer calls Publish, which folds each chunk
+// into the single in-memory ring (internal/tsjoin) and wakes any viewer parked at
+// the live edge. A viewer follows the ring by cursor for its whole session — the
+// join history and then the live tail — via Join + Follow (ADR 0004): it reads the
+// ring forward in pinned runs and, at the edge, parks on the wake signal until the
+// next Publish. A viewer slower than the stream has its cursor pruned off the
+// ring's tail (Follow reports it behind) and is let go, so it can never stall the
+// producer or the other viewers. There is no per-viewer copy and no per-viewer
+// queue: the ring is the one byte store for join, live tail and HLS alike.
 package hub
 
 import (
 	"sync"
 
-	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsjoin"
 )
-
-// subQueue bounds how much a single subscriber may fall behind before it is
-// dropped (number of pending chunks).
-const subQueue = defaults.SubscriberQueue
 
 // Burst is a viewer's join burst: the tables, then keyframe-aligned history.
 //
@@ -76,138 +76,109 @@ func (b *Burst) Release() {
 	})
 }
 
-// Sub is a single subscriber's delivery channel.
-type Sub struct {
-	ch   chan []byte
-	done chan struct{}
-	once sync.Once
-}
-
-// C is the stream of chunks to write to the client.
-func (s *Sub) C() <-chan []byte { return s.ch }
-
-// Done is closed when the subscriber is dropped or unsubscribed.
-func (s *Sub) Done() <-chan struct{} { return s.done }
-
-func (s *Sub) close() { s.once.Do(func() { close(s.done) }) }
-
 // Hub is the per-stream fan-out point.
 type Hub struct {
 	mu   sync.Mutex
-	subs map[*Sub]struct{}
 	join *tsjoin.State
+
+	// wake is the follower notify signal (ADR 0004): a channel closed and
+	// replaced under h.mu on every data Publish, so a viewer parked at the live
+	// edge (Follow, atEnd) wakes and reads the newly-appended ring bytes. Capturing
+	// it under the same lock that Publish takes to close it is what makes it
+	// lost-wakeup-free — see Follow. closed is set once by CloseAll (teardown), so
+	// a parked follower wakes to an ended stream instead of blocking forever.
+	wake   chan struct{}
+	closed bool
 }
 
 // New returns a Hub. maxGOP caps a single GOP (bytes); maxPrebufMS is how many
 // milliseconds of keyframe-aligned history the join state keeps for client
 // prebuffer (0 = current GOP only).
 func New(maxGOP int, maxPrebufMS int64) *Hub {
-	return &Hub{subs: make(map[*Sub]struct{}), join: tsjoin.New(maxGOP, maxPrebufMS)}
+	return &Hub{join: tsjoin.New(maxGOP, maxPrebufMS), wake: make(chan struct{})}
 }
 
-// Publish folds a packet-aligned chunk into the join state and broadcasts it to
-// every subscriber. Slow subscribers are dropped rather than blocked.
+// signalWake wakes every follower parked at the live edge and re-arms the signal
+// for the next Publish. Caller holds h.mu and has checked !h.closed (after CloseAll
+// the channel is closed for good and must not be closed again).
+func (h *Hub) signalWake() {
+	close(h.wake)
+	h.wake = make(chan struct{})
+}
+
+// Publish folds a packet-aligned chunk into the ring and wakes any viewer parked
+// at the live edge (ADR 0004). There is no per-chunk copy and no broadcast: the
+// chunk is folded in place — join.Update copies what it retains into the ring's
+// own (recycled) GOP buffers and keeps no reference to the input, and Update runs
+// to completion before Publish returns, so the caller may reuse its buffer at
+// once. Viewers read those bytes back out of the ring themselves (Follow), so the
+// only work here is the single ring copy every published byte already needed. This
+// is what removed the per-chunk broadcast allocation and the redundant second copy
+// that the old push-to-N-channels fan-out made on every watched stream.
 //
-// The per-chunk copy is made ONLY when there are subscribers: a subscriber holds
-// the buffer in its channel across later Publish calls, so it must get a stable
-// copy the caller cannot overwrite. With no subscribers (a fed-but-unwatched
-// stream — the common idle case) the chunk is folded in place: join.Update copies
-// what it retains into the ring's own (recycled) GOP buffers and keeps no
-// reference to the input, and Update runs to completion before Publish returns, so
-// the caller may reuse its buffer either way. Skipping the copy here removes the
-// dominant per-chunk allocation on idle streams (it was the main remaining GC
-// churn once GOP buffers were recycled).
+// The wake is skipped for an empty chunk (nothing was appended to wake for) and
+// after teardown (the wake channel is already closed for good — see CloseAll).
 func (h *Hub) Publish(chunk []byte) {
 	h.mu.Lock()
-	if len(h.subs) == 0 {
-		h.join.Update(chunk)
-		h.mu.Unlock()
-		return
-	}
-
-	b := make([]byte, len(chunk))
-	copy(b, chunk)
-	h.join.Update(b)
-	for s := range h.subs {
-		select {
-		case s.ch <- b:
-		default:
-			// Subscriber is too slow — drop it.
-			delete(h.subs, s)
-			s.close()
-		}
+	h.join.Update(chunk)
+	if len(chunk) > 0 && !h.closed {
+		h.signalWake()
 	}
 	h.mu.Unlock()
 }
 
-// Subscribe registers a new subscriber and returns it together with the join
-// burst the caller must write before draining Sub.C(), and then Release. prebufMS
-// is how many milliseconds of prebuffer the subscriber wants (0 = current GOP
-// only). Registering the subscriber and capturing the burst happen under the same
-// lock, so the live tail continues exactly where the burst ends — no gap, no
-// duplication.
+// Follow returns the next run of ring bytes from cursor c — about max of them,
+// pinned in a Burst the caller writes and then Releases — and the cursor after
+// it. It is the pull-based live path of ADR 0004: a viewer follows the ring by
+// cursor for its whole session (join and tail), reading forward in runs and,
+// when it reaches the live edge, parking on wake until the next Publish.
 //
-// Only the capture is under the lock, and nothing is copied at all: the burst's
-// GOP buffers are pinned, which is what lets the caller write them — for as long
-// as a slow viewer takes — with the lock released and the producer running.
-// Everything published from the moment of registration reaches this subscriber
-// through its channel instead.
-func (h *Hub) Subscribe(prebufMS int64) (*Sub, *Burst) {
-	h.mu.Lock()
-	head, parts := h.join.SnapshotPin(nil, prebufMS)
-	s := &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
-	h.subs[s] = struct{}{}
-	h.mu.Unlock()
-
-	return s, &Burst{Head: head, Parts: parts, h: h}
-}
-
-// Join begins a viewer's join WITHOUT subscribing it: the header to write first
-// (PAT/PMT) and a cursor at the start of its prebufMS of history. The viewer then
-// takes that history with CatchUp, straight out of the ring, and is subscribed to
-// the live tail only when it reaches the edge.
+//   - behind: c has left the ring (a reader slower than the stream) — drop it.
+//   - ended: the stream was torn down (CloseAll) — return.
+//   - atEnd: the run reached the live edge; wake is a channel closed by the next
+//     data Publish (or by teardown). Select on it — together with the caller's
+//     ctx / kick / idle-timeout — then call Follow again. wake is nil when there
+//     is more to read right now (keep reading before parking).
 //
-// Subscribing at once and queuing the live tail behind the history is what
-// Subscribe does, and it forces a choice: a queue short enough to be cheap
-// (256 chunks, ~5 s of a 4.7 Mbit/s stream) drops every viewer whose link cannot
-// take a 30 s burst within that — anything under ~30 Mbit/s, which reconnects
-// into another burst — and one long enough to hold the burst lets each stalled
-// viewer pin up to that much stream in memory. Reading the ring forward needs
-// neither: the history is already there, once, for everyone.
-func (h *Hub) Join(prebufMS int64) ([]byte, tsjoin.Cursor) {
+// The wake channel is captured under the same lock Publish takes to close it, so
+// a Publish landing between this return and the caller's select finds the channel
+// already closed: the select fires at once and the caller re-reads. No wakeup is
+// lost. Nothing is pinned when the returned Burst has no parts.
+func (h *Hub) Follow(c tsjoin.Cursor, max int) (burst *Burst, next tsjoin.Cursor, atEnd bool, wake <-chan struct{}, behind, ended bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.join.JoinStart(nil, prebufMS)
-}
-
-// CatchUp returns the next run (about max bytes) of a joining viewer's history
-// from c, pinned in a Burst the caller writes and Releases, and the cursor after
-// it. When that run reaches the live edge the viewer is subscribed in the same
-// critical section (sub != nil), so the live tail continues exactly where the
-// run ends — no gap, no duplication. behind reports that c has left the ring: a
-// viewer slower than the stream, which can never catch up and should be let go.
-func (h *Hub) CatchUp(c tsjoin.Cursor, max int) (burst *Burst, next tsjoin.Cursor, sub *Sub, behind bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	if h.closed {
+		return &Burst{}, c, false, nil, false, true
+	}
 	parts, next, atEnd, behind := h.join.ReadFrom(c, max)
 	if behind {
-		return &Burst{}, c, nil, true
+		return &Burst{}, c, false, nil, true, false
 	}
 	burst = &Burst{Parts: parts}
 	if len(parts) > 0 {
 		burst.h = h // pinned: Release unpins
 	}
 	if atEnd {
-		sub = &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
-		h.subs[sub] = struct{}{}
+		wake = h.wake // park on this; the next Publish closes it
 	}
-	return burst, next, sub, false
+	return burst, next, atEnd, wake, false, false
+}
+
+// Join begins a viewer's session: the header to write first (PAT/PMT, copied —
+// they are mutated in place) and a cursor at the start of its prebufMS of history.
+// The viewer then reads the ring forward from that cursor with Follow — the
+// history and then the live tail — with nothing copied per viewer and nothing
+// queued: the history is already in the ring, once, for everyone.
+func (h *Hub) Join(prebufMS int64) ([]byte, tsjoin.Cursor) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.join.JoinStart(nil, prebufMS)
 }
 
 // Snapshot returns a fresh clean-entry snapshot (PAT/PMT + keyframe, optionally
-// prebufMS of history) without subscribing — used to re-seed a decoder mid-stream
-// (e.g. the transient ffmpeg that burns a "send message" overlay for one viewer).
-// Like Subscribe, it copies with the lock released.
+// prebufMS of history) — used to re-seed a decoder mid-stream (e.g. the transient
+// ffmpeg that burns a "send message" overlay for one viewer). Only the capture is
+// under the lock; it copies out with the lock released, the pin making that safe.
 func (h *Hub) Snapshot(prebufMS int64) []byte {
 	h.mu.Lock()
 	head, parts := h.join.SnapshotPin(nil, prebufMS)
@@ -320,32 +291,23 @@ func (h *Hub) NoKeyframeCuts() int64 {
 	return n
 }
 
-// Unsubscribe removes a subscriber (idempotent).
-func (h *Hub) Unsubscribe(s *Sub) {
+// CloseAll marks the hub torn down and wakes every viewer parked at the live edge
+// so its next Follow returns ended and its serveLive unwinds. Called when a stream
+// is removed from the registry (DELETE /streams|/ingest): without it the viewers
+// following it at that moment block forever on a hub that will never publish again
+// — their handler goroutines, their connStat entries and the whole Stream (hub,
+// ring and all) stay alive until each client happens to disconnect, while the
+// stream is already out of the registry and so invisible to /connections. Waking
+// them lets each serveLive return and run its deferred detach/removeConn.
+// Idempotent: the wake channel is closed for good here and never re-armed, and
+// closed short-circuits Follow, Publish and signalWake from now on.
+func (h *Hub) CloseAll() {
 	h.mu.Lock()
-	if _, ok := h.subs[s]; ok {
-		delete(h.subs, s)
-		s.close()
+	if !h.closed {
+		h.closed = true
+		close(h.wake)
 	}
 	h.mu.Unlock()
-}
-
-// CloseAll drops every subscriber, as Unsubscribe does for one. Called when a
-// stream is torn down (DELETE /streams|/ingest): without it the viewers attached
-// at that moment keep blocking on a hub that will never publish again — their
-// handler goroutines, their connStat entries and the whole Stream (hub, ring and
-// all) stay alive until each client happens to disconnect, while the stream is
-// already out of the registry and so invisible to /connections. Closing them lets
-// serveLive return and run its deferred detach/removeConn.
-func (h *Hub) CloseAll() int {
-	h.mu.Lock()
-	n := len(h.subs)
-	for s := range h.subs {
-		delete(h.subs, s)
-		s.close()
-	}
-	h.mu.Unlock()
-	return n
 }
 
 // RingStats reports the join ring's bytes, span (ms) and GOP count.
@@ -353,12 +315,4 @@ func (h *Hub) RingStats() (bytes int, spanMS int64, gops int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.join.RingStats()
-}
-
-// Count returns the current number of subscribers.
-func (h *Hub) Count() int {
-	h.mu.Lock()
-	n := len(h.subs)
-	h.mu.Unlock()
-	return n
 }

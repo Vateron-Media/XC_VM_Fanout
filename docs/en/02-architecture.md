@@ -50,7 +50,7 @@ machine is faster.
 | Package | File | Role |
 |---------|------|------|
 | `server` | [server.go](../../internal/server/server.go) | Registry `id → Stream`, both HTTP surfaces, on-demand stream lifecycle. |
-| `hub` | [hub.go](../../internal/hub/hub.go) | Fan-out of a single TS stream to many subscribers; drops the slow ones. |
+| `hub` | [hub.go](../../internal/hub/hub.go) | Fan-out of a single TS stream to many viewers, who follow the ring by cursor (ADR 0004); drops the slow ones. |
 | `tsjoin` | [tsjoin.go](../../internal/tsjoin/tsjoin.go) | The single per-stream buffer: PAT/PMT + a GOP ring for the "clean entry" and prebuffer, **and** the HLS segment index derived from that ring. |
 | `hlscrypt` | [hlscrypt.go](../../internal/hlscrypt/hlscrypt.go) | AES-128-CBC encryption of HLS segments (compatible with the panel), applied on the fly as a segment is assembled. |
 | `puller` | [puller.go](../../internal/puller/puller.go) | Source acquisition (direct mp2t, native conversion or ffmpeg remux), reconnect with backoff. |
@@ -105,8 +105,8 @@ All data enters `Stream` through a single point — the `Publish` method.
 
 ## Design principles
 
-- **One source — many viewers.** The source is pulled once (`Hub` copies each chunk to the
-  subscribers).
+- **One source — many viewers.** The source is pulled once into a single in-memory ring; each
+  viewer reads that ring by cursor (ADR 0004), so there is no per-viewer copy of the stream.
 - **PHP outside the byte path.** Video does not pass through PHP — only control commands.
 - **Nothing to disk.** Both TS and HLS live in RAM.
 - **One buffer, not two.** A single TS ring per stream serves live-TS *and* HLS (HLS is a

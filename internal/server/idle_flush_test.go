@@ -93,13 +93,9 @@ func TestIdleStopReleasesTheRing(t *testing.T) {
 		t.Fatal("a returning viewer did not restart the flushed stream")
 	}
 	feedStream(st)
-	if st.Hub.Count() != 0 {
-		t.Fatal("touch must not subscribe")
-	}
-	sub, burst := st.Hub.Subscribe(0)
-	defer st.Hub.Unsubscribe(sub)
-	defer burst.Release()
-	if burst.Len() == 0 {
+	// A joining viewer gets a clean-entry snapshot again — proof the ring refilled
+	// after the flush (viewers follow the ring now; Snapshot reads it the same way).
+	if snap := st.Hub.Snapshot(0); len(snap) == 0 {
 		t.Error("the ring did not refill after a flush: a joiner got no clean-entry snapshot")
 	}
 }

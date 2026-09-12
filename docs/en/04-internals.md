@@ -163,78 +163,58 @@ output, and push mode (data from the ingest socket).
 
 ## TS fan-out — `hub`
 
-[`Hub`](../../internal/hub/hub.go) is the point of distribution of a single stream to many subscribers.
-One `Hub` per stream.
+[`Hub`](../../internal/hub/hub.go) is the point of distribution of a single stream to many viewers.
+One `Hub` per stream. Since **ADR 0004** ([`docs/adr/0004`](../adr/0004-ring-is-the-live-tail.md))
+the ring is the one byte store for the join history, the live tail **and** HLS: a viewer **follows
+the ring by cursor** for its whole session — there is no per-viewer channel and no per-viewer copy.
 
-- **`Publish(chunk)`**: **copies** the chunk (so the source can reuse the buffer),
-  folds it into the join state (see below) and **non-blockingly** broadcasts it to all
-  subscribers through buffered channels.
-- **A slow subscriber is dropped.** Each subscriber has a buffer of `subQueue = 256`
-  chunks. If it overflows (the viewer can't keep up reading) — the subscriber is closed and
-  removed. This way one lagging viewer **never stalls the source or the others**.
-- **`Subscribe(prebufMS)`**: under a single mutex it simultaneously **captures** the history to send
-  and registers the subscriber. Atomicity matters: the live tail continues exactly where the
-  snapshot ended — **with no gap and no duplication**. Nothing is copied: the viewer is written
-  straight out of the ring's pinned GOP buffers, with the lock **released** — see below.
+- **`Publish(chunk)`**: folds the chunk into the join state (see below) **in place** — no copy, no
+  broadcast — and closes the **wake** signal so any viewer parked at the live edge reads on.
+  `join.Update` copies what it retains into the ring's own (recycled) GOP buffers and keeps no
+  reference to the input, so the source may reuse its buffer the moment `Publish` returns. The only
+  copy of a published byte is the single one into the ring that retention already needed.
+- **`Join(prebufMS)`** returns the header to write first (PAT/PMT) and a **cursor** at the start of
+  the viewer's prebuffer — nothing is registered.
+- **`Follow(cursor, max)`** returns the next run of ring bytes from the cursor (about `max`,
+  **pinned** in a `Burst` the caller writes then `Release`s) and the cursor after it. When the run
+  reaches the live edge it returns `atEnd` with the wake channel to park on; a viewer whose cursor
+  has been pruned off the ring's tail (a link **slower than the stream**) gets `behind` and is let
+  go; a torn-down stream (`CloseAll`) gets `ended`. One lagging viewer thus **never stalls the
+  source or the others**, and the drop bound is the ring's own retention, not a separate queue.
 
-#### Why the join burst is neither copied nor written under the lock
+#### Why a run is pinned, and read with the lock released
 
-The snapshot a viewer gets on connect is up to the whole ring: **14 MB at a 40 s prebuffer**,
-~3 ms to copy. Doing that under the hub lock stalled the stream's producer for that long on
-*every* join, and serialised a join storm — a channel going live, an EPG event, a restreamer fleet
-reconnecting — into one stall after another.
+A viewer reads the ring straight out of its GOP buffers, at its own link speed, with the hub lock
+**released** — so a slow socket never holds the lock and the producer keeps publishing. `Follow`
+captures a run's GOP byte slices under the lock and **pins** them; the caller writes them and then
+`Unpin`s (via `Burst.Release`). While anything is pinned, `prune` stops **recycling** dropped GOP
+arrays — it leaves them to GC, which the in-flight reader's own slices keep alive for exactly as
+long as it needs them. Without that pin a recycled array would be handed to a new GOP and rewritten
+mid-write, and the viewer would receive a splice of two different points in the stream. A pin lasts
+**one run** (`joinRunBytes = 1 MB`), never a whole burst, so recycling is suspended only briefly.
 
-`SnapshotPin` captures under the lock (the header, which is mutated in place as new PAT/PMT
-arrive, is copied there and then; the GOP byte slices are captured with the lengths they have at
-that instant) and **pins** those buffers. The caller then releases the lock, appends the parts,
-and `Unpin`s. While anything is pinned, `prune` stops **recycling** dropped GOP arrays — it leaves
-them to GC, which the in-flight reader's own slices keep alive for exactly as long as it needs
-them. Without that pin a recycled array gets handed to a new GOP and rewritten mid-copy, and the
-joining viewer receives a splice of two different points in the stream.
+**No gap, no duplication:** the cursor advances monotonically and the ring only appends and prunes
+from the front, so the run after a `Follow` begins exactly one byte past the last one returned. The
+join history and the live tail are one continuous cursor read — the hand-over that used to need a
+snapshot captured atomically with a channel registration is now simply "keep reading from the same
+cursor".
 
-Atomicity survives because the capture fixes the content at the moment of registration: the open
-GOP growing afterwards is invisible (the captured length does not move), and every chunk published
-from that point reaches the viewer through its channel instead.
+Three earlier shapes each failed at scale, and ADR 0004 is the end of that line. Copying the burst
+per viewer allocated up to the whole client prebuffer on every join (the panel's `client_prebuffer`
+defaults to **30 s** — ~30 MB of an 8 Mbit/s channel) and held it while the viewer drained it: 90
+viewers joining with `prebuffer=30` across 30 channels grew the heap by 2 GB in five seconds.
+Pinning the burst instead of copying it fixed the join allocation, but the **live tail** still went
+through a per-viewer buffered channel, which forced a second copy of every chunk on every watched
+stream (~250 MB/s of redundant memcpy and GC on a busy node) and a 256-chunk queue that dropped any
+viewer whose link could not take a 30 s burst within ~5 s. Following the ring needs neither: the
+bytes are in the ring already, once, for everyone, so `Publish` copies nothing per viewer and holds
+no queue. A viewer on any link faster than the stream keeps up; one slower falls off the ring's tail
+and is let go.
 
-**Since 0.13.2 a live-TS viewer catches up through the ring instead.** `Subscribe` (above) is
-still the primitive, but `serveLive` no longer registers the viewer and queues the live tail behind
-its history. `Hub.Join` places a **cursor** at the start of the viewer's prebuffer and registers
-nothing; `Hub.CatchUp` then hands it the ring's bytes from that cursor in pinned runs of 1 MB, and
-subscribes it to the live tail **in the same critical section in which a run reaches the edge** —
-so the tail continues exactly where the history ends, the same no-gap, no-duplicate guarantee.
-
-Two earlier shapes each failed at scale. Copying the burst per viewer allocated up to the whole
-client prebuffer on every join (the panel's `client_prebuffer` defaults to **30 s** — ~30 MB of an
-8 Mbit/s channel) and held it while the viewer drained it: 90 viewers joining with `prebuffer=30`
-across 30 channels grew the heap by 2 GB in five seconds. Writing the pinned burst without a copy
-fixed that, but left the live tail queuing behind the history in the subscriber's 256-chunk queue
-(~5 s of a 4.7 Mbit/s stream) — so every viewer whose link could not take a 30 s burst within ~5 s
-(anything under ~30 Mbit/s) was dropped as "too slow" and reconnected into another burst; and a
-queue sized to the burst instead let each stalled viewer pin that much stream (a 200-channel stress
-run reached a 5–7 GB heap on 2–3 GB of rings). Reading the ring forward needs neither: the history
-is already there, once, for everyone. A viewer on any link faster than the stream catches up with
-the fixed queue; one slower than the stream falls off the ring's tail and is let go; and a pin
-lasts one run, never a whole burst.
-
-```
-lock held per join:      3.13 ms → 1.30 µs
-192 joins at 40 s:        604 ms → 337 ms
-```
-
-The storm is now bound by **memory bandwidth**, not the lock: 192 joins × 14 MB is 2.7 GB to copy,
-however it is scheduled. The producer's worst-case wait during one is no longer the serialised
-copies (a tight ~77 ms before) but scheduler contention with the copying goroutines (26–81 ms,
-variable). If join storms hurt, the lever is **prebuffer depth**, which the panel sets per viewer —
-not the lock.
-
-> **Why `Publish` still copies.** The copy is made once per chunk and **shared by every
-> subscriber**, so it is already O(1) in audience size — a subscriber holds the buffer in its
-> channel across later publishes, so it cannot be handed the producer's reusable one. Measured, it
-> costs ~2.3 µs per 12 KB chunk, i.e. under 5% of one core at 500 streams pulling simultaneously.
-> Removing it would take either per-stream slab allocation (which parks unused slab tail on every
-> stream — paying RAM, the scarcer resource here, to save CPU that is not scarce) or recycling
-> buffers on a fixed cycle, which races with a dropped subscriber's handler that may still be
-> writing the buffer it already pulled from its channel. It stays.
+> **Teardown.** `CloseAll` (on `DELETE /streams|/ingest`) marks the hub closed and closes the wake
+> channel once, so every parked viewer's next `Follow` returns `ended` and its `serveLive` unwinds
+> and runs its deferred `detach`/`removeConn`. It is idempotent and racing publishes after it are
+> no-ops — a producer may keep publishing for a moment while its puller notices cancellation.
 
 ### Guarding against stalled and idle viewers
 

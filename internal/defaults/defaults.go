@@ -42,10 +42,6 @@ const (
 	// forever. A healthy real-time viewer produces at most ~1s of backlog per
 	// second, so this only ever fires on a genuinely stalled connection.
 	WriteTimeout = 15 * time.Second
-
-	// SubscriberQueue bounds how many pending chunks a single hub subscriber may
-	// fall behind before it is dropped rather than allowed to stall the producer.
-	SubscriberQueue = 256
 )
 
 // HLSSegCacheEntries is how many recently-served HLS segments a stream keeps

@@ -85,6 +85,31 @@ func TestOverlaySegmentRealFFmpeg(t *testing.T) {
 	}
 }
 
+// TestOverlaySegmentSpecialChars proves the drawtext escaping actually parses
+// under real ffmpeg for a message carrying the characters that are special to the
+// filtergraph — an apostrophe and a colon. Before the '\'' fix the apostrophe
+// broke the filter parse, so the re-encode failed and the overlay silently served
+// the plain segment: exactly the "returned unchanged" state that would pass the
+// other tests while the feature was dead for any message with a quote in it.
+func TestOverlaySegmentSpecialChars(t *testing.T) {
+	ffmpeg := systemFFmpeg(t)
+	font := systemFont(t)
+	seg := realMpegTS(t, ffmpeg)
+
+	mgr := NewManager(1<<20, 0, 2, 6, 0)
+	mgr.SetOverlay(ffmpeg, font)
+
+	for _, msg := range []string{"it's back", "on at 3:00", "it's on at 3:00!"} {
+		out := mgr.overlaySegment(seg, pendingSignal{text: msg, fontSize: 20, color: "white", x: 10, y: 10}, "h264")
+		if len(out) == 0 || out[0] != 0x47 {
+			t.Fatalf("msg %q: overlay produced an invalid TS (%d bytes)", msg, len(out))
+		}
+		if bytes.Equal(out, seg) {
+			t.Fatalf("msg %q: overlay returned the input unchanged — the filter failed to parse", msg)
+		}
+	}
+}
+
 // TestOverlaySegmentGracefulOnFailure: a failing ffmpeg must never break
 // playback — the plain segment is returned unchanged.
 func TestOverlaySegmentGracefulOnFailure(t *testing.T) {
@@ -122,27 +147,24 @@ func TestOverlaySegmentDisabled(t *testing.T) {
 }
 
 // TestOverlayTSWindowContinuesRawOnStartFailure: when the overlay ffmpeg is
-// disabled or cannot start, overlayTSWindow returns true (keep serving the raw
-// fan-out) rather than dropping the viewer.
+// disabled or cannot start, overlayTSWindow returns alive=true (keep serving the
+// raw fan-out) and the cursor unchanged, rather than dropping the viewer.
 func TestOverlayTSWindowContinuesRawOnStartFailure(t *testing.T) {
 	mgr := NewManager(1<<20, 0, 2, 6, 0)
 	st := mgr.GetOrCreate("w")
 	feedStream(st)
 	write := func([]byte) error { return nil }
 	sig := pendingSignal{text: "x", fontSize: 20}
+	_, cur := st.Hub.Join(0)
 
-	// Disabled (no overlay configured) → continue raw.
-	sub, _ := st.Hub.Subscribe(0)
-	if !mgr.overlayTSWindow(st, sub, write, sig, "h264") {
-		t.Fatal("disabled overlay must return true (continue raw)")
+	// Disabled (no overlay configured) → continue raw from the same cursor.
+	if next, alive := mgr.overlayTSWindow(st, cur, write, sig, "h264"); !alive || next != cur {
+		t.Fatalf("disabled overlay must return (cur, true); got next=%+v alive=%v", next, alive)
 	}
-	st.Hub.Unsubscribe(sub)
 
 	// Configured but the binary does not exist → Start fails → continue raw.
 	mgr.SetOverlay(filepath.Join(t.TempDir(), "nonexistent-ffmpeg"), "/font.ttf")
-	sub2, _ := st.Hub.Subscribe(0)
-	if !mgr.overlayTSWindow(st, sub2, write, sig, "h264") {
-		t.Fatal("unstartable overlay ffmpeg must return true (continue raw)")
+	if next, alive := mgr.overlayTSWindow(st, cur, write, sig, "h264"); !alive || next != cur {
+		t.Fatalf("unstartable overlay ffmpeg must return (cur, true); got next=%+v alive=%v", next, alive)
 	}
-	st.Hub.Unsubscribe(sub2)
 }

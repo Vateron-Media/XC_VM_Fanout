@@ -41,12 +41,15 @@ func TestUnregisterReleasesAttachedViewers(t *testing.T) {
 		}
 	}()
 
+	// Wait for the viewer's handler to attach and register its uuid. Viewers follow
+	// the ring (ADR 0004) rather than subscribing, so presence is the tracked uuid,
+	// not a hub subscriber count.
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && st.Hub.Count() == 0 {
+	for time.Now().Before(deadline) && len(st.connUUIDs()) == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if st.Hub.Count() == 0 {
-		t.Fatal("viewer never subscribed")
+	if len(st.connUUIDs()) == 0 {
+		t.Fatal("viewer never attached")
 	}
 
 	mgr.Unregister("5")
@@ -58,9 +61,6 @@ func TestUnregisterReleasesAttachedViewers(t *testing.T) {
 	}
 	if n := len(st.connUUIDs()); n != 0 {
 		t.Errorf("torn-down stream still tracks %d viewer(s): %v", n, st.connUUIDs())
-	}
-	if st.Hub.Count() != 0 {
-		t.Errorf("torn-down stream still has %d subscriber(s)", st.Hub.Count())
 	}
 }
 

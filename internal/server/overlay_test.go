@@ -57,7 +57,10 @@ func TestParseXY(t *testing.T) {
 
 func TestEscapeDrawtext(t *testing.T) {
 	got := escapeDrawtext(`a:b'c\d%e`)
-	want := `a\:b\'c\\d\%e`
+	// A single quote becomes the '\'' break-out sequence (it cannot be escaped
+	// inside the surrounding single quotes); the colon keeps its \: escape, which
+	// ffmpeg's filtergraph parser requires and consumes even inside quotes.
+	want := `a\:b'\''c\\d\%e`
 	if got != want {
 		t.Fatalf("escapeDrawtext = %q; want %q", got, want)
 	}

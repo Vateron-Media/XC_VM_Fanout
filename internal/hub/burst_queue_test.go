@@ -58,26 +58,29 @@ func gens(dst []uint16, b []byte) []uint16 {
 
 // catchUp drives a joining viewer that takes readPerStep bytes of history for
 // every second of stream published meanwhile — its link speed relative to the
-// stream's. It returns the generations it received, whether it got subscribed,
-// and whether it fell behind.
-func catchUp(t *testing.T, g *genStream, prebufMS int64, readPerStep int, maxSteps int) (seen []uint16, sub *Sub, behind bool) {
+// stream's. It follows the ring by cursor (ADR 0004) and returns the generations
+// it received, the cursor it reached, whether it reached the live edge, and
+// whether it fell behind.
+func catchUp(t *testing.T, g *genStream, prebufMS int64, readPerStep int, maxSteps int) (seen []uint16, cur tsjoin.Cursor, reachedEdge, behind bool) {
 	t.Helper()
-	_, cur := g.h.Join(prebufMS)
+	_, cur = g.h.Join(prebufMS)
 	for step := 0; step < maxSteps; step++ {
-		var burst *Burst
-		var s *Sub
-		var next tsjoin.Cursor
-		burst, next, s, behind = g.h.CatchUp(cur, readPerStep)
-		if behind {
-			return seen, nil, true
+		burst, next, atEnd, _, bh, ended := g.h.Follow(cur, readPerStep)
+		if bh {
+			burst.Release()
+			return seen, cur, false, true
+		}
+		if ended {
+			burst.Release()
+			return seen, cur, false, false
 		}
 		for _, p := range burst.Parts {
 			seen = gens(seen, p)
 		}
 		burst.Release()
 		cur = next
-		if s != nil {
-			return seen, s, false
+		if atEnd {
+			return seen, cur, true, false
 		}
 		g.second() // the stream moves on while the viewer writes that run
 	}
@@ -86,22 +89,18 @@ func catchUp(t *testing.T, g *genStream, prebufMS int64, readPerStep int, maxSte
 }
 
 // TestSlowJoinerCatchesUpThroughTheRing: a viewer on a link twice the stream's
-// rate takes its 30 s of history straight out of the ring and is subscribed when
-// it reaches the edge. It used to be subscribed first with the live tail queued
-// behind the history, and a queue short enough to be cheap (256 chunks) dropped
-// it as too slow before the history was through.
+// rate takes its 30 s of history straight out of the ring and reaches the live
+// edge. It used to be subscribed first with the live tail queued behind the
+// history, and a queue short enough to be cheap (256 chunks) dropped it as too
+// slow before the history was through; following the ring has no such queue.
 func TestSlowJoinerCatchesUpThroughTheRing(t *testing.T) {
 	g := newGenStream(40)
 	for i := 0; i < 40; i++ {
 		g.second()
 	}
-	_, sub, behind := catchUp(t, g, 30000, 2*secondBytes, 1000)
-	if behind || sub == nil {
-		t.Fatalf("a viewer on a link twice the stream's rate did not catch up (behind=%v)", behind)
-	}
-	defer g.h.Unsubscribe(sub)
-	if c := cap(sub.ch); c != subQueue {
-		t.Errorf("subscriber queue holds %d chunks, want the fixed %d: catching up must cost no per-viewer memory", c, subQueue)
+	_, _, edge, behind := catchUp(t, g, 30000, 2*secondBytes, 1000)
+	if behind || !edge {
+		t.Fatalf("a viewer on a link twice the stream's rate did not catch up (behind=%v, edge=%v)", behind, edge)
 	}
 }
 
@@ -112,30 +111,43 @@ func TestHopelesslySlowJoinerFallsBehind(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		g.second()
 	}
-	_, sub, behind := catchUp(t, g, 10000, secondBytes/2, 1000)
-	if !behind || sub != nil {
-		t.Fatalf("a viewer at half the stream's rate was not let go (behind=%v, subscribed=%v)", behind, sub != nil)
+	_, _, edge, behind := catchUp(t, g, 10000, secondBytes/2, 1000)
+	if !behind || edge {
+		t.Fatalf("a viewer at half the stream's rate was not let go (behind=%v, edge=%v)", behind, edge)
 	}
 }
 
 // TestCatchUpHasNoGapOrDuplicate: the history a joiner reads through the ring,
-// followed by what reaches it on the live channel, is every packet from its
-// starting keyframe on, exactly once — the atomicity Subscribe gave, kept.
+// followed by the live tail it reads once it reaches the edge, is every packet
+// from its starting keyframe on, exactly once — the atomicity Subscribe gave,
+// kept by the single-cursor follow.
 func TestCatchUpHasNoGapOrDuplicate(t *testing.T) {
 	g := newGenStream(20)
 	for i := 0; i < 20; i++ {
 		g.second()
 	}
-	seen, sub, behind := catchUp(t, g, 5000, 3*secondBytes, 1000)
-	if behind || sub == nil {
+	seen, cur, edge, behind := catchUp(t, g, 5000, 3*secondBytes, 1000)
+	if behind || !edge {
 		t.Fatal("did not catch up")
 	}
-	defer g.h.Unsubscribe(sub)
 	for i := 0; i < 3; i++ {
 		g.second()
 	}
-	for len(sub.ch) > 0 {
-		seen = gens(seen, <-sub.ch)
+	// Read the live tail from where catch-up left off, right up to the edge.
+	for {
+		burst, next, atEnd, _, bh, ended := g.h.Follow(cur, 1<<24)
+		if bh || ended {
+			burst.Release()
+			t.Fatalf("tail read did not complete (behind=%v ended=%v)", bh, ended)
+		}
+		for _, p := range burst.Parts {
+			seen = gens(seen, p)
+		}
+		burst.Release()
+		cur = next
+		if atEnd {
+			break
+		}
 	}
 	if len(seen) == 0 {
 		t.Fatal("nothing received")
