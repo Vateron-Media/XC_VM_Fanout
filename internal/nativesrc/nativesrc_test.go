@@ -295,3 +295,38 @@ func TestOpenAcceptsTSWithGenericContentType(t *testing.T) {
 		t.Fatalf("first byte 0x%02x, want the sync byte", got[0])
 	}
 }
+
+// TestOpenJoinsALiveWindowNearItsEdge: a live playlist is joined three
+// segments from its end, as ffmpeg does, not from its oldest entry — which put a
+// whole window of old content into the pipeline at download speed, and again
+// on every reconnect.
+func TestOpenJoinsALiveWindowNearItsEdge(t *testing.T) {
+	segs := map[string][]byte{}
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n")
+	for i := 0; i < 10; i++ {
+		name := fmt.Sprintf("s%d.ts", i)
+		segs[name] = tsSegment(int64(i) * 6 * 90000)
+		fmt.Fprintf(&b, "#EXTINF:6.0,\n%s\n", name)
+	}
+	srv := newHLSServer(t, b.String(), segs) // live: no ENDLIST
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rc, err := Open(ctx, srv.URL+"/index.m3u8", Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+	_, _ = io.ReadAll(io.LimitReader(rc, int64(4*len(segs["s0.ts"]))))
+
+	var fetched []string
+	for _, r := range srv.seen() {
+		if strings.HasSuffix(r.URL.Path, ".ts") {
+			fetched = append(fetched, strings.TrimPrefix(r.URL.Path, "/"))
+		}
+	}
+	if len(fetched) == 0 || fetched[0] != "s7.ts" {
+		t.Fatalf("a live pull fetched %v first, want it to start three from the edge (s7.ts)", fetched)
+	}
+}

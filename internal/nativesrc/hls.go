@@ -147,6 +147,10 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 	return pr, nil
 }
 
+// hlsLiveStartSegments is how many of a live playlist's newest segments a pull
+// starts with — ffmpeg's default live_start_index of -3.
+const hlsLiveStartSegments = 3
+
 type hlsPuller struct {
 	ctx    context.Context
 	base   *url.URL
@@ -173,6 +177,17 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 	defer p.client.CloseIdleConnections()
 
 	pl := initial
+	// A live playlist is joined near its edge, as ffmpeg's HLS demuxer does
+	// (live_start_index -3), not from its oldest entry. Streaming the whole
+	// window first put up to a minute of old content into the pipeline in a few
+	// seconds at download speed — and every reconnect, starting from an empty
+	// seen map, sent segments already published all over again. A VOD playlist
+	// (ENDLIST) still plays from its start.
+	if !pl.Endlist && len(pl.Segments) > hlsLiveStartSegments {
+		for _, seg := range pl.Segments[:len(pl.Segments)-hlsLiveStartSegments] {
+			p.seen[seg.URI.String()] = true
+		}
+	}
 	// Segment failures and manifest failures are counted SEPARATELY. A shared
 	// counter that any success reset meant a source serving a perfectly valid
 	// playlist of dead segments could never trip it whenever the live window held
