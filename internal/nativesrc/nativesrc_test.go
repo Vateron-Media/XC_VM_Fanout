@@ -330,3 +330,49 @@ func TestOpenJoinsALiveWindowNearItsEdge(t *testing.T) {
 		t.Fatalf("a live pull fetched %v first, want it to start three from the edge (s7.ts)", fetched)
 	}
 }
+
+// TestHLSSourceCarriesItsOwnIdleBound: a live HLS source arrives a segment at a
+// time and is silent in between, so its stall bound must outlast a segment. The
+// default bound (8 s) closed any source with longer segments between two healthy
+// ones — here, 1 s segments against a 0.5 s default, the same shape.
+func TestHLSSourceCarriesItsOwnIdleBound(t *testing.T) {
+	started := time.Now()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".ts") {
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write(tsSegment(0))
+			return
+		}
+		n := int(time.Since(started)/time.Second) + 3
+		var b strings.Builder
+		fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n", n-3)
+		for i := n - 3; i < n; i++ {
+			fmt.Fprintf(&b, "#EXTINF:1.0,\ns%d.ts\n", i)
+		}
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	rc, err := Open(ctx, srv.URL+"/index.m3u8", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := IdleBound(rc, 500*time.Millisecond); b < DefaultSourceIdleTimeout {
+		t.Fatalf("an HLS source's idle bound is %s, want at least the %s floor", b, DefaultSourceIdleTimeout)
+	}
+	rc = WrapIdleTimeout(rc, IdleBound(rc, 500*time.Millisecond))
+	defer rc.Close()
+
+	buf := make([]byte, 64<<10)
+	for time.Since(started) < 3*time.Second {
+		if _, err := rc.Read(buf); err != nil {
+			t.Fatalf("a healthy HLS source was closed after %s: %v", time.Since(started).Round(100*time.Millisecond), err)
+		}
+	}
+	if b := IdleBound(io.NopCloser(strings.NewReader("")), 7*time.Second); b != 7*time.Second {
+		t.Errorf("a source with no bound of its own gets %s, want the default", b)
+	}
+}

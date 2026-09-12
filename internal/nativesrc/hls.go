@@ -144,7 +144,31 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		seen:   map[string]bool{},
 		pw:     pw,
 	}).run(pl)
-	return pr, nil
+	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl)}, nil
+}
+
+// hlsReader is the byte stream of a live HLS pull, which knows how long it may
+// legitimately go without bytes: see IdleBound.
+type hlsReader struct {
+	*io.PipeReader
+	idle time.Duration
+}
+
+// IdleBound is the longest silence this source can have while healthy. A live
+// HLS source arrives a whole segment at a time and says nothing in between, so
+// the gap is the upstream's segment duration — ten seconds is common. The
+// default stall bound (eight seconds, the ffmpeg path's -rw_timeout) closed
+// every such source between two healthy segments; a stall here is three target
+// durations without a new segment, which is also how a playlist that stopped
+// updating is caught.
+func (r *hlsReader) IdleBound() time.Duration { return r.idle }
+
+func hlsIdleBound(pl *hlsPlaylist) time.Duration {
+	d := 3 * time.Duration(pl.TargetDuration) * time.Second
+	if d < DefaultSourceIdleTimeout {
+		d = DefaultSourceIdleTimeout
+	}
+	return d
 }
 
 // hlsLiveStartSegments is how many of a live playlist's newest segments a pull

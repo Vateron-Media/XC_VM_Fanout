@@ -64,6 +64,18 @@ type idleTimeoutReader struct {
 
 // WrapIdleTimeout wraps rc so a no-bytes stall longer than idle becomes a read
 // error. idle <= 0 (or a nil rc) returns rc unchanged.
+// IdleBound is the stall bound to use for rc: its own, when it knows it may be
+// silent longer than def (a live HLS pull goes a whole segment between
+// bursts), else def. Pass the result to WrapIdleTimeout.
+func IdleBound(rc io.ReadCloser, def time.Duration) time.Duration {
+	if b, ok := rc.(interface{ IdleBound() time.Duration }); ok {
+		if d := b.IdleBound(); d > def {
+			return d
+		}
+	}
+	return def
+}
+
 func WrapIdleTimeout(rc io.ReadCloser, idle time.Duration) io.ReadCloser {
 	if rc == nil || idle <= 0 {
 		return rc

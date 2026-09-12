@@ -167,10 +167,36 @@ func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < defaults.PullBackoffMax {
-			backoff *= 2
-		}
+		backoff = nextBackoff(backoff, time.Since(start))
 	}
+}
+
+// backoffResetAfter is how long a pull must have run for its failure to count
+// as a new incident rather than another retry of the last one.
+const backoffResetAfter = time.Minute
+
+// nextBackoff is the wait before the next attempt, after one that ran for
+// ranFor. It doubles up to PullBackoffMax while failures follow each other, and
+// starts over after a long healthy run — doubling forever put every reconnect
+// at the full 8 s after a stream's third blip in its lifetime.
+func nextBackoff(cur, ranFor time.Duration) time.Duration {
+	if ranFor > backoffResetAfter {
+		return defaults.PullBackoffInitial
+	}
+	if cur < defaults.PullBackoffMax {
+		return cur * 2
+	}
+	return cur
+}
+
+// ffmpegStallBound is how long the ffmpeg path may deliver nothing before it is
+// treated as stalled: the native path's bound, and room for a segment-at-a-time
+// HLS source, which ffmpeg also reads in bursts.
+func ffmpegStallBound(raw string) time.Duration {
+	if strings.Contains(strings.ToLower(raw), ".m3u8") {
+		return 3 * nativesrc.DefaultSourceIdleTimeout
+	}
+	return nativesrc.DefaultSourceIdleTimeout
 }
 
 // pullOnce tries each URL once: mp2t is streamed directly, anything else goes
@@ -343,6 +369,12 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 		rc, err = nativesrc.Open(ctx, raw, opt)
 	}
 	if err == nil {
+		// Bound a stall, as the direct-MPEG-TS path does: a frozen upstream (a
+		// live playlist that stops updating, a half-open connection) otherwise
+		// left ingest.Copy blocked forever, with no retry and no failover. The
+		// bound is the source's own when it is longer — a live HLS pull is
+		// silent for a whole segment between bursts.
+		rc = nativesrc.WrapIdleTimeout(rc, nativesrc.IdleBound(rc, nativesrc.DefaultSourceIdleTimeout))
 		defer rc.Close()
 		src.reportPath(PathNative)
 		dlog.Logf("puller", "id=%s connected native (no ffmpeg child): %s", src.Label, raw)
@@ -424,7 +456,11 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 		"-f", "mpegts", "-",
 	)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	// Its own context, so a stalled ffmpeg can be ended without stopping the
+	// stream: see the stall bound below.
+	cctx, ccancel := context.WithCancel(ctx)
+	defer ccancel()
+	cmd := exec.CommandContext(cctx, bin, args...)
 	stderr := &tailBuffer{max: 4096}
 	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
@@ -434,7 +470,13 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	copyErr := ingest.Copy(stdout, chunkSize, publish)
+	// Bound a stall. A half-open upstream or a frozen live playlist leaves
+	// ffmpeg alive and silent — its -reconnect options only act on an error it
+	// can see — and ingest.Copy then blocked forever: no retry, no failover,
+	// while viewers who reconnected kept the stream referenced. Close the pipe
+	// after the stall bound, then end the process before waiting on it.
+	copyErr := ingest.Copy(nativesrc.WrapIdleTimeout(stdout, ffmpegStallBound(raw)), chunkSize, publish)
+	ccancel()
 	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
 		return copyErr // we cancelled it (stream stop/shutdown) — not a fault
