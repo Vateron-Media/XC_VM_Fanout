@@ -96,7 +96,15 @@ type Hub struct {
 	mu   sync.Mutex
 	subs map[*Sub]struct{}
 	join *tsjoin.State
+	// avgChunk is a running average of published chunk sizes, for sizing a new
+	// subscriber's queue to its join burst (see Subscribe).
+	avgChunk int
 }
+
+// maxSubQueue caps a subscriber's queue however deep its burst: 64k chunk
+// slots is ~1.5 MB of channel and, at 12 KB chunks, ~750 MB of stream a viewer
+// may fall behind by — far past any burst the ring can hold.
+const maxSubQueue = 64 << 10
 
 // New returns a Hub. maxGOP caps a single GOP (bytes); maxPrebufMS is how many
 // milliseconds of keyframe-aligned history the join state keeps for client
@@ -119,6 +127,11 @@ func New(maxGOP int, maxPrebufMS int64) *Hub {
 // churn once GOP buffers were recycled).
 func (h *Hub) Publish(chunk []byte) {
 	h.mu.Lock()
+	if h.avgChunk == 0 {
+		h.avgChunk = len(chunk)
+	} else {
+		h.avgChunk += (len(chunk) - h.avgChunk) / 8
+	}
 	if len(h.subs) == 0 {
 		h.join.Update(chunk)
 		h.mu.Unlock()
@@ -155,11 +168,36 @@ func (h *Hub) Publish(chunk []byte) {
 func (h *Hub) Subscribe(prebufMS int64) (*Sub, *Burst) {
 	h.mu.Lock()
 	head, parts := h.join.SnapshotPin(nil, prebufMS)
-	s := &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
+	s := &Sub{ch: make(chan []byte, h.queueFor(head, parts)), done: make(chan struct{})}
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()
 
 	return s, &Burst{Head: head, Parts: parts, h: h}
+}
+
+// queueFor sizes a new subscriber's queue to its join burst. While the burst is
+// being written the live tail queues behind it, and a fixed subQueue (~3 MB at
+// 12 KB chunks, ~5 s of a 4.7 Mbit/s stream) dropped every viewer whose link
+// could not take the whole burst within that — with the panel's 30 s prebuffer,
+// anything under ~30 Mbit/s — as "too slow", after which the player reconnected
+// into another burst, and another. A viewer takes the burst at its link speed
+// while the stream keeps arriving at its own, so a link faster than the stream
+// queues at most the burst's worth of chunks; twice that is headroom for short
+// reads. A link slower than the stream still fills this and is still dropped,
+// which is right — it could never keep up. Caller holds h.mu.
+func (h *Hub) queueFor(head []byte, parts [][]byte) int {
+	n := len(head)
+	for _, p := range parts {
+		n += len(p)
+	}
+	q := subQueue
+	if c := h.avgChunk; c > 0 {
+		q += 2 * n / c
+	}
+	if q > maxSubQueue {
+		q = maxSubQueue
+	}
+	return q
 }
 
 // Snapshot returns a fresh clean-entry snapshot (PAT/PMT + keyframe, optionally

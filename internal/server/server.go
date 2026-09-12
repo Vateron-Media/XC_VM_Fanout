@@ -1588,6 +1588,11 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// pinned GOP — and unpin it the moment it is written, so the ring can recycle
 	// those buffers again. No copy of the history is ever made for a viewer; each
 	// GOP gets its own write deadline, like every chunk of the live tail.
+	//
+	// A burst can take a slow viewer many seconds, and the pin holds recycling
+	// off for the whole stream meanwhile — so between GOPs, stop the moment the
+	// viewer is gone for any of the reasons the live loop below would notice:
+	// dropped by the hub, kicked by the panel, or the client closing.
 	var snapErr error
 	if len(burst.Head) > 0 {
 		snapErr = write(burst.Head)
@@ -1595,6 +1600,21 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	for _, p := range burst.Parts {
 		if snapErr != nil {
 			break
+		}
+		select {
+		case <-sub.Done():
+			burst.Release()
+			reason = "dropped: too slow (hub buffer full, during the join burst)"
+			return
+		case <-killC:
+			burst.Release()
+			reason = "dropped by panel (kick / connection limit)"
+			return
+		case <-r.Context().Done():
+			burst.Release()
+			reason = "client closed (during the join burst)"
+			return
+		default:
 		}
 		if len(p) > 0 {
 			snapErr = write(p)
