@@ -96,15 +96,7 @@ type Hub struct {
 	mu   sync.Mutex
 	subs map[*Sub]struct{}
 	join *tsjoin.State
-	// avgChunk is a running average of published chunk sizes, for sizing a new
-	// subscriber's queue to its join burst (see Subscribe).
-	avgChunk int
 }
-
-// maxSubQueue caps a subscriber's queue however deep its burst: 64k chunk
-// slots is ~1.5 MB of channel and, at 12 KB chunks, ~750 MB of stream a viewer
-// may fall behind by — far past any burst the ring can hold.
-const maxSubQueue = 64 << 10
 
 // New returns a Hub. maxGOP caps a single GOP (bytes); maxPrebufMS is how many
 // milliseconds of keyframe-aligned history the join state keeps for client
@@ -127,11 +119,6 @@ func New(maxGOP int, maxPrebufMS int64) *Hub {
 // churn once GOP buffers were recycled).
 func (h *Hub) Publish(chunk []byte) {
 	h.mu.Lock()
-	if h.avgChunk == 0 {
-		h.avgChunk = len(chunk)
-	} else {
-		h.avgChunk += (len(chunk) - h.avgChunk) / 8
-	}
 	if len(h.subs) == 0 {
 		h.join.Update(chunk)
 		h.mu.Unlock()
@@ -168,36 +155,53 @@ func (h *Hub) Publish(chunk []byte) {
 func (h *Hub) Subscribe(prebufMS int64) (*Sub, *Burst) {
 	h.mu.Lock()
 	head, parts := h.join.SnapshotPin(nil, prebufMS)
-	s := &Sub{ch: make(chan []byte, h.queueFor(head, parts)), done: make(chan struct{})}
+	s := &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()
 
 	return s, &Burst{Head: head, Parts: parts, h: h}
 }
 
-// queueFor sizes a new subscriber's queue to its join burst. While the burst is
-// being written the live tail queues behind it, and a fixed subQueue (~3 MB at
-// 12 KB chunks, ~5 s of a 4.7 Mbit/s stream) dropped every viewer whose link
-// could not take the whole burst within that — with the panel's 30 s prebuffer,
-// anything under ~30 Mbit/s — as "too slow", after which the player reconnected
-// into another burst, and another. A viewer takes the burst at its link speed
-// while the stream keeps arriving at its own, so a link faster than the stream
-// queues at most the burst's worth of chunks; twice that is headroom for short
-// reads. A link slower than the stream still fills this and is still dropped,
-// which is right — it could never keep up. Caller holds h.mu.
-func (h *Hub) queueFor(head []byte, parts [][]byte) int {
-	n := len(head)
-	for _, p := range parts {
-		n += len(p)
+// Join begins a viewer's join WITHOUT subscribing it: the header to write first
+// (PAT/PMT) and a cursor at the start of its prebufMS of history. The viewer then
+// takes that history with CatchUp, straight out of the ring, and is subscribed to
+// the live tail only when it reaches the edge.
+//
+// Subscribing at once and queuing the live tail behind the history is what
+// Subscribe does, and it forces a choice: a queue short enough to be cheap
+// (256 chunks, ~5 s of a 4.7 Mbit/s stream) drops every viewer whose link cannot
+// take a 30 s burst within that — anything under ~30 Mbit/s, which reconnects
+// into another burst — and one long enough to hold the burst lets each stalled
+// viewer pin up to that much stream in memory. Reading the ring forward needs
+// neither: the history is already there, once, for everyone.
+func (h *Hub) Join(prebufMS int64) ([]byte, tsjoin.Cursor) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.join.JoinStart(nil, prebufMS)
+}
+
+// CatchUp returns the next run (about max bytes) of a joining viewer's history
+// from c, pinned in a Burst the caller writes and Releases, and the cursor after
+// it. When that run reaches the live edge the viewer is subscribed in the same
+// critical section (sub != nil), so the live tail continues exactly where the
+// run ends — no gap, no duplication. behind reports that c has left the ring: a
+// viewer slower than the stream, which can never catch up and should be let go.
+func (h *Hub) CatchUp(c tsjoin.Cursor, max int) (burst *Burst, next tsjoin.Cursor, sub *Sub, behind bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	parts, next, atEnd, behind := h.join.ReadFrom(c, max)
+	if behind {
+		return &Burst{}, c, nil, true
 	}
-	q := subQueue
-	if c := h.avgChunk; c > 0 {
-		q += 2 * n / c
+	burst = &Burst{Parts: parts}
+	if len(parts) > 0 {
+		burst.h = h // pinned: Release unpins
 	}
-	if q > maxSubQueue {
-		q = maxSubQueue
+	if atEnd {
+		sub = &Sub{ch: make(chan []byte, subQueue), done: make(chan struct{})}
+		h.subs[sub] = struct{}{}
 	}
-	return q
+	return burst, next, sub, false
 }
 
 // Snapshot returns a fresh clean-entry snapshot (PAT/PMT + keyframe, optionally

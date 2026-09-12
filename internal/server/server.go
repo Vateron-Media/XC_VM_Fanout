@@ -1473,6 +1473,12 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// joinRunBytes is how much join history a viewer is written per pinned run
+// while it catches up to the live edge: big enough to keep lock round-trips
+// rare, small enough that a slow viewer never holds a pin — which suspends GOP
+// recycling for the whole stream — for more than a moment.
+const joinRunBytes = 1 << 20
+
 func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/live/")
 	st := m.Get(id)
@@ -1495,12 +1501,11 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// would do it too, but only after Subscribe had already copied.
 	st.restoreBuffer()
 
-	// Subscribe FIRST, then attach: registering the subscriber before the puller
-	// starts is what guarantees no published chunk falls between the snapshot and
-	// the live tail.
-	sub, burst := st.Hub.Subscribe(prebufMS)
-	defer burst.Release() // normally released as soon as it is written, below
-	defer st.Hub.Unsubscribe(sub)
+	// Place the join FIRST, then attach: the cursor fixes where this viewer's
+	// history starts before the puller (if it was stopped) begins publishing, and
+	// the catch-up below subscribes it at the live edge with no gap between the
+	// history and the live tail.
+	head, cur := st.Hub.Join(prebufMS)
 	st.attach()
 	defer st.detach()
 
@@ -1584,46 +1589,53 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	}
 	lastChunk := time.Now()
 
-	// Write the join burst straight out of the ring — the tables, then each
-	// pinned GOP — and unpin it the moment it is written, so the ring can recycle
-	// those buffers again. No copy of the history is ever made for a viewer; each
-	// GOP gets its own write deadline, like every chunk of the live tail.
-	//
-	// A burst can take a slow viewer many seconds, and the pin holds recycling
-	// off for the whole stream meanwhile — so between GOPs, stop the moment the
-	// viewer is gone for any of the reasons the live loop below would notice:
-	// dropped by the hub, kicked by the panel, or the client closing.
-	var snapErr error
-	if len(burst.Head) > 0 {
-		snapErr = write(burst.Head)
-	}
-	for _, p := range burst.Parts {
-		if snapErr != nil {
-			break
-		}
-		select {
-		case <-sub.Done():
-			burst.Release()
-			reason = "dropped: too slow (hub buffer full, during the join burst)"
+	// Take the join history straight out of the ring — the tables, then the
+	// prebuffer in runs of joinRunBytes, each pinned only while it is written —
+	// and subscribe to the live tail in the same step that reaches the edge.
+	// Nothing of the history is copied per viewer, and nothing queues behind it:
+	// a viewer takes it at its own link speed, and one slower than the stream
+	// falls off the ring's tail and is let go. Between runs, stop the moment the
+	// viewer is kicked or gone.
+	if len(head) > 0 {
+		if err := write(head); err != nil {
+			reason = writeFailReason(err)
 			return
-		case <-killC:
-			burst.Release()
-			reason = "dropped by panel (kick / connection limit)"
-			return
-		case <-r.Context().Done():
-			burst.Release()
-			reason = "client closed (during the join burst)"
-			return
-		default:
-		}
-		if len(p) > 0 {
-			snapErr = write(p)
 		}
 	}
-	burst.Release()
-	if snapErr != nil {
-		reason = writeFailReason(snapErr)
-		return
+	var sub *hub.Sub
+	for sub == nil {
+		burst, next, s, behind := st.Hub.CatchUp(cur, joinRunBytes)
+		if behind {
+			reason = "dropped: fell behind the ring while taking its prebuffer (link slower than the stream)"
+			return
+		}
+		if s != nil {
+			sub = s
+			defer st.Hub.Unsubscribe(sub)
+		}
+		var werr error
+		for _, p := range burst.Parts {
+			select {
+			case <-killC:
+				burst.Release()
+				reason = "dropped by panel (kick / connection limit)"
+				return
+			case <-r.Context().Done():
+				burst.Release()
+				reason = "client closed (during the join)"
+				return
+			default:
+			}
+			if werr = write(p); werr != nil {
+				break
+			}
+		}
+		burst.Release()
+		if werr != nil {
+			reason = writeFailReason(werr)
+			return
+		}
+		cur = next
 	}
 	lastChunk = time.Now()
 	for {

@@ -668,6 +668,23 @@ func (s *State) SnapshotInto(dst []byte, reqMS int64) []byte {
 // published after that point reaches the viewer through its channel, everything
 // before it is in these bytes, with no gap and no duplication.
 func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
+	start := s.joinIndex(reqMS)
+
+	out := append(dst[:0], s.lastPAT...)
+	out = append(out, s.lastPMT...)
+
+	parts := make([][]byte, 0, len(s.gops)-start)
+	for i := start; i < len(s.gops); i++ {
+		parts = append(parts, s.gops[i].data)
+	}
+	s.pins++
+	return out, parts
+}
+
+// joinIndex is the ring index a join with a reqMS prebuffer starts at: that far
+// back on the ring clock (0 or no clock: the current block), then moved to a
+// block a decoder can begin on.
+func (s *State) joinIndex(reqMS int64) int {
 	start := len(s.gops) - 1
 	if start < 0 {
 		start = 0
@@ -685,18 +702,90 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 			start = i
 		}
 	}
+	return s.snapshotStart(start)
+}
 
-	start = s.snapshotStart(start)
+// Cursor is a joining viewer's place in the ring: the block it is in, and how
+// many of that block's bytes it has already been written.
+type Cursor struct {
+	GOP int64
+	Off int
+}
 
-	out := append(dst[:0], s.lastPAT...)
-	out = append(out, s.lastPMT...)
-
-	parts := make([][]byte, 0, len(s.gops)-start)
-	for i := start; i < len(s.gops); i++ {
-		parts = append(parts, s.gops[i].data)
+// JoinStart begins a join: the header a viewer is written first (latest PAT and
+// PMT, copied — they are mutated in place) and the cursor its history starts
+// at. Nothing is pinned and nothing registered; the viewer catches up with
+// ReadFrom. Caller (Hub) serialises access.
+func (s *State) JoinStart(dst []byte, reqMS int64) ([]byte, Cursor) {
+	head := append(dst[:0], s.lastPAT...)
+	head = append(head, s.lastPMT...)
+	if len(s.gops) == 0 {
+		return head, Cursor{GOP: s.nextGOPID} // nothing retained yet: start at the edge
 	}
-	s.pins++
-	return out, parts
+	return head, Cursor{GOP: s.gops[s.joinIndex(reqMS)].id}
+}
+
+// ReadFrom returns the ring's bytes from c onwards — about max of them, cut on
+// a packet boundary — and the cursor after them, PINNED (the caller writes them
+// with the lock released, then Unpins; nothing is pinned when parts is empty).
+// atEnd reports that they reach the live edge: everything the ring holds. behind
+// reports that c's block has left the ring — the reader fell further behind than
+// the ring reaches.
+//
+// This is how a viewer takes its join history without a copy AND without a
+// queue: it reads the ring forward in runs until it is at the edge, and only
+// then subscribes to the live tail. The live tail used to queue behind the whole
+// burst instead, and a queue short enough to be cheap dropped every viewer whose
+// link could not take a 30 s burst in ~5 s. Caller (Hub) serialises access.
+func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool) {
+	if len(s.gops) == 0 {
+		return nil, c, true, false
+	}
+	first := s.gops[0].id
+	if c.GOP < first {
+		return nil, c, false, true
+	}
+	i := int(c.GOP - first) // ids are consecutive: blocks are appended in order and pruned from the front
+	if i >= len(s.gops) {
+		return nil, c, true, false
+	}
+	if max < PacketSize {
+		max = PacketSize
+	}
+	n := 0
+	next = c
+	for ; i < len(s.gops); i++ {
+		g := s.gops[i]
+		off := 0
+		if g.id == c.GOP {
+			off = c.Off
+		}
+		if off > len(g.data) {
+			off = len(g.data)
+		}
+		rem := g.data[off:]
+		if n+len(rem) > max {
+			take := (max - n) / PacketSize * PacketSize
+			if take > 0 {
+				parts = append(parts, rem[:take])
+				n += take
+			}
+			next = Cursor{GOP: g.id, Off: off + take}
+			if len(parts) > 0 {
+				s.pins++
+			}
+			return parts, next, false, false
+		}
+		if len(rem) > 0 {
+			parts = append(parts, rem)
+			n += len(rem)
+		}
+		next = Cursor{GOP: g.id, Off: len(g.data)}
+	}
+	if len(parts) > 0 {
+		s.pins++
+	}
+	return parts, next, true, false
 }
 
 // snapshotStart moves a join's first block to one a decoder can start on: the
