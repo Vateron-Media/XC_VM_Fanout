@@ -35,7 +35,7 @@ running daemon — each test wires up exactly what it needs in-process.
 
 | Package | What its tests cover |
 |---------|----------------------|
-| `hub` | Fan-out correctness (every subscriber gets the identical byte stream), slow-subscriber drop, snapshot/unsubscribe. |
+| `hub` | Fan-out correctness (every viewer following the ring sees the identical byte stream), slow-viewer drop (cursor pruned off the tail), pin stability while the producer recycles, and teardown wake. |
 | `tsjoin` | Clean-join parsing (PAT/PMT + keyframe), the prebuffer ring rewind, and the HLS-from-ring view (segment cutting on keyframes, the display window, playlist/segment assembly). |
 | `config` | The self-healing JSON contract: self-create when absent, backfill missing keys, keep defaults on malformed, atomic write, clamp ranges. |
 | `hlscrypt` | AES-128-CBC segment encryption round-trips. |

@@ -42,8 +42,8 @@ Keeps the connection open and continuously streams MPEG-TS to the viewer. The ha
 1. Finds the stream by `<id>` (otherwise `404`).
 2. Reads the prebuffer from `?prebuffer=` and honors it as-is (falling back to
    `default_prebuffer_sec` when the param is absent).
-3. Atomically takes a "clean-entry snapshot" (PAT/PMT + the needed tail of GOPs) and
-   subscribes to the live tail — without a gap or duplication.
+3. Places a cursor at the start of its prebuffer (PAT/PMT header first, then the needed tail of
+   GOPs) and follows the ring forward into the live tail — without a gap or duplication (ADR 0004).
 4. `attach()` — accounts for the viewer and **starts the puller on the first viewer**
    (for streams managed via the control API).
 5. If `?c=<uuid>` is given — registers the connection for reconciliation.
@@ -261,8 +261,8 @@ the stream's expected bitrate (`streams_servers.bitrate / 8 * 0.92`) and records
 viewer's `divergence` in `lines_live` / `lines_divergence` (ADR 0003, P4). On the rare chance a uuid
 is live on more than one stream, the higher rate wins.
 
-> Because the daemon **drops** a viewer that falls behind (slow-subscriber eviction + the write
-> deadline), a sustained-slow reading rarely appears here — a healthy realtime viewer's average
+> Because the daemon **drops** a viewer that falls behind (its cursor is pruned off the ring's tail,
+> plus the write deadline), a sustained-slow reading rarely appears here — a healthy realtime viewer's average
 > converges to the stream bitrate, so divergence for daemon-served viewers is normally ~0. The value
 > is the connection-speed signal and admin display, not a fast-pull fraud check (a viewer cannot pull
 > faster than the live tail is fanned out).

@@ -60,11 +60,12 @@ func (m *Manager) serveMemory(w http.ResponseWriter, r *http.Request) {
 		bytes, spanMS, gops := st.Hub.RingStats()
 		st.mu.Lock()
 		gated := !st.buffered
+		viewers := st.refs // live-TS followers (ADR 0004: viewers follow the ring, no Sub to count)
 		st.mu.Unlock()
 		out.RingBytes += int64(bytes)
 		rings = append(rings, ringView{
 			ID: st.id, Bytes: bytes, Seconds: float64(spanMS) / 1000, GOPs: gops,
-			Viewers: st.Hub.Count(), Gated: gated,
+			Viewers: viewers, Gated: gated,
 		})
 	}
 	sort.Slice(rings, func(i, j int) bool { return rings[i].Bytes > rings[j].Bytes })

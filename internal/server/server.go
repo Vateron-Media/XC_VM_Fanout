@@ -1086,8 +1086,8 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 					// nokf > 0 means the source carries no random_access_indicator: the
 					// ring is being cut on the byte cap instead of on keyframes, and
 					// HLS cannot produce segments for it at all.
-					dlog.Logf("stats", "id=%s mode=%s running=%v route=%s refs=%d subs=%d conns=%d data_age=%s nokf=%d",
-						st.id, mode, running, route, refs, st.Hub.Count(), conns, dataAge, st.Hub.NoKeyframeCuts())
+					dlog.Logf("stats", "id=%s mode=%s running=%v route=%s refs=%d conns=%d data_age=%s nokf=%d",
+						st.id, mode, running, route, refs, conns, dataAge, st.Hub.NoKeyframeCuts())
 				}
 			}
 		}
@@ -1210,18 +1210,20 @@ func (m *Manager) RegisterIngest(id string, chunk int) (string, error) {
 // nothing — the puller is stopped and the producer hung up — and once the stream
 // leaves the registry they are invisible to /connections, so PHP closes their
 // lines_live rows while their handler goroutines sit forever on a hub that will
-// never publish again, pinning the Stream, its hub and its whole ring. Closing
-// the subscribers lets each serveLive return and run its deferred cleanup, so the
-// viewer reconnects (and re-authorises) instead of freezing on an orphan.
+// never publish again, pinning the Stream, its hub and its whole ring. Waking the
+// followers (CloseAll) lets each serveLive return and run its deferred cleanup, so
+// the viewer reconnects (and re-authorises) instead of freezing on an orphan.
 func (m *Manager) Unregister(id string) {
 	if st := m.Get(id); st != nil {
 		st.mu.Lock()
 		st.cfg = nil
 		st.stopLocked()
 		st.stopIngestLocked()
+		viewers := st.refs // live-TS followers being dropped by the teardown
 		st.mu.Unlock()
-		if n := st.Hub.CloseAll(); n > 0 {
-			dlog.Logf("ctl", "id=%s dropped %d attached viewer(s) on teardown", id, n)
+		st.Hub.CloseAll() // wake every follower parked at the edge so serveLive unwinds
+		if viewers > 0 {
+			dlog.Logf("ctl", "id=%s dropped %d attached viewer(s) on teardown", id, viewers)
 		}
 		st.dropSegCache()
 	}
@@ -1229,6 +1231,26 @@ func (m *Manager) Unregister(id string) {
 	delete(m.streams, id)
 	m.mu.Unlock()
 	dlog.Logf("ctl", "id=%s unregistered and removed", id)
+}
+
+// UnregisterAll tears down every registered stream — the whole node's fan-out —
+// exactly as Unregister does for one (stop the puller, hang up producers, drop
+// viewers, release the ring), and returns how many it removed. The ids are
+// snapshotted under m.mu and torn down with the lock released, so a bulk teardown
+// never blocks GetOrCreate behind the per-stream hub work. This is an explicit
+// operator action on the PHP-only control socket, logged per stream by
+// Unregister — not a hidden or automatic path.
+func (m *Manager) UnregisterAll() int {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.streams))
+	for id := range m.streams {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	for _, id := range ids {
+		m.Unregister(id)
+	}
+	return len(ids)
 }
 
 // ClientHandler routes the nginx-facing surface: live TS, HLS, health.
@@ -1246,6 +1268,7 @@ func (m *Manager) ClientHandler() http.Handler {
 // ControlHandler routes the PHP-only control surface.
 func (m *Manager) ControlHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/streams", m.serveControlAll)
 	mux.HandleFunc("/streams/", m.serveControl)
 	mux.HandleFunc("/ingest/", m.serveIngest)
 	mux.HandleFunc("/probe/", m.serveProbe)
@@ -1511,6 +1534,25 @@ func normalizeBackend(b string) string {
 	return ""
 }
 
+// serveControlAll is the bulk control surface at /streams (no id): DELETE tears
+// down every registered stream in one call — the same teardown DELETE
+// /streams/<id> performs for one, applied across the whole registry. It exists so
+// an operator can stop the node's fan-out explicitly (a maintenance drain, a node
+// decommission) instead of scripting a DELETE per id, and it answers with the
+// count it removed. It lives on the PHP-only control socket and logs every
+// teardown, so it is an auditable operator action, not a hidden switch. Any method
+// other than DELETE is rejected — this path never lists or mutates silently.
+func (m *Manager) serveControlAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n := m.UnregisterAll()
+	dlog.Logf("ctl", "teardown all: unregistered %d stream(s) (DELETE /streams)", n)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{"unregistered": n})
+}
+
 func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/streams/")
 	if id == "" {
@@ -1605,7 +1647,10 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// write stalled past the timeout), how long it lasted and how much it got.
 	start := time.Now()
 	reason := "client closed"
-	dlog.Logf("viewer", "id=%s live attach uuid=%s prebuffer=%dms subs=%d", id, uuid, prebufMS, st.Hub.Count())
+	st.mu.Lock()
+	nviewers := st.refs // live-TS followers on this stream (ADR 0004: no Sub to count)
+	st.mu.Unlock()
+	dlog.Logf("viewer", "id=%s live attach uuid=%s prebuffer=%dms viewers=%d", id, uuid, prebufMS, nviewers)
 	defer func() {
 		var sent int64
 		if cs != nil {
@@ -1620,11 +1665,10 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// Bound every write with a deadline. A viewer that stops draining its socket
 	// without cleanly closing the connection (a backgrounded/force-switched
 	// player, a dropped mobile link) fills its OS send buffer and blocks the
-	// write forever — neither sub.Done() (the hub drops the slow subscriber) nor
-	// r.Context().Done() can interrupt an in-flight Write. The deadline turns that
-	// stall into an error so the deferred detach/removeConn run and fanout_sync
-	// can close the lines_live row, instead of a ghost connection lingering on the
-	// stream the viewer already left.
+	// write forever — and r.Context().Done() cannot interrupt an in-flight Write.
+	// The deadline turns that stall into an error so the deferred detach/removeConn
+	// run and fanout_sync can close the lines_live row, instead of a ghost
+	// connection lingering on the stream the viewer already left.
 	rc := http.NewResponseController(w)
 	write := func(b []byte) error {
 		if err := rc.SetWriteDeadline(time.Now().Add(time.Duration(m.writeTimeout.Load()))); err != nil {
@@ -1645,18 +1689,40 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		}
 		return rc.Flush()
 	}
+	// writeRun writes a whole Follow run (the ring's GOP slices) under a SINGLE
+	// write deadline and a single flush. The deadline is set once, at the start of
+	// the run, so it is absolute across every part: a viewer that cannot drain the
+	// run within writeTimeout is dropped even if it trickles a few bytes at a time.
+	// Deadlining each 188-byte part separately (as an earlier version did) let a
+	// slow-drain client reset the timer on every packet and never time out — and it
+	// also flushed once per GOP, a syscall per part on the hot path. One deadline,
+	// one flush per run fixes both.
+	writeRun := func(parts [][]byte) error {
+		deadlined := rc.SetWriteDeadline(time.Now().Add(time.Duration(m.writeTimeout.Load()))) == nil
+		for _, p := range parts {
+			n, err := w.Write(p)
+			if cs != nil && n > 0 {
+				cs.bytes.Add(int64(n))
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if !deadlined {
+			return nil // no deadline support: plain buffered write, as write() falls back to
+		}
+		return rc.Flush()
+	}
 
 	// Guard against a viewer that receives nothing at all. The per-write deadline
 	// above can only fire while there are bytes to write, so it does not cover the
-	// other half of the problem: a stream that goes off-air stops producing chunks,
-	// nothing is ever written, and a client whose socket is half-open (a dropped
-	// mobile link that sent no FIN nor RST) is never noticed by anyone — not by us,
-	// and not by nginx, which is equally idle. That connection sat in the select
-	// below forever, holding its uuid in /connections as a ghost the reconciler
-	// could never clear. A single timer, re-armed for the remainder when it finds
-	// a chunk has landed since it was set — so the hot path stays a timestamp
-	// store, the drop fires exactly at the timeout, and a healthy viewer costs one
-	// wakeup per timeout instead of the four the old approximating ticker spent.
+	// other half of the problem: a stream that goes off-air stops producing, so a
+	// follower parked at the live edge with a half-open socket (a dropped mobile
+	// link that sent no FIN nor RST) is never noticed by us or by nginx, and would
+	// sit forever holding its uuid in /connections as a ghost the reconciler could
+	// never clear. The idle timer fires only while the follower is parked at the
+	// edge — which is exactly "receiving nothing" — and is reset on every delivered
+	// run, so a viewer actively draining the ring never trips it.
 	var idleC <-chan time.Time
 	var idleTimer *time.Timer
 	idleTimeout := time.Duration(m.viewerIdleNS.Load())
@@ -1665,34 +1731,67 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		defer idleTimer.Stop()
 		idleC = idleTimer.C
 	}
-	lastChunk := time.Now()
+	resetIdle := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleTimeout)
+	}
 
-	// Take the join history straight out of the ring — the tables, then the
-	// prebuffer in runs of joinRunBytes, each pinned only while it is written —
-	// and subscribe to the live tail in the same step that reaches the edge.
-	// Nothing of the history is copied per viewer, and nothing queues behind it:
-	// a viewer takes it at its own link speed, and one slower than the stream
-	// falls off the ring's tail and is let go. Between runs, stop the moment the
-	// viewer is kicked or gone.
+	// Follow the ring by cursor for the WHOLE session — the join history and then
+	// the live tail, one loop (ADR 0004). Nothing is copied per viewer and nothing
+	// queues behind the history: the viewer takes the ring at its own link speed in
+	// runs of joinRunBytes (each pinned only while it is written), and one slower
+	// than the stream falls off the ring's tail (behind) and is let go. At the live
+	// edge the follower parks on wake until the next Publish, and a teardown
+	// (CloseAll) surfaces as ended so this handler returns and runs its cleanup.
 	if len(head) > 0 {
 		if err := write(head); err != nil {
 			reason = writeFailReason(err)
 			return
 		}
 	}
-	var sub *hub.Sub
-	for sub == nil {
-		burst, next, s, behind := st.Hub.CatchUp(cur, joinRunBytes)
+	for {
+		// Admin "send message" overlay (rare): burn it onto a short window via a
+		// transient ffmpeg fed from the ring, then resume the raw fan-out from where
+		// the overlay left off. peek keeps the hot path a single map read.
+		if uuid != "" && m.signals.peek(uuid) {
+			if sig, ok := m.signals.take(uuid); ok {
+				dlog.Logf("signal", "id=%s uuid=%s applying overlay to live TS window", id, uuid)
+				next, alive := m.overlayTSWindow(st, cur, write, sig, codec)
+				if !alive {
+					reason = "client closed (during overlay)"
+					return
+				}
+				cur = next
+				resetIdle() // the overlay delivered a window of video, not silence
+				continue
+			}
+		}
+
+		burst, next, atEnd, wake, behind, ended := st.Hub.Follow(cur, joinRunBytes)
 		if behind {
-			reason = "dropped: fell behind the ring while taking its prebuffer (link slower than the stream)"
+			burst.Release()
+			reason = "dropped: fell behind the ring (link slower than the stream)"
 			return
 		}
-		if s != nil {
-			sub = s
-			defer st.Hub.Unsubscribe(sub)
+		if ended {
+			burst.Release()
+			reason = "stream torn down"
+			return
 		}
-		var werr error
-		for _, p := range burst.Parts {
+		// Write the whole run under one deadline (writeRun); a kick / client-close is
+		// checked once before it. A run is bounded by joinRunBytes, so a healthy
+		// viewer clears it in milliseconds, and a stalled one is dropped by the run's
+		// write deadline.
+		delivered := false
+		if len(burst.Parts) > 0 {
 			select {
 			case <-killC:
 				burst.Release()
@@ -1700,66 +1799,39 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 				return
 			case <-r.Context().Done():
 				burst.Release()
-				reason = "client closed (during the join)"
+				reason = "client closed"
 				return
 			default:
 			}
-			if werr = write(p); werr != nil {
-				break
-			}
-		}
-		burst.Release()
-		if werr != nil {
-			reason = writeFailReason(werr)
-			return
-		}
-		cur = next
-	}
-	lastChunk = time.Now()
-	for {
-		// Admin "send message" overlay (rare): if one is queued for this viewer,
-		// burn it onto a short window of the stream via a transient ffmpeg, then
-		// fall back to the raw fan-out. peek keeps the hot path a single map read.
-		if uuid != "" && m.signals.peek(uuid) {
-			if sig, ok := m.signals.take(uuid); ok {
-				dlog.Logf("signal", "id=%s uuid=%s applying overlay to live TS window", id, uuid)
-				if !m.overlayTSWindow(st, sub, write, sig, codec) {
-					reason = "client closed (during overlay)"
-					return
-				}
-				// The overlay goroutine drained sub.C() for the window, so no chunk
-				// reached the idle check meanwhile — don't count that as silence.
-				lastChunk = time.Now()
-			}
-		}
-		select {
-		case b := <-sub.C():
-			lastChunk = time.Now()
-			if err := write(b); err != nil {
-				reason = writeFailReason(err)
+			werr := writeRun(burst.Parts)
+			burst.Release()
+			if werr != nil {
+				reason = writeFailReason(werr)
 				return
 			}
-		case now := <-idleC:
-			// A chunk may have landed since the timer was armed; re-arm for the
-			// remainder rather than polling at four times the rate to approximate
-			// it. One timer per viewer either way, but a healthy viewer now wakes
-			// once per timeout instead of four times, and the drop fires exactly at
-			// the timeout rather than up to a quarter of it late.
-			if left := idleTimeout - now.Sub(lastChunk); left > 0 {
-				idleTimer.Reset(left)
-				continue
+			delivered = true
+		} else {
+			burst.Release()
+		}
+		cur = next
+		if delivered {
+			resetIdle()
+		}
+		if atEnd {
+			select {
+			case <-wake:
+				// New data landed (or the stream was torn down, which the next
+				// Follow reports as ended). Loop and read it.
+			case <-idleC:
+				reason = "no data for " + idleTimeout.String() + " (source off-air; dropped)"
+				return
+			case <-killC:
+				reason = "dropped by panel (kick / connection limit)"
+				return
+			case <-r.Context().Done():
+				reason = "client closed"
+				return
 			}
-			reason = "no data for " + idleTimeout.String() + " (source off-air; dropped)"
-			return
-		case <-sub.Done():
-			reason = "dropped: too slow (hub buffer full)"
-			return
-		case <-killC:
-			reason = "dropped by panel (kick / connection limit)"
-			return
-		case <-r.Context().Done():
-			reason = "client closed"
-			return
 		}
 	}
 }

@@ -70,6 +70,64 @@ func TestControlRegisterAndUnregister(t *testing.T) {
 	}
 }
 
+// TestControlTeardownAll covers DELETE /streams: the explicit bulk teardown
+// removes every registered stream in one call and reports the count, while any
+// other method on the collection is rejected.
+func TestControlTeardownAll(t *testing.T) {
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
+	ts := httptest.NewServer(mgr.ControlHandler())
+	defer ts.Close()
+
+	for _, id := range []string{"3", "5", "7"} {
+		mgr.GetOrCreate(id)
+	}
+
+	// A non-DELETE method on the collection is not allowed — this path never
+	// lists or mutates silently.
+	if code := ctlRequest(t, ts.URL, http.MethodGet, "/streams", ""); code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /streams: status %d, want 405", code)
+	}
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/streams", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /streams: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE /streams: status %d, want 200", resp.StatusCode)
+	}
+	var got struct {
+		Unregistered int `json:"unregistered"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode teardown response: %v", err)
+	}
+	if got.Unregistered != 3 {
+		t.Fatalf("teardown reported %d streams, want 3", got.Unregistered)
+	}
+	for _, id := range []string{"3", "5", "7"} {
+		if mgr.Get(id) != nil {
+			t.Fatalf("stream %s must be gone after teardown", id)
+		}
+	}
+
+	// Idempotent: a second call tears down nothing and says so.
+	req2, _ := http.NewRequest(http.MethodDelete, ts.URL+"/streams", nil)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("second DELETE /streams: %v", err)
+	}
+	defer resp2.Body.Close()
+	var got2 struct {
+		Unregistered int `json:"unregistered"`
+	}
+	_ = json.NewDecoder(resp2.Body).Decode(&got2)
+	if got2.Unregistered != 0 {
+		t.Fatalf("second teardown reported %d streams, want 0", got2.Unregistered)
+	}
+}
+
 func TestControlRejectsBadRequests(t *testing.T) {
 	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	ts := httptest.NewServer(mgr.ControlHandler())

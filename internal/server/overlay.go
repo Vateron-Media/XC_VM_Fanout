@@ -17,7 +17,7 @@ import (
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
-	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsjoin"
 )
 
 // overlayTSDuration is how long an admin "send message" banner stays burned onto
@@ -124,11 +124,21 @@ func parseXY(offset string) (int, int) {
 // option (which treats \ : ' % specially, and must stay single-line). The value
 // is passed to ffmpeg as one argv element, so there is no shell involved — this
 // is purely filtergraph-syntax safety.
+//
+// The whole value is wrapped in single quotes by the caller (…:text='…':…), and
+// a single quote CANNOT be escaped inside a single-quoted ffmpeg token: the only
+// way to include one is to close the quote, emit an escaped quote, and reopen —
+// the shell-style '\'' sequence. The previous \' broke the filtergraph parse for
+// any message carrying an apostrophe ("it's back"), so the whole re-encode failed
+// and — being best-effort — the overlay silently served plain video instead. The
+// colon still needs \: even inside the quotes: ffmpeg's filtergraph parser splits
+// options on a bare ':' regardless of quoting, and consumes the backslash, so it
+// renders clean.
 func escapeDrawtext(s string) string {
 	return strings.NewReplacer(
 		`\`, `\\`,
 		`:`, `\:`,
-		`'`, `\'`,
+		`'`, `'\''`,
 		`%`, `\%`,
 		"\n", " ",
 		"\r", " ",
@@ -201,18 +211,23 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 
 // overlayTSWindow burns the signal's banner onto a live-TS viewer's stream for
 // overlayTSDuration by piping it through ffmpeg drawtext. A fresh clean-join
-// snapshot re-seeds ffmpeg's decoder at a keyframe; hub chunks then feed its
-// stdin while its stdout goes to the viewer via write(). After the window ffmpeg
-// stops and the caller resumes the raw tail (the player resyncs on the next
-// keyframe the hub emits). Returns false ONLY if the viewer connection broke
-// (caller should stop serving); overlay disabled / ffmpeg failure returns true
-// so the caller simply continues raw — a signal never breaks playback.
+// snapshot re-seeds ffmpeg's decoder at a keyframe; the ring — followed by cursor
+// from cur — feeds its stdin while its stdout goes to the viewer via write().
+// After the window ffmpeg stops and the caller resumes the raw tail from the
+// returned cursor (the player resyncs on the next keyframe the ring emits).
 //
-// The feed goroutine is the sole consumer of sub.C() for the window and is
-// joined before returning, so it can never steal chunks from the raw loop after.
-func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) error, sig pendingSignal, codec string) bool {
+// It returns the cursor to resume the raw fan-out from — advanced to wherever the
+// feed reached, so there is no gap or duplication across the window — and false
+// ONLY if the viewer connection broke (caller should stop serving). Overlay
+// disabled / ffmpeg failure returns (cur, true) so the caller simply continues
+// raw from where it was: a signal never breaks playback.
+//
+// The feed goroutine is the sole reader of the ring for the window and is joined
+// before returning, so the returned cursor is stable and it can never race the
+// raw loop after.
+func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]byte) error, sig pendingSignal, codec string) (tsjoin.Cursor, bool) {
 	if m.ffmpegBin == "" || m.fontPath == "" {
-		return true
+		return cur, true
 	}
 	if codec == "" {
 		codec = defaults.OverlayDefaultCodec
@@ -241,35 +256,57 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 	stdout, err2 := cmd.StdoutPipe()
 	if err1 != nil || err2 != nil {
 		dlog.Logf("signal", "overlay TS window: pipe setup failed (%v / %v), continuing raw", err1, err2)
-		return true
+		return cur, true
 	}
 	if err := cmd.Start(); err != nil {
 		dlog.Logf("signal", "overlay TS window: ffmpeg start failed (%v), continuing raw", err)
-		return true // couldn't start ffmpeg → continue raw
+		return cur, true // couldn't start ffmpeg → continue raw
 	}
 
 	stopFeed := make(chan struct{})
 	feedDone := make(chan struct{})
+	endCur := cur
 	go func() {
-		defer close(feedDone)
+		c := cur
+		// endCur is read by the caller only after feedDone closes, so this write
+		// is safely published; stdin.Close (registered later, so it runs first on
+		// return) lets ffmpeg drain and finish its output.
+		defer func() { endCur = c; close(feedDone) }()
 		defer stdin.Close()
 		_, _ = stdin.Write(st.Hub.Snapshot(0)) // clean keyframe entry for the decoder
 		deadline := time.After(overlayTSDuration)
 		for {
 			select {
-			case b, ok := <-sub.C():
-				if !ok {
-					return
-				}
-				if _, err := stdin.Write(b); err != nil {
-					return
-				}
 			case <-deadline:
-				return
-			case <-sub.Done():
 				return
 			case <-stopFeed:
 				return
+			default:
+			}
+			b, next, atEnd, wake, behind, ended := st.Hub.Follow(c, joinRunBytes)
+			if behind || ended {
+				b.Release()
+				return
+			}
+			var werr error
+			for _, p := range b.Parts {
+				if _, werr = stdin.Write(p); werr != nil {
+					break
+				}
+			}
+			b.Release()
+			if werr != nil {
+				return
+			}
+			c = next
+			if atEnd {
+				select {
+				case <-wake:
+				case <-deadline:
+					return
+				case <-stopFeed:
+					return
+				}
 			}
 		}
 	}()
@@ -295,5 +332,5 @@ func (m *Manager) overlayTSWindow(st *Stream, sub *hub.Sub, write func([]byte) e
 		// anything else is a real overlay ffmpeg failure worth surfacing.
 		dlog.Logf("signal", "overlay TS window: ffmpeg exited (%v): %s", err, strings.TrimSpace(errBuf.String()))
 	}
-	return ok
+	return endCur, ok
 }
