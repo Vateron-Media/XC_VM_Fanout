@@ -280,3 +280,49 @@ func TestConfigRejectsUnusablePattern(t *testing.T) {
 		}
 	}
 }
+
+// TestCutsOnTheKeyframeClockNotThePCR: segments are timed on the keyframes' own
+// PTS, as ffmpeg's hls muxer times them. The PCR — sampled from whatever packet
+// last carried one before the keyframe — jitters around it, and with the GOP
+// equal to the target the next keyframe read as just under target half the time,
+// missed the cut and ran a whole GOP long: segments averaging ~3.5 s against
+// ffmpeg's exact 2 s, and nearly twice the tmpfs for the same list size.
+func TestCutsOnTheKeyframeClockNotThePCR(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, InitSec: 2, ListSize: 20, KeepExtra: 0, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), pmtWithPCR())
+	for g := 0; g < 12; g++ {
+		pts := int64(g) * 2 * 90000 // a GOP exactly the target, 2 s
+		// The PCR arrives on its own packet a little ahead of the keyframe, as
+		// muxers place it: 40 ms early on every other GOP.
+		early := int64(0)
+		if g%2 == 1 {
+			early = 3600
+		}
+		r.feed(pcrOnly(vpid, pts-early), tsfixture.Keyframe(vpid, pts))
+		for i := 0; i < 5; i++ {
+			r.feed(tsfixture.Fill(vpid))
+		}
+	}
+	durs := regexp.MustCompile(`#EXTINF:([0-9.]+),`).FindAllStringSubmatch(r.playlist(), -1)
+	if len(durs) < 10 {
+		t.Fatalf("%d segments from 12 two-second GOPs, want one per GOP:\n%s", len(durs), r.playlist())
+	}
+	for _, d := range durs {
+		if v, _ := strconv.ParseFloat(d[1], 64); v < 1.99 || v > 2.01 {
+			t.Fatalf("segment of %ss, want every one exactly 2 s:\n%s", d[1], r.playlist())
+		}
+	}
+}
+
+// pcrOnly is an adaptation-only packet on pid carrying just a PCR.
+func pcrOnly(pid int, pcr int64) []byte {
+	p := make([]byte, tspes.PacketSize)
+	p[0] = 0x47
+	p[1], p[2] = byte(pid>>8)&0x1f, byte(pid)
+	p[3] = 0x20
+	p[4] = 183
+	p[5] = 0x10 // PCR_flag
+	p[6], p[7], p[8], p[9] = byte(pcr>>25), byte(pcr>>17), byte(pcr>>9), byte(pcr>>1)
+	p[10] = byte(pcr&1) << 7
+	return p
+}

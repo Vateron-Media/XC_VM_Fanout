@@ -305,13 +305,23 @@ func (s *Segmenter) notePTS(pts int64) {
 	}
 }
 
-// elapsed is the open segment's duration in 90 kHz ticks: PCR, else PTS.
+// elapsed is the open segment's duration in 90 kHz ticks: on the video PTS, as
+// ffmpeg's hls muxer measures it, else on the PCR.
+//
+// Every caller asks at a keyframe, when lastPTS is that keyframe's own
+// presentation time and startPTS the one that opened the segment — so the answer
+// is exactly the GOPs in between. The PCR, which this used first, is sampled from
+// whatever packet last carried one before the keyframe, and jitters by tens of
+// milliseconds around it: with the GOP equal to the target (a 2 s GOP under a
+// 2 s, 4 s or 6 s hls_time) the next keyframe read as "1.96 s" about half the
+// time, missed the cut, and the segment ran a whole GOP long — segments averaging
+// 3.5 s against ffmpeg's exact 2 s, and nearly twice the tmpfs.
 func (s *Segmenter) elapsed() int64 {
-	if s.startPCR >= 0 && s.lastPCR >= 0 {
-		return s.delta(s.lastPCR, s.startPCR)
-	}
 	if s.havePTS && s.startPTS >= 0 {
 		return s.delta(s.lastPTS, s.startPTS)
+	}
+	if s.startPCR >= 0 && s.lastPCR >= 0 {
+		return s.delta(s.lastPCR, s.startPCR)
 	}
 	return 0
 }

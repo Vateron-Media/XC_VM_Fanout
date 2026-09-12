@@ -220,6 +220,13 @@ the P2PTV project's native remuxer — its source layer (`internal/nativesrc`), 
 segmenter (`internal/tsseg`) and its keyframe detection (`internal/tspes`, which also lets the
 daemon cut HLS from sources that never set `random_access_indicator`).
 
+Segments are cut and timed exactly as ffmpeg's hls muxer does it: at the first keyframe at or
+past `hls_time`, measured on the keyframes' own PTS, and deleted the same way — the playlist lists
+`hls_list_size` segments and `hls_delete_threshold` more stay on disk, so a stream holds the same
+number of files in the tmpfs whichever producer runs it. (Before 0.13.2 the timing ran on the PCR,
+which jitters around the keyframe; with the GOP equal to the target half the cuts were missed and
+segments averaged ~3.5 s against a 2 s `hls_time` — nearly twice ffmpeg's tmpfs footprint.)
+
 Unlike ffmpeg's tee slave, whose feed into the daemon stays broken once a daemon restart breaks
 it, the remuxer **redials** the ingest socket — after a daemon restart the stream is adopted and
 carries on without restarting.
