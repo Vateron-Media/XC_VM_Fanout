@@ -123,6 +123,13 @@ type State struct {
 	// into ~zero. Capped at defaults.JoinFreeGOPBufs; buffers hold len 0, cap kept.
 	freeBufs [][]byte
 
+	// prunedID / prunedLen are the id and final length of the newest block to
+	// leave the ring (prunedID -1 = none yet). A block is final once a newer one
+	// opens, so a reader whose cursor sits at prunedLen in prunedID took every byte
+	// of it and continues at the next block — see ReadFrom.
+	prunedID  int64
+	prunedLen int
+
 	// HLS segment view over the ring (hlsTargetMS == 0 disables it). The ring is
 	// the single cache; HLS segments are cut from these GOPs on demand rather than
 	// buffered a second time.
@@ -164,7 +171,7 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, prunedID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
@@ -439,7 +446,7 @@ func (s *State) prune() {
 	if s.ring90 <= 0 {
 		if len(s.gops) > 1 {
 			for i := 0; i < len(s.gops)-1; i++ {
-				s.putBuf(s.gops[i].data)
+				s.release(s.gops[i])
 			}
 			s.gops = append(s.gops[:0], s.gops[len(s.gops)-1])
 		}
@@ -456,7 +463,7 @@ func (s *State) prune() {
 		}
 		if drop > 0 {
 			for i := 0; i < drop; i++ {
-				s.putBuf(s.gops[i].data)
+				s.release(s.gops[i])
 			}
 			s.gops = append(s.gops[:0], s.gops[drop:]...)
 		}
@@ -468,7 +475,7 @@ func (s *State) prune() {
 	}
 	for total > s.maxRing && len(s.gops) > 1 {
 		total -= len(s.gops[0].data)
-		s.putBuf(s.gops[0].data)
+		s.release(s.gops[0])
 		s.gops = append(s.gops[:0], s.gops[1:]...)
 	}
 	s.hlsPrune()
@@ -799,7 +806,13 @@ func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd,
 	}
 	first := s.gops[0].id
 	if c.GOP < first {
-		return nil, c, false, true
+		// Its block has left the ring. If the reader had taken every byte of it —
+		// a live viewer parked at the edge when a ring shorter than one GOP prunes
+		// the block it just finished — nothing was lost: go on at the next block.
+		if c.GOP != s.prunedID || first != s.prunedID+1 || c.Off < s.prunedLen {
+			return nil, c, false, true
+		}
+		c = Cursor{GOP: first}
 	}
 	i := int(c.GOP - first) // ids are consecutive: blocks are appended in order and pruned from the front
 	if i >= len(s.gops) {
@@ -884,6 +897,9 @@ func (s *State) Reset() {
 			s.discDropped++
 		}
 	}
+	if n := len(s.gops); n > 0 {
+		s.prunedID, s.prunedLen = s.gops[n-1].id, len(s.gops[n-1].data)
+	}
 	s.gops = nil
 	s.segs = nil
 	s.freeBufs = nil
@@ -946,6 +962,14 @@ func (s *State) getBuf() []byte {
 	s.freeBufs[n-1] = nil // drop the slot's reference so it can't pin the array
 	s.freeBufs = s.freeBufs[:n-1]
 	return b[:0]
+}
+
+// release is how prune lets a block leave the ring: it is remembered for ReadFrom
+// (blocks leave oldest first, so the last one released is the newest gone) and its
+// array recycled.
+func (s *State) release(g gop) {
+	s.prunedID, s.prunedLen = g.id, len(g.data)
+	s.putBuf(g.data)
 }
 
 // putBuf recycles a dropped GOP's backing array for reuse, capacity preserved.
