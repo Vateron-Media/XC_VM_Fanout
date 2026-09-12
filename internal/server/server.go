@@ -12,6 +12,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"runtime/metrics"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -128,9 +130,17 @@ func (s *Stream) setEnc(keyHex, ivHex string) {
 		}
 	}
 	s.encMu.Lock()
+	changed := !bytes.Equal(s.hlsKey, k) || !bytes.Equal(s.hlsIV, iv)
 	s.hlsKey, s.hlsIV = k, iv
 	s.encMu.Unlock()
-	s.dropSegCache() // cached segments carry the OLD key's ciphertext
+	// Cached segments carry the OLD key's ciphertext — but only a change of key
+	// makes them stale. The panel re-registers a stream on every request it
+	// serves, HLS playlist polls included, and dropping the cache each time left
+	// the single-flight cache empty: every segment re-assembled and re-encrypted
+	// per viewer.
+	if changed {
+		s.dropSegCache()
+	}
 }
 
 // encryptSegment returns the segment encrypted for HLS when a key is set, else
@@ -407,6 +417,7 @@ func (s *Stream) Publish(chunk []byte) {
 func (s *Stream) setConfig(src puller.Source, chunk int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed := s.cfg != nil && !sameSource(*s.cfg, src)
 	c := src
 	s.cfg = &c
 	if chunk > 0 {
@@ -414,8 +425,25 @@ func (s *Stream) setConfig(src puller.Source, chunk int) {
 	}
 	dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, src.URLs, src.Proxy, s.refs)
 	if s.refs > 0 {
+		// A running puller holds the Source it started with, so an edit made in
+		// the panel (a new URL, a changed user agent) reached a watched channel
+		// only after its audience had been gone for the whole grace period —
+		// never, on a busy one. Restart it when the source really changed; the
+		// panel re-registers on every request, so an identical config must not.
+		if changed && s.running {
+			dlog.Logf("ctl", "id=%s source changed while running: restarting the puller", s.id)
+			s.stopLocked()
+		}
 		s.startLocked()
 	}
+}
+
+// sameSource reports whether two registrations describe the same pull — every
+// field that shapes what is fetched and how.
+func sameSource(a, b puller.Source) bool {
+	return slices.Equal(a.URLs, b.URLs) && a.UserAgent == b.UserAgent && a.Proxy == b.Proxy &&
+		a.Cookie == b.Cookie && a.FfmpegBin == b.FfmpegBin && a.Insecure == b.Insecure &&
+		slices.Equal(a.Headers, b.Headers) && a.Backend == b.Backend
 }
 
 func (s *Stream) startLocked() {
