@@ -794,7 +794,15 @@ func (s *State) JoinStart(dst []byte, reqMS int64) ([]byte, Cursor) {
 	if len(s.gops) == 0 {
 		return head, Cursor{GOP: s.nextGOPID} // nothing retained yet: start at the edge
 	}
-	return head, Cursor{GOP: s.gops[s.joinIndex(reqMS)].id}
+	i := s.joinIndex(reqMS)
+	// A viewer takes its history over time, at its own link speed, so it must not
+	// start in the block the next keyframe prunes: that left it one GOP to take a
+	// whole block, and any slower (a storm of joins, a busy node) was dropped as
+	// behind. A request for the whole ring — or more — starts one block in.
+	if i == 0 && len(s.gops) > 1 {
+		i = s.snapshotStart(1)
+	}
+	return head, Cursor{GOP: s.gops[i].id}
 }
 
 // ReadFrom returns the ring's bytes from c onwards — about max of them, cut on
