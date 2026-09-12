@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/supervisor"
@@ -221,9 +222,12 @@ func (m *Manager) EnableSupervision() {
 
 // streamHasData reports whether a registered stream has ever published a
 // non-empty chunk. Used as the supervisor's start-confirmation signal.
-func (m *Manager) streamHasData(id string) bool {
+// streamHasData is the supervisor's start confirmation: did bytes arrive for the
+// stream after since, the moment the encoder was launched? The Stream outlives
+// every encoder, so "has it ever had data" would confirm every restart at once.
+func (m *Manager) streamHasData(id string, since time.Time) bool {
 	st := m.Get(id)
-	return st != nil && st.lastData.Load() != 0
+	return st != nil && st.lastData.Load() > since.UnixNano()
 }
 
 // DetachSupervision stops watching every supervised stream but leaves its
