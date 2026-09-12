@@ -110,12 +110,15 @@ type State struct {
 	ring90    int64 // history retained, in 90 kHz ticks (0 = current GOP only)
 	maxRing   int   // absolute byte ceiling for the whole ring — memory backstop
 
-	// pins counts snapshots currently copying out of the ring. While non-zero,
-	// prune must not RECYCLE a dropped GOP's array (it leaves it to GC instead):
-	// a snapshot in flight holds slices into those arrays and is copying them
-	// with the lock released, so handing one to a new GOP would rewrite bytes
-	// mid-copy. See SnapshotPin.
-	pins int
+	// pinned counts, per block id, the readers holding slices into that block
+	// while they copy or write with the lock released (a Pin). prune must not
+	// RECYCLE a pinned block's array — handing it to a new GOP would rewrite bytes
+	// under the reader — so a pinned block goes to GC instead. Counting per block
+	// matters since every live viewer pins as it writes (ADR 0004): one global
+	// count let a single viewer stuck in a write suspend recycling for the whole
+	// stream, and every GOP opened meanwhile grew a fresh array from nothing —
+	// over five bytes allocated per byte published.
+	pinned map[int64]int32
 
 	// freeBufs recycles the byte arrays of GOPs dropped by prune so opening the
 	// next GOP reuses one instead of allocating a fresh array every keyframe. This
@@ -626,7 +629,7 @@ func (s *State) HLSPlaylist() string {
 // multi-megabyte copy. Hub uses the two-phase HLSSegmentPin/Unpin below instead,
 // to copy with the lock released. Caller serialises access.
 func (s *State) HLSSegment(seq int) []byte {
-	head, parts, ok := s.HLSSegmentPin(nil, seq)
+	head, parts, pin, ok := s.HLSSegmentPin(nil, seq)
 	if !ok {
 		return nil
 	}
@@ -639,7 +642,7 @@ func (s *State) HLSSegment(seq int) []byte {
 	for _, p := range parts {
 		out = append(out, p...)
 	}
-	s.Unpin()
+	s.Unpin(pin)
 	return out
 }
 
@@ -652,7 +655,7 @@ func (s *State) HLSSegment(seq int) []byte {
 // stream's producer blocked behind it, once per segment per stream. The pin
 // machinery to avoid that already existed for the join burst; this just uses it.
 // ok=false means the segment is unknown or has aged out, and NOTHING is pinned.
-func (s *State) HLSSegmentPin(dst []byte, seq int) ([]byte, [][]byte, bool) {
+func (s *State) HLSSegmentPin(dst []byte, seq int) ([]byte, [][]byte, Pin, bool) {
 	for i := range s.segs {
 		if s.segs[i].seq != seq {
 			continue
@@ -666,23 +669,27 @@ func (s *State) HLSSegmentPin(dst []byte, seq int) ([]byte, [][]byte, bool) {
 		// from that, where a 404 just makes it skip. gops is id-ascending, so one
 		// comparison against the oldest settles it.
 		if len(s.gops) == 0 || s.gops[0].id > sg.startID {
-			return nil, nil, false // aged out between playlist render and fetch
+			return nil, nil, Pin{}, false // aged out between playlist render and fetch
 		}
 		out := append(dst[:0], s.lastPAT...)
 		out = append(out, s.lastPMT...)
 		parts := make([][]byte, 0, len(s.gops))
+		lo, hi := int64(-1), int64(-1)
 		for j := range s.gops {
 			if s.gops[j].id >= sg.startID && s.gops[j].id <= sg.endID {
 				parts = append(parts, s.gops[j].data)
+				if lo < 0 {
+					lo = s.gops[j].id
+				}
+				hi = s.gops[j].id
 			}
 		}
 		if len(parts) == 0 {
-			return nil, nil, false
+			return nil, nil, Pin{}, false
 		}
-		s.pins++
-		return out, parts, true
+		return out, parts, s.pin(lo, hi), true
 	}
-	return nil, nil, false
+	return nil, nil, Pin{}, false
 }
 
 // Snapshot returns the bytes a new subscriber should receive before the live
@@ -705,11 +712,11 @@ func (s *State) Snapshot(reqMS int64) []byte {
 // duration. Hub uses the two-phase SnapshotPin/Unpin below instead, to copy with
 // the lock released.
 func (s *State) SnapshotInto(dst []byte, reqMS int64) []byte {
-	out, parts := s.SnapshotPin(dst, reqMS)
+	out, parts, pin := s.SnapshotPin(dst, reqMS)
 	for _, p := range parts {
 		out = append(out, p...)
 	}
-	s.Unpin()
+	s.Unpin(pin)
 	return out
 }
 
@@ -730,7 +737,7 @@ func (s *State) SnapshotInto(dst []byte, reqMS int64) []byte {
 // safe to pair with registering a subscriber under the same lock: everything
 // published after that point reaches the viewer through its channel, everything
 // before it is in these bytes, with no gap and no duplication.
-func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
+func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte, Pin) {
 	start := s.joinIndex(reqMS)
 
 	out := append(dst[:0], s.lastPAT...)
@@ -740,8 +747,10 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 	for i := start; i < len(s.gops); i++ {
 		parts = append(parts, s.gops[i].data)
 	}
-	s.pins++
-	return out, parts
+	if len(parts) == 0 {
+		return out, parts, Pin{}
+	}
+	return out, parts, s.pin(s.gops[start].id, s.gops[len(s.gops)-1].id)
 }
 
 // joinIndex is the ring index a join with a reqMS prebuffer starts at: that far
@@ -800,9 +809,9 @@ func (s *State) JoinStart(dst []byte, reqMS int64) ([]byte, Cursor) {
 // then subscribes to the live tail. The live tail used to queue behind the whole
 // burst instead, and a queue short enough to be cheap dropped every viewer whose
 // link could not take a 30 s burst in ~5 s. Caller (Hub) serialises access.
-func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool) {
+func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool, pin Pin) {
 	if len(s.gops) == 0 {
-		return nil, c, true, false
+		return nil, c, true, false, Pin{}
 	}
 	first := s.gops[0].id
 	if c.GOP < first {
@@ -810,19 +819,20 @@ func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd,
 		// a live viewer parked at the edge when a ring shorter than one GOP prunes
 		// the block it just finished — nothing was lost: go on at the next block.
 		if c.GOP != s.prunedID || first != s.prunedID+1 || c.Off < s.prunedLen {
-			return nil, c, false, true
+			return nil, c, false, true, Pin{}
 		}
 		c = Cursor{GOP: first}
 	}
 	i := int(c.GOP - first) // ids are consecutive: blocks are appended in order and pruned from the front
 	if i >= len(s.gops) {
-		return nil, c, true, false
+		return nil, c, true, false, Pin{}
 	}
 	if max < PacketSize {
 		max = PacketSize
 	}
 	n := 0
 	next = c
+	lo, hi := int64(-1), int64(-1) // blocks the run's parts point into
 	for ; i < len(s.gops); i++ {
 		g := s.gops[i]
 		off := 0
@@ -838,23 +848,31 @@ func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd,
 			if take > 0 {
 				parts = append(parts, rem[:take])
 				n += take
+				if lo < 0 {
+					lo = g.id
+				}
+				hi = g.id
 			}
 			next = Cursor{GOP: g.id, Off: off + take}
 			if len(parts) > 0 {
-				s.pins++
+				pin = s.pin(lo, hi)
 			}
-			return parts, next, false, false
+			return parts, next, false, false, pin
 		}
 		if len(rem) > 0 {
 			parts = append(parts, rem)
 			n += len(rem)
+			if lo < 0 {
+				lo = g.id
+			}
+			hi = g.id
 		}
 		next = Cursor{GOP: g.id, Off: len(g.data)}
 	}
 	if len(parts) > 0 {
-		s.pins++
+		pin = s.pin(lo, hi)
 	}
-	return parts, next, true, false
+	return parts, next, true, false, pin
 }
 
 // snapshotStart moves a join's first block to one a decoder can start on: the
@@ -923,11 +941,37 @@ func (s *State) RingStats() (bytes int, spanMS int64, gops int) {
 	return bytes, spanMS, len(s.gops)
 }
 
-// Unpin releases a SnapshotPin, letting prune recycle dropped GOP buffers again.
-// Caller (Hub) serialises access, and must call it exactly once per SnapshotPin.
-func (s *State) Unpin() {
-	if s.pins > 0 {
-		s.pins--
+// Pin is a reader's hold on the blocks its slices point into (ids lo..hi), taken
+// by ReadFrom, SnapshotPin or HLSSegmentPin and given back with Unpin, exactly
+// once. The zero Pin holds nothing.
+type Pin struct {
+	lo, hi int64
+	held   bool
+}
+
+// pin holds blocks lo..hi. Caller (Hub) serialises access.
+func (s *State) pin(lo, hi int64) Pin {
+	if s.pinned == nil {
+		s.pinned = make(map[int64]int32)
+	}
+	for id := lo; id <= hi; id++ {
+		s.pinned[id]++
+	}
+	return Pin{lo: lo, hi: hi, held: true}
+}
+
+// Unpin gives back a Pin, letting prune recycle those blocks' arrays again once
+// no other reader holds them. Caller (Hub) serialises access.
+func (s *State) Unpin(p Pin) {
+	if !p.held {
+		return
+	}
+	for id := p.lo; id <= p.hi; id++ {
+		if n := s.pinned[id]; n > 1 {
+			s.pinned[id] = n - 1
+		} else {
+			delete(s.pinned, id)
+		}
 	}
 }
 
@@ -966,9 +1010,12 @@ func (s *State) getBuf() []byte {
 
 // release is how prune lets a block leave the ring: it is remembered for ReadFrom
 // (blocks leave oldest first, so the last one released is the newest gone) and its
-// array recycled.
+// array recycled — unless a reader still holds it, when it goes to GC instead.
 func (s *State) release(g gop) {
 	s.prunedID, s.prunedLen = g.id, len(g.data)
+	if s.pinned[g.id] > 0 {
+		return
+	}
 	s.putBuf(g.data)
 }
 
@@ -977,12 +1024,10 @@ func (s *State) release(g gop) {
 // ring. Buffers past the cap are left to GC, which is what we want on a gating
 // ring-shrink (the goal there is to release memory).
 //
-// Recycling is suspended while a snapshot is pinned: that reader is copying GOP
-// bytes with the lock released, so its arrays must not be handed to a new GOP
-// underneath it. They go to GC for the duration instead, which the reader's own
-// slices keep alive for exactly as long as it needs them.
+// A block a reader still holds never gets here (see release): its array goes to
+// GC, which the reader's own slices keep alive for exactly as long as it needs it.
 func (s *State) putBuf(b []byte) {
-	if cap(b) == 0 || s.pins > 0 || len(s.freeBufs) >= defaults.JoinFreeGOPBufs {
+	if cap(b) == 0 || len(s.freeBufs) >= defaults.JoinFreeGOPBufs {
 		return
 	}
 	s.freeBufs = append(s.freeBufs, b[:0])
