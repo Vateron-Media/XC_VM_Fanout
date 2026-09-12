@@ -42,8 +42,11 @@ const pcrHz = 90
 type gop struct {
 	id   int64
 	data []byte
-	pcr  int64 // PCR base at open (90 kHz), or -1 — drives ring retention
-	pts  int64 // HLS clock at open: the keyframe's PES PTS, or the PCR fallback, or -1
+	// t is the ring clock at open (90 kHz), or -1 before the stream has shown a
+	// PCR — see ringClock. It drives retention and the prebuffer walk-back, and it
+	// only ever moves forward, which the raw PCR does not.
+	t   int64
+	pts int64 // HLS clock at open: the keyframe's PES PTS, or the PCR fallback, or -1
 	// video reports that this block opens on a VIDEO random-access point, i.e. a
 	// decoder handed these bytes starts producing pictures. A block opened by the
 	// maxGOP cut (a source with no detectable keyframes) or by the pre-roll before
@@ -87,9 +90,21 @@ type State struct {
 	videoFrames int64
 	gops        []gop // oldest→newest; the last element is the open (current) GOP
 	lastPCR     int64 // most recent PCR base seen (90 kHz), or -1
-	maxGOP      int   // cap on a single GOP's length (bytes) — memory guard
-	ring90      int64 // history retained, in 90 kHz ticks (0 = current GOP only)
-	maxRing     int   // absolute byte ceiling for the whole ring — memory backstop
+	// pcrPID is the PMT's PCR_PID, or -1. Once a PCR has been seen on it, only
+	// that PID drives the clock: a source carrying a second, unrelated PCR (another
+	// programme, a passthrough of a muxer that stamps several PIDs) would otherwise
+	// interleave two clocks, and the ring's duration would be noise.
+	pcrPID   int
+	pcrOnPID bool
+	// The ring clock (ringClock): the PCR it last advanced from, the monotonic
+	// time it has reached, and the last plausible step, reused across a
+	// discontinuity.
+	clockPCR  int64
+	clockT    int64
+	clockStep int64
+	maxGOP    int   // cap on a single GOP's length (bytes) — memory guard
+	ring90    int64 // history retained, in 90 kHz ticks (0 = current GOP only)
+	maxRing   int   // absolute byte ceiling for the whole ring — memory backstop
 
 	// pins counts snapshots currently copying out of the ring. While non-zero,
 	// prune must not RECYCLE a dropped GOP's array (it leaves it to GC instead):
@@ -142,7 +157,7 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
@@ -257,7 +272,12 @@ func (s *State) Update(chunk []byte) {
 		rap := false
 		if hasAdaptation && pkt[4] > 0 {
 			flags := pkt[5]
-			if flags&0x10 != 0 { // PCR_flag: refresh the stream clock
+			// PCR_flag: refresh the stream clock — from the programme's own PCR
+			// PID once that has shown one, from any PID until then.
+			if flags&0x10 != 0 && (pid == s.pcrPID || !s.pcrOnPID) {
+				if pid == s.pcrPID {
+					s.pcrOnPID = true
+				}
 				s.lastPCR = readPCR(pkt)
 			}
 			if flags&0x40 != 0 { // random_access_indicator
@@ -286,6 +306,9 @@ func (s *State) Update(chunk []byte) {
 			if v, t := parseVideoPID(pkt); v >= 0 {
 				s.videoPID, s.videoType = v, t
 			}
+			if m, ok := tspes.ParsePMT(pkt); ok && int(m.PCRPID) != s.pcrPID {
+				s.pcrPID, s.pcrOnPID = int(m.PCRPID), false
+			}
 			if a := parseAudioPID(pkt); a >= 0 {
 				s.audioPID = a
 			}
@@ -312,7 +335,7 @@ func (s *State) Update(chunk []byte) {
 					s.hlsOnKeyframe(id, pts)
 				}
 			}
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: pts, video: onVideo})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: s.ringClock(), pts: pts, video: onVideo})
 			s.prune()
 		case len(s.gops) > 0 && len(s.gops[len(s.gops)-1].data)+PacketSize <= s.maxGOP:
 			g := &s.gops[len(s.gops)-1]
@@ -339,10 +362,52 @@ func (s *State) Update(chunk []byte) {
 			}
 			id := s.nextGOPID
 			s.nextGOPID++
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), pcr: s.lastPCR, pts: -1})
+			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: s.ringClock(), pts: -1})
 			s.prune()
 		}
 	}
+}
+
+// maxClockStep is the largest PCR advance between two block opens taken at face
+// value. Blocks are a GOP or a maxGOP cut — seconds, not minutes — so a step
+// beyond this is a splice, not time passing.
+const maxClockStep = 60 * 90000
+
+// ringClock stamps a new block with the ring's own clock: the PCR, made monotonic.
+//
+// Retention used to subtract raw PCRs — newest minus oldest — and the PCR is not
+// monotonic. It restarts near zero with every producer restart (a fresh ffmpeg
+// starts its own clock), jumps with a source failover, and wraps at 2^33 every
+// 26.5 hours. Across any of those the difference goes NEGATIVE, which the prune
+// read as "still inside the window" — so it stopped dropping anything, and the
+// ring grew to its byte backstop (prebuffer × 24 Mbit/s: 120 MB at the default
+// 40 s, whatever the stream's bitrate) and sat there until every pre-splice block
+// had been pushed out. On a node restarting producers or carrying a source with
+// two interleaved PCR clocks, that was most of the daemon's memory.
+//
+// Here the clock advances by the PCR step when the step is plausible, unwraps the
+// 33-bit rollover, and across anything else keeps going at the last good cadence
+// — so the window stays a window. -1 until the stream has shown a PCR.
+func (s *State) ringClock() int64 {
+	if s.lastPCR < 0 {
+		return -1
+	}
+	if s.clockPCR < 0 {
+		s.clockPCR, s.clockT = s.lastPCR, 0
+		return 0
+	}
+	d := s.lastPCR - s.clockPCR
+	if d < 0 && d+ptsWrap <= maxClockStep {
+		d += ptsWrap // the 33-bit PCR wrap
+	}
+	if d < 0 || d > maxClockStep {
+		d = s.clockStep // discontinuity: carry on at the last known cadence
+	} else {
+		s.clockStep = d
+	}
+	s.clockPCR = s.lastPCR
+	s.clockT += d
+	return s.clockT
 }
 
 // prune drops the oldest GOPs once the ring exceeds the configured duration
@@ -358,11 +423,11 @@ func (s *State) prune() {
 		}
 		return
 	}
-	// Duration-based prune (needs valid PCR on both ends).
-	if newest := s.gops[len(s.gops)-1].pcr; newest >= 0 {
+	// Duration-based prune, on the ring clock (needs one on both ends).
+	if newest := s.gops[len(s.gops)-1].t; newest >= 0 {
 		drop := 0
 		for drop < len(s.gops)-1 {
-			if p := s.gops[drop].pcr; p >= 0 && newest-p <= s.ring90 {
+			if p := s.gops[drop].t; p >= 0 && newest-p <= s.ring90 {
 				break
 			}
 			drop++
@@ -594,11 +659,11 @@ func (s *State) SnapshotPin(dst []byte, reqMS int64) ([]byte, [][]byte) {
 		start = 0
 	}
 	if reqMS > 0 && len(s.gops) > 0 {
-		if newest := s.gops[len(s.gops)-1].pcr; newest >= 0 {
+		if newest := s.gops[len(s.gops)-1].t; newest >= 0 {
 			req := reqMS * pcrHz
 			i := len(s.gops) - 1
 			for i > 0 {
-				if p := s.gops[i-1].pcr; p < 0 || newest-p > req {
+				if p := s.gops[i-1].t; p < 0 || newest-p > req {
 					break
 				}
 				i--

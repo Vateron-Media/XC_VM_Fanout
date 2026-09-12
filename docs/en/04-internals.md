@@ -259,7 +259,8 @@ a new viewer needs to start:
 
 - the last **PAT** and the last **PMT** (the PMT PID is computed from the PAT);
 - a **ring of GOPs** — blocks "from one keyframe to the next keyframe", each tagged
-  with a **monotonic id** and a time from the PCR clock (90 kHz).
+  with a **monotonic id** and a time on the **ring clock**: the PCR (90 kHz), made monotonic —
+  see below.
 
 Since **0.11.1** this ring is the daemon's **single per-stream buffer**: it serves the live-TS
 clean join and prebuffer, *and* HLS is derived from it (see
@@ -276,7 +277,7 @@ How it works:
   from the middle of a GOP whose SPS/PPS it never got — `non-existing PPS 0 referenced`, a black
   picture until the next real keyframe, and with `prebuffer=0` (only the current GOP is kept) that
   was **every** join. A stream with no video at all (radio) keeps the plain random-access rule;
-- `prune()` discards old GOPs: by **duration** (capped at `prebuffer_max_sec`
+- `prune()` discards old GOPs: by **duration** on the ring clock (capped at `prebuffer_max_sec`
   seconds, if PCR parses) or by a **byte backstop** (~24 Mbit/s estimate — in
   case PCR can't be read), so that the ring doesn't grow without bound. When the stream is
   **idle** the ring is collapsed to `prebuffer_max_sec × idle_buffer_ratio` (see
@@ -287,6 +288,33 @@ How it works:
     random-access block at or after it, else the newest one before it;
   - `reqMS > 0` → the ring is rewound to a keyframe ~N seconds back, and the viewer gets
     more history, so that their player starts with an already filled cache.
+
+#### The ring clock
+
+Retention used to subtract raw PCRs — newest minus oldest — and **the PCR is not monotonic**. It
+starts over near zero with every producer restart (a fresh ffmpeg starts its own clock), jumps with
+a source failover, and wraps at 2³³ every 26.5 hours. Across any of those the difference went
+**negative**, which `prune` read as "still inside the window", so it stopped dropping anything:
+the ring grew to its byte backstop — `prebuffer × 24 Mbit/s`, **120 MB at the default 40 s**
+(60 MB when idle-gated) whatever the stream's real bitrate — and stayed there until every
+pre-splice GOP had been pushed out. A source carrying a second, unrelated PCR on another PID flipped
+the sign constantly and never pruned at all.
+
+Since 0.13.2 each GOP is stamped by `ringClock()`: it advances by the PCR step when that step is
+plausible (0–60 s), unwraps the 33-bit rollover, and across anything else carries on at the last
+good cadence — so the window stays a window. And once the PMT's declared **PCR PID** has shown a
+PCR, only that PID drives the clock. Measured on real ffmpeg output across a producer restart, a
+20 s window held:
+
+```
+before:  35 GOPs (~70 s of video)
+after:   11 GOPs (20.0 s)
+```
+
+On a daemon with 30 supervised channels, restarting every producer once took the heap from 602 MB
+to 1,963 MB and kept it there for minutes; at 155 channels that is the difference between a node
+at a few GB and one at 9 GB. `GET /memory` on the control socket shows each ring's bytes and span,
+so an operator can see this directly — see [03. HTTP endpoints](03-endpoints.md#get-memory--where-the-memory-is).
 
 This reproduces `client_prebuffer` from the legacy `live.php`, which the transfer via X-Accel
 otherwise bypasses. The prebuffer depth is the **panel's** call: it passes the chosen value in
