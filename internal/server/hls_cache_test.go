@@ -140,3 +140,26 @@ func TestMemoryScavengerRateFloor(t *testing.T) {
 		t.Error("a ring collapse did not trigger a release: the gate must bypass the rate floor")
 	}
 }
+
+// TestRingCollapseReleasesEvenBelowTheThreshold: the GOPs a gate drops are
+// garbage, not the swept free heap the threshold measures, and on a steady
+// ingest no GC comes along to sweep them — so the threshold is never met on
+// their account. A collapse must force the release anyway, or the collapsed
+// ring stays resident: 30 channels' rings held 513 MB while the heap sat at 1.9 GB.
+func TestRingCollapseReleasesEvenBelowTheThreshold(t *testing.T) {
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A threshold no heap can reach: only the gate may cause a release.
+	m.startMemoryScavenger(ctx, 10*time.Millisecond, 1<<62, 0)
+
+	m.gatedSinceScavenge.Store(true)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && m.gatedSinceScavenge.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if m.gatedSinceScavenge.Load() {
+		t.Fatal("a ring collapse did not trigger a release while the swept-free heap was under the threshold")
+	}
+}

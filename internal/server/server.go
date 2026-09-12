@@ -925,10 +925,19 @@ func (m *Manager) startMemoryScavenger(ctx context.Context, interval time.Durati
 			case now := <-t.C:
 				metrics.Read(samples)
 				retained := samples[0].Value.Uint64()
-				if retained < threshold {
+				// A ring collapse releases first, threshold or not. heap/free counts
+				// memory a GC has already swept; the GOPs a gate just dropped are not
+				// that yet — they are garbage, and on a steady ingest (GOP buffers
+				// recycled, next to nothing allocated) no GC comes along to sweep
+				// them. This check used to come after the threshold, which such
+				// garbage can never meet, so a collapsed ring's bytes stayed resident
+				// indefinitely: on 30 channels the rings held 513 MB and the heap
+				// 1.9 GB. The forced collection is what turns them into memory the
+				// OS gets back.
+				gated := m.gatedSinceScavenge.Swap(false)
+				if !gated && retained < threshold {
 					continue
 				}
-				gated := m.gatedSinceScavenge.Swap(false)
 				if !gated && !lastRelease.IsZero() && now.Sub(lastRelease) < minGap {
 					continue // rate floor: not worth another full GC yet
 				}
