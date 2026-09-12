@@ -161,10 +161,10 @@ One `Hub` per stream.
   removed. This way one lagging viewer **never stalls the source or the others**.
 - **`Subscribe(prebufMS)`**: under a single mutex it simultaneously **captures** the history to send
   and registers the subscriber. Atomicity matters: the live tail continues exactly where the
-  snapshot ended — **with no gap and no duplication**. The copy itself happens with the lock
-  **released** — see below.
+  snapshot ended — **with no gap and no duplication**. Nothing is copied: the viewer is written
+  straight out of the ring's pinned GOP buffers, with the lock **released** — see below.
 
-#### Why the join copy is not done under the lock
+#### Why the join burst is neither copied nor written under the lock
 
 The snapshot a viewer gets on connect is up to the whole ring: **14 MB at a 40 s prebuffer**,
 ~3 ms to copy. Doing that under the hub lock stalled the stream's producer for that long on
@@ -182,6 +182,20 @@ joining viewer receives a splice of two different points in the stream.
 Atomicity survives because the capture fixes the content at the moment of registration: the open
 GOP growing afterwards is invisible (the captured length does not move), and every chunk published
 from that point reaches the viewer through its channel instead.
+
+**Since 0.13.2 the burst is not copied at all.** `Subscribe` returns a `Burst` — the header, plus
+the pinned GOP slices themselves — and `serveLive` writes them to the socket one GOP at a time
+(each with its own write deadline, like every chunk of the live tail) and then releases the pin.
+The copy had bought nothing the pin did not already provide, and it was the daemon's largest
+transient: every join allocated up to the whole client prebuffer (the panel's `client_prebuffer`
+defaults to **30 s** — ~30 MB of an 8 Mbit/s channel; buffers over 16 MB were not even pooled) and
+held it for as long as the viewer took to drain it. Measured on 30 channels at 6.6 Mbit/s, 90
+viewers joining with `prebuffer=30`:
+
+```
+heap after the storm:   2,669 MB → 1,440 MB peak
+retained afterwards:    +1,650 MB (join copies) → +0 (only the ungated rings)
+```
 
 ```
 lock held per join:      3.13 ms → 1.30 µs

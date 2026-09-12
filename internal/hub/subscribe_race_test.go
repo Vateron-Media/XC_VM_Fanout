@@ -65,8 +65,21 @@ func TestSubscribeSnapshotStableWhileProducing(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	joins, checked := 0, 0
 	for time.Now().Before(deadline) {
-		sub, snap := h.Subscribe(300) // ask for the whole ring
+		sub, burst := h.Subscribe(300) // ask for the whole ring
 		joins++
+
+		// Read the burst IN PLACE, as serveLive writes it: straight out of the
+		// ring's pinned GOP buffers, while the producer keeps publishing. Walking
+		// the parts one at a time with a pause between them stands in for a slow
+		// viewer's socket — the pin has to hold for the whole write, not just a
+		// quick copy.
+		var snap []byte
+		for i, part := range burst.Parts {
+			if i%4 == 3 {
+				time.Sleep(50 * time.Microsecond)
+			}
+			snap = append(snap, part...)
+		}
 
 		var last uint16
 		checked0 := checked
@@ -88,8 +101,8 @@ func TestSubscribeSnapshotStableWhileProducing(t *testing.T) {
 			last = g
 			checked++
 		}
+		burst.Release()
 		h.Unsubscribe(sub)
-		ReleaseSnapshot(snap)
 	}
 
 	stop.Store(true)
@@ -126,8 +139,10 @@ func TestSubscribeNoGapNoDuplication(t *testing.T) {
 		publishGOP()
 	}
 
-	sub, snap := h.Subscribe(10000)
+	sub, burst := h.Subscribe(10000)
 	defer h.Unsubscribe(sub)
+	snap := burst.Bytes()
+	burst.Release()
 
 	// Everything published from here on must arrive on the channel, not the snapshot.
 	for i := 0; i < 3; i++ {

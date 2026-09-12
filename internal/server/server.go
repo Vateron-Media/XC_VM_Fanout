@@ -1488,7 +1488,8 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// Subscribe FIRST, then attach: registering the subscriber before the puller
 	// starts is what guarantees no published chunk falls between the snapshot and
 	// the live tail.
-	sub, snap := st.Hub.Subscribe(prebufMS)
+	sub, burst := st.Hub.Subscribe(prebufMS)
+	defer burst.Release() // normally released as soon as it is written, below
 	defer st.Hub.Unsubscribe(sub)
 	st.attach()
 	defer st.detach()
@@ -1573,14 +1574,23 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	}
 	lastChunk := time.Now()
 
-	// Write the join burst, then return its (pooled) buffer at once — the viewer
-	// holds no reference to it past this write, so it can be reused by the next
-	// connect instead of lingering as garbage for the whole session.
+	// Write the join burst straight out of the ring — the tables, then each
+	// pinned GOP — and unpin it the moment it is written, so the ring can recycle
+	// those buffers again. No copy of the history is ever made for a viewer; each
+	// GOP gets its own write deadline, like every chunk of the live tail.
 	var snapErr error
-	if len(snap) > 0 {
-		snapErr = write(snap)
+	if len(burst.Head) > 0 {
+		snapErr = write(burst.Head)
 	}
-	hub.ReleaseSnapshot(snap)
+	for _, p := range burst.Parts {
+		if snapErr != nil {
+			break
+		}
+		if len(p) > 0 {
+			snapErr = write(p)
+		}
+	}
+	burst.Release()
 	if snapErr != nil {
 		reason = writeFailReason(snapErr)
 		return

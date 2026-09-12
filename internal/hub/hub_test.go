@@ -131,42 +131,41 @@ func TestPublishNoSubsCopiesIntoRing(t *testing.T) {
 	}
 
 	// And a subscriber that joins afterwards still receives the buffered content.
-	sub, s2 := h.Subscribe(0)
+	sub, burst := h.Subscribe(0)
+	s2 := burst.Bytes()
 	if len(s2) != 188 || s2[3] != 9 {
 		t.Fatalf("late subscriber join burst wrong; got len=%d byte[3]=%d", len(s2), s2[3])
 	}
+	burst.Release()
 	h.Unsubscribe(sub)
-	ReleaseSnapshot(s2)
 }
 
-// TestSubscribeSnapshotPoolRoundTrip: the join burst from Subscribe is correct,
-// and a released buffer is handed back out on the next Subscribe (pool reuse)
-// without corrupting the content.
-func TestSubscribeSnapshotPoolRoundTrip(t *testing.T) {
+// TestSubscribeBurstIsTheRingNotACopy: the join burst is the ring's own bytes
+// (no per-viewer copy of the history), it reads back correctly, and Release is
+// safe to call more than once — serveLive releases right after the write and
+// again, deferred, on every exit path.
+func TestSubscribeBurstIsTheRingNotACopy(t *testing.T) {
 	h := New(1<<20, 0)
 	h.Publish(mkPkt(7))
 
-	sub1, snap1 := h.Subscribe(0)
-	if len(snap1) == 0 || snap1[0] != 0x47 {
-		t.Fatalf("Subscribe join burst must be TS-aligned, got %d bytes", len(snap1))
+	sub1, b1 := h.Subscribe(0)
+	want := b1.Bytes()
+	if len(want) == 0 || want[0] != 0x47 {
+		t.Fatalf("Subscribe join burst must be TS-aligned, got %d bytes", len(want))
 	}
-	// Copy the expected content before releasing (the buffer may be reused/overwritten).
-	want := append([]byte(nil), snap1...)
+	if b1.Len() != len(want) {
+		t.Fatalf("Len() = %d, Bytes() gave %d", b1.Len(), len(want))
+	}
+	b1.Release()
+	b1.Release() // idempotent
 	h.Unsubscribe(sub1)
-	ReleaseSnapshot(snap1)
 
-	// Next Subscribe should still yield identical, uncorrupted content even though
-	// it may draw the recycled buffer.
-	sub2, snap2 := h.Subscribe(0)
-	if !bytes.Equal(snap2, want) {
-		t.Fatalf("recycled join burst differs from the original: got %d bytes, want %d", len(snap2), len(want))
+	sub2, b2 := h.Subscribe(0)
+	if !bytes.Equal(b2.Bytes(), want) {
+		t.Fatalf("second join burst differs from the first: got %d bytes, want %d", b2.Len(), len(want))
 	}
+	b2.Release()
 	h.Unsubscribe(sub2)
-	ReleaseSnapshot(snap2)
-
-	// ReleaseSnapshot on a nil/empty slice must be a harmless no-op.
-	ReleaseSnapshot(nil)
-	ReleaseSnapshot([]byte{})
 }
 
 // TestCloseAll: a stream teardown must release every subscriber at once, so the
