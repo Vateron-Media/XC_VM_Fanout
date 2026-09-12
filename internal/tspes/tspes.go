@@ -285,8 +285,9 @@ func ParsePMTStreams(pkt []byte) ([]ES, bool) {
 	}
 	var out []ES
 	for i := 12 + progInfoLen; i+5 <= end; {
+		esInfoLen := int(sec[i+3]&0x0f)<<8 | int(sec[i+4])
 		out = append(out, ES{PID: uint16(sec[i+1]&0x1f)<<8 | uint16(sec[i+2]), Type: sec[i]})
-		i += 5 + int(sec[i+3]&0x0f)<<8 + int(sec[i+4])
+		i += 5 + esInfoLen
 	}
 	return out, len(out) > 0
 }
