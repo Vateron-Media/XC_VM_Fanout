@@ -39,6 +39,7 @@ type Burst struct {
 	Parts [][]byte
 
 	h    *Hub
+	pin  tsjoin.Pin
 	once sync.Once
 }
 
@@ -71,7 +72,7 @@ func (b *Burst) Release() {
 			return
 		}
 		b.h.mu.Lock()
-		b.h.join.Unpin()
+		b.h.join.Unpin(b.pin)
 		b.h.mu.Unlock()
 	})
 }
@@ -89,6 +90,10 @@ type Hub struct {
 	// a parked follower wakes to an ended stream instead of blocking forever.
 	wake   chan struct{}
 	closed bool
+	// armed: Follow has handed the current wake channel to a parked viewer since
+	// the last signal. Only then does Publish close and replace it — re-arming on
+	// every chunk made a channel per Publish on every stream, watched or not.
+	armed bool
 }
 
 // New returns a Hub. maxGOP caps a single GOP (bytes); maxPrebufMS is how many
@@ -121,8 +126,9 @@ func (h *Hub) signalWake() {
 func (h *Hub) Publish(chunk []byte) {
 	h.mu.Lock()
 	h.join.Update(chunk)
-	if len(chunk) > 0 && !h.closed {
+	if len(chunk) > 0 && h.armed && !h.closed {
 		h.signalWake()
+		h.armed = false
 	}
 	h.mu.Unlock()
 }
@@ -150,16 +156,17 @@ func (h *Hub) Follow(c tsjoin.Cursor, max int) (burst *Burst, next tsjoin.Cursor
 	if h.closed {
 		return &Burst{}, c, false, nil, false, true
 	}
-	parts, next, atEnd, behind := h.join.ReadFrom(c, max)
+	parts, next, atEnd, behind, pin := h.join.ReadFrom(c, max)
 	if behind {
 		return &Burst{}, c, false, nil, true, false
 	}
-	burst = &Burst{Parts: parts}
+	burst = &Burst{Parts: parts, pin: pin}
 	if len(parts) > 0 {
 		burst.h = h // pinned: Release unpins
 	}
 	if atEnd {
 		wake = h.wake // park on this; the next Publish closes it
+		h.armed = true
 	}
 	return burst, next, atEnd, wake, false, false
 }
@@ -181,17 +188,17 @@ func (h *Hub) Join(prebufMS int64) ([]byte, tsjoin.Cursor) {
 // under the lock; it copies out with the lock released, the pin making that safe.
 func (h *Hub) Snapshot(prebufMS int64) []byte {
 	h.mu.Lock()
-	head, parts := h.join.SnapshotPin(nil, prebufMS)
+	head, parts, pin := h.join.SnapshotPin(nil, prebufMS)
 	h.mu.Unlock()
-	return h.copyPinned(head, parts)
+	return h.copyPinned(head, parts, pin)
 }
 
 // copyPinned appends a pinned capture's GOP bytes to head and releases the pin.
 // Runs with the lock RELEASED: the pin is what makes that safe.
-func (h *Hub) copyPinned(head []byte, parts [][]byte) []byte {
+func (h *Hub) copyPinned(head []byte, parts [][]byte, pin tsjoin.Pin) []byte {
 	defer func() {
 		h.mu.Lock()
-		h.join.Unpin()
+		h.join.Unpin(pin)
 		h.mu.Unlock()
 	}()
 	for _, p := range parts {
@@ -256,7 +263,7 @@ func (h *Hub) HLSPlaylist() string {
 // recycling those GOP buffers mid-copy.
 func (h *Hub) HLSSegment(seq int) []byte {
 	h.mu.Lock()
-	head, parts, ok := h.join.HLSSegmentPin(nil, seq)
+	head, parts, pin, ok := h.join.HLSSegmentPin(nil, seq)
 	h.mu.Unlock()
 	if !ok {
 		return nil
@@ -267,7 +274,7 @@ func (h *Hub) HLSSegment(seq int) []byte {
 	}
 	out := make([]byte, 0, n)
 	out = append(out, head...)
-	return h.copyPinned(out, parts)
+	return h.copyPinned(out, parts, pin)
 }
 
 // Counters reports the join state's health counters (audio packets, video access
