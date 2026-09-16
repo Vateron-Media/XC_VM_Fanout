@@ -98,6 +98,10 @@ func OpenHLSPull(ctx context.Context, rawURL string, opt Options) (io.ReadCloser
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse: %v", ErrUnsupportedSource, err)
 	}
+	// Every fetch from here — the manifest polls, the variant, each segment —
+	// carries the source's headers. A Host override among them belongs to this
+	// host only.
+	opt = opt.scopedTo(u)
 	// A proxy that cannot be used is a refusal: the manifest polls and every
 	// segment fetch would otherwise go direct from the node's own IP.
 	if err := opt.checkProxy(); err != nil {

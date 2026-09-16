@@ -32,8 +32,36 @@ type Options struct {
 	// Headers are extra request headers as raw "Key: value" lines. They apply
 	// to every fetch this package makes for the source — the playlist AND each
 	// segment — because an upstream that gates on a header gates on all of it.
-	// A "Host:" line overrides the request's Host, as ffmpeg's -headers does.
+	// A "Host:" line overrides the request's Host, as ffmpeg's -headers does,
+	// for fetches to the source's own host — see scopedTo.
 	Headers []string
+
+	// hostScope is the host of the URL these options were configured for, set by
+	// scopedTo as a source is opened. A configured "Host:" line is an answer to
+	// ONE origin (a vhost reached by IP), and a playlist there can list segments
+	// on a separate CDN name; sending the origin's vhost to that CDN is the 404
+	// the line exists to avoid. Empty means "unknown", where the line still
+	// applies: it is the most specific thing anyone said about the source.
+	hostScope string
+}
+
+// scopedTo pins the configured Host override to the host of the URL the source
+// was opened at. Only the first call counts: the scope belongs to the source
+// URL, not to whatever host a later fetch happens to reach.
+func (o Options) scopedTo(u *url.URL) Options {
+	if o.hostScope == "" && u != nil {
+		o.hostScope = u.Host
+	}
+	return o
+}
+
+// hostInScope reports whether req is going to the host the source was opened at,
+// which is where a configured Host override belongs.
+func (o Options) hostInScope(req *http.Request) bool {
+	if o.hostScope == "" || req.URL == nil {
+		return true
+	}
+	return strings.EqualFold(req.URL.Host, o.hostScope)
 }
 
 // Timeouts. Bounded fetches (playlists, segments) get a whole-request deadline;
@@ -175,9 +203,12 @@ func (o Options) apply(req *http.Request) {
 		// Header["Host"] on the floor. A vhost-routed origin reached by IP —
 		// which is why anyone configures this line — would have kept seeing the
 		// IP and answering 404. An empty value is left alone, since blanking
-		// req.Host makes the request unroutable.
+		// req.Host makes the request unroutable, and a request to a host other
+		// than the source's is left alone too: that origin's playlist can list
+		// segments on a separate CDN name, and the source's vhost means nothing
+		// there but a 403.
 		if strings.EqualFold(name, "Host") {
-			if value != "" {
+			if value != "" && o.hostInScope(req) {
 				req.Host = value
 			}
 			// Drop any earlier attempt at it too, so what is in the map is what

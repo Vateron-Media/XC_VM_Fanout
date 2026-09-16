@@ -299,6 +299,7 @@ func openHTTP(ctx context.Context, u *url.URL, opt Options) (io.ReadCloser, erro
 	if err != nil {
 		return nil, err
 	}
+	opt = opt.scopedTo(u)
 	opt.apply(req)
 	client := newStreamClient(opt)
 	resp, err := client.Do(req)
@@ -343,6 +344,9 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 		return nil, err
 	}
 	final := resp.Request.URL // honour redirects when resolving segment URIs
+	// A caller that fetched the URL itself (internal/puller) has not pinned the
+	// source's headers to a host yet. The response says which one it was.
+	opt = opt.scopedTo(final)
 
 	// Bound the reads THIS function makes — the sniff below and the playlist
 	// read. They are the two that come first and they used to be unbounded: the
