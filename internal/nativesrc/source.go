@@ -60,6 +60,12 @@ type idleTimeoutReader struct {
 	last atomic.Int64 // unixnano of the last byte received
 	done chan struct{}
 	once sync.Once
+	// stalled records that the watchdog, not the consumer and not the upstream,
+	// is why rc is closed. Without it the read error that follows is whatever
+	// closing happened to produce — "io: read/write on closed pipe", "use of
+	// closed network connection" — which reads in a log like a local bug rather
+	// than the frozen upstream it actually is.
+	stalled atomic.Bool
 }
 
 // WrapIdleTimeout wraps rc so a no-bytes stall longer than idle becomes a read
@@ -112,6 +118,9 @@ func (r *idleTimeoutReader) watch() {
 			return
 		case <-t.C:
 			if time.Since(time.Unix(0, r.last.Load())) > r.idle {
+				// Flagged BEFORE the close, so the Read it unblocks can
+				// already see why it is failing.
+				r.stalled.Store(true)
 				_ = r.rc.Close() // unblock a stuck Read: it returns an error
 				return
 			}
@@ -123,6 +132,14 @@ func (r *idleTimeoutReader) Read(p []byte) (int, error) {
 	n, err := r.rc.Read(p)
 	if n > 0 {
 		r.last.Store(time.Now().UnixNano())
+	}
+	// Name the watchdog as the cause. puller.Run logs this error verbatim and
+	// remux writes it to <id>.errors, so it is the only place an operator can
+	// learn that the upstream went quiet rather than that something local broke.
+	// io.EOF is left exactly as it is: callers compare it by identity, and a
+	// clean end of stream is not this wrapper's business to redefine.
+	if err != nil && err != io.EOF && r.stalled.Load() {
+		return n, fmt.Errorf("source idle for %s: %w", r.idle, err)
 	}
 	return n, err
 }
