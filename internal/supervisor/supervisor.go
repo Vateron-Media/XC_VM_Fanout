@@ -554,6 +554,17 @@ func (st *stream) run(ctx context.Context) {
 	first := true
 
 	for ctx.Err() == nil {
+		// An operator's forced source outranks the loop's own failover choice,
+		// and has to be honoured HERE as well as in watch(): watch is reached
+		// only once a start has worked, so a stream that cannot start — exactly
+		// when the manual rescue is reached for — would never look at it.
+		if idx := st.takeForced(); idx >= 0 {
+			st.switchTo(idx)
+			if next, ok := st.sourceAt(idx); ok {
+				st.emit(EventForceSource, next.Label)
+			}
+			dlog.Logf("monitor", "id=%s operator forced source %d for the next start", st.id, idx)
+		}
 		src := st.currentSource()
 
 		proc, err := st.startOnce(ctx, src)

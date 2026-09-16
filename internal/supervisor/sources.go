@@ -96,8 +96,14 @@ func (s *Supervisor) ForceSource(id string, idx int) error {
 	if idx < 0 || idx >= len(st.spec.Sources) {
 		return fmt.Errorf("source %d out of range (stream has %d)", idx, len(st.spec.Sources))
 	}
-	if idx == st.srcIdx {
-		return nil // already on it; nothing to do
+	if idx == st.srcIdx && st.running {
+		// Already on it: restarting a working encoder onto the source it
+		// already has would be an outage for nothing. Only while it RUNS,
+		// though — a failing loop walks the list between attempts, so a force on
+		// the index it happens to be sitting at this instant still has to be
+		// queued, or the operator gets a 204 and a stream that walks off the
+		// source they picked.
+		return nil
 	}
 	st.forced = idx
 	return nil
