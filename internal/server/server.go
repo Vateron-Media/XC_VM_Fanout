@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -1343,17 +1344,24 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 // the stream down in between — the panel re-registers on every request, so the
 // two really do overlap. setConfig refuses the stream it took out of the
 // registry; registering again picks up the fresh one GetOrCreate then makes.
-func (m *Manager) Register(id string, src puller.Source, chunk int) {
+//
+// It reports whether the registration landed. The retry is bounded, so it can
+// run out, and a registration that never landed means the channel has no source
+// on this node: the caller has to say so rather than let the panel believe a
+// registration it never got. The give-up goes to the ordinary log, not dlog — it
+// is not debug narration, it is a request the daemon dropped.
+func (m *Manager) Register(id string, src puller.Source, chunk int) bool {
 	for attempt := 0; attempt < registerAttempts; attempt++ {
 		st := m.GetOrCreate(id)
 		st.mu.Lock()
 		st.pinnedBackend = src.Backend
 		st.mu.Unlock()
 		if st.setConfig(src, chunk) {
-			return
+			return true
 		}
 	}
-	dlog.Logf("ctl", "id=%s registration lost to concurrent teardowns %d times: not registered", id, registerAttempts)
+	log.Printf("server: id=%s registration lost to concurrent teardowns %d times: not registered", id, registerAttempts)
+	return false
 }
 
 // registerAttempts bounds the Register/RegisterIngest retry when a teardown takes
@@ -1826,7 +1834,7 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad config", http.StatusBadRequest)
 			return
 		}
-		m.Register(id, puller.Source{
+		if !m.Register(id, puller.Source{
 			URLs:      c.URLs,
 			UserAgent: c.UA,
 			Proxy:     c.Proxy,
@@ -1834,7 +1842,14 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 			Headers:   c.Headers,
 			FfmpegBin: c.Ffmpeg,
 			Backend:   normalizeBackend(c.Backend),
-		}, c.Chunk)
+		}, c.Chunk) {
+			// Teardowns beat every attempt, so this channel has no source here.
+			// Saying 204 would tell the panel the opposite; 503 is transient by
+			// definition, so its next request — it re-registers on every one —
+			// retries instead of trusting a registration that never happened.
+			http.Error(w, "registration lost to a concurrent teardown", http.StatusServiceUnavailable)
+			return
+		}
 		m.GetOrCreate(id).setEnc(c.Key, c.IV)
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodGet:
