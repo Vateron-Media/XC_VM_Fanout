@@ -80,10 +80,23 @@ func WrapIdleTimeout(rc io.ReadCloser, idle time.Duration) io.ReadCloser {
 	if rc == nil || idle <= 0 {
 		return rc
 	}
+	return newIdleTimeout(rc, idle)
+}
+
+func newIdleTimeout(rc io.ReadCloser, idle time.Duration) *idleTimeoutReader {
 	r := &idleTimeoutReader{rc: rc, idle: idle, done: make(chan struct{})}
 	r.last.Store(time.Now().UnixNano())
 	go r.watch()
 	return r
+}
+
+// detach stops the watcher and hands back the source it was guarding, still
+// open, so a caller that only needed a bound for its OWN reads does not leave
+// one armed on the stream it passes on. If the watcher has already fired, the
+// source comes back closed — which is the right answer: it stalled.
+func (r *idleTimeoutReader) detach() io.ReadCloser {
+	r.once.Do(func() { close(r.done) })
+	return r.rc
 }
 
 func (r *idleTimeoutReader) watch() {
@@ -289,6 +302,11 @@ func openHTTP(ctx context.Context, u *url.URL, opt Options) (io.ReadCloser, erro
 // one's connection unusable for the pool because it was closed undrained. The
 // caller keeps ownership of the http.Client the response came from; only the body
 // transfers.
+//
+// The reader that comes back is NOT stall-bounded: wrap it in
+// WrapIdleTimeout(rc, IdleBound(rc, def)), as Open's callers do, so one bound —
+// the caller's, widened by the source's own when it is silent between bursts —
+// governs the whole session.
 func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCloser, error) {
 	if resp.StatusCode/100 != 2 {
 		_ = resp.Body.Close()
@@ -296,22 +314,30 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 	}
 	final := resp.Request.URL // honour redirects when resolving segment URIs
 
-	// Bound EVERY read from here on, classification included. The stall wrapper
-	// used to go on only around the body we had already decided to keep, which
-	// left the two reads that come FIRST — the sniff below and the playlist read
-	// — unbounded: the caller's probe client carries no Client.Timeout,
-	// ResponseHeaderTimeout covers only the headers, and ctx is the stream's
-	// whole lifetime. An upstream that flushed 200 and then went silent parked
-	// the puller here for good, so the stream never errored, never reconnected
-	// and never reached its backup URLs while still reporting itself healthy.
-	body := WrapIdleTimeout(resp.Body, DefaultSourceIdleTimeout)
+	// Bound the reads THIS function makes — the sniff below and the playlist
+	// read. They are the two that come first and they used to be unbounded: the
+	// caller's probe client carries no Client.Timeout, ResponseHeaderTimeout
+	// covers only the headers, and ctx is the stream's whole lifetime. An
+	// upstream that flushed 200 and then went silent parked the puller here for
+	// good, so the stream never errored, never reconnected and never reached its
+	// backup URLs while still reporting itself healthy.
+	//
+	// The bound is detached again before a live body is handed on, because the
+	// body's bound belongs to the CALLER: remux carries the operator's
+	// -idle_timeout and the puller takes the source's own longer bound for a
+	// segment-at-a-time pull. Leaving this 8s default armed inside meant the
+	// inner watcher always fired first, so `-idle_timeout 30` could only ever
+	// shorten the bound and never lengthen it, and every http TS source ran two
+	// watcher goroutines and two tickers.
+	classify := newIdleTimeout(resp.Body, DefaultSourceIdleTimeout)
+	body := io.ReadCloser(classify)
 
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	switch {
 	case strings.Contains(ct, "mpegurl"):
 		return adoptHLS(ctx, final, opt, nil, body)
 	case strings.Contains(ct, "mp2t"):
-		return body, nil
+		return classify.detach(), nil
 	}
 
 	// Anything else has to PROVE what it is before we hand it on. Upstream this
@@ -330,7 +356,8 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 	}
 	switch {
 	case looksLikeTS(head):
-		return &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), body), c: body}, nil
+		live := classify.detach()
+		return &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), live), c: live}, nil
 	case looksLikePlaylist(head):
 		return adoptHLS(ctx, final, opt, head, body)
 	}
