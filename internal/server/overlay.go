@@ -23,7 +23,11 @@ import (
 // overlayTSDuration is how long an admin "send message" banner stays burned onto
 // a live-TS viewer's stream before it rejoins the raw fan-out. Mirrors the legacy
 // one-segment overlay; kept short since it costs a transient per-viewer re-encode.
-const overlayTSDuration = defaults.OverlayTSDuration
+//
+// A var, not a const, purely so the tests can shrink the window instead of
+// sitting out five seconds of wall clock per case; nothing in the daemon ever
+// assigns to it.
+var overlayTSDuration = defaults.OverlayTSDuration
 
 // pendingSignal is an admin "send message" overlay queued for one viewer uuid.
 // It reproduces the legacy admin "send message" feature: a text banner burned into the
@@ -209,12 +213,22 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 	return out.Bytes()
 }
 
+// laterCursor returns whichever of two cursors on the same ring is further on.
+// Block ids are monotonic and a cursor only ever moves forward inside a block, so
+// comparing them lexicographically is the ring's own ordering.
+func laterCursor(a, b tsjoin.Cursor) tsjoin.Cursor {
+	if b.GOP > a.GOP || (b.GOP == a.GOP && b.Off > a.Off) {
+		return b
+	}
+	return a
+}
+
 // overlayTSWindow burns the signal's banner onto a live-TS viewer's stream for
-// overlayTSDuration by piping it through ffmpeg drawtext. A fresh clean-join
-// snapshot re-seeds ffmpeg's decoder at a keyframe; the ring — followed by cursor
-// from cur — feeds its stdin while its stdout goes to the viewer via write().
-// After the window ffmpeg stops and the caller resumes the raw tail from the
-// returned cursor (the player resyncs on the next keyframe the ring emits).
+// overlayTSDuration by piping it through ffmpeg drawtext. ffmpeg's stdin gets the
+// latest PAT/PMT and then ONE contiguous run of ring bytes, followed by cursor
+// from the start of the viewer's own block; its stdout goes to the viewer via
+// write(). After the window ffmpeg stops and the caller resumes the raw tail from
+// the returned cursor (the player resyncs on the next keyframe the ring emits).
 //
 // It returns the cursor to resume the raw fan-out from — advanced to wherever the
 // feed reached, so there is no gap or duplication across the window — and false
@@ -267,13 +281,34 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 	feedDone := make(chan struct{})
 	endCur := cur
 	go func() {
-		c := cur
+		// Rewind to the START of the viewer's own block and read forward from
+		// there. The ring is cut at random-access points, so a block start is a
+		// decoder entry point, and everything after it is one unbroken run of the
+		// stream — which is the whole contract of this window.
+		//
+		// It used to seed ffmpeg with a live Snapshot(0) and then follow cur. But
+		// cur is ALWAYS behind the live edge here: serveLive looks for a queued
+		// signal only at the top of its loop, which it reaches right after a wake
+		// (a Publish has appended bytes since the cursor was set) or while the
+		// viewer is still taking its join history. So the snapshot and the follow
+		// were two different places in the stream spliced together. A viewer parked
+		// at the edge had the newest block encoded twice; one further back got the
+		// live GOP and then mid-GOP bytes from seconds earlier, referencing
+		// pictures the decoder never had. Either way the banner window opened on
+		// macroblock garbage — and on a long GOP that is the whole window.
+		c := tsjoin.Cursor{GOP: cur.GOP}
+		rewound := c != cur
 		// endCur is read by the caller only after feedDone closes, so this write
 		// is safely published; stdin.Close (registered later, so it runs first on
-		// return) lets ffmpeg drain and finish its output.
-		defer func() { endCur = c; close(feedDone) }()
+		// return) lets ffmpeg drain and finish its output. The resume point never
+		// goes backwards: the replayed head of the block was already sent raw, so
+		// the caller must carry on from cur even if the feed never got that far.
+		defer func() { endCur = laterCursor(cur, c); close(feedDone) }()
 		defer stdin.Close()
-		_, _ = stdin.Write(st.Hub.Snapshot(0)) // clean keyframe entry for the decoder
+		head, _ := st.Hub.Join(0) // latest PAT/PMT, so ffmpeg can find the program
+		if _, err := stdin.Write(head); err != nil {
+			return
+		}
 		deadline := time.After(overlayTSDuration)
 		for {
 			select {
@@ -284,6 +319,16 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 			default:
 			}
 			b, next, atEnd, wake, behind, ended := st.Hub.Follow(c, joinRunBytes)
+			if behind && rewound {
+				// The block's head was pruned between the viewer's last read and
+				// now, but cur itself can still be live (a ring shorter than one
+				// GOP — see ReadFrom). Feed from there rather than let an admin
+				// message cost the viewer its session.
+				b.Release()
+				c, rewound = cur, false
+				continue
+			}
+			rewound = false
 			if behind || ended {
 				b.Release()
 				return
