@@ -353,8 +353,24 @@ func (s *State) Update(chunk []byte) {
 			if m, ok := tspes.ParsePMT(pkt); ok && int(m.PCRPID) != s.pcrPID {
 				s.pcrPID, s.pcrOnPID = int(m.PCRPID), false
 			}
-			if a := parseAudioPID(pkt); a >= 0 {
-				s.audioPID = a
+			// The audio declaration MIRRORS the table: a PMT that lists no audio
+			// ES means this source has none now. Kept sticky, "the stream has
+			// audio" outlived the source it was true for — the daemon reports it
+			// to the supervisor, whose audio-loss rule restarts a channel
+			// carrying video and no audio, so a failover to a genuinely
+			// video-only backup was restarted every audio_loss_sec for ever,
+			// each restart landing back on the same silent source. Only a table
+			// that parsed WITH entries is allowed to withdraw it: a truncated or
+			// corrupt one says nothing about the stream, and reading it as "the
+			// audio is gone" would switch the rule off for a channel that has it.
+			if es, ok := tspes.ParsePMTStreams(pkt); ok {
+				s.audioPID = -1
+				for _, e := range es {
+					if isAudioStreamType(e.Type) {
+						s.audioPID = int(e.PID)
+						break
+					}
+				}
 			}
 		}
 
