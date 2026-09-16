@@ -612,15 +612,25 @@ func (s *State) closeSegment(newID, durMS int64) {
 	s.plValid = false
 }
 
-// hlsPrune drops segments whose GOPs have fully aged out of the ring, so the
-// playlist only ever lists segments Segment can still assemble.
+// hlsPrune drops segments the ring can no longer assemble, so the playlist only
+// ever lists segments HLSSegmentPin will serve.
+//
+// The test is the same one HLSSegmentPin applies: the segment's FIRST GOP must
+// still be in the ring, since a segment handed over without its own keyframe is
+// a decode error rather than a skip. Dropping only when the LAST GOP had gone
+// left every partially-pruned segment listed and 404ing for as long as it took
+// the ring to pass its end — the steady state on a ring shorter than the HLS
+// floor, which is what the byte backstop (defaults.JoinRingBytesPerMS, ≈24
+// Mbit/s) makes of a higher-bitrate channel: four listed segments in five
+// returned nothing. The one-segment case was not covered by HLSPlaylist's fetch
+// margin either, which only holds a segment back when there is more than one.
 func (s *State) hlsPrune() {
 	if len(s.segs) == 0 || len(s.gops) == 0 {
 		return
 	}
 	oldest := s.gops[0].id
 	drop := 0
-	for drop < len(s.segs) && s.segs[drop].endID < oldest {
+	for drop < len(s.segs) && s.segs[drop].startID < oldest {
 		drop++
 	}
 	if drop > 0 {
