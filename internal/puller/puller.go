@@ -438,6 +438,17 @@ func isHLSSource(raw string, resp *http.Response, refusal error) bool {
 // added to nativesrc after the classifier was written and nobody came back
 // here, so a byte-range or packed-audio source under an extensionless path was
 // still given the 8s continuous bound.
+//
+// Sentinels are all this side CAN test, and nativesrc's HLS path also refuses
+// in ways that carry none: a variant whose audio is a separate EXT-X-MEDIA
+// rendition, a master with no usable variant, a manifest that will not parse
+// (internal/nativesrc/hls.go, startHLSPull). Those are HLS sources too and
+// still get the continuous bound here. Widening the test to every ErrFormat
+// would catch them and also catch every refusal that is NOT HLS — a source
+// that is not an mpegts stream at all, a udp option — and hand a genuinely
+// continuous source a 24s stall bound, which is three times as long to notice
+// a frozen upstream. The fix belongs upstream: one nativesrc predicate over
+// its own refusal set, which this list then defers to.
 var hlsRefusals = []error{
 	nativesrc.ErrHLSIsFMP4,
 	nativesrc.ErrHLSEncrypted,
