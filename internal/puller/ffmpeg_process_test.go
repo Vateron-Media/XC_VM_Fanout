@@ -192,7 +192,7 @@ func TestFfmpegWaitBoundedByADescendantHoldingStderr(t *testing.T) {
 	// always won that race; on a loaded CI runner running every package in
 	// parallel it lost, and the test failed with "never recorded its worker pid".
 	script := "#!/bin/sh\n" +
-		"(sleep 0.3; setsid sh -c 'echo $$ > " + pidPath + ".tmp && mv " + pidPath + ".tmp " + pidPath + "; sleep 120') >/dev/null &\n" +
+		"setsid sh -c 'echo $$ > " + pidPath + ".tmp && mv " + pidPath + ".tmp " + pidPath + "; sleep 120' >/dev/null &\n" +
 		"i=0; while [ ! -s " + pidPath + " ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done\n" +
 		"cat " + payloadPath + "\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
