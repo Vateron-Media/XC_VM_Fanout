@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // shellLauncher runs one encoder command.
@@ -135,8 +136,36 @@ func shellProber(ctx context.Context, cmd string) bool {
 
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// End the whole group, not just the shell. A probe command is compound —
+	// the panel's is `timeout N ffprobe …`, often with a pipe — so /bin/sh does
+	// not exec into it and the real work is a child of the shell. os/exec's
+	// default cancel signals the shell's pid alone, which left an ffprobe behind
+	// on every probe that had to be cancelled, holding its connection to an
+	// origin that accepts TCP and never answers. That is what the process group
+	// asked for two lines up was for. Same shape as the encoder launcher's Kill
+	// and internal/puller's, for the same reason.
+	c.Cancel = func() error {
+		if err := syscall.Kill(-c.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				// Already gone: the ordinary case for a probe that answered just
+				// as the cancel landed. os/exec turns any other error from here
+				// into Wait's result, so say it the way it expects.
+				return os.ErrProcessDone
+			}
+			return c.Process.Kill()
+		}
+		return nil
+	}
+	// A backstop for anything the group kill cannot reach (a descendant in a
+	// session of its own): the health loop must never wait on a probe.
+	c.WaitDelay = probeWaitDelay
 	return c.Run() == nil
 }
+
+// probeWaitDelay bounds how long a cancelled probe may be waited on after its
+// group has been signalled. A probe answers a yes/no question; nothing about it
+// is worth holding the watch loop for.
+const probeWaitDelay = 2 * time.Second
 
 // findProcess reports a pid's command line and whether it is alive.
 //
