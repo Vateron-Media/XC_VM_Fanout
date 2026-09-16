@@ -110,6 +110,15 @@ type Stream struct {
 	publishedBytes atomic.Int64
 	lastAccess     atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
 
+	// rateMu guards the publish-rate samples below. rateOld is the oldest
+	// reading still inside the measurement horizon and rateNew the most recent
+	// roll point; publishRate differences publishedBytes against rateOld, so the
+	// horizon is always rateSampleEvery..2*rateSampleEvery of real seconds and
+	// never collapses to nothing just after a roll. See publishRate.
+	rateMu  sync.Mutex
+	rateOld rateSample
+	rateNew rateSample
+
 	connMu sync.Mutex           // guards conns (map + each connStat's refs/since)
 	conns  map[string]*connStat // active live-TS viewer uuids (from the ?c= param)
 
@@ -437,11 +446,82 @@ func (s *Stream) stopIngestLocked() {
 // off-air detection via status()).
 func (s *Stream) Publish(chunk []byte) {
 	if len(chunk) > 0 {
-		s.lastData.Store(time.Now().UnixNano())
-		s.publishedBytes.Add(int64(len(chunk)))
+		now := time.Now()
+		s.lastData.Store(now.UnixNano())
+		total := s.publishedBytes.Add(int64(len(chunk)))
+		s.noteRate(total-int64(len(chunk)), now)
 	}
 	s.Hub.Publish(chunk)
 }
+
+// rateSample is one reading of publishedBytes and the wall time it was taken at.
+type rateSample struct {
+	bytes int64
+	at    time.Time
+}
+
+// rateSampleEvery is how often the publish-rate horizon is rolled forward, so a
+// rate is always measured over the last rateSampleEvery..2*rateSampleEvery.
+//
+// It is long on purpose. A source does not arrive evenly: an upstream HLS
+// playlist hands the puller a whole 6 s segment in one burst and then nothing,
+// and a window short enough to land inside one burst reads several times the
+// channel's real rate — which is the dangerous direction, because runBytes turns
+// a rate into how much a viewer must drain inside one write deadline. Averaged
+// over half a minute any delivery pattern flattens out. A var so a test can
+// shorten it.
+var rateSampleEvery = 15 * time.Second
+
+// noteRate folds one published chunk into the stream's rate measurement. base is
+// publishedBytes as it stood BEFORE the chunk, so the first sample counts the
+// first chunk rather than skipping it. Called from Publish, i.e. once per source
+// read (tens of times a second at most), and the lock is otherwise untaken.
+func (s *Stream) noteRate(base int64, now time.Time) {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	switch {
+	case s.rateNew.at.IsZero():
+		s.rateOld = rateSample{bytes: base, at: now}
+		s.rateNew = s.rateOld
+	case now.Sub(s.rateNew.at) >= rateSampleEvery:
+		s.rateOld, s.rateNew = s.rateNew, rateSample{bytes: base, at: now}
+	}
+}
+
+// publishRate reports how fast the source is feeding this stream, in bytes per
+// second, and whether there is a measurement at all. It differences
+// publishedBytes against the oldest sample still in the horizon, so it needs
+// neither a PCR nor a keyframe — which is the whole point: a source that never
+// signals a random-access point gives the ring no clock of its own (tsjoin cuts
+// it only on the max_gop_bytes backstop, leaving a single block, and a single
+// block spans nothing), and that is precisely the low-bitrate class whose
+// viewers a bitrate-blind run size drops. See runBytes.
+//
+// ok is false only while nothing has been published yet, or while the sample is
+// too young to divide by. A stream that IS publishing nothing measures 0, which
+// is a real answer and a different one.
+func (s *Stream) publishRate(now time.Time) (int64, bool) {
+	total := s.publishedBytes.Load()
+	s.rateMu.Lock()
+	old := s.rateOld
+	s.rateMu.Unlock()
+	if old.at.IsZero() {
+		return 0, false
+	}
+	elapsed := now.Sub(old.at)
+	if elapsed < rateSampleMin {
+		return 0, false
+	}
+	if total <= old.bytes {
+		return 0, true // publishing nothing: a run of one packet is the right answer
+	}
+	return int64(float64(total-old.bytes) / elapsed.Seconds()), true
+}
+
+// rateSampleMin is the shortest span publishRate will divide by; below it one
+// source read dominates the answer. meta.go's minBitrateWindow makes the same
+// call for the bitrate the panel is shown.
+const rateSampleMin = minBitrateWindow
 
 // setConfig registers/updates the pull config; if viewers are already waiting,
 // or a puller is already running on a source that just changed, it (re)starts the
@@ -1765,15 +1845,35 @@ const runResizeEvery = 5 * time.Second
 // over the stream time it spans) — so the bar a viewer must clear is "keep up
 // with the stream, with a factor of two to spare".
 //
-// Clamped to [minRunBytes, joinRunBytes]. A ring with no clock yet (a cold start,
-// where there is no backlog to drain anyway) keeps the ceiling.
-func (m *Manager) runBytes(st *Stream) int {
-	ringBytes, spanMS, _ := st.Hub.RingStats()
+// The ring's own clock is the first choice: it measures the source in STREAM
+// time, so a bursty delivery (a whole HLS segment at once) cannot fool it. Not
+// every source has one, though — one that never signals a random-access point
+// gives tsjoin nothing to cut on but the max_gop_bytes backstop, so its ring
+// holds a single block, and a single block spans 0 ms for as long as the stream
+// runs. That is not "a cold start with no backlog to drain": the block can hold
+// megabytes, and it is exactly the low-bitrate class (radio, low-res) whose
+// viewers the fixed run dropped. So fall back to the stream's published bytes
+// over wall time, which needs neither PCR nor keyframe.
+//
+// Clamped to [minRunBytes, joinRunBytes]. Only a stream that has published
+// nothing measurable — where there is genuinely no backlog to drain — keeps the
+// ceiling.
+func (m *Manager) runBytes(st *Stream, now time.Time) int {
 	timeoutMS := int64(time.Duration(m.writeTimeout.Load()) / time.Millisecond)
-	if ringBytes <= 0 || spanMS <= 0 || timeoutMS <= 0 {
+	if timeoutMS <= 0 {
 		return joinRunBytes
 	}
-	n := int64(ringBytes) * timeoutMS / (2 * spanMS)
+	if ringBytes, spanMS, _ := st.Hub.RingStats(); ringBytes > 0 && spanMS > 0 {
+		return clampRunBytes(int64(ringBytes) * timeoutMS / (2 * spanMS))
+	}
+	if bps, ok := st.publishRate(now); ok {
+		return clampRunBytes(bps * timeoutMS / 2000)
+	}
+	return joinRunBytes
+}
+
+// clampRunBytes bounds a sized run to [minRunBytes, joinRunBytes].
+func clampRunBytes(n int64) int {
 	if n > joinRunBytes {
 		return joinRunBytes
 	}
@@ -1940,7 +2040,8 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// At the live edge the follower parks on wake until the next Publish, and a
 	// teardown (CloseAll) surfaces as ended so this handler returns and runs its
 	// cleanup.
-	runMax, runMeasured := m.runBytes(st), time.Now()
+	runMeasured := time.Now()
+	runMax := m.runBytes(st, runMeasured)
 	if len(head) > 0 {
 		if err := write(head); err != nil {
 			reason = writeFailReason(err)
@@ -1967,8 +2068,8 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 
 		// Re-measure the run size occasionally: a stream that was cold at join has
 		// a rate only once it has published something.
-		if time.Since(runMeasured) >= runResizeEvery {
-			runMax, runMeasured = m.runBytes(st), time.Now()
+		if now := time.Now(); now.Sub(runMeasured) >= runResizeEvery {
+			runMax, runMeasured = m.runBytes(st, now), now
 		}
 		burst, next, atEnd, wake, behind, ended := st.Hub.Follow(cur, runMax)
 		if behind {
