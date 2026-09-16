@@ -121,16 +121,34 @@ func credentialReplacements(src Source, raw string) []string {
 		// a credential rather than a word: replacing a two-character string
 		// everywhere would mangle the message the line is logged for, and a
 		// secret that short is not one worth protecting a log line over.
+		//
+		// With the separator it is followed by, never bare. redact.maskPath
+		// masks the two ACCOUNT segments and the stream id follows them, so a
+		// masked segment is never the last one and the "/" is always there in
+		// the child's text too — while matching without it let a provider
+		// username that is also an ordinary word ("user", "test") rewrite the
+		// message around it: "Option user_agent not found." came out as
+		// "Option xxxxx_agent not found.".
 		from, to := strings.Split(u.EscapedPath(), "/"), strings.Split(ru.EscapedPath(), "/")
 		for i := range from {
 			if i < len(to) && from[i] != to[i] && len(from[i]) >= minTailSecretLen {
-				add(from[i], to[i])
+				add(from[i]+"/", to[i]+"/")
 			}
 		}
 	}
-	// The proxy is the other configured value carrying a password, and it is
-	// quoted back by a child that failed to reach it.
-	add(strings.TrimSpace(src.Proxy), proxyForLog(src.Proxy))
+	// The proxy is the other configured value carrying a password, and a child
+	// that failed to reach it quotes it back. Replace the CREDENTIAL in it, not
+	// the value: proxyForLog normalises as well as redacting — it adds the
+	// scheme the panel's documented "host:port" form leaves out — so pairing
+	// the configured value with it rewrote ffmpeg's own "Connection to
+	// tcp://10.0.0.5:3128 failed" as "tcp://http://10.0.0.5:3128", mangling the
+	// one address that line exists to name. A proxy the child quotes WITH its
+	// scheme is a URL, and the pass below redacts it as one.
+	if pu, perr := proxyURL(src.Proxy); perr == nil && pu != nil && pu.User != nil {
+		if ru, rerr := url.Parse(redact.URL(pu.String())); rerr == nil && ru.User != nil {
+			add(pu.User.String()+"@", ru.User.String()+"@")
+		}
+	}
 
 	sort.SliceStable(pairs, func(i, j int) bool { return len(pairs[i].from) > len(pairs[j].from) })
 	out := make([]string, 0, 2*len(pairs))
