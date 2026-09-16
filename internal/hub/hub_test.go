@@ -124,18 +124,51 @@ func TestPublishAfterCloseAllTouchesNothing(t *testing.T) {
 	}
 }
 
-// TestCloseAllKeepsWhatItAlreadyHeld: closing must not disturb the bytes already
-// in the ring — an HLS segment request or a Snapshot may still be in flight when
-// the teardown lands, and they read through the same join state.
+// TestCloseAllKeepsWhatItAlreadyHeld: teardown must not disturb the bytes the
+// ring already holds — an HLS segment request, a Snapshot or a Follow burst may
+// still be in flight when it lands, and all three read through the same join
+// state — AND neither must the chunks that keep arriving after it.
+//
+// That second half is the bound on Publish's early return, and the reason this
+// test takes a pin before the teardown: without the early return every stray
+// chunk still ran a full join.Update, so the ring an in-flight reader is holding
+// went on growing (and, at a real prebuffer depth, pruning) underneath it. With
+// it, the ring is frozen at exactly what the teardown found.
 func TestCloseAllKeepsWhatItAlreadyHeld(t *testing.T) {
 	h := New(1<<20, 0)
+	_, cur := h.Join(0)
 	h.Publish(mkPkt(5))
 	before, _, _ := h.RingStats()
 	if before == 0 {
 		t.Fatal("setup: expected the ring to hold the published packet")
 	}
+
+	// A read already in flight when the teardown lands: Parts are the ring's own
+	// pinned buffers, not a copy of them.
+	b, _, _, _, behind, ended := h.Follow(cur, 1<<20)
+	if behind || ended {
+		t.Fatalf("setup: Follow before teardown reported behind=%v ended=%v, want both false", behind, ended)
+	}
+	defer b.Release()
+	held := b.Bytes()
+	if len(held) != before {
+		t.Fatalf("setup: the in-flight read holds %d bytes, the ring holds %d", len(held), before)
+	}
+
 	h.CloseAll()
 	if after, _, _ := h.RingStats(); after != before {
 		t.Fatalf("CloseAll changed the ring: %d bytes, want %d", after, before)
+	}
+
+	// The producer notices its cancellation asynchronously, so chunks keep
+	// arriving for a moment after the teardown. They must land nowhere.
+	for i := 0; i < 64; i++ {
+		h.Publish(mkPkt(6))
+	}
+	if after, _, _ := h.RingStats(); after != before {
+		t.Fatalf("publishing after CloseAll grew the ring under an in-flight read: %d bytes, want %d", after, before)
+	}
+	if got := b.Bytes(); !bytes.Equal(got, held) {
+		t.Fatalf("the in-flight read's bytes changed across the teardown: got %d, want the %d it pinned", len(got), len(held))
 	}
 }
