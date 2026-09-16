@@ -485,3 +485,51 @@ func TestSpliceCutsTheSegmentAtTheJump(t *testing.T) {
 	}
 	r.checkTimeline()
 }
+
+// TestForwardTimelineJumpIsASplice: an encoder that restarts with its clock an
+// hour AHEAD is as much a splice as one that restarts at zero, but only
+// backwards steps were treated as one. The huge elapsed sailed past the cut, so
+// finalize clamped the duration to 4×hls_time and published that: a segment
+// holding two seconds of media listed as '#EXTINF:8.000000', and
+// '#EXT-X-TARGETDURATION:8' for as long as it stayed in the window — the HLS
+// spec says TARGETDURATION must not change, and every player's reload interval
+// follows it. The segment that started the new timeline carried no
+// #EXT-X-DISCONTINUITY at all.
+func TestForwardTimelineJumpIsASplice(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), pmtWithPCR())
+	for g := 0; g <= 3; g++ {
+		r.gop(100 + float64(g)*2)
+	}
+	for g := 0; g <= 3; g++ { // the encoder restarts an hour ahead
+		r.gop(3700 + float64(g)*2)
+	}
+
+	list := r.listed()
+	if len(list) < 5 {
+		t.Fatalf("%d segments listed:\n%s", len(list), r.playlist())
+	}
+	jumped, prevLast := -1, int64(-1)
+	for i, sg := range list {
+		pts := r.segPTS(sg.name)
+		if len(pts) == 0 {
+			t.Fatalf("%s carries no video PES", sg.name)
+		}
+		if span := float64(pts[len(pts)-1]-pts[0]) / 90000; sg.dur > span+2.001 {
+			t.Errorf("%s holds %.3fs of media but is listed as #EXTINF:%.6f:\n%s", sg.name, span, sg.dur, r.playlist())
+		}
+		if prevLast >= 0 && pts[0]-prevLast > 60*90000 {
+			jumped = i
+		}
+		prevLast = pts[len(pts)-1]
+	}
+	if jumped < 0 {
+		t.Fatalf("no segment starts the jumped-to timeline:\n%s", r.playlist())
+	}
+	if !list[jumped].disc {
+		t.Errorf("%s opens an hour after the segment before it with no #EXT-X-DISCONTINUITY:\n%s", list[jumped].name, r.playlist())
+	}
+	if !strings.Contains(r.playlist(), "#EXT-X-TARGETDURATION:2\n") {
+		t.Errorf("TARGETDURATION is not the real 2s target, so every player slows its reload:\n%s", r.playlist())
+	}
+}

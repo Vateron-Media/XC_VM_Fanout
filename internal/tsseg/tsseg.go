@@ -16,12 +16,13 @@
 //     (tspes.StartsKeyframe) — so each one decodes on its own;
 //   - the latest PAT, PMT and SDT are re-emitted at every segment head, so a
 //     player (or the panel's tv_archive worker) can start from any file;
-//   - durations come from the PCR, else the video PTS; a backwards step that is
-//     not a 33-bit wrap is a source splice, which cuts the segment at that
-//     keyframe, rebases the clock and marks the NEXT segment
-//     EXT-X-DISCONTINUITY — so the jump falls on a segment boundary a player can
-//     reset at, rather than inside a file where no tag can mark it, and no
-//     EXTINF is absurd enough to stall every player's reload timer;
+//   - durations come from the PCR, else the video PTS; a step between keyframes
+//     that no wrap and no keyframe interval explains — backwards, or far enough
+//     forward — is a source splice, which cuts the segment at that keyframe,
+//     rebases the clock and marks the NEXT segment EXT-X-DISCONTINUITY — so the
+//     jump falls on a segment boundary a player can reset at, rather than inside
+//     a file where no tag can mark it, and no EXTINF is absurd enough to stall
+//     every player's reload timer;
 //   - the first segment is cut early (InitSec) so a cold-started channel lists
 //     a segment sooner;
 //   - no keyframe for too long is ErrNoKeyframe: this source needs ffmpeg.
@@ -66,6 +67,16 @@ const (
 	// a genuine wrap leaves the delta near -2^33, a splice or an upstream encoder
 	// restart leaves it small and negative.
 	pcrWrapFloor = -(int64(1) << 32)
+
+	// spliceForward is the floor under the forward step between two keyframes
+	// that is read as a splice rather than as a long GOP. An encoder that
+	// restarts ahead of itself lands minutes or hours away, while a keyframe
+	// interval of half a minute is not something this can cut into hls_time
+	// segments anyway. The floor matters because the bound is otherwise
+	// 4×TargetSec — the span finalize refuses to believe — and under hls_time=2
+	// that would be 8s, close enough to a real sparse-keyframe source to mark
+	// every one of its segments discontinuous.
+	spliceForward = 30 * 90000
 
 	// fpsWindow is the wall-clock span over which frames are counted for the
 	// reported frame rate. The stream is realtime, so frames over wall time is
@@ -400,21 +411,33 @@ func clockDelta(last, start int64) (int64, bool) {
 	return d, true
 }
 
-// spliced reports whether the clock a keyframe carries steps backwards from the
-// previous keyframe's by more than a 33-bit wrap explains: an upstream splice,
-// or an encoder that restarted and began counting again. It is asked BEFORE the
-// new clock is committed, so the caller can still close the open segment on the
-// old one.
+// spliced reports whether the clock a keyframe carries jumps away from the
+// previous keyframe's: an upstream splice, or an encoder that restarted and
+// began counting again. Backwards by more than a 33-bit wrap explains, or
+// forward by more than any keyframe interval explains — a restart is as likely
+// to land an hour ahead as back at zero, and a forward jump left unrecognised
+// reaches finalize as an elapsed no EXTINF can honestly carry. It is asked
+// BEFORE the new clock is committed, so the caller can still close the open
+// segment on the old one.
 func (s *Segmenter) spliced(pts int64, hasPTS bool, pcr int64, hasPCR bool) bool {
-	if hasPTS && s.keyPTS >= 0 {
-		_, ok := clockDelta(pts, s.keyPTS)
-		return !ok
+	var d int64
+	var ok bool
+	switch {
+	case hasPTS && s.keyPTS >= 0:
+		d, ok = clockDelta(pts, s.keyPTS)
+	case hasPCR && s.keyPCR >= 0:
+		d, ok = clockDelta(pcr, s.keyPCR)
+	default:
+		return false
 	}
-	if hasPCR && s.keyPCR >= 0 {
-		_, ok := clockDelta(pcr, s.keyPCR)
-		return !ok
+	if !ok {
+		return true // backwards, and no wrap explains it
 	}
-	return false
+	fwd := int64(4*s.cfg.TargetSec) * 90000
+	if fwd < spliceForward {
+		fwd = spliceForward
+	}
+	return d > fwd
 }
 
 func (s *Segmenter) open() {
