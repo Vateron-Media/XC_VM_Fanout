@@ -247,7 +247,16 @@ func (v *Values) clamp() {
 	v.GraceSec = clampInt(v.GraceSec, 1, 3600)
 	v.WriteTimeoutSec = clampInt(v.WriteTimeoutSec, 1, 600)
 	v.ChunkBytes = clampInt(v.ChunkBytes, 188, 4<<20)
-	v.MaxGOPBytes = clampInt(v.MaxGOPBytes, 188, 256<<20)
+	// max_gop_bytes caps ONE ring block, so its floor has to be a size that can
+	// still hold a GOP. Floored at a single TS packet it was not a small buffer
+	// but a different data structure: the open block is full after one packet, so
+	// every further packet opens a new block and prunes the ring — and prune sums
+	// and shifts the whole ring under the hub lock. An admin who typed 1 or 10
+	// meaning megabytes got ~133k blocks and ~0.5 ms of CPU per 188-byte packet,
+	// a producer that could not keep up in real time, and every viewer on the
+	// stream stalled behind the lock it held. Exactly the pathological state this
+	// clamp exists to make impossible.
+	v.MaxGOPBytes = clampInt(v.MaxGOPBytes, defaults.CfgMinMaxGOPBytes, 256<<20)
 	v.IdleBufferGraceSec = clampInt(v.IdleBufferGraceSec, 0, 3600)
 	// 0 disables the viewer idle-drop; anything above 0 is floored at 5 s so a
 	// typo cannot start culling healthy viewers between two chunks.

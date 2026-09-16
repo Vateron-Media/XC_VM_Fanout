@@ -145,9 +145,20 @@ const (
 	CfgWriteTimeoutSec     = 15       // per-write deadline for a live-TS viewer (seconds)
 	CfgChunkBytes          = 12032    // source read size for daemon-pulled streams (aligned down to 188)
 	CfgMaxGOPBytes         = 10528000 // cap on a single join-snapshot GOP (bytes)
-	CfgSourceInsecure      = true     // skip upstream TLS verification when pulling HTTPS sources
-	CfgIdleBufferGraceSec  = 30       // no-viewer window before the ring collapses (seconds); 0 = gate off
-	CfgIdleBufferRatio     = 0.5      // fraction of the buffer kept while unwatched (HLS still cut from it)
+	// CfgMinMaxGOPBytes is the smallest max_gop_bytes the daemon will accept. The
+	// value caps ONE ring block, and a block that cannot hold a GOP is not a small
+	// buffer — it is a different data structure. Once a block fills, every further
+	// packet opens a new one and prunes the ring (tsjoin.Update), and prune walks
+	// and shifts the whole ring under the hub lock. Floored at one packet, as it
+	// used to be, an admin who typed max_gop_bytes=1 meaning a megabyte got a ring
+	// of one block per TS packet: ~133k blocks at 5 Mbit/s, ~0.5 ms of CPU per
+	// 188-byte packet, a producer that cannot keep up in real time and viewers
+	// stalled behind the lock it holds. 1 MiB is a second or two of a normal
+	// stream — well under any real GOP cap, far above a packet.
+	CfgMinMaxGOPBytes     = 1 << 20
+	CfgSourceInsecure     = true // skip upstream TLS verification when pulling HTTPS sources
+	CfgIdleBufferGraceSec = 30   // no-viewer window before the ring collapses (seconds); 0 = gate off
+	CfgIdleBufferRatio    = 0.5  // fraction of the buffer kept while unwatched (HLS still cut from it)
 	// CfgViewerIdleTimeoutSec bounds how long a live-TS viewer may sit receiving
 	// NOTHING before it is dropped (0 = never). The per-write deadline only fires
 	// while there are bytes to write, so a viewer whose stream went off-air AND
