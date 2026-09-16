@@ -619,15 +619,6 @@ func (s *Stream) touch() {
 	s.mu.Unlock()
 }
 
-// restoreBuffer pumps a gated ring back to the full prebuffer + HLS view. It is
-// ensureBufferedLocked's locking wrapper, for the one caller that needs the ring
-// restored before it takes a join snapshot.
-func (s *Stream) restoreBuffer() {
-	s.mu.Lock()
-	s.ensureBufferedLocked()
-	s.mu.Unlock()
-}
-
 // ensureBufferedLocked pumps the ring back to the full prebuffer + HLS view if
 // the stream was gated down to the idle floor. Called when a viewer returns (TS
 // attach or HLS touch) so the audience gets the configured buffer depth again —
@@ -1684,18 +1675,22 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// the ring (maxPrebufMS).
 	prebufMS := m.resolvePrebufMS(r.URL.Query().Get("prebuffer"))
 
-	// Restore a gated ring BEFORE capturing the join burst, so this viewer's own
-	// snapshot is drawn from the full buffer rather than the idle floor. attach()
-	// would do it too, but only after Subscribe had already copied.
-	st.restoreBuffer()
-
-	// Place the join FIRST, then attach: the cursor fixes where this viewer's
-	// history starts before the puller (if it was stopped) begins publishing, and
-	// the catch-up below subscribes it at the live edge with no gap between the
-	// history and the live tail.
-	head, cur := st.Hub.Join(prebufMS)
+	// Attach FIRST, then place the join. attach takes the ref, stamps lastAccess,
+	// restores a gated ring to the full buffer and starts the puller if it was
+	// stopped — all under st.mu — so the cursor below is placed in a ring the
+	// reaper can no longer touch: refs>0 blocks both the idle-stop (Hub.Flush) and
+	// the idle-buffer gate.
+	//
+	// The cursor used to be placed first, which left a window where the viewer
+	// held a cursor while the stream still looked unwatched (refs==0, lastAccess
+	// as old as the last departure). A reaper sweep landing in it flushed or gated
+	// the ring under the joining viewer, its block was pruned, and its very first
+	// Follow reported behind: a fresh zap on a fast link dropped as "fell behind
+	// the ring". Nothing is lost by joining second — whatever the restarted puller
+	// publishes in between is history this viewer then starts from.
 	st.attach()
 	defer st.detach()
+	head, cur := st.Hub.Join(prebufMS)
 
 	// Track this viewer by its connection uuid (from live.php's X-Accel URL) so
 	// fanout_sync can detect its disconnect and close the lines_live row, and so
