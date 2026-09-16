@@ -243,7 +243,30 @@ func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize in
 		// the daemon no matter what the operator configured.
 		if nativeOnlyScheme(raw) {
 			dlog.Logf("puller", "id=%s non-http source, skipping probe: %s", src.Label, raw)
-			return convert(ctx, src, raw, nil, chunkSize, publish)
+			// A native-only URL is a CANDIDATE like any other. This branch used
+			// to return the attempt's error, so a stream whose first URL was
+			// udp://, rtp:// or a path never reached its configured backups:
+			// Run always restarts pullOnce at URLs[0], so a node with no route
+			// to the group, or a missing file, stayed off air forever with a
+			// healthy HTTP backup sitting untouched in its config — while the
+			// same config with an HTTP primary failed over on the first probe.
+			//
+			// Fall through only when the attempt produced NOTHING, which is
+			// this path's equivalent of a failed probe. A source that was on
+			// air and then ended keeps the stream: rotating on that would
+			// migrate a channel off its primary after one hiccup hours into a
+			// healthy run, and Run's backoff returns to URLs[0] anyway.
+			delivered := false
+			err := convert(ctx, src, raw, nil, chunkSize, func(b []byte) {
+				delivered = true
+				publish(b)
+			})
+			if err == nil || delivered || ctx.Err() != nil {
+				return err
+			}
+			dlog.Logf("puller", "id=%s source delivered nothing: %s: %v", src.Label, raw, err)
+			lastErr = err
+			continue
 		}
 		resp, err := probe(ctx, client, src, raw)
 		if err != nil {
