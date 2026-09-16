@@ -119,6 +119,13 @@ func (r *idleTimeoutReader) Close() error {
 	return r.rc.Close()
 }
 
+// playlistReadDeadline is the ABSOLUTE cap on reading one playlist body during
+// classification. The stall bound cannot catch a slow loris — a byte at a time
+// keeps resetting it — and a playlist, unlike a live body, is a bounded object
+// that has no business taking longer than one ordinary fetch. A var so tests can
+// shorten it.
+var playlistReadDeadline = pullRequestTimeout
+
 // ErrUnsupportedSource is returned by Open when the URL scheme or content-type
 // isn't something the native reader can take. The caller falls back to ffmpeg.
 var ErrUnsupportedSource = errors.New("remux: unsupported source")
@@ -245,12 +252,22 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 	}
 	final := resp.Request.URL // honour redirects when resolving segment URIs
 
+	// Bound EVERY read from here on, classification included. The stall wrapper
+	// used to go on only around the body we had already decided to keep, which
+	// left the two reads that come FIRST — the sniff below and the playlist read
+	// — unbounded: the caller's probe client carries no Client.Timeout,
+	// ResponseHeaderTimeout covers only the headers, and ctx is the stream's
+	// whole lifetime. An upstream that flushed 200 and then went silent parked
+	// the puller here for good, so the stream never errored, never reconnected
+	// and never reached its backup URLs while still reporting itself healthy.
+	body := WrapIdleTimeout(resp.Body, DefaultSourceIdleTimeout)
+
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	switch {
 	case strings.Contains(ct, "mpegurl"):
-		return adoptHLS(ctx, final, opt, nil, resp.Body)
+		return adoptHLS(ctx, final, opt, nil, body)
 	case strings.Contains(ct, "mp2t"):
-		return WrapIdleTimeout(resp.Body, DefaultSourceIdleTimeout), nil
+		return body, nil
 	}
 
 	// Anything else has to PROVE what it is before we hand it on. Upstream this
@@ -261,20 +278,19 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 	// serve real TS, and the odd playlist, as application/octet-stream, so the
 	// header alone is neither sufficient nor necessary.
 	head := make([]byte, tsSyncProbePackets*tsPacketSize)
-	n, err := io.ReadFull(resp.Body, head)
+	n, err := io.ReadFull(body, head)
 	head = head[:n]
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		_ = resp.Body.Close()
+		_ = body.Close()
 		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, redact(final), err)
 	}
 	switch {
 	case looksLikeTS(head):
-		body := &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), resp.Body), c: resp.Body}
-		return WrapIdleTimeout(body, DefaultSourceIdleTimeout), nil
+		return &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), body), c: body}, nil
 	case looksLikePlaylist(head):
-		return adoptHLS(ctx, final, opt, head, resp.Body)
+		return adoptHLS(ctx, final, opt, head, body)
 	}
-	_ = resp.Body.Close()
+	_ = body.Close()
 	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redact(final))
 }
 
@@ -283,6 +299,10 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 // second time. Always closes body.
 func adoptHLS(ctx context.Context, base *url.URL, opt Options, head []byte, body io.ReadCloser) (io.ReadCloser, error) {
 	defer body.Close()
+	// Closing the body is what unblocks a read that is trickling rather than
+	// stalled; see playlistReadDeadline.
+	stop := time.AfterFunc(playlistReadDeadline, func() { _ = body.Close() })
+	defer stop.Stop()
 	rest, err := io.ReadAll(io.LimitReader(body, maxPlaylistBytes-int64(len(head))))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: read playlist: %v", ErrUnsupportedSource, redact(base), err)
