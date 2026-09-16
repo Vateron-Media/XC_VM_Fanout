@@ -876,8 +876,18 @@ func (m *Manager) resolvePrebufMS(param string) int64 {
 // ApplyConfig live-applies operator tuning (from the polled config file) to the
 // running daemon. New streams pick up the new values at creation; every existing
 // stream's prebuffer ring and HLS window are reconfigured in place, so lowering
-// them frees memory within one poll — no restart, no viewer drop. Safe to call
-// from the config-poll goroutine while streams are serving.
+// them frees memory within one poll, with no restart and no stream dropped. Safe
+// to call from the config-poll goroutine while streams are serving.
+//
+// One caveat, with the ring as the live tail (ADR 0004): a viewer holds a cursor
+// INTO the ring, and LOWERING prebuffer_max_sec prunes on the spot everything
+// older than the new window. A viewer sitting deeper than that — one that joined
+// with a large ?prebuffer and is still catching up, or a player that stopped
+// reading ahead once its own buffer filled — has its block pruned and is dropped
+// as behind on its next read, then reconnects into the new, shorter ring.
+// Everything within the new window plays on untouched. Shrinking the ring is the
+// one config change that costs those viewers a reconnect; raising it, and every
+// other key, costs none.
 func (m *Manager) ApplyConfig(v config.Values) {
 	m.maxPrebufMS.Store(int64(v.PrebufferMaxSec) * 1000)
 	m.defaultPrebufMS.Store(int64(v.DefaultPrebufferSec) * 1000)
