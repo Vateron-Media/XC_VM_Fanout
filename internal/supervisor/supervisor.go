@@ -603,6 +603,7 @@ func (st *stream) run(ctx context.Context) {
 
 		// Watch until the encoder exits or a health rule condemns it.
 		verdict := st.watch(ctx, proc)
+		ranFor := st.sup.now().Sub(st.startTime())
 		st.markStopped(nil)
 
 		if ctx.Err() != nil {
@@ -642,6 +643,20 @@ func (st *stream) run(ctx context.Context) {
 			}
 			st.emit(EventStreamFailed, src.Label)
 			dlog.Logf("monitor", "id=%s process exited; restarting", st.id)
+
+			// It ended before the run could be called healthy: an ordinary
+			// failure, which walks the source list exactly as a failed start
+			// does. Without this, a source that accepts the connection, sends a
+			// few seconds of TS and drops — an upstream connection limit, a
+			// short error clip — flaps on that one source forever while a
+			// working backup sits unused. A run that LASTED is a source that
+			// works and merely ended; it keeps the stream where it is.
+			if ranFor < st.minHealthyRun() {
+				st.note(fmt.Sprintf("encoder exited after %s, before the start had proved itself", ranFor.Round(time.Second)), 0)
+				st.advanceAfterFailure()
+				dlog.Logf("monitor", "id=%s exited after %s (short of %s); trying the next source",
+					st.id, ranFor.Round(time.Second), st.minHealthyRun())
+			}
 		}
 
 		if !st.sup.sleep(ctx, time.Duration(st.policy().StreamFailSleepSec)*time.Second) {
@@ -988,6 +1003,20 @@ func (st *stream) policy() Policy {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.spec.Policy
+}
+
+// minHealthyRun is how long an encoder has to stay up for its start to count as
+// having worked. An exit before that walks the source list, the same as a start
+// that never produced anything; an exit after it leaves the stream on a source
+// that was plainly working.
+//
+// It is the start timeout because that is the daemon's existing statement of how
+// long a start may take to prove itself: a process that confirmed inside that
+// window and was gone again before it closed never delivered a stream, it
+// delivered a few seconds of one. No new setting — the panel already tunes this
+// through start_timeout_sec.
+func (st *stream) minHealthyRun() time.Duration {
+	return time.Duration(st.policy().StartTimeoutSec) * time.Second
 }
 
 // currentSource is the source the next start should use.
