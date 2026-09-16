@@ -421,6 +421,19 @@ func (s *State) ringClock() int64 {
 	}
 	if s.clockPCR < 0 {
 		s.clockPCR, s.clockT = s.lastPCR, 0
+		// The clock starts HERE, so the blocks already in the ring — the pre-roll
+		// opened before the stream showed a PCR, carrying t=-1 — happened at its
+		// origin, not before the beginning of time. Left at -1 they read as older
+		// than any window, and prune dropped them in the very Update that had just
+		// appended to them: on a cold channel (the puller starts on the first
+		// viewer's attach) that is the block the first viewer is reading, and it
+		// was dropped as behind at the stream's first keyframe, 0 bytes sent.
+		// lastPCR is never unset, so this backfill runs at most once per stream.
+		for i := range s.gops {
+			if s.gops[i].t < 0 {
+				s.gops[i].t = 0
+			}
+		}
 		return 0
 	}
 	d := s.lastPCR - s.clockPCR
