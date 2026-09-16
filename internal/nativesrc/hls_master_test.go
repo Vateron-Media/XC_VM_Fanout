@@ -109,6 +109,38 @@ func TestMasterWithMuxedAudioRenditionIsServed(t *testing.T) {
 	}
 }
 
+// TestMasterWithAMixedAudioGroupIsServed: RFC 8216 makes URI optional on an
+// EXT-X-MEDIA AUDIO rendition, and a multi-language channel routinely ships one
+// group holding both — the default language muxed into the variant's own
+// segments (no URI) and the alternates as separate renditions (URI). The
+// variant's TS therefore DOES carry audio. Marking the whole group demuxed as
+// soon as any one rendition had a URI refused those masters, so a channel that
+// played natively with sound was pushed onto ffmpeg for good.
+func TestMasterWithAMixedAudioGroupIsServed(t *testing.T) {
+	srv := newMasterServer(t, map[string]string{
+		"master.m3u8": "#EXTM3U\n" +
+			"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",DEFAULT=YES\n" +
+			"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Spanish\",URI=\"es.m3u8\"\n" +
+			"#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"aud\"\nvideo.m3u8\n",
+		"video.m3u8": "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nv1.ts\n#EXT-X-ENDLIST\n",
+		"es.m3u8":    "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\na1.ts\n#EXT-X-ENDLIST\n",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	rc, err := Open(ctx, srv.URL+"/master.m3u8", Options{})
+	if err != nil {
+		t.Fatalf("a master whose audio group has a muxed default rendition was refused: %v\n"+
+			"The variant's own segments carry that audio; refusing sends a working "+
+			"native channel to ffmpeg permanently", err)
+	}
+	defer rc.Close()
+	got, _ := io.ReadAll(rc)
+	if len(got) == 0 || got[0] != 0x47 {
+		t.Fatalf("mixed-audio-group master delivered %d bytes", len(got))
+	}
+}
+
 // TestMasterWithSubtitleRenditionIsServed: subtitles living outside the variant
 // is normal and costs the viewer nothing on a TS fan-out, so it must not be
 // mistaken for the demuxed-audio case and refused.

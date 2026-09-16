@@ -147,7 +147,7 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		// video-only segments, and this package passes segment bytes through
 		// unread — so taking it would fan out a silent channel with nothing to
 		// say anything was wrong. Refuse: ffmpeg maps the rendition back in.
-		if pl.DemuxedAudio[variant.Audio] {
+		if pl.audioIsElsewhere(variant.Audio) {
 			return refuse(fmt.Errorf("%w: hls audio is a separate rendition (EXT-X-MEDIA group %q)", ErrFormat, variant.Audio))
 		}
 		body, finalURL, err := hlsFetch(ctx, variant.URI, opt, client)
@@ -716,9 +716,22 @@ type hlsPlaylist struct {
 	Variants       []hlsVariant
 	// DemuxedAudio holds the GROUP-IDs of #EXT-X-MEDIA TYPE=AUDIO renditions
 	// that carry their OWN URI. Per RFC 8216 such a rendition lives outside the
-	// variant, so a variant referencing one has video-only segments. A rendition
-	// with no URI is muxed into the variant and is not listed here.
+	// variant, so a variant referencing one has video-only segments.
 	DemuxedAudio map[string]bool
+	// MuxedAudio holds the GROUP-IDs that have at least one AUDIO rendition with
+	// NO URI — audio that is already in the variant's own segments. A group can
+	// hold both shapes (a muxed default language plus separate alternates), and
+	// then the variant does carry sound: see audioIsElsewhere.
+	MuxedAudio map[string]bool
+}
+
+// audioIsElsewhere reports whether a variant's audio group leaves the variant's
+// own segments silent — every rendition in the group having its own URI. A group
+// with even one URI-less AUDIO rendition is muxed into the variant, which is the
+// common multi-language shape (default language in the segments, alternates as
+// renditions) and plays natively with sound.
+func (pl *hlsPlaylist) audioIsElsewhere(group string) bool {
+	return pl.DemuxedAudio[group] && !pl.MuxedAudio[group]
 }
 
 type hlsSegment struct {
@@ -788,18 +801,30 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 				}
 			}
 		case strings.HasPrefix(line, "#EXT-X-MEDIA:"):
-			// Only a rendition with a URI matters here: that is the one whose
-			// media is NOT in the variant's own segments.
+			// Both halves matter. A rendition WITH a URI has its media outside
+			// the variant; one WITHOUT has it muxed into the variant's own
+			// segments. RFC 8216 makes URI optional for AUDIO, and a
+			// multi-language group commonly holds one of each — so the group is
+			// only demuxed when EVERY rendition in it has its own URI.
 			attrs := splitAttrs(strings.TrimPrefix(line, "#EXT-X-MEDIA:"))
-			if !strings.EqualFold(attrValue(attrs, "TYPE"), "AUDIO") || attrValue(attrs, "URI") == "" {
+			if !strings.EqualFold(attrValue(attrs, "TYPE"), "AUDIO") {
 				continue
 			}
-			if g := attrValue(attrs, "GROUP-ID"); g != "" {
-				if pl.DemuxedAudio == nil {
-					pl.DemuxedAudio = map[string]bool{}
-				}
-				pl.DemuxedAudio[g] = true
+			g := attrValue(attrs, "GROUP-ID")
+			if g == "" {
+				continue
 			}
+			if attrValue(attrs, "URI") == "" {
+				if pl.MuxedAudio == nil {
+					pl.MuxedAudio = map[string]bool{}
+				}
+				pl.MuxedAudio[g] = true
+				continue
+			}
+			if pl.DemuxedAudio == nil {
+				pl.DemuxedAudio = map[string]bool{}
+			}
+			pl.DemuxedAudio[g] = true
 		case strings.HasPrefix(line, "#EXTINF:"):
 			rest := strings.TrimPrefix(line, "#EXTINF:")
 			if comma := strings.IndexByte(rest, ','); comma >= 0 {
