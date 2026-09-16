@@ -79,15 +79,41 @@ func TestAudioLossFiresOnceAudioStops(t *testing.T) {
 }
 
 // TestAudioSeenOnlyBeforeThisStartIsIgnored: evidence from the previous encoder
-// must not condemn the new one, or every restart cascades into another.
+// must not condemn the new one, or every restart cascades into another. The new
+// encoder gets a window of its own, measured from its start.
 func TestAudioSeenOnlyBeforeThisStartIsIgnored(t *testing.T) {
 	h := Health{AudioLossSec: 30}
 	base := &fpsBaseline{}
 	started := t0.Add(time.Minute)
 	v := Vitals{LastData: started.Add(time.Second), LastAudio: t0} // audio predates the restart
 
-	if got := h.check(started.Add(90*time.Second), started, v, base); got.failed() {
-		t.Fatalf("condemned on the previous encoder's audio: %+v", got)
+	for _, after := range []time.Duration{time.Second, 20 * time.Second, 29 * time.Second} {
+		if got := h.check(started.Add(after), started, v, base); got.failed() {
+			t.Fatalf("after %s: condemned on the previous encoder's audio: %+v", after, got)
+		}
+	}
+}
+
+// TestDeclaredAudioThatNeverArrivesIsStillLost: a stream whose PMT declares an
+// audio PID that carries nothing is the exact fault audio_restart_loss is for,
+// and it is the state a restart FOR audio loss leaves behind when the new
+// encoder is silent too: the last audio then predates every later start, so the
+// rule skipped itself for the whole life of that encoder and the channel stayed
+// silent with no event, no restart and no failover. The stall rule answers the
+// same "nothing since the start" case by measuring from the start; so does this.
+func TestDeclaredAudioThatNeverArrivesIsStillLost(t *testing.T) {
+	h := Health{AudioLossSec: 30}
+	base := &fpsBaseline{}
+	started := t0.Add(time.Minute)
+	v := Vitals{LastData: started.Add(time.Second), LastAudio: t0} // declared, never moved
+
+	got := h.check(started.Add(31*time.Second), started, v, base)
+	if !got.failed() || got.event != EventAudioLoss {
+		t.Fatalf("verdict = %+v, want %s once the window has passed with no audio at all", got, EventAudioLoss)
+	}
+	// A stream that never had audio at all still has none to lose.
+	if got := h.check(started.Add(time.Hour), started, Vitals{LastData: started}, base); got.failed() {
+		t.Fatalf("video-only stream condemned for audio loss: %+v", got)
 	}
 }
 

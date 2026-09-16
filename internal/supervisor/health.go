@@ -184,13 +184,29 @@ func (h Health) check(now, startedAt time.Time, v Vitals, base *fpsBaseline) hea
 
 	// Audio loss. Only meaningful once audio has been seen at all: a video-only
 	// channel has no audio to lose, and restarting it forever would be the
-	// obvious way to get that wrong.
-	if h.AudioLossSec > 0 && !v.LastAudio.IsZero() && v.LastAudio.After(startedAt) {
+	// obvious way to get that wrong. A zero LastAudio is exactly that case and
+	// is left alone.
+	//
+	// Audio last seen BEFORE this encoder started is not evidence against it
+	// either — that would make every restart cascade into another — but it is
+	// not a reason to stop looking. It is measured from the start instead, the
+	// same answer the stall rule gives to "nothing since this encoder came up":
+	// a stream that declares an audio PID and carries nothing on it for the whole
+	// window is broken, whether the silence began before this start or during it.
+	// Skipping instead left the rule switched off for the entire life of any
+	// encoder that never carried audio — including the replacement an AUDIO_LOSS
+	// restart had just started — so the channel stayed silent with no further
+	// event, restart or failover.
+	if h.AudioLossSec > 0 && !v.LastAudio.IsZero() {
 		limit := time.Duration(h.AudioLossSec) * time.Second
-		if now.Sub(v.LastAudio) >= limit {
+		last := v.LastAudio
+		if last.Before(startedAt) {
+			last = startedAt
+		}
+		if now.Sub(last) >= limit {
 			return healthVerdict{
 				event:  EventAudioLoss,
-				reason: fmt.Sprintf("no audio for %s", now.Sub(v.LastAudio).Round(time.Second)),
+				reason: fmt.Sprintf("no audio for %s", now.Sub(last).Round(time.Second)),
 			}
 		}
 	}
