@@ -71,11 +71,15 @@ type Stream struct {
 	// nothing else records it.
 	lastBackend string
 	chunk       int
-	grace       time.Duration
-	running     bool
-	cancel      context.CancelFunc
-	refs        int  // live TS viewers currently connected
-	buffered    bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
+	// grace is the idle-stop window this stream is reaped on, read by the reaper
+	// under s.mu. Copied from Manager.grace when the stream is created AND
+	// re-copied by ApplyConfig, so lowering grace_sec in the panel also reaches
+	// the channels the panel registered before the change.
+	grace    time.Duration
+	running  bool
+	cancel   context.CancelFunc
+	refs     int  // live TS viewers currently connected
+	buffered bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
 	// removed is set by Unregister once this Stream has left the registry, and is
 	// never cleared: a Stream is single-use. Register and RegisterIngest look a
 	// stream up and configure it in two steps, so a teardown landing in between
@@ -871,8 +875,12 @@ type Manager struct {
 	// maxPrebufMS/writeTimeout/hlsTargetMS/hlsWindow/idleBuffer* are read off m.mu
 	// on hot paths (the client handler, the reaper's buffer gate, the attach/touch
 	// buffer restore), so they are atomic — ApplyConfig retunes them live without a
-	// lock. grace is read only under m.mu (stream creation), so it stays a plain
-	// field guarded by it.
+	// lock. grace is off every hot path, so it stays a plain field guarded by
+	// m.mu: it is read under m.mu at stream creation and on each reaper tick
+	// (reapInterval, so a retuned grace_sec changes the sweep cadence), and
+	// written under m.mu by ApplyConfig — which then carries the new value to
+	// each live Stream.grace under that stream's own st.mu. Creation is no
+	// longer the only place it is touched; the locking is what makes that safe.
 	maxPrebufMS     atomic.Int64 // the buffer/ring size (ms of TS history) + ceiling for a per-viewer burst
 	defaultPrebufMS atomic.Int64 // per-viewer join burst (ms) fallback ONLY when the panel passes no ?prebuffer=
 	hlsTargetMS     atomic.Int64 // HLS target segment duration (ms); HLS is cut from the ring, not sized by it
