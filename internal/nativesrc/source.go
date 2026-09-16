@@ -402,6 +402,16 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 		// With nothing to classify, there is nothing to refuse on.
 		return nil, fmt.Errorf("%w: %s: empty body", ErrUnsupportedSource, redactURL(final))
 	}
+	if looksLikeErrorPage(ct, head) {
+		// The other half of the same blip, and the commoner one: an origin over
+		// its connection limit, or an account that has just expired, answers the
+		// stream URL with 200 and a web page. That says the source is
+		// unavailable right now, not that it is in another container — and
+		// ffmpeg cannot play an HTML page either, so moving the stream onto its
+		// fallback for the life of the spec buys nothing and loses the native
+		// path once the account comes back.
+		return nil, fmt.Errorf("%w: %s: a web page, not a stream", ErrUnsupportedSource, redactURL(final))
+	}
 	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redactURL(final))
 }
 
@@ -461,6 +471,21 @@ func looksLikeTS(head []byte) bool {
 // octet-stream would otherwise be bounced to ffmpeg for no reason.
 func looksLikePlaylist(head []byte) bool {
 	return bytes.HasPrefix(bytes.TrimLeft(head, "\xef\xbb\xbf \t\r\n"), []byte("#EXTM3U"))
+}
+
+// looksLikeErrorPage reports whether a 200 body is a web page rather than
+// media — the shape an IPTV origin answers with when the account is over its
+// connection limit, expired, or the backend is restarting behind a portal. It is
+// a statement about this minute, not about the source's container, so it must
+// not read as a format refusal. Either signal settles it: a text/* content type,
+// or a body that opens with a tag. A real TS or playlist body never gets here —
+// both are recognised before this is asked, whatever content type they carried.
+func looksLikeErrorPage(contentType string, head []byte) bool {
+	if strings.HasPrefix(strings.TrimSpace(strings.ToLower(contentType)), "text/") {
+		return true
+	}
+	h := bytes.TrimLeft(head, "\xef\xbb\xbf \t\r\n")
+	return len(h) > 0 && h[0] == '<'
 }
 
 // prefixedReadCloser replays already-consumed bytes ahead of the live body while

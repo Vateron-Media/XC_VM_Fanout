@@ -21,18 +21,23 @@ import (
 func TestFormatRefusalsAreFormat(t *testing.T) {
 	fmp4 := newHLSServer(t, "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\ns0.m4s\n", nil)
 	enc := newHLSServer(t, "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\"\n#EXTINF:2.0,\ns0.ts\n", nil)
-	html := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = io.WriteString(w, strings.Repeat("<html>not a stream</html>", 100))
+	// A body that positively identifies as ANOTHER container is the case
+	// ErrFormat is for: retrying cannot make an MP4 into MPEG-TS, and ffmpeg
+	// remuxes it. (A text/html "max connections" page is NOT this case — it is a
+	// source that is down; see TestAnErrorPageIsNotAFormatRefusal.)
+	mp4 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(append([]byte("\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41"),
+			make([]byte, 2048)...))
 	}))
-	defer html.Close()
+	defer mp4.Close()
 
 	for _, c := range []struct{ name, url string }{
 		{"rtmp scheme", "rtmp://host/app/stream"},
 		{"srt scheme", "srt://host:9000"},
 		{"fmp4 hls", fmp4.URL + "/index.m3u8"},
 		{"encrypted hls", enc.URL + "/index.m3u8"},
-		{"not a stream", html.URL + "/live"},
+		{"not a stream", mp4.URL + "/live"},
 	} {
 		_, err := Open(context.Background(), c.url, Options{})
 		if !IsFormat(err) {
