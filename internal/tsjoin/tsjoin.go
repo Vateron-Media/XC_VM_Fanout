@@ -560,7 +560,26 @@ func (s *State) prune() {
 	for i := range s.gops {
 		total += len(s.gops[i].data)
 	}
-	for total > s.maxRing && len(s.gops) > 1 {
+	// The backstop is sized from an ASSUMED bitrate (JoinRingBytesPerMS, ~24
+	// Mbit/s). A stream that actually runs faster than that hit it before the
+	// window it is supposed to hold was full, so the ring kept less than the two
+	// segments the HLS view needs and the playlist went empty — a manifest 404,
+	// which is fatal to a player, where losing a segment is not. Where the ring
+	// HAS a clock, duration pruning above is the real bound and this is only a
+	// backstop, so let the stream's own measured rate raise it. Where it has no
+	// clock there is no rate to measure and the assumption stands, which is the
+	// unbounded-growth case the backstop exists for.
+	limit := s.maxRing
+	if n := len(s.gops); n > 1 {
+		if span := (s.gops[n-1].t - s.gops[0].t) / pcrHz; span > 0 && s.gops[0].t >= 0 {
+			if need := s.ring90 / pcrHz; need > 0 {
+				if want := int(int64(total) * need / span); want > limit {
+					limit = want
+				}
+			}
+		}
+	}
+	for total > limit && len(s.gops) > 1 {
 		total -= len(s.gops[0].data)
 		s.release(s.gops[0])
 		s.gops = append(s.gops[:0], s.gops[1:]...)
