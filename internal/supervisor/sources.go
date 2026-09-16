@@ -123,6 +123,18 @@ func (st *stream) takeForced() int {
 	return idx
 }
 
+// requeueForce puts a force back that the loop consumed but could not carry out
+// — adoption having landed the stream on the source a survivor is running. A
+// force queued in the meantime is a NEWER instruction from the operator and
+// wins, so it is left alone.
+func (st *stream) requeueForce(idx int) {
+	st.mu.Lock()
+	if st.forced < 0 && idx >= 0 && idx < len(st.spec.Sources) {
+		st.forced = idx
+	}
+	st.mu.Unlock()
+}
+
 // switchTo moves the stream onto a different source for its next start. The
 // choice was made deliberately (an operator's force, a priority switch), so it
 // also begins a fresh failure pass from there.

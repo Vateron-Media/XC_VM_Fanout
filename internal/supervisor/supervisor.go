@@ -580,7 +580,15 @@ func (st *stream) run(ctx context.Context) {
 		// and has to be honoured HERE as well as in watch(): watch is reached
 		// only once a start has worked, so a stream that cannot start — exactly
 		// when the manual rescue is reached for — would never look at it.
-		if idx := st.takeForced(); idx >= 0 {
+		//
+		// Only when it CHANGES something, the same guard watch() has. A force
+		// naming the index the failing loop is already sitting on is queued on
+		// purpose (the walk would otherwise carry the stream off it), but acting
+		// on it writes a FORCE_SOURCE into the panel's log for a switch that did
+		// not happen, and restarts the failure pass.
+		forced := -1
+		if idx := st.takeForced(); idx >= 0 && idx != st.sourceIndex() {
+			forced = idx
 			st.switchTo(idx)
 			if next, ok := st.sourceAt(idx); ok {
 				st.emit(EventForceSource, next.Label)
@@ -653,6 +661,16 @@ func (st *stream) run(ctx context.Context) {
 		// attempt picked — its command line is what decided — so take the source
 		// back from the stream before anything is logged against it.
 		src = st.currentSource()
+		if forced >= 0 && st.sourceIndex() != forced {
+			// Adoption overruled the operator: the survivor is on the source it
+			// is on, and killing it to obey would take the channel off air
+			// before anything else had been tried. The choice is not dropped
+			// either — it goes back on the queue, and watch() carries it out on
+			// its next tick, by which time the stream is up to be switched.
+			st.requeueForce(forced)
+			dlog.Logf("monitor", "id=%s adoption landed on source %d; the forced switch to %d is still queued",
+				st.id, st.sourceIndex(), forced)
+		}
 		st.beginSourceWalk() // this source starts: the failure pass is over
 		if confirmed {
 			st.markConfirmed()
