@@ -558,11 +558,23 @@ func (p *hlsPuller) resync(pl, next *hlsPlaylist) {
 	case !next.HasMediaSeq:
 		// The tag we were following vanished; nothing left to follow.
 		p.uriFallback(pl, next)
-	case next.MediaSequence < p.first:
-		// The sequence went BACKWARDS: this is a new stream on the same URL, an
-		// encoder that restarted. Its segments are new content however familiar
-		// their names are, so rejoin as if opening the playlist fresh.
+	case next.MediaSequence < p.first && !overlapsWindow(pl, next):
+		// The sequence went BACKWARDS and lands nowhere near the window it
+		// replaced: this is a new stream on the same URL, an encoder that
+		// restarted and began numbering again. Its segments are new content
+		// however familiar their names are, so rejoin as if opening the playlist
+		// fresh.
 		p.join(next)
+	case next.MediaSequence < p.first:
+		// Backwards, but still over the same numbering: one poll answered by a
+		// CDN edge holding a slightly older copy, or by a second origin behind
+		// the same hostname running a few segments behind. That is the SAME
+		// stream lagging, not a new one. Rejoining would stream its window
+		// again, putting PTS and PCR backwards into the ring. Keep the position
+		// already reached — everything at or past it is still unseen and will go
+		// out when this copy catches up — and follow the sequence down so the
+		// next poll is measured against what was actually served.
+		p.first = next.MediaSequence
 	case next.MediaSequence == p.first && rolledUnderAFrozenSequence(pl, next):
 		p.uriFallback(pl, next)
 	default:
@@ -581,6 +593,18 @@ func (p *hlsPuller) uriFallback(pl, next *hlsPlaylist) {
 	}
 	p.bySeq = false
 	p.seen = retainSeenInWindow(p.seen, next)
+}
+
+// overlapsWindow reports whether next's media sequences reach into the window
+// pl covered. It is what separates a stream that restarted its numbering from
+// one whose playlist merely came back a little stale: a restart begins again
+// from zero (or from wherever the new encoder starts), far below the window it
+// replaced, while a lagging copy of the same stream still overlaps it.
+func overlapsWindow(pl, next *hlsPlaylist) bool {
+	if len(pl.Segments) == 0 || len(next.Segments) == 0 {
+		return false
+	}
+	return next.MediaSequence+int64(len(next.Segments)) > pl.MediaSequence
 }
 
 // rolledUnderAFrozenSequence reports whether next's window has moved on while
