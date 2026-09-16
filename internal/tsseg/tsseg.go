@@ -70,6 +70,19 @@ const (
 	// the frame rate, with no PTS reordering or wrap to handle.
 	fpsWindow = 5 * time.Second
 
+	// deliveryStep bounds how much of one gap between packets counts towards
+	// MaxNoKeyframe. A source is not obliged to deliver continuously: a native
+	// HLS pull hands over a whole upstream segment at once and then says nothing
+	// until the next one — with a ten-second upstream target duration, gaps of
+	// 11-13s are healthy, and the reader's own idle bound (3×TD) treats them as
+	// such. Charging the wall clock counted that silence as "this source shows
+	// no keyframes", so under hls_time=2 (a 12s limit) the first packet of the
+	// next burst tripped ErrNoKeyframe and the remuxer moved a perfectly
+	// segmentable source to ffmpeg for good. One second per gap still lets a
+	// source that is genuinely delivering video without keyframes reach the
+	// limit, and costs a silent one almost nothing.
+	deliveryStep = time.Second
+
 	writeBuf = 64 << 10
 )
 
@@ -165,6 +178,7 @@ type Segmenter struct {
 	written []segment // oldest→newest, still on disk
 
 	lastKey    time.Time
+	lastFeed   time.Time // when the previous packet arrived; zero before the first
 	frames     int64
 	fpsFrames  int64
 	fpsStart   time.Time
@@ -184,10 +198,13 @@ func New(cfg Config) (*Segmenter, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.Playlist), 0o755); err != nil {
 		return nil, err
 	}
+	// lastKey is deliberately NOT started here: the caller builds the segmenter
+	// before it opens the source, and a dial, a TLS handshake and a first
+	// manifest and segment fetch are not the stream failing to show a keyframe.
+	// The limit starts at the first packet (see chargeGap).
 	s := &Segmenter{
 		cfg:      cfg,
 		startPCR: -1, startPTS: -1, lastPCR: -1, lastPTS: -1,
-		lastKey: cfg.Now(),
 	}
 	s.sweep()
 	return s, nil
@@ -236,6 +253,7 @@ func (s *Segmenter) Feed(pkt []byte) error {
 	}
 
 	now := s.cfg.Now()
+	s.chargeGap(now)
 	if key {
 		s.lastKey = now
 		cut := int64(float64(s.cfg.TargetSec) * 90000)
@@ -256,6 +274,19 @@ func (s *Segmenter) Feed(pkt []byte) error {
 		s.write(pkt)
 	}
 	return nil
+}
+
+// chargeGap keeps the no-keyframe limit measured on stream that arrived rather
+// than on wall time. Time in which nothing was delivered at all says nothing
+// about whether this source has keyframes, so a gap between packets is charged
+// at most deliveryStep and the rest of it moves the deadline along with it.
+func (s *Segmenter) chargeGap(now time.Time) {
+	if s.lastFeed.IsZero() {
+		s.lastKey = now // the limit starts at the first packet, not at New
+	} else if gap := now.Sub(s.lastFeed); gap > deliveryStep {
+		s.lastKey = s.lastKey.Add(gap - deliveryStep)
+	}
+	s.lastFeed = now
 }
 
 // Close finishes the open segment (a clean stop) and releases the file.

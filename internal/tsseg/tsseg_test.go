@@ -314,6 +314,47 @@ func TestCutsOnTheKeyframeClockNotThePCR(t *testing.T) {
 	}
 }
 
+// TestDeliveryGapIsNotAMissingKeyframe: the no-keyframe limit must be spent on
+// stream that arrived, not on silence. A native HLS pull hands over a whole
+// upstream segment at once and then says nothing until the next one — with an
+// upstream TARGETDURATION of 10s and a poll every 5s, 13s between bursts is a
+// healthy source, and the reader's own idle bound (3×TD) agrees. Under
+// hls_time=2 the limit is 12s, so the first packet of the next burst — the PAT,
+// which is not a keyframe — reported ErrNoKeyframe, and the remuxer moved a
+// perfectly segmentable source onto ffmpeg for the rest of the spec's life.
+func TestDeliveryGapIsNotAMissingKeyframe(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 5}) // MaxNoKeyframe = 12s
+	r.feed(tsfixture.PAT(0x100), pmtWithPCR())
+	pts := 0.0
+	for burst := 0; burst < 4; burst++ {
+		for g := 0; g < 5; g++ { // one upstream segment, delivered back to back
+			r.gop(pts)
+			pts += 2
+		}
+		r.now = r.now.Add(13 * time.Second) // ...then nothing at all
+		// The next burst opens with the tables, ahead of its first keyframe.
+		if err := r.s.Feed(tsfixture.PAT(0x100)); err != nil {
+			t.Fatalf("burst %d: a delivery gap was read as a missing keyframe: %v", burst, err)
+		}
+	}
+	if n := strings.Count(r.playlist(), "#EXTINF:"); n < 3 {
+		t.Fatalf("%d segments from a bursty source, want one per GOP:\n%s", n, r.playlist())
+	}
+}
+
+// TestSlowOpenIsNotAMissingKeyframe: the limit starts at the first packet, not
+// at New. remux.Run builds the segmenter BEFORE it opens the source, so a dial,
+// a TLS handshake, a master playlist, a variant playlist and a first segment all
+// happen on the clock — over 12s of that, and the very first packet of a healthy
+// stream came back ErrNoKeyframe.
+func TestSlowOpenIsNotAMissingKeyframe(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2})
+	r.now = r.now.Add(13 * time.Second)
+	if err := r.s.Feed(tsfixture.PAT(0x100)); err != nil {
+		t.Fatalf("a slow first open was read as a missing keyframe: %v", err)
+	}
+}
+
 // pcrOnly is an adaptation-only packet on pid carrying just a PCR.
 func pcrOnly(pid int, pcr int64) []byte {
 	p := make([]byte, tspes.PacketSize)
