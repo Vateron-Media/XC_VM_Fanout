@@ -6,6 +6,7 @@ package remux
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,11 @@ const (
 	ingestQueue        = 256 // chunks, ~3 MB at the 12 KB read size
 	ingestWriteTimeout = 2 * time.Second
 	ingestRedial       = 500 * time.Millisecond
+	// ingestStall is how long a connected-but-unreadable daemon is waited out
+	// before the connection is treated as dead after all. A stall that long is
+	// not back-pressure any more, and whatever is queued on the socket is far
+	// too old to be worth protecting.
+	ingestStall = 30 * time.Second
 )
 
 func newIngestWriter(path string, logf func(string, ...any)) *ingestWriter {
@@ -96,12 +102,57 @@ func (w *ingestWriter) run(ctx context.Context) {
 		case <-w.done:
 			return
 		case b := <-w.queue:
-			_ = conn.SetWriteDeadline(time.Now().Add(ingestWriteTimeout))
-			if _, err := conn.Write(b); err != nil {
+			if err := w.write(ctx, conn, b); err != nil {
 				w.logf("ingest %s write: %v; reconnecting", w.path, err)
 				_ = conn.Close()
 				conn = nil
+				// Whatever is queued was produced before the break and is stale
+				// by the time a connection exists again.
+				w.drain()
 			}
+		}
+	}
+}
+
+// write puts one chunk on the connection, keeping the connection across a write
+// DEADLINE.
+//
+// A deadline here means the daemon is not reading fast enough, not that it has
+// gone: its socket buffer is full. Reconnecting on it used to hand the daemon a
+// second producer while the first connection still had up to a full send buffer
+// queued — a unix socket keeps that readable after the writer closes — and the
+// daemon runs one publisher goroutine per accepted connection with no rule that
+// a newer producer replaces an older one. Old and new chunks then went into the
+// ring interleaved: the PCR steps backwards, GOPs are corrupted and HLS cuts a
+// discontinuity. So keep pushing the rest of THIS chunk, which is also what
+// keeps the feed packet-aligned, and let the bounded queue drop the chunks that
+// pile up behind it. Only a hard error (EPIPE, ECONNRESET, a closed socket) or
+// a stall past ingestStall is a broken connection.
+func (w *ingestWriter) write(ctx context.Context, conn net.Conn, b []byte) error {
+	giveUp := time.Now().Add(ingestStall)
+	for {
+		_ = conn.SetWriteDeadline(time.Now().Add(ingestWriteTimeout))
+		n, err := conn.Write(b)
+		b = b[n:]
+		if err == nil {
+			return nil
+		}
+		var ne net.Error
+		if !errors.As(err, &ne) || !ne.Timeout() {
+			return err
+		}
+		if len(b) == 0 {
+			return nil // the whole chunk went out before the deadline landed
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-w.done:
+			return err
+		default:
+		}
+		if time.Now().After(giveUp) {
+			return err
 		}
 	}
 }
