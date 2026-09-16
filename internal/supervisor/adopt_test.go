@@ -75,19 +75,19 @@ func TestAdoptableRequiresBothLivenessAndIdentity(t *testing.T) {
 
 	// Nothing running.
 	writePID(t, pidPath, 4242)
-	if _, ok := adoptable(spec, w.find); ok {
+	if _, _, ok := adoptable(spec, w.find); ok {
 		t.Error("adopted a pid that is not running")
 	}
 
 	// Running, but it is somebody else's process that inherited the pid.
 	w.add(4242, "/usr/bin/postgres -D /var/lib/pgsql")
-	if _, ok := adoptable(spec, w.find); ok {
+	if _, _, ok := adoptable(spec, w.find); ok {
 		t.Error("adopted a recycled pid belonging to an unrelated process")
 	}
 
 	// Running, and it is our encoder.
 	w.add(4242, "ffmpeg -i http://src -f hls /home/xc_vm/streams/5_.m3u8")
-	pid, ok := adoptable(spec, w.find)
+	pid, _, ok := adoptable(spec, w.find)
 	if !ok || pid != 4242 {
 		t.Errorf("did not adopt the real encoder: pid=%d ok=%v", pid, ok)
 	}
@@ -103,7 +103,7 @@ func TestAdoptionIsOffWithoutAMatch(t *testing.T) {
 	w.add(4242, "ffmpeg -i whatever")
 	writePID(t, pidPath, 4242)
 
-	if _, ok := adoptable(Spec{PIDPath: pidPath}, w.find); ok {
+	if _, _, ok := adoptable(Spec{PIDPath: pidPath}, w.find); ok {
 		t.Error("adopted with no AdoptMatch configured")
 	}
 }
@@ -125,11 +125,11 @@ func TestAdoptableHandlesAMissingOrJunkPIDFile(t *testing.T) {
 		if err := os.WriteFile(path, []byte(c.contents), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := adoptable(Spec{PIDPath: path, AdoptMatch: "/streams/5_"}, w.find); ok {
+		if _, _, ok := adoptable(Spec{PIDPath: path, AdoptMatch: "/streams/5_"}, w.find); ok {
 			t.Errorf("%s pid file was adopted", c.name)
 		}
 	}
-	if _, ok := adoptable(Spec{PIDPath: filepath.Join(dir, "nope"), AdoptMatch: "x"}, w.find); ok {
+	if _, _, ok := adoptable(Spec{PIDPath: filepath.Join(dir, "nope"), AdoptMatch: "x"}, w.find); ok {
 		t.Error("adopted from a pid file that does not exist")
 	}
 }

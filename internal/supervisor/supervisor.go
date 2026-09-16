@@ -612,6 +612,10 @@ func (st *stream) run(ctx context.Context) {
 		}
 
 		consecutiveFails = 0
+		// An adopted encoder may be serving a different source from the one this
+		// attempt picked — its command line is what decided — so take the source
+		// back from the stream before anything is logged against it.
+		src = st.currentSource()
 		st.beginSourceWalk() // this source starts: the failure pass is over
 		if confirmed {
 			st.markConfirmed()
@@ -925,7 +929,7 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, bool, err
 	// duplicated. Launching alongside it would put two encoders on one source,
 	// and killing it on sight would take the channel off air for the length of
 	// every daemon restart.
-	if pid, ok := adoptable(spec, st.sup.find); ok {
+	if pid, cmdline, ok := adoptable(spec, st.sup.find); ok {
 		dlog.Logf("monitor", "id=%s adopting encoder pid=%d that outlived the daemon", st.id, pid)
 		proc := &adoptedProcess{
 			pid:   pid,
@@ -935,7 +939,17 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, bool, err
 			done:  make(chan struct{}),
 		}
 		st.markAdopted(true)
-		st.markFallback(false)
+		// The survivor may be on a source the previous daemon failed it over to,
+		// not on the one this spec starts at. Its command line says which.
+		if idx, fb, ok := matchRunningSource(cmdline, spec.Sources); ok {
+			st.switchTo(idx)
+			st.markFallback(fb)
+			if s, ok := st.sourceAt(idx); ok {
+				src = s
+			}
+		} else {
+			st.markFallback(false)
+		}
 		adoptedAt := st.sup.now()
 		st.markStarted(proc, src.Label)
 

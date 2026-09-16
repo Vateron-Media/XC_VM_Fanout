@@ -101,20 +101,70 @@ func readPID(path string) int {
 // encoder runs unsupervised. AdoptMatch is supplied by the panel (which knows
 // the paths that identify this stream's encoder) rather than guessed at here, so
 // an empty one simply disables adoption instead of matching loosely.
-func adoptable(spec Spec, find ProcessFinder) (int, bool) {
+// The command line comes back with the pid because it also says WHICH source the
+// survivor is serving -- see matchRunningSource.
+func adoptable(spec Spec, find ProcessFinder) (int, string, bool) {
 	if spec.AdoptMatch == "" || find == nil {
-		return 0, false
+		return 0, "", false
 	}
 	pid := readPID(spec.PIDPath)
 	if pid <= 0 {
-		return 0, false
+		return 0, "", false
 	}
 	cmdline, alive := find(pid)
 	if !alive {
-		return 0, false
+		return 0, "", false
 	}
 	if !strings.Contains(cmdline, spec.AdoptMatch) {
-		return 0, false
+		return 0, "", false
 	}
-	return pid, true
+	return pid, cmdline, true
+}
+
+// matchRunningSource works out which of the spec's sources an adopted encoder is
+// actually serving, by comparing its command line with the commands the panel
+// handed us. It reports the index, whether that source's FallbackCmd is what is
+// running, and false when nothing matches unambiguously.
+//
+// It matters because a survivor is not necessarily on source 0: the daemon that
+// started it may have failed it over to a backup, and the spec the panel re-PUTs
+// is still in priority order. Assuming the top source published the wrong
+// current_source, made a force back to it a no-op ("already on it"), and left
+// the priority-backup climb switched off, since that only runs below the top.
+//
+// The comparison is on normalised text because /proc/<pid>/cmdline is the argv
+// the SHELL produced: the quoting and the whitespace runs of the panel's command
+// line are gone from it. A survivor whose line matches nothing is adopted all
+// the same and keeps the index the spec starts at -- not adopting it would put a
+// second encoder on the source, which is the thing adoption exists to prevent.
+func matchRunningSource(cmdline string, sources []Source) (int, bool, bool) {
+	want := normaliseCmd(cmdline)
+	if want == "" {
+		return 0, false, false
+	}
+	idx, fallback, found := 0, false, false
+	for i, s := range sources {
+		for _, c := range []struct {
+			cmd string
+			fb  bool
+		}{{s.Cmd, false}, {s.FallbackCmd, true}} {
+			if c.cmd == "" || normaliseCmd(c.cmd) != want {
+				continue
+			}
+			if found && (idx != i || fallback != c.fb) {
+				// Two sources run the same command: which one is up is not
+				// something this can answer, so it does not guess.
+				return 0, false, false
+			}
+			idx, fallback, found = i, c.fb, true
+		}
+	}
+	return idx, fallback, found
+}
+
+// normaliseCmd renders a command line the way both a shell command and the argv
+// it turns into can be compared: without quotes, and with every run of
+// whitespace as one space.
+func normaliseCmd(s string) string {
+	return strings.Join(strings.Fields(strings.NewReplacer("'", "", `"`, "").Replace(s)), " ")
 }
