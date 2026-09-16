@@ -446,16 +446,38 @@ func (s *Segmenter) notePTS(pts int64) {
 // 2 s, 4 s or 6 s hls_time) the next keyframe read as "1.96 s" about half the
 // time, missed the cut, and the segment ran a whole GOP long — segments averaging
 // 3.5 s against ffmpeg's exact 2 s, and nearly twice the tmpfs.
+// elapsed is how much media the open segment holds. A clock that has gone
+// backwards by less than a wrap is a splice the keyframe-level check did not
+// catch — the packet that carried it was not a keyframe, or carried neither
+// clock — and it must not leave this pinned at 0: the segment would then never
+// reach its target, so nothing would be finalised and the playlist would freeze
+// at the live edge until the new clock climbed back past the old one, which is
+// the source's whole previous uptime. Rebase on the clock the stream is running
+// at now and mark the next segment discontinuous.
 func (s *Segmenter) elapsed() int64 {
 	if s.havePTS && s.startPTS >= 0 {
-		d, _ := clockDelta(s.lastPTS, s.startPTS)
-		return d
+		d, ok := clockDelta(s.lastPTS, s.startPTS)
+		if ok {
+			return d
+		}
+		s.rebase()
+		return 0
 	}
 	if s.startPCR >= 0 && s.lastPCR >= 0 {
-		d, _ := clockDelta(s.lastPCR, s.startPCR)
-		return d
+		d, ok := clockDelta(s.lastPCR, s.startPCR)
+		if ok {
+			return d
+		}
+		s.rebase()
 	}
 	return 0
+}
+
+// rebase restarts the open segment's clocks where the stream now is, and marks
+// the next segment EXT-X-DISCONTINUITY.
+func (s *Segmenter) rebase() {
+	s.startPCR, s.startPTS = s.lastPCR, s.lastPTS
+	s.pendingDisc = true
 }
 
 // clockDelta is last-start across a 33-bit wrap. ok is false for a backwards
@@ -488,6 +510,16 @@ func (s *Segmenter) spliced(pts int64, hasPTS bool, pcr int64, hasPCR bool) bool
 		d, ok = clockDelta(pts, s.keyPTS)
 	case hasPCR && s.keyPCR >= 0:
 		d, ok = clockDelta(pcr, s.keyPCR)
+	case s.lastPCR >= 0 && s.keyPCR >= 0:
+		// The keyframe packet itself carries neither clock. That is ordinary: a
+		// stream whose PCR sits on its own PID (the PMT's PCR_PID need not be the
+		// video PID) and whose video PES headers carry no PTS gives this packet
+		// nothing to compare. Judge it on the clock the stream is RUNNING at
+		// instead — lastPCR is still the value from before this keyframe, which
+		// is exactly what elapsed() measures against. Without this the splice
+		// check simply answered "no" for such a source, so a backwards splice was
+		// neither marked nor recovered from.
+		d, ok = clockDelta(s.lastPCR, s.keyPCR)
 	default:
 		return false
 	}

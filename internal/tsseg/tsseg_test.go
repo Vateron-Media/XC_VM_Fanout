@@ -659,3 +659,58 @@ func TestAMultiPacketPMTIsAdopted(t *testing.T) {
 		t.Error("no segments were cut: the multi-packet PMT was never adopted, so the segmenter never found the video PID")
 	}
 }
+
+// rai is a video keyframe flagged by random_access_indicator alone: no PES
+// header, so no PTS, and no PCR either — the clock lives on its own PID.
+func rai(pid int) []byte {
+	p := make([]byte, tspes.PacketSize)
+	for i := range p {
+		p[i] = 0xff
+	}
+	p[0], p[1], p[2], p[3] = 0x47, byte((pid>>8)&0x1f)|0x40, byte(pid), 0x30
+	p[4], p[5] = 1, 0x40 // adaptation_field_length, random_access_indicator
+	return p
+}
+
+// pmtSplitClock announces video on 0x101 with the PCR on its own PID, 0x200 —
+// an ordinary broadcast layout the PMT is free to use.
+func pmtSplitClock() []byte {
+	p := tsfixture.PMT(0x100, vpid)
+	p[13], p[14] = 0xe2, 0x00 // PCR_PID = 0x200
+	return p
+}
+
+// A source whose keyframes carry neither PTS nor PCR — the clock is on its own
+// PID — still splices. The keyframe-level check had nothing to compare on such
+// a stream, so a backwards splice was neither marked nor recovered from: the
+// open segment's elapsed time stayed 0, nothing was ever finalised, and the
+// playlist froze at the live edge until the new clock climbed back past the old
+// one, which is the source's whole previous uptime.
+func TestASpliceIsCaughtWhenTheClockIsOnItsOwnPID(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10})
+	r.feed(tsfixture.PAT(0x100), pmtSplitClock())
+
+	// Nine GOPs two seconds apart, at 100 s on the source clock.
+	pcr := int64(100 * 90000)
+	for g := 0; g < 9; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.feed(pcrOnly(0x200, pcr), rai(vpid), tsfixture.Fill(vpid))
+		pcr += 2 * 90000
+	}
+	before := len(r.segFiles())
+
+	// The upstream encoder restarts: the clock lands back at one second.
+	pcr = 1 * 90000
+	for g := 0; g < 9; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.feed(pcrOnly(0x200, pcr), rai(vpid), tsfixture.Fill(vpid))
+		pcr += 2 * 90000
+	}
+
+	if after := len(r.segFiles()); after <= before {
+		t.Errorf("segments went %d -> %d across the splice: the segmenter stopped cutting", before, after)
+	}
+	if pl := r.playlist(); !strings.Contains(pl, "#EXT-X-DISCONTINUITY\n") {
+		t.Errorf("the splice was not marked:\n%s", pl)
+	}
+}
