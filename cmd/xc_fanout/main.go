@@ -143,11 +143,13 @@ func main() {
 	// malformed file falls back to the built-in defaults. The daemon then polls the
 	// file and applies changes live (prebuffer/HLS retune existing streams).
 	cfg := config.Defaults()
+	var startupCfg *config.Values // the boot tuning, once it is known to be real
 	if *configPath != "" {
 		if v, wrote, err := config.Load(*configPath); err != nil {
 			log.Printf("config: %v (using built-in defaults)", err)
 		} else {
 			cfg = v
+			startupCfg = &cfg
 			if wrote {
 				log.Printf("config: seeded/backfilled %s", *configPath)
 			}
@@ -180,7 +182,7 @@ func main() {
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
 
 	if *configPath != "" {
-		go pollConfig(ctx, *configPath, time.Duration(*configInterval)*time.Second, mgr)
+		go pollConfig(ctx, *configPath, time.Duration(*configInterval)*time.Second, mgr, startupCfg)
 	}
 
 	clientSrv, cleanupClient := serveUnix(*sock, mgr.ClientHandler())
@@ -251,13 +253,15 @@ func main() {
 // If the file is deleted out from under a running daemon it is recreated,
 // preserving the running tuning (or the built-in defaults if nothing has loaded
 // yet), so the self-healing contract holds at runtime, not just at startup.
+// `startup` is the tuning main loaded at boot, so that contract also holds in
+// the first interval, before any tick has run.
 // configApplier is the part of the Manager the poll loop drives. It is an
 // interface so the loop's gating can be tested without a live stream registry.
 type configApplier interface {
 	ApplyConfig(config.Values)
 }
 
-func pollConfig(ctx context.Context, path string, every time.Duration, mgr configApplier) {
+func pollConfig(ctx context.Context, path string, every time.Duration, mgr configApplier, startup *config.Values) {
 	if every < time.Second {
 		every = time.Second
 	}
@@ -265,7 +269,14 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr confi
 	defer t.Stop()
 	var lastMod time.Time
 	var lastSize int64
-	var current *config.Values // last successfully applied tuning, or nil
+	current := startup // last applied tuning (the boot one to begin with), or nil
+	if current != nil {
+		// Seed the gate from the file the daemon booted with, so the first tick
+		// is not a pointless re-apply of what is already in force.
+		if fi, err := os.Stat(path); err == nil {
+			lastMod, lastSize = fi.ModTime(), fi.Size()
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
