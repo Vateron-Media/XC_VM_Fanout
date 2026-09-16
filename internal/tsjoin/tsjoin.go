@@ -290,8 +290,11 @@ func (s *State) Update(chunk []byte) {
 		if hasAdaptation && pkt[4] > 0 {
 			flags := pkt[5]
 			// PCR_flag: refresh the stream clock — from the programme's own PCR
-			// PID once that has shown one, from any PID until then.
-			if flags&0x10 != 0 && (pid == s.pcrPID || !s.pcrOnPID) {
+			// PID once that has shown one, from any PID until then. The field
+			// must be long enough to HOLD the PCR (1 flags byte + 6): a corrupt
+			// or truncated adaptation field otherwise had its payload read as a
+			// clock, and one such packet moves the whole ring's timeline.
+			if flags&0x10 != 0 && pkt[4] >= 7 && (pid == s.pcrPID || !s.pcrOnPID) {
 				if pid == s.pcrPID {
 					s.pcrOnPID = true
 				}
@@ -386,10 +389,11 @@ func (s *State) Update(chunk []byte) {
 	}
 }
 
-// maxCadence bounds the step ringClock remembers as the stream's cadence — what
-// it advances by across a discontinuity. A GOP is seconds; a longer step (a
-// maxGOP cut on a slow source with no detectable keyframes, or a forward splice)
-// still counts as time passing, it just is not a cadence to repeat.
+// maxCadence bounds the step ringClock takes at face value, and so the one it
+// remembers as the stream's cadence — what it advances by across a
+// discontinuity. A GOP is seconds; a longer step is a timeline jump, not time
+// passing, unless no cadence is known yet (a slow source with no detectable
+// keyframes, whose maxGOP-cut blocks can each span minutes).
 const maxCadence = 60 * 90000
 
 // maxWrap is how far past the 33-bit rollover a backwards step may land and
@@ -408,13 +412,20 @@ const maxWrap = 10 * 60 * 90000
 // had been pushed out. On a node restarting producers or carrying a source with
 // two interleaved PCR clocks, that was most of the daemon's memory.
 //
-// Here a FORWARD step is taken as time passing, whatever its size: a slow
-// source's long block must advance the clock (capping it froze the clock on
-// keyframe-less radio, whose maxGOP-cut blocks each span minutes), and a forward
-// splice can only make the ring prune sooner, never grow. A backwards step that
-// is the 33-bit wrap is unwrapped. Any other backwards step — a restart, a
-// failover — advances by the last plausible cadence, so the window stays a
-// window. -1 until the stream has shown a PCR.
+// A backwards step that is the 33-bit wrap is unwrapped. Any other step no
+// cadence can explain — a restart, a failover, a splice, in EITHER direction —
+// advances by the last plausible cadence instead, so the window stays a window:
+// under ADR 0004 the ring is the live tail, and an hour's forward jump aged the
+// whole of it out in one Update, dropping every follower and emptying the HLS
+// playlist. (It used only to cost memory, hence the old "a forward splice can
+// only make the ring prune sooner".) The HLS segment clock already reads a jump
+// this way; this is the ring clock agreeing with it.
+//
+// Until a cadence is known (clockStep == 0) a forward step is taken in full
+// whatever its size, which is what keeps keyframe-less radio moving: its
+// maxGOP-cut blocks each span minutes, more than any cadence, and capping them
+// froze the clock so nothing was ever pruned. -1 until the stream has shown a
+// PCR; the blocks opened before that are stamped when it starts.
 func (s *State) ringClock() int64 {
 	if s.lastPCR < 0 {
 		return -1
@@ -437,18 +448,18 @@ func (s *State) ringClock() int64 {
 		return 0
 	}
 	d := s.lastPCR - s.clockPCR
+	if d < 0 && d+ptsWrap <= maxWrap {
+		d += ptsWrap // the 33-bit PCR wrap: a forward step after all
+	}
 	switch {
-	case d >= 0:
-		if d > 0 && d <= maxCadence {
-			s.clockStep = d
-		}
-	case d+ptsWrap <= maxWrap:
-		d += ptsWrap // the 33-bit PCR wrap
-		if d <= maxCadence {
-			s.clockStep = d
-		}
-	default:
+	case d < 0:
 		d = s.clockStep // a discontinuity: carry on at the last known cadence
+	case d <= maxCadence:
+		if d > 0 {
+			s.clockStep = d
+		}
+	case s.clockStep > 0:
+		d = s.clockStep // a jump forward no cadence explains: another discontinuity
 	}
 	s.clockPCR = s.lastPCR
 	s.clockT += d
@@ -1003,8 +1014,9 @@ func (s *State) Unpin(p Pin) {
 func (s *State) NoKeyframeCuts() int64 { return s.noKeyframeCuts }
 
 // readPCR extracts the 33-bit PCR base (90 kHz) from a packet whose adaptation
-// field carries it. The caller has verified afc has adaptation, pkt[4] > 0 and
-// the PCR_flag is set, so bytes 6..10 hold the base.
+// field carries it. The caller has verified afc has adaptation, the PCR_flag is
+// set and adaptation_field_length is at least 7 — the flags byte plus the six
+// PCR bytes — so bytes 6..10 hold the base.
 func readPCR(pkt []byte) int64 {
 	return int64(pkt[6])<<25 | int64(pkt[7])<<17 | int64(pkt[8])<<9 |
 		int64(pkt[9])<<1 | int64(pkt[10])>>7
