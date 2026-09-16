@@ -54,29 +54,17 @@ func URL(raw string) string {
 		return maskUserinfo(raw)
 	}
 	if u.User != nil {
+		// Only rewrite what is actually a credential. ffmpeg's multicast form is
+		// udp://@239.0.0.1:1234 — an EMPTY userinfo, nothing to hide — and
+		// masking it changes the address an operator has to recognise in the log.
 		if _, hasPass := u.User.Password(); hasPass {
 			u.User = url.UserPassword(u.User.Username(), mask)
-		} else {
+		} else if u.User.Username() != "" {
 			u.User = url.User(mask)
 		}
 	}
 	u.Path = maskPath(u.Path)
-	if q := u.Query(); len(q) > 0 {
-		changed := false
-		for k, vs := range q {
-			if !secretParams[strings.ToLower(k)] {
-				continue
-			}
-			for i := range vs {
-				vs[i] = mask
-			}
-			q[k] = vs
-			changed = true
-		}
-		if changed {
-			u.RawQuery = q.Encode()
-		}
-	}
+	u.RawQuery = maskQuery(u.RawQuery)
 	return u.String()
 }
 
@@ -89,31 +77,67 @@ func URLs(raws []string) []string {
 	return out
 }
 
-// maskPath blanks the two account segments of an XC-style path. Both the
-// prefixed form (/live/<user>/<pass>/<id>.ts) and the bare one that older
-// panels emit (/<user>/<pass>/<id>.ts) are covered; anything else — a plain
-// /stream.ts, an HLS variant path — is left alone.
+// maskPath blanks the two account segments of an XC-style path: the prefixed
+// form (/live/<user>/<pass>/<id>.ts and its siblings), the token form some
+// providers hand out (/hlsr/<token>/<user>/<pass>/<id>/…), and the bare one
+// older panels emit (/<user>/<pass>/<id>.ts). Anything else — a plain
+// /stream.ts, an HLS variant path, the daemon's own /hls/<id>/<seq>.ts — is
+// left alone: a log line that no longer says which stream failed is useless.
 func maskPath(p string) string {
 	if p == "" {
 		return p
 	}
 	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	first := strings.ToLower(segs[0])
 	i := -1
 	switch {
-	case len(segs) >= 4 && credPrefixes[strings.ToLower(segs[0])]:
+	case first == "hlsr" && len(segs) >= 5:
+		// /hlsr/<token>/<user>/<pass>/…: the token is a credential too.
+		segs[1] = mask
+		i = 2
+	case len(segs) >= 4 && credPrefixes[first]:
 		i = 1
-	case len(segs) == 3 && segs[0] != "" && segs[1] != "" && segs[2] != "":
-		// /<user>/<pass>/<id>[.ext]: only when the last segment is an id, so a
-		// genuine three-deep content path is not mangled.
-		if isStreamID(segs[2]) {
-			i = 0
-		}
+	case len(segs) == 3 && segs[0] != "" && segs[1] != "" && isStreamID(segs[2]) && !credPrefixes[first] && first != "hlsr":
+		// /<user>/<pass>/<id>[.ext]. The content words are excluded because
+		// /hls/12/34.ts has exactly this shape and carries nothing secret — the
+		// account form of those paths has four segments and is handled above.
+		i = 0
 	}
 	if i < 0 {
 		return p
 	}
 	segs[i], segs[i+1] = mask, mask
 	return "/" + strings.Join(segs, "/")
+}
+
+// maskQuery masks the credential parameters of the XC API, rewriting the raw
+// query in place. Round-tripping through url.Values instead would reorder the
+// pairs and silently DROP any net/url refuses to parse — a ';'-separated pair
+// among them — which would take the rest of the line with it.
+func maskQuery(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	out := []byte(raw)
+	for i := 0; i < len(raw); {
+		// A pair runs to the next separator; '&' and ';' have both been used.
+		end := strings.IndexAny(raw[i:], "&;")
+		if end < 0 {
+			end = len(raw)
+		} else {
+			end += i
+		}
+		if eq := strings.IndexByte(raw[i:end], '='); eq >= 0 {
+			if secretParams[strings.ToLower(raw[i:i+eq])] {
+				masked := append(out[:i+eq+1:i+eq+1], mask...)
+				out = append(masked, out[end:]...)
+				raw = string(out)
+				end = i + eq + 1 + len(mask)
+			}
+		}
+		i = end + 1
+	}
+	return string(out)
 }
 
 // isStreamID reports whether seg is an XC stream id: digits, optionally with a

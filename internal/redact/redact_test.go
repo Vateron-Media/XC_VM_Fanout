@@ -18,7 +18,8 @@ func TestURL(t *testing.T) {
 		{"xc timeshift", "http://host/timeshift/bob/s3cr3t/60/2026-01-01:00-00/9.ts", "http://host/timeshift/xxxxx/xxxxx/60/2026-01-01:00-00/9.ts"},
 		{"legacy bare path", "http://host:8080/bob/s3cr3t/1234.ts", "http://host:8080/xxxxx/xxxxx/1234.ts"},
 		{"legacy bare path no ext", "http://host:8080/bob/s3cr3t/1234", "http://host:8080/xxxxx/xxxxx/1234"},
-		{"query credentials", "http://host/get.php?username=bob&password=s3cr3t&type=m3u", "http://host/get.php?password=xxxxx&type=m3u&username=xxxxx"},
+		// The pairs keep their order and spelling: only the values change.
+		{"query credentials", "http://host/get.php?username=bob&password=s3cr3t&type=m3u", "http://host/get.php?username=xxxxx&password=xxxxx&type=m3u"},
 		{"both", "http://bob:s3cr3t@host/live/bob/s3cr3t/1.ts", "http://bob:xxxxx@host/live/xxxxx/xxxxx/1.ts"},
 		{"plain source is untouched", "http://cdn.example.com/stream.ts", "http://cdn.example.com/stream.ts"},
 		{"content path is untouched", "http://cdn.example.com/a/b/index.m3u8", "http://cdn.example.com/a/b/index.m3u8"},
@@ -61,5 +62,43 @@ func TestURLs(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("URLs[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// The masker must not invent a credential where the URL has none, and must not
+// mangle a path that is only content. Both were found by a reviewer reading the
+// first version of this package.
+func TestURLDoesNotInventOrMangle(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		// ffmpeg's multicast form carries an EMPTY userinfo: there is nothing to
+		// hide, and rewriting it changes the address an operator has to recognise.
+		{"multicast with empty userinfo", "udp://@239.0.0.1:1234", "udp://@239.0.0.1:1234"},
+		{"rtp multicast with empty userinfo", "rtp://@239.0.0.1:5004", "rtp://@239.0.0.1:5004"},
+		// /hls/<id>/<seq>.ts is the daemon's OWN path shape: three segments
+		// ending in a numeric file, and not a credential in sight.
+		{"hls content path", "http://host/hls/12/34.ts", "http://host/hls/12/34.ts"},
+		{"live content path", "http://host/live/12/34.ts", "http://host/live/12/34.ts"},
+		// The four-segment XC shape still masks.
+		{"xc live path still masked", "http://host/live/bob/s3cr3t/34.ts", "http://host/live/xxxxx/xxxxx/34.ts"},
+		// A query net/url cannot round-trip must not lose its other pairs.
+		{"semicolon query keeps its pairs", "http://host/get.php?a=1;b=2&password=s3cr3t", "http://host/get.php?a=1;b=2&password=xxxxx"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := URL(c.in); got != c.want {
+				t.Errorf("URL(%q)\n got %q\nwant %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// The /hlsr/<token>/<user>/<pass>/<id> shape upstream providers use.
+func TestURLMasksTheHlsrShape(t *testing.T) {
+	got := URL("http://host:8080/hlsr/TOKEN/bob/s3cr3t/1234/0.ts")
+	if strings.Contains(got, "s3cr3t") || strings.Contains(got, "bob") {
+		t.Errorf("URL(hlsr) = %q: the account survived", got)
+	}
+	if !strings.Contains(got, "1234") {
+		t.Errorf("URL(hlsr) = %q: the stream id must stay", got)
 	}
 }
