@@ -17,9 +17,11 @@
 //   - the latest PAT, PMT and SDT are re-emitted at every segment head, so a
 //     player (or the panel's tv_archive worker) can start from any file;
 //   - durations come from the PCR, else the video PTS; a backwards step that is
-//     not a 33-bit wrap is a source splice, which rebases the clock and marks
-//     the next segment EXT-X-DISCONTINUITY instead of producing an absurd
-//     EXTINF that would stall every player's reload timer;
+//     not a 33-bit wrap is a source splice, which cuts the segment at that
+//     keyframe, rebases the clock and marks the NEXT segment
+//     EXT-X-DISCONTINUITY — so the jump falls on a segment boundary a player can
+//     reset at, rather than inside a file where no tag can mark it, and no
+//     EXTINF is absurd enough to stall every player's reload timer;
 //   - the first segment is cut early (InitSec) so a cold-started channel lists
 //     a segment sooner;
 //   - no keyframe for too long is ErrNoKeyframe: this source needs ffmpeg.
@@ -175,6 +177,7 @@ type Segmenter struct {
 	seq      int
 
 	lastPCR, lastPTS int64
+	keyPCR, keyPTS   int64 // the clock the previous keyframe carried; -1 = none yet
 	havePTS          bool
 	firstDone        bool
 	pendingDisc      bool
@@ -208,7 +211,7 @@ func New(cfg Config) (*Segmenter, error) {
 	// The limit starts at the first packet (see chargeGap).
 	s := &Segmenter{
 		cfg:      cfg,
-		startPCR: -1, startPTS: -1, lastPCR: -1, lastPTS: -1,
+		startPCR: -1, startPTS: -1, lastPCR: -1, lastPTS: -1, keyPCR: -1, keyPTS: -1,
 	}
 	s.sweep()
 	return s, nil
@@ -241,19 +244,39 @@ func (s *Segmenter) Feed(pkt []byte) error {
 		}
 	}
 
+	// The clocks this packet carries are read but not committed yet: a keyframe
+	// that splices has to close the segment that is open on the clock that
+	// segment was measured against, before the new timeline replaces it.
+	pcr, hasPCR := int64(0), false
 	if s.havePMT && pid == s.pcrPID {
-		if pcr, ok := tspes.PCR(pkt); ok {
-			s.lastPCR = pcr
-		}
+		pcr, hasPCR = tspes.PCR(pkt)
 	}
 
 	key := false
+	pts, hasPTS := int64(0), false
 	if s.havePMT && pid == s.videoPID && pusi {
 		s.countFrame()
-		if pts, ok := tspes.PTS(pkt); ok {
-			s.notePTS(pts)
-		}
+		pts, hasPTS = tspes.PTS(pkt)
 		key = tspes.RAI(pkt) || tspes.StartsKeyframe(pkt, s.videoType)
+	}
+
+	if key && s.spliced(pts, hasPTS, pcr, hasPCR) {
+		// Cut HERE. The jump then falls on a segment boundary; the segment just
+		// closed is measured on the timeline it actually holds; and the tag goes
+		// in front of the segment that starts the new one, which is where a
+		// player has to reset. finalize is a no-op when nothing is open, so a
+		// splice that lands after an abandoned segment is still marked.
+		s.finalize()
+		s.pendingDisc = true
+	}
+	if hasPCR {
+		s.lastPCR = pcr
+	}
+	if hasPTS {
+		s.notePTS(pts)
+	}
+	if key {
+		s.keyPCR, s.keyPTS = s.lastPCR, s.lastPTS
 	}
 
 	now := s.cfg.Now()
@@ -353,27 +376,45 @@ func (s *Segmenter) notePTS(pts int64) {
 // 3.5 s against ffmpeg's exact 2 s, and nearly twice the tmpfs.
 func (s *Segmenter) elapsed() int64 {
 	if s.havePTS && s.startPTS >= 0 {
-		return s.delta(s.lastPTS, s.startPTS)
+		d, _ := clockDelta(s.lastPTS, s.startPTS)
+		return d
 	}
 	if s.startPCR >= 0 && s.lastPCR >= 0 {
-		return s.delta(s.lastPCR, s.startPCR)
+		d, _ := clockDelta(s.lastPCR, s.startPCR)
+		return d
 	}
 	return 0
 }
 
-// delta is last-start across a 33-bit wrap. A backwards step that is not a wrap
-// is a timeline jump: rebase and flag a discontinuity rather than report ~26h.
-func (s *Segmenter) delta(last, start int64) int64 {
+// clockDelta is last-start across a 33-bit wrap. ok is false for a backwards
+// step no wrap explains — a source timeline jump, whose "duration" would read as
+// about 26 hours.
+func clockDelta(last, start int64) (int64, bool) {
 	d := last - start
 	if d < 0 {
 		if d >= pcrWrapFloor {
-			s.startPCR, s.startPTS = s.lastPCR, s.lastPTS
-			s.pendingDisc = true
-			return 0
+			return 0, false
 		}
 		d += 1 << 33
 	}
-	return d
+	return d, true
+}
+
+// spliced reports whether the clock a keyframe carries steps backwards from the
+// previous keyframe's by more than a 33-bit wrap explains: an upstream splice,
+// or an encoder that restarted and began counting again. It is asked BEFORE the
+// new clock is committed, so the caller can still close the open segment on the
+// old one.
+func (s *Segmenter) spliced(pts int64, hasPTS bool, pcr int64, hasPCR bool) bool {
+	if hasPTS && s.keyPTS >= 0 {
+		_, ok := clockDelta(pts, s.keyPTS)
+		return !ok
+	}
+	if hasPCR && s.keyPCR >= 0 {
+		_, ok := clockDelta(pcr, s.keyPCR)
+		return !ok
+	}
+	return false
 }
 
 func (s *Segmenter) open() {

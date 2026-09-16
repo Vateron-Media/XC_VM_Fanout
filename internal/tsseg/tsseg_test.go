@@ -380,3 +380,108 @@ func TestConfigRejectsPercentDOutsideTheFileName(t *testing.T) {
 		t.Fatalf("segment pattern %q accepted: %%d outside the file name names one file per directory", cfg.SegPattern)
 	}
 }
+
+// listedSeg is one playlist entry: its file, its EXTINF and whether an
+// #EXT-X-DISCONTINUITY stands in front of it.
+type listedSeg struct {
+	name string
+	dur  float64
+	disc bool
+}
+
+func (r *rig) listed() []listedSeg {
+	r.t.Helper()
+	var out []listedSeg
+	disc := false
+	for _, l := range strings.Split(strings.TrimSpace(r.playlist()), "\n") {
+		switch {
+		case l == "#EXT-X-DISCONTINUITY":
+			disc = true
+		case strings.HasPrefix(l, "#EXTINF:"):
+			d, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimPrefix(l, "#EXTINF:"), ","), 64)
+			if err != nil {
+				r.t.Fatalf("EXTINF %q: %v", l, err)
+			}
+			out = append(out, listedSeg{dur: d, disc: disc})
+			disc = false
+		case strings.HasSuffix(l, ".ts"):
+			out[len(out)-1].name = l
+		}
+	}
+	return out
+}
+
+// segPTS lists the video PTSs a written segment carries, in file order.
+func (r *rig) segPTS(name string) []int64 {
+	r.t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.dir, name))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	var out []int64
+	for off := 0; off+tspes.PacketSize <= len(b); off += tspes.PacketSize {
+		p := b[off : off+tspes.PacketSize]
+		if int(tspes.PID(p)) != vpid || !tspes.PUSI(p) {
+			continue
+		}
+		if pts, ok := tspes.PTS(p); ok {
+			out = append(out, pts)
+		}
+	}
+	return out
+}
+
+// checkTimeline asserts what a source splice has to look like from the outside:
+// no segment holds media from both sides of the jump, the segment that starts
+// the new timeline is the one carrying #EXT-X-DISCONTINUITY, and every EXTINF
+// covers the media its own file holds.
+func (r *rig) checkTimeline() {
+	r.t.Helper()
+	list := r.listed()
+	if len(list) < 3 {
+		r.t.Fatalf("%d segments listed:\n%s", len(list), r.playlist())
+	}
+	prevFirst := int64(-1)
+	for _, sg := range list {
+		pts := r.segPTS(sg.name)
+		if len(pts) == 0 {
+			r.t.Fatalf("%s carries no video PES", sg.name)
+		}
+		for i := 1; i < len(pts); i++ {
+			if pts[i] < pts[i-1] {
+				r.t.Errorf("%s spans the jump (PTS %d then %d): the discontinuity is mid-segment, where no tag can mark it:\n%s",
+					sg.name, pts[i-1], pts[i], r.playlist())
+				break
+			}
+		}
+		if prevFirst >= 0 && pts[0] < prevFirst && !sg.disc {
+			r.t.Errorf("%s restarts the timeline (PTS %d after %d) with no #EXT-X-DISCONTINUITY in front of it:\n%s",
+				sg.name, pts[0], prevFirst, r.playlist())
+		}
+		if span := float64(pts[len(pts)-1]-pts[0]) / 90000; span > sg.dur+0.001 {
+			r.t.Errorf("%s holds %.3fs of media but is listed as #EXTINF:%.6f:\n%s", sg.name, span, sg.dur, r.playlist())
+		}
+		prevFirst = pts[0]
+	}
+}
+
+// TestSpliceCutsTheSegmentAtTheJump: an upstream splice sends the clock
+// backwards, and the cut has to happen ON that keyframe — so the jump lands on a
+// segment boundary and the EXT-X-DISCONTINUITY goes in front of the segment that
+// starts the new timeline. Rebasing the clock and carrying on left the segment
+// that was already open holding both timelines — twelve seconds of media
+// labelled six — with the tag in front of IT, where the previous segment is in
+// fact continuous, and the real jump buried inside it where no tag can mark it.
+// Players reset their timeline at the wrong place and then met a mid-segment PTS
+// jump, and the live edge drifted by the missing seconds.
+func TestSpliceCutsTheSegmentAtTheJump(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 6, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), pmtWithPCR())
+	for g := 0; g <= 5; g++ {
+		r.gop(100 + float64(g)*2)
+	}
+	for g := 0; g <= 6; g++ { // the source splices back to the start of its clock
+		r.gop(1 + float64(g)*2)
+	}
+	r.checkTimeline()
+}
