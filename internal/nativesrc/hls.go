@@ -237,6 +237,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 	segFails, manifestFails := 0, 0
 	for {
 		// First pass: enqueue any new segments from the current pl.
+		stalled := false
 		for _, seg := range pl.Segments {
 			if p.ctx.Err() != nil {
 				return
@@ -251,7 +252,13 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 					p.pw.CloseWithError(fmt.Errorf("hls pull: %d consecutive segment failures: %w", segFails, err))
 					return
 				}
-				continue
+				// End the pass here rather than stepping over the hole. The
+				// segment stays unseen so the next poll retries it — but its
+				// successors must not go out first, or that retry lands BEHIND
+				// newer content already on the wire: PTS and PCR jump backwards
+				// and the ring and the HLS cutter see time reverse.
+				stalled = true
+				break
 			}
 			// Mark seen only after a successful stream so a transient fetch
 			// failure is retried on the next manifest poll instead of being
@@ -259,7 +266,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			p.seen[uri] = true
 			segFails = 0
 		}
-		if pl.Endlist {
+		if pl.Endlist && !stalled {
 			return // VOD: source-side ended.
 		}
 		// Sleep before re-fetching the manifest. HLS spec says clients
