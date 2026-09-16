@@ -152,30 +152,57 @@ func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 	for ctx.Err() == nil {
 		start := time.Now()
 		err := pullOnce(ctx, client, src, chunkSize, publish)
+		// How long the attempt itself ran, measured before the wait below can be
+		// folded into it: a pull that streamed for 55s and failed is not a
+		// healthy minute just because an 8s backoff was added to it.
+		ran := time.Since(start)
+		// A pull that stayed up is a NEW incident, not one more retry of the
+		// last one, so its first reconnect is the fast one. Deciding this only
+		// after the wait armed the reset for the NEXT failure instead: a stream
+		// that flapped in the morning, climbed to the 8s ceiling and then
+		// streamed cleanly for hours still opened its next incident with the
+		// full 8s of dead air — exactly what the reset was added to remove.
+		if ran > backoffResetAfter {
+			backoff = defaults.PullBackoffInitial
+		}
 		if err != nil && ctx.Err() == nil {
 			log.Printf("puller: id=%s %v (retry in %s)", src.Label, err, backoff)
 		} else if ctx.Err() == nil {
 			// A pullOnce that returned nil/EOF means the source ended cleanly; the
 			// daemon still reconnects (live sources are not supposed to end).
-			dlog.Logf("puller", "id=%s source ended after %s (retry in %s)", src.Label, time.Since(start).Round(time.Millisecond), backoff)
+			dlog.Logf("puller", "id=%s source ended after %s (retry in %s)", src.Label, ran.Round(time.Millisecond), backoff)
 		}
 		if ctx.Err() != nil {
 			dlog.Logf("puller", "id=%s stop (context cancelled)", src.Label)
 			return
 		}
-		select {
-		case <-ctx.Done():
+		if !waitBackoff(ctx, backoff) {
 			dlog.Logf("puller", "id=%s stop (context cancelled)", src.Label)
 			return
-		case <-time.After(backoff):
 		}
-		backoff = nextBackoff(backoff, time.Since(start))
+		// And double for the attempt after this one. ran is the attempt's own
+		// duration, so the reset above and this one agree: a source that just
+		// came back holds the initial wait for one more try before climbing.
+		backoff = nextBackoff(backoff, ran)
+	}
+}
+
+// waitBackoff waits d before the next attempt, cut short when ctx ends; it
+// reports whether the wait ran to completion. A var so a test can read the
+// reconnect loop's decisions without spending the seconds they take.
+var waitBackoff = func(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
 	}
 }
 
 // backoffResetAfter is how long a pull must have run for its failure to count
-// as a new incident rather than another retry of the last one.
-const backoffResetAfter = time.Minute
+// as a new incident rather than another retry of the last one. A var so a test
+// can compress a healthy run.
+var backoffResetAfter = time.Minute
 
 // nextBackoff is the wait before the next attempt, after one that ran for
 // ranFor. It doubles up to PullBackoffMax while failures follow each other, and
