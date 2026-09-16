@@ -103,6 +103,11 @@ func (s *Supervisor) ForceSource(id string, idx int) error {
 		// the index it happens to be sitting at this instant still has to be
 		// queued, or the operator gets a 204 and a stream that walks off the
 		// source they picked.
+		//
+		// It does cancel a switch queued a moment ago and not yet acted on: an
+		// operator who picks a backup and changes their mind inside one health
+		// tick means the stream stays where it is, not that it moves anyway.
+		st.forced = -1
 		return nil
 	}
 	st.forced = idx

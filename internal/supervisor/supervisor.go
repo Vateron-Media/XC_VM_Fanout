@@ -742,8 +742,12 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 		}
 
 		// An operator asked for a specific source: that outranks everything,
-		// including whether the current one looks healthy.
-		if idx := st.takeForced(); idx >= 0 {
+		// including whether the current one looks healthy. A choice the stream
+		// has since landed on by itself — the failover walk reached it while the
+		// starts were failing — is dropped instead: killing a healthy encoder to
+		// restart the same command is an outage for nothing, and the panel would
+		// be told it was a FORCE_SOURCE.
+		if idx := st.takeForced(); idx >= 0 && idx != st.sourceIndex() {
 			return healthVerdict{
 				event:        EventForceSource,
 				reason:       fmt.Sprintf("forced switch to source %d", idx),
