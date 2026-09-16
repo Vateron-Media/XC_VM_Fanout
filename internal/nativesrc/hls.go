@@ -286,7 +286,10 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 	// counter that any success reset meant a source serving a perfectly valid
 	// playlist of dead segments could never trip it whenever the live window held
 	// fewer segments than the threshold: each manifest poll wiped the tally.
-	segFails, manifestFails := 0, 0
+	// notTS counts segment BODIES in a row that were not MPEG-TS, separately
+	// again: what the upstream is has to be read off a run of bodies, not off
+	// one. See the escalation below.
+	segFails, manifestFails, notTS := 0, 0, 0
 	for {
 		// First pass: enqueue any new segments from the current pl.
 		stalled := false
@@ -298,13 +301,24 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 				continue
 			}
 			if err := p.streamSegment(seg.URI); err != nil {
-				// What the upstream IS cannot be retried away, so a segment that
-				// is not MPEG-TS ends the pull immediately — the same move a
-				// playlist that changes flavour mid-life makes, and the one that
-				// hands the stream to ffmpeg instead of stalling it silently.
+				// A segment body that is not MPEG-TS says the upstream is
+				// something this package cannot pass through — but ONE of them
+				// does not. An origin over its connection limit answers a
+				// segment with 200 and an HTML page and serves the same segment
+				// correctly a second later, and a format refusal is what hands
+				// the stream to ffmpeg for the life of its spec. So it takes a
+				// run of them, the same evidence the playlist's own extensions
+				// give at once (see servable): a provider really serving packed
+				// audio from .ts URLs reaches ffmpeg a few polls later, while a
+				// blip costs a retry.
 				if IsFormat(err) {
-					p.pw.CloseWithError(fmt.Errorf("hls pull: %w", err))
-					return
+					notTS++
+					if notTS >= maxHLSConsecutiveFails {
+						p.pw.CloseWithError(fmt.Errorf("hls pull: %d segment bodies running: %w", notTS, err))
+						return
+					}
+				} else {
+					notTS = 0
 				}
 				segFails++
 				if segFails >= maxHLSConsecutiveFails {
@@ -341,7 +355,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			// permanently skipped by retainSeenInWindow.
 			p.markStreamed(pl, i)
 			p.clearStall()
-			segFails = 0
+			segFails, notTS = 0, 0
 		}
 		if pl.Endlist && !stalled {
 			return // VOD: source-side ended.
