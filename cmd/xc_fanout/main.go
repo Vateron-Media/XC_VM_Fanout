@@ -90,6 +90,21 @@ func main() {
 	}
 	flag.Parse()
 
+	// A leftover positional word is never a daemon launch — refuse it instead of
+	// silently ignoring it. flag.Parse stops at the first non-flag argument, so
+	// `xc_fanout version`, `xc_fanout status`, or the panel's
+	// `xc_fanout remux -i … <playlist>` line handed to a binary from BEFORE the
+	// native remuxer, all used to fall straight through into a full daemon on the
+	// DEFAULT -sock path. On a production node that second instance took the
+	// running daemon's client socket (see listenUnix) and the whole node went
+	// dark. Exit 2, the same "bad usage" status the remux mode uses.
+	if flag.NArg() > 0 {
+		out := flag.CommandLine.Output()
+		fmt.Fprintf(out, "%s: unknown command %q — this binary takes flags only (and `remux`, see -h)\n", os.Args[0], flag.Arg(0))
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	if *showVersion {
 		fmt.Println(buildVersion())
 		return
@@ -295,26 +310,88 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 }
 
 // serveUnix starts an HTTP server on a fresh unix socket and returns it with a
-// cleanup that removes the socket file.
+// cleanup that removes the socket file. A socket the daemon cannot bind is
+// fatal: without it nginx has nothing to reach.
 func serveUnix(path string, h http.Handler) (*http.Server, func()) {
+	srv, cleanup, err := listenUnix(path, h)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return srv, cleanup
+}
+
+// listenUnix binds path and serves h on it, returning the server and a cleanup
+// that removes the socket file.
+//
+// Binding a unix socket means unlinking whatever is at the path first, which is
+// how the daemon heals after its own unclean exit: a SIGKILLed instance leaves
+// the file behind and nothing else will ever remove it. Done blind, though, that
+// unlink also takes the socket of a daemon that is still RUNNING and serving
+// nginx — the whole node then reaches an instance with an empty registry, every
+// /live and /hls request 404s, and when the impostor stops it takes the path
+// with it. So probe first: if something ANSWERS on the path, another daemon owns
+// it and this one refuses rather than evicting it. Only a dead file is removed.
+func listenUnix(path string, h http.Handler) (*http.Server, func(), error) {
 	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
+	}
+	if socketAnswers(path) {
+		return nil, nil, fmt.Errorf("listen %s: another xc_fanout is already listening there; refusing to take its socket", path)
 	}
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
-		log.Fatalf("listen %s: %v", path, err)
+		return nil, nil, fmt.Errorf("listen %s: %w", path, err)
 	}
 	_ = os.Chmod(path, 0o660)
+	owned := &ownedListener{Listener: ln}
 
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: defaults.HTTPReadHeaderTimeout}
 	go func() {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(owned); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve %s: %v", path, err)
 		}
 	}()
 	log.Printf("xc_fanout listening on unix:%s", path)
-	return srv, func() { _ = os.Remove(path) }
+	// Closing the listener is what unlinks the socket — it owns the file it
+	// created — so once Shutdown has run there is nothing left to remove, and
+	// removing the path BY NAME anyway is how an exiting daemon used to delete
+	// its REPLACEMENT's socket: Shutdown gets two seconds, and a daemon still
+	// inside it when the new instance binds the same path took the new socket
+	// with it, leaving nginx with nothing to reach and a healthy daemon behind
+	// it. So clean up only while we still hold the listener, when the path can
+	// only be our own socket.
+	return srv, func() {
+		if !owned.closed.Load() {
+			_ = os.Remove(path)
+		}
+	}, nil
+}
+
+// ownedListener records that the socket file has been unlinked — which is what
+// closing a unix listener does — before it can happen, so the cleanup above can
+// never race the close and delete a path that by then belongs to someone else.
+type ownedListener struct {
+	net.Listener
+	closed atomic.Bool
+}
+
+func (l *ownedListener) Close() error {
+	l.closed.Store(true)
+	return l.Listener.Close()
+}
+
+// socketAnswers reports whether a connection can be made to path right now, i.e.
+// whether a live daemon is serving it. A socket file with no listener behind it
+// (an unclean exit) refuses the connection immediately and reads as free, which
+// is what keeps the self-heal working.
+func socketAnswers(path string) bool {
+	c, err := net.DialTimeout("unix", path, defaults.SocketProbeTimeout)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
 }
 
 // buildVersion returns the ldflags-stamped version, or—when the binary was

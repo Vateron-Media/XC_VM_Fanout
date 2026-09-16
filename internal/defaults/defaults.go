@@ -28,6 +28,13 @@ import "time"
 // and never finishes its request line.
 const HTTPReadHeaderTimeout = 10 * time.Second
 
+// SocketProbeTimeout bounds the connect a starting daemon makes to its own
+// socket paths to find out whether another instance is already serving them
+// (cmd/xc_fanout, listenUnix). A local unix connect either completes or is
+// refused in microseconds; this only has to cover a loaded box, and it is paid
+// twice at boot and never again.
+const SocketProbeTimeout = 200 * time.Millisecond
+
 // ── Live-TS fan-out ────────────────────────────────────────────────────────
 
 const (
