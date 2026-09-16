@@ -321,7 +321,14 @@ func (s *State) Update(chunk []byte) {
 			if p := parsePMTPID(pkt); p >= 0 {
 				s.pmtPID = p
 			}
-		case s.pmtPID >= 0 && pid == s.pmtPID:
+		// A section is read only from the packet that STARTS it. A PMT too long
+		// for one packet continues in the next, which carries no PUSI; parsing
+		// those continuation bytes as a section of their own read them as
+		// pointer_field and ES entries, which could move videoPID or audioPID to
+		// whatever they happened to spell — and left lastPMT holding a packet that
+		// is not a table, which is then the packet every join burst and every HLS
+		// segment starts with. Multi-packet PMTs are ordinary on DVB passthrough.
+		case s.pmtPID >= 0 && pid == s.pmtPID && pusi:
 			s.lastPMT = cloneInto(s.lastPMT, pkt)
 			if v, t := parseVideoPID(pkt); v >= 0 {
 				s.videoPID, s.videoType = v, t
@@ -1123,21 +1130,11 @@ func (s *State) Counters() (audioPkts, videoFrames int64, hasAudio bool) {
 // or -1. Mirrors parseVideoPID; the two differ only in the stream types they
 // accept.
 func parseAudioPID(pkt []byte) int {
-	ps := payloadOffset(pkt)
-	if ps < 0 || ps >= len(pkt) {
-		return -1
-	}
-	p := ps + 1 + int(pkt[ps]) // skip pointer_field
-	if p+12 > len(pkt) {
-		return -1
-	}
-	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
-	es := p + 12 + pil
-	for es+5 <= len(pkt) {
-		if isAudioStreamType(pkt[es]) {
-			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2])
+	es, _ := tspes.ParsePMTStreams(pkt)
+	for _, e := range es {
+		if isAudioStreamType(e.Type) {
+			return int(e.PID)
 		}
-		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
 	}
 	return -1
 }
@@ -1156,22 +1153,23 @@ func isAudioStreamType(t byte) bool {
 // parseVideoPID reads the first video elementary-stream PID out of a PMT packet,
 // with its stream_type, or -1. Used to locate the PES that carries the HLS
 // segment clock (PTS), and to know how to read a keyframe off that PES.
+//
+// The ES loop is tspes's, which reads the table_id and walks bounded by
+// section_length. The loop here ran to the end of the 188-byte PACKET instead,
+// so on a table whose entries do not fill it — an audio-only PMT, one AAC stream
+// — it stepped straight onto the section's CRC32 and read that as another entry.
+// About six CRC values in 256 begin with a video stream_type, and a table's CRC
+// is fixed, so an affected channel stayed affected across restarts: it then had a
+// video PID nothing ever arrived on, `rap && (onVideo || videoPID < 0)` was never
+// true, and the stream was cut into blocks only by the maxGOP cap — minutes at
+// radio bitrates, which a listener joins at the start of and never catches up
+// from.
 func parseVideoPID(pkt []byte) (int, byte) {
-	ps := payloadOffset(pkt)
-	if ps < 0 || ps >= len(pkt) {
-		return -1, 0
-	}
-	p := ps + 1 + int(pkt[ps]) // skip pointer_field
-	if p+12 > len(pkt) {
-		return -1, 0
-	}
-	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
-	es := p + 12 + pil
-	for es+5 <= len(pkt) {
-		if isVideoStreamType(pkt[es]) {
-			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2]), pkt[es]
+	es, _ := tspes.ParsePMTStreams(pkt)
+	for _, e := range es {
+		if isVideoStreamType(e.Type) {
+			return int(e.PID), e.Type
 		}
-		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
 	}
 	return -1, 0
 }
