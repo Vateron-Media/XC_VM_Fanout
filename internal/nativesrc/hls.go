@@ -136,22 +136,40 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		return refuse(err)
 	}
 	pr, pw := io.Pipe()
+	// The puller dies with its READER, not with the stream. It used to run on the
+	// caller's ctx — the stream's whole lifetime — while Close() only shut the
+	// pipe, so a puller whose reader had gone kept polling. Against a frozen
+	// playlist it never writes again, so its segment-failure counter never grows,
+	// and every poll succeeds, so its manifest counter keeps resetting: nothing
+	// could ever stop it. Every reconnect left another one behind, each with its
+	// own transport, all hammering the upstream. Cancelling also aborts an
+	// in-flight segment or manifest fetch instead of waiting it out.
+	pctx, cancel := context.WithCancel(ctx)
 	go (&hlsPuller{
-		ctx:    ctx,
+		ctx:    pctx,
 		base:   base,
 		client: client,
 		opt:    opt,
 		seen:   map[string]bool{},
 		pw:     pw,
 	}).run(pl)
-	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl)}, nil
+	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl), cancel: cancel}, nil
 }
 
 // hlsReader is the byte stream of a live HLS pull, which knows how long it may
 // legitimately go without bytes: see IdleBound.
 type hlsReader struct {
 	*io.PipeReader
-	idle time.Duration
+	idle   time.Duration
+	cancel context.CancelFunc
+}
+
+// Close stops the puller goroutine as well as the pipe. Closing only the pipe
+// left the puller running: it notices a dead reader on its next pw.Write, and a
+// frozen playlist gives it nothing to write.
+func (r *hlsReader) Close() error {
+	r.cancel()
+	return r.PipeReader.Close()
 }
 
 // IdleBound is the longest silence this source can have while healthy. A live
