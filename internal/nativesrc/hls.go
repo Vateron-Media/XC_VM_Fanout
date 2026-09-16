@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 )
 
 // newPullClient builds the client for manifest and segment fetches. Unlike the
@@ -53,6 +55,22 @@ const maxRetainedSegBuf = 16 << 20
 // of two segments would then never reach the threshold, and a source serving an
 // intact playlist of dead segments would retry forever), and vice versa.
 const maxHLSConsecutiveFails = 5
+
+// maxSegmentStalls is how many consecutive manifest polls the pass may be held
+// at the SAME failing segment before it is written off and stepped over, in
+// order. Retrying a segment in place is what keeps the wire in time order, but
+// an unbounded hold turns one segment the packager lost into a dead channel:
+// nothing downstream of it goes out, so the consecutive-failure threshold trips
+// on it and the pipe closes, and the reconnect rejoins at a live edge where the
+// same segment may still be sitting.
+//
+// Three attempts spans two poll waits — one target duration — so a transient
+// 5xx or timeout is retried in place and recovers with no hole at all, while the
+// silence before the pull gives up stays well inside the source's own stall
+// bound of three target durations. The give-up is not a free pass: the failure
+// still counts toward maxHLSConsecutiveFails, so a source whose segments are ALL
+// dead still fails over to the next URL.
+const maxSegmentStalls = 3
 
 // OpenHLSPull returns an io.ReadCloser that yields concatenated MPEG-TS
 // bytes from a live HLS manifest. It supports the common case for IPTV
@@ -238,6 +256,13 @@ type hlsPuller struct {
 	bySeq bool  // de-dup follows the media sequence rather than the URI
 	first int64 // MEDIA-SEQUENCE of the playlist the state was last synced to
 
+	// Which segment the pass is currently held at, and for how many polls
+	// running — see maxSegmentStalls. The key follows the same identity the
+	// de-dup does, so an upstream that re-signs every URL is still recognised as
+	// stalling on the same segment rather than on a new one each poll.
+	stallKey   string
+	stallTries int
+
 	// segBuf stages one segment body at a time. run() is the only goroutine that
 	// touches it and pw.Write blocks until the consumer has drained what it was
 	// handed, so the buffer is free again by the next iteration. Allocating it per
@@ -286,6 +311,23 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 					p.pw.CloseWithError(fmt.Errorf("hls pull: %d consecutive segment failures: %w", segFails, err))
 					return
 				}
+				// A segment that has been failing for maxSegmentStalls polls
+				// running is not coming back, and holding the pass at it holds
+				// the whole channel: write it off and step over it, IN ORDER, so
+				// what is behind it reaches viewers. markStreamed is what makes
+				// the skip permanent — the retry that would otherwise land
+				// behind newer content can no longer happen. Only worth doing
+				// when something newer is actually waiting: with nothing behind
+				// it there is nothing to release, and retiring the segment would
+				// take the evidence away from the failure threshold and leave
+				// the pull silently polling a window it will never take from.
+				if p.stalledOn(pl, i) >= maxSegmentStalls && p.unseenAfter(pl, i) {
+					dlog.Logf("hls", "segment %s failed %d polls running, skipping it: %v",
+						redactURL(seg.URI), p.stallTries, err)
+					p.markStreamed(pl, i)
+					p.clearStall()
+					continue
+				}
 				// End the pass here rather than stepping over the hole. The
 				// segment stays unseen so the next poll retries it — but its
 				// successors must not go out first, or that retry lands BEHIND
@@ -298,6 +340,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			// failure is retried on the next manifest poll instead of being
 			// permanently skipped by retainSeenInWindow.
 			p.markStreamed(pl, i)
+			p.clearStall()
 			segFails = 0
 		}
 		if pl.Endlist && !stalled {
@@ -436,6 +479,44 @@ func (p *hlsPuller) streamed(pl *hlsPlaylist, i int) bool {
 		return pl.MediaSequence+int64(i) < p.seq
 	}
 	return p.seen[pl.Segments[i].URI.String()]
+}
+
+// segKey identifies the segment at index i the way the de-dup does: by its place
+// in the stream when the playlist carries a media sequence, by its URI when it
+// does not. Used to tell "still stuck on the same segment" from "stuck on a new
+// one", which the URI alone cannot do for an upstream that re-signs every URL.
+func (p *hlsPuller) segKey(pl *hlsPlaylist, i int) string {
+	if p.bySeq {
+		return strconv.FormatInt(pl.MediaSequence+int64(i), 10)
+	}
+	return pl.Segments[i].URI.String()
+}
+
+// stalledOn counts this pass's failure at i against the segment it is stuck on
+// and returns how many polls running that has now been. A failure at a different
+// segment starts the count again: the bound is on ONE segment holding the pass,
+// not on the source's failures in general, which maxHLSConsecutiveFails covers.
+func (p *hlsPuller) stalledOn(pl *hlsPlaylist, i int) int {
+	if k := p.segKey(pl, i); k != p.stallKey {
+		p.stallKey, p.stallTries = k, 0
+	}
+	p.stallTries++
+	return p.stallTries
+}
+
+// clearStall forgets the held segment, after a successful stream or once the
+// pass has given up on it.
+func (p *hlsPuller) clearStall() { p.stallKey, p.stallTries = "", 0 }
+
+// unseenAfter reports whether any segment after i is still unstreamed — whether
+// giving up on i would release anything at all.
+func (p *hlsPuller) unseenAfter(pl *hlsPlaylist, i int) bool {
+	for j := i + 1; j < len(pl.Segments); j++ {
+		if !p.streamed(pl, j) {
+			return true
+		}
+	}
+	return false
 }
 
 // markStreamed records that it has. Called only after a successful stream, so a
