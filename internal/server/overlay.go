@@ -399,6 +399,17 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 		defer func() { close(watchStop); <-watchDone }()
 	}
 
+	// Size the feed's ring runs the way the raw fan-out sizes a viewer's: from
+	// what this stream itself produces, not at the fixed joinRunBytes ceiling.
+	// The feed holds each run's pin across the stdin.Write that hands it to
+	// ffmpeg, and ffmpeg stops reading as soon as the viewer downstream of it
+	// stops draining — so the run is how much of the ring one signalled viewer
+	// can freeze for every other viewer of the same stream. On a low-bitrate
+	// channel a fixed megabyte is far more than anything downstream can absorb,
+	// so the feed blocked inside its very first run: the whole pin held, and the
+	// cursor (which only advances on a run written in full) never moved, so the
+	// raw fan-out resumed where the window began and re-sent it.
+	runMax := m.runBytes(st)
 	stopFeed := make(chan struct{})
 	feedDone := make(chan struct{})
 	endCur := cur
@@ -440,7 +451,7 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 				return
 			default:
 			}
-			b, next, atEnd, wake, behind, ended := st.Hub.Follow(c, joinRunBytes)
+			b, next, atEnd, wake, behind, ended := st.Hub.Follow(c, runMax)
 			if behind && rewound {
 				// The block's head was pruned between the viewer's last read and
 				// now, but cur itself can still be live (a ring shorter than one
