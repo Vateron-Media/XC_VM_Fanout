@@ -367,6 +367,12 @@ func servable(pl *hlsPlaylist) error {
 		return ErrHLSIsFMP4
 	case pl.Encrypted:
 		return ErrHLSEncrypted
+	case pl.HasByteRange:
+		// Segments are ranges of one resource. streamSegment sends no Range
+		// header and de-dups on the URI, so serving this would fetch the whole
+		// resource once and drop every later entry — and fetch nothing at all
+		// once it outgrows the runaway limit. Refuse rather than half-serve.
+		return ErrHLSByteRange
 	}
 	for _, seg := range pl.Segments {
 		if ext := strings.ToLower(path.Ext(seg.URI.Path)); nonTSSegmentExt[ext] {
@@ -606,7 +612,11 @@ type hlsPlaylist struct {
 	// freeze the channel.
 	MediaSequence int64
 	HasMediaSeq   bool
-	MapURI        *url.URL // EXT-X-MAP target (fMP4 init)
+	// HasByteRange is set by #EXT-X-BYTERANGE: the segments are slices of a
+	// larger resource, not whole files. This puller fetches a segment URI whole,
+	// so it cannot serve one of those.
+	HasByteRange bool
+	MapURI       *url.URL // EXT-X-MAP target (fMP4 init)
 	Segments       []hlsSegment
 	Variants       []hlsVariant
 	// DemuxedAudio holds the GROUP-IDs of #EXT-X-MEDIA TYPE=AUDIO renditions
@@ -658,6 +668,10 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 				pl.MediaSequence = n
 				pl.HasMediaSeq = true
 			}
+		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
+			// The segment that follows is a slice of its URI, not the whole of
+			// it. Noticed, never honoured — see servable.
+			pl.HasByteRange = true
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.Endlist = true
 		case strings.HasPrefix(line, "#EXT-X-KEY:"):

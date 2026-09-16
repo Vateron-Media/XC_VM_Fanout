@@ -74,6 +74,15 @@ var ErrHLSEncrypted = fmt.Errorf("%w: hls segments are encrypted", ErrFormat)
 // (IsFormat) that the fallback can serve.
 var ErrHLSNotTS = fmt.Errorf("%w: hls segments are not mpeg-ts", ErrFormat)
 
+// ErrHLSByteRange marks an HLS source whose segments are #EXT-X-BYTERANGE slices
+// of one larger resource rather than whole files. This package GETs a segment
+// URI and passes the whole response through, so such a playlist would fetch the
+// entire resource for its first entry and then skip every later one that names
+// it again — and once that resource grows past the runaway limit, fetch nothing
+// at all. ffmpeg sends a Range header per segment, so this is a format refusal
+// (IsFormat) that the fallback can serve.
+var ErrHLSByteRange = fmt.Errorf("%w: hls segments are byte ranges of one resource", ErrFormat)
+
 // transport builds the shared transport shape. dialWait separates the two
 // callers: a bounded fetch can afford to wait a little longer to connect than a
 // live body, which should fail fast so the puller can rotate to the next URL.
