@@ -465,12 +465,19 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	var conn *net.UDPConn
-	if addr.IP.IsMulticast() {
-		conn, err = net.ListenMulticastUDP("udp", nil, addr)
-	} else {
-		conn, err = net.ListenUDP("udp", addr)
+	q := u.Query()
+	// Options that decide WHICH datagrams arrive cannot be quietly ignored: a
+	// source-filtered join that falls back to any-source delivers a different
+	// stream from the one that was configured. Refuse as a format refusal, which
+	// is what hands the source to ffmpeg — where they work. Everything else in a
+	// udp:// query (fifo_size, buffer_size, overrun_nonfatal, pkt_size…) is
+	// tuning, and refusing tuning would take working multicast sources off air.
+	for _, k := range []string{"sources", "block"} {
+		if q.Get(k) != "" {
+			return nil, fmt.Errorf("%w: udp option %q is not read natively", ErrFormat, k)
+		}
 	}
+	conn, err := listenUDP(addr, strings.TrimSpace(q.Get("localaddr")))
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +488,76 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 	r := &udpReader{conn: conn, ctx: ctx, done: make(chan struct{}), rtp: strings.EqualFold(u.Scheme, "rtp")}
 	go r.watch()
 	return r, nil
+}
+
+// listenUDP binds the socket a udp:// read URL asks for, following the same
+// rules ffmpeg's udp.c does — the two backends must reach the same source the
+// same way, or `backend=auto` changes what an operator gets.
+//
+//   - multicast: join on the interface that carries localaddr, if one was named.
+//     A nil interface lets the kernel pick from the routing table, which on a
+//     node whose feed arrives on a dedicated VLAN NIC is the wrong one: the join
+//     succeeds, no datagrams arrive, and the stall bound reconnects forever.
+//   - localaddr on a unicast URL: bind it, as asked.
+//   - a unicast host that is not one of ours: the URL is naming the SENDER,
+//     which ffmpeg accepts and binds INADDR_ANY:port for. Binding the remote
+//     address failed with "cannot assign requested address" — not a format
+//     refusal, so remux exited 1 and the supervisor restart-looped a channel
+//     whose fallback would have played it. An address that IS local still binds
+//     exactly as configured, so a feed deliberately pinned to one NIC stays
+//     pinned.
+func listenUDP(addr *net.UDPAddr, localaddr string) (*net.UDPConn, error) {
+	if addr.IP.IsMulticast() {
+		var ifi *net.Interface
+		if localaddr != "" {
+			var err error
+			if ifi, err = interfaceForIP(localaddr); err != nil {
+				return nil, err
+			}
+		}
+		return net.ListenMulticastUDP("udp", ifi, addr)
+	}
+	if localaddr != "" {
+		lip := net.ParseIP(localaddr)
+		if lip == nil {
+			return nil, fmt.Errorf("%w: localaddr %q is not an ip address", ErrUnsupportedSource, localaddr)
+		}
+		return net.ListenUDP("udp", &net.UDPAddr{IP: lip, Port: addr.Port, Zone: addr.Zone})
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err == nil || addr.IP == nil || addr.IP.IsUnspecified() {
+		return conn, err
+	}
+	wild, werr := net.ListenUDP("udp", &net.UDPAddr{Port: addr.Port})
+	if werr != nil {
+		return nil, err // the original failure is the more specific one
+	}
+	return wild, nil
+}
+
+// interfaceForIP resolves a localaddr to the interface that carries it, which is
+// what a multicast join takes.
+func interfaceForIP(raw string) (*net.Interface, error) {
+	ip := net.ParseIP(raw)
+	if ip == nil {
+		return nil, fmt.Errorf("%w: localaddr %q is not an ip address", ErrUnsupportedSource, raw)
+	}
+	ifis, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	for i := range ifis {
+		addrs, err := ifis[i].Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+				return &ifis[i], nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("%w: localaddr %s is on no interface of this node", ErrUnsupportedSource, ip)
 }
 
 // udpReader adapts a datagram socket to io.Reader.
