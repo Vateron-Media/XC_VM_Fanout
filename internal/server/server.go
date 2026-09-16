@@ -1091,10 +1091,16 @@ func (m *Manager) startMemoryScavenger(ctx context.Context, interval time.Durati
 // push-fed via ingest), how many live-TS viewers hold a ref, the hub subscriber
 // count, tracked viewer uuids, and the age of the last data (a growing data_age
 // on a running stream is the off-air signal). This is the "what is the daemon
-// doing right now" view. No-op when debug is off or every <= 0, so it costs
-// nothing in normal operation. Call once from main.
+// doing right now" view. No-op when every <= 0 or neither category it writes is
+// enabled, so it costs nothing in normal operation. Call once from main.
+//
+// It gates on the CATEGORIES it writes, not on dlog.On(): an operator narrowing
+// debug to one subsystem (-debug-cats=puller, which is what the filter is for)
+// had this loop go on waking every few seconds to take every stream's mu and
+// connMu and its hub lock (NoKeyframeCuts) and format a line per stream — on a
+// 500-channel node, all of it thrown away by Logf's filter.
 func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
-	if !dlog.On() || every <= 0 {
+	if every <= 0 || (!dlog.OnCat("stats") && !dlog.OnCat("monitor")) {
 		return
 	}
 	go func() {
@@ -1105,12 +1111,6 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				m.mu.Lock()
-				streams := make([]*Stream, 0, len(m.streams))
-				for _, st := range m.streams {
-					streams = append(streams, st)
-				}
-				m.mu.Unlock()
 				// Supervision first: it is a different question from "what are
 				// the streams doing", and on a node that supervises nothing the
 				// single line saying so is itself the answer.
@@ -1123,6 +1123,18 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 						dlog.Logf("monitor", "%s", l)
 					}
 				}
+				// Everything below feeds the "stats" category alone: skip the
+				// registry snapshot, the per-stream locks and the formatting when
+				// only "monitor" is selected.
+				if !dlog.OnCat("stats") {
+					continue
+				}
+				m.mu.Lock()
+				streams := make([]*Stream, 0, len(m.streams))
+				for _, st := range m.streams {
+					streams = append(streams, st)
+				}
+				m.mu.Unlock()
 				if len(streams) == 0 {
 					dlog.Logf("stats", "no streams registered")
 					continue
