@@ -98,6 +98,35 @@ func TestOpenOnAnEmptyFileIsNotAFormatRefusal(t *testing.T) {
 	}
 }
 
+// TestOpenOnAFileShorterThanOnePacketIsNotAFormatRefusal: a file with fewer
+// than 188 bytes in it has not said what it is. An encoder that has just created
+// its output — the local-file case this package exists to serve — looks exactly
+// like this for a moment, and a format refusal is what pins the stream to ffmpeg
+// for the life of its spec. The segment body check already draws the line here;
+// a file on disk is no different.
+func TestOpenOnAFileShorterThanOnePacketIsNotAFormatRefusal(t *testing.T) {
+	p := writeFixture(t, "ch.ts", tsSegment(0)[:100])
+	rc, err := Open(context.Background(), p, Options{})
+	if err == nil {
+		rc.Close()
+		t.Fatal("Open accepted a file too short to hold one TS packet")
+	}
+	if !errors.Is(err, ErrUnsupportedSource) {
+		t.Fatalf("err = %v, want ErrUnsupportedSource", err)
+	}
+	if IsFormat(err) {
+		t.Fatalf("err = %v reads as a format refusal: the file is a producer mid-write, "+
+			"not another container", err)
+	}
+	// The same file, once a whole packet has been written, opens.
+	full := writeFixture(t, "full.ts", tsSegment(0))
+	rc, err = Open(context.Background(), full, Options{})
+	if err != nil {
+		t.Fatalf("Open on a whole segment: %v", err)
+	}
+	rc.Close()
+}
+
 // TestOpenOnAMissingFileStillReportsTheOSError: refusing unreadable content must
 // not swallow "no such file", which is the one thing that tells an operator the
 // path in the panel is wrong.

@@ -250,6 +250,13 @@ func openFile(name string) (io.ReadCloser, error) {
 		// rather than the format refusal that pins a stream to ffmpeg for good.
 		return nil, fmt.Errorf("%w: %s: empty", ErrUnsupportedSource, name)
 	}
+	if n < tsPacketSize && !namesAnotherContainer(head) {
+		// Nor does a file too short to hold one packet: the producer is a moment
+		// further on, and looksLikeTS cannot confirm what it cannot see a whole
+		// packet of. The segment body check already draws the line exactly here.
+		return nil, fmt.Errorf("%w: %s: %d bytes, short of one %d-byte packet",
+			ErrUnsupportedSource, name, n, tsPacketSize)
+	}
 	return nil, fmt.Errorf("%w: %s: not an mpegts stream", ErrFormat, name)
 }
 
@@ -468,6 +475,25 @@ func looksLikeTS(head []byte) bool {
 		}
 	}
 	return true
+}
+
+// namesAnotherContainer reports whether the opening bytes POSITIVELY identify a
+// container this package does not serve. It only has to answer for a body too
+// short to hold one TS packet, where "does not look like TS" is no evidence at
+// all — the first bytes of a real TS file do not look like TS either. A file
+// that opens with an ISO-BMFF box, a Matroska header or a playlist is a fact a
+// retry cannot change, and ffmpeg reads all three, so those stay format
+// refusals however short they are.
+func namesAnotherContainer(head []byte) bool {
+	switch {
+	case looksLikePlaylist(head):
+		return true
+	case len(head) >= 8 && string(head[4:8]) == "ftyp": // MP4, fMP4
+		return true
+	case bytes.HasPrefix(head, []byte{0x1a, 0x45, 0xdf, 0xa3}): // Matroska, WebM
+		return true
+	}
+	return false
 }
 
 // looksLikePlaylist reports whether head opens an m3u8, tolerating a UTF-8 BOM
