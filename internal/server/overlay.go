@@ -429,6 +429,17 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 		if n > 0 {
 			if werr := write(buf[:n]); werr != nil {
 				ok = false
+				// Kill ffmpeg before joining the feed. Nobody drains its stdout
+				// from here on, so it fills that pipe, blocks, and stops reading
+				// its stdin — leaving the feed goroutine stuck inside
+				// stdin.Write, which is not a select and never sees stopFeed. The
+				// join below then waited for the context's own kill, holding this
+				// handler, an ffmpeg process and a pinned ring run (which
+				// suspends GOP-buffer recycling for the whole stream) for the
+				// rest of the window, long after the viewer had gone. Killing
+				// ffmpeg closes the pipe, so the blocked write returns EPIPE at
+				// once and the feed unwinds.
+				cancel()
 				break
 			}
 		}
