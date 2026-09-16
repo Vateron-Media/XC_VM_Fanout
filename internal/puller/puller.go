@@ -596,7 +596,16 @@ func runFfmpeg(ctx context.Context, src Source, raw string, stall time.Duration,
 	// can see — and ingest.Copy then blocked forever: no retry, no failover,
 	// while viewers who reconnected kept the stream referenced. Close the pipe
 	// after the stall bound, then end the process before waiting on it.
-	copyErr := ingest.Copy(nativesrc.WrapIdleTimeout(stdout, stall), chunkSize, publish)
+	//
+	// The wrapper is a goroutine and a ticker, and it stops only when it is
+	// Closed or its bound fires. Passed inline it was never closed, so every
+	// attempt — the ordinary clean end included — left one watching a dead pipe
+	// for the whole bound (8s, 24s for an HLS source). Close it on the way out,
+	// AFTER cmd.Wait: closing the read end while the child is still writing
+	// would hand ffmpeg an EPIPE and turn a clean end into a fault.
+	stdoutBounded := nativesrc.WrapIdleTimeout(stdout, stall)
+	defer stdoutBounded.Close()
+	copyErr := ingest.Copy(stdoutBounded, chunkSize, publish)
 	ccancel()
 	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
