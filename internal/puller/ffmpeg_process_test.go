@@ -181,8 +181,19 @@ func TestFfmpegWaitBoundedByADescendantHoldingStderr(t *testing.T) {
 	// out of reach of a process-group kill. Its stdout goes to /dev/null so only
 	// STDERR is still held: the main body then emits the payload and exits,
 	// stdout closes, ingest.Copy ends cleanly, and Wait is what is left blocking.
+	//
+	// The main body must not exit until the holder has actually LEFT its process
+	// group. Exiting ends stdout, which is what makes the daemon kill the group —
+	// correctly — and a holder that has not reached setsid() yet is still in it
+	// and dies with it: no pid file, and nothing left holding stderr. The holder
+	// writes its pid only after setsid (it is the setsid'd shell writing $$), and
+	// renames it into place so no reader sees a partial write, so "the file
+	// exists" means "the holder is out". On an idle machine the holder nearly
+	// always won that race; on a loaded CI runner running every package in
+	// parallel it lost, and the test failed with "never recorded its worker pid".
 	script := "#!/bin/sh\n" +
-		"setsid sh -c 'echo $$ > " + pidPath + "; sleep 120' >/dev/null &\n" +
+		"(sleep 0.3; setsid sh -c 'echo $$ > " + pidPath + ".tmp && mv " + pidPath + ".tmp " + pidPath + "; sleep 120') >/dev/null &\n" +
+		"i=0; while [ ! -s " + pidPath + " ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done\n" +
 		"cat " + payloadPath + "\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
