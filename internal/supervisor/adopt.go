@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,6 +47,7 @@ type adoptedProcess struct {
 	kill   func(pid int)
 	done   chan struct{}
 	closer func()
+	once   sync.Once
 }
 
 func (p *adoptedProcess) Pid() int { return p.pid }
@@ -74,6 +76,20 @@ func (p *adoptedProcess) Kill() {
 		p.closer()
 	}
 	p.kill(p.pid)
+}
+
+// stopWatching ends the liveness poll without touching the encoder, for a
+// DETACH: the daemon is going away and leaving this process running for the next
+// one to adopt, so there is nobody left for the poller to report to. Without it
+// the goroutine keeps waking once a second for as long as that encoder lives —
+// one per adopted stream, all of them outliving the supervision they belonged
+// to. Wait then reports the same nil it always does, which is all it ever had to
+// say about a process that is not ours.
+//
+// A STOP is different and must not use this: there the encoder is killed, and
+// the poll is the only evidence that it really went.
+func (p *adoptedProcess) stopWatching() {
+	p.once.Do(func() { close(p.done) })
 }
 
 // readPID reads a pid file, or 0.

@@ -690,10 +690,15 @@ func (st *stream) run(ctx context.Context) {
 
 		if ctx.Err() != nil {
 			// We ended it (Release / shutdown), not a fault. A stop ends the
-			// encoder with it; a detach leaves it for the next daemon to adopt.
+			// encoder with it; a detach leaves it for the next daemon to adopt,
+			// and stops watching it — an adopted encoder is watched by a
+			// goroutine polling its liveness, which would otherwise outlive the
+			// supervision it belonged to.
 			if st.killOnExit.Load() {
 				proc.Kill()
 				proc.Wait()
+			} else {
+				stopWatching(proc)
 			}
 			return
 		}
@@ -1186,6 +1191,11 @@ func (st *stream) awaitData(ctx context.Context, proc Process, exited chan error
 		if st.killOnExit.Load() {
 			proc.Kill()
 			<-exited
+		} else {
+			// A detach leaves the encoder running, so nothing here waits for it
+			// — but an adopted one is watched by a goroutine polling its
+			// liveness, and that goroutine has nobody to report to any more.
+			stopWatching(proc)
 		}
 		return false, ctx.Err()
 	}
@@ -1197,6 +1207,18 @@ func (st *stream) awaitData(ctx context.Context, proc Process, exited chan error
 			st.markStopped(werr)
 			if isUnsupportedExit(werr) {
 				return false, fmt.Errorf("%w (exited during startup: %v)", errUnsupported, werr)
+			}
+			if werr == nil {
+				// No error to report. One we launched exited cleanly without
+				// producing anything; an adopted survivor never had a status to
+				// give — its exit belongs to init, not to us — so its Wait
+				// always says nil. Either way "<nil>" is not an explanation, and
+				// an operator reading /monitor/<id> gets one sentence about this
+				// start and it had better be true.
+				if killOnTimeout {
+					return false, errors.New("exited during startup without producing anything")
+				}
+				return false, errors.New("the adopted encoder is gone")
 			}
 			return false, fmt.Errorf("exited during startup: %v", werr)
 		case <-ctx.Done():
@@ -1229,6 +1251,19 @@ func (st *stream) awaitData(ctx context.Context, proc Process, exited chan error
 // watch loop and the post-kill reap wait on this. Reading the channel directly
 // would let the first caller consume the only value and leave the second blocked
 // forever — which is precisely the deadlock this shape exists to prevent.
+// watchStopper is a Process whose WATCHER can be ended without ending the
+// process. Only an adopted encoder has one to end: it is watched by a goroutine
+// polling its liveness, where a child is watched by a blocking wait that costs
+// nothing. stopWatching is the detach path's way of saying so through the
+// Process interface, which deliberately knows nothing about either.
+type watchStopper interface{ stopWatching() }
+
+func stopWatching(p Process) {
+	if s, ok := p.(watchStopper); ok {
+		s.stopWatching()
+	}
+}
+
 type waitedProcess struct {
 	Process
 	wait chan error
@@ -1241,6 +1276,10 @@ type waitedProcess struct {
 func newWaitedProcess(p Process, wait chan error) *waitedProcess {
 	return &waitedProcess{Process: p, wait: wait, done: make(chan struct{})}
 }
+
+// stopWatching passes the detach through to the process underneath: the wrapper
+// exists to share one Wait, and it is that Wait's watcher being ended.
+func (w *waitedProcess) stopWatching() { stopWatching(w.Process) }
 
 func (w *waitedProcess) Wait() error {
 	w.once.Do(func() {
