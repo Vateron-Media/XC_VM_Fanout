@@ -2003,19 +2003,29 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// run and fanout_sync can close the lines_live row, instead of a ghost
 	// connection lingering on the stream the viewer already left.
 	rc := http.NewResponseController(w)
+	// written counts what has gone out through write(). Only this goroutine
+	// touches it, and the overlay window writes through the same closure, so
+	// differencing it across a window says whether anything reached the viewer.
+	var written int64
 	write := func(b []byte) error {
 		if err := rc.SetWriteDeadline(time.Now().Add(time.Duration(m.writeTimeout.Load()))); err != nil {
 			// Deadlines unsupported (shouldn't happen for a real conn) — fall back
 			// to a plain write rather than aborting the viewer.
 			n, werr := w.Write(b)
-			if cs != nil && n > 0 {
-				cs.bytes.Add(int64(n))
+			if n > 0 {
+				written += int64(n)
+				if cs != nil {
+					cs.bytes.Add(int64(n))
+				}
 			}
 			return werr
 		}
 		n, err := w.Write(b)
-		if cs != nil && n > 0 {
-			cs.bytes.Add(int64(n))
+		if n > 0 {
+			written += int64(n)
+			if cs != nil {
+				cs.bytes.Add(int64(n))
+			}
 		}
 		if err != nil {
 			return err
@@ -2100,13 +2110,23 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		if uuid != "" && m.signals.peek(uuid) {
 			if sig, ok := m.signals.take(uuid); ok {
 				dlog.Logf("signal", "id=%s uuid=%s applying overlay to live TS window", id, uuid)
+				before := written
 				next, alive := m.overlayTSWindow(st, cur, write, sig, codec)
 				if !alive {
 					reason = "client closed (during overlay)"
 					return
 				}
 				cur = next
-				resetIdle() // the overlay delivered a window of video, not silence
+				// Only if the window really delivered a span of video. It can
+				// deliver nothing and keep the viewer's cursor — a vc this ffmpeg
+				// build lacks, a colour drawtext rejects, an off-air stream with no
+				// video to burn the banner onto — and then the viewer has received
+				// nothing, which is precisely what the idle timer is there to
+				// notice. Resetting it anyway handed a ghost connection the whole
+				// window plus a fresh idle period for a banner nobody saw.
+				if written > before {
+					resetIdle()
+				}
 				continue
 			}
 		}
