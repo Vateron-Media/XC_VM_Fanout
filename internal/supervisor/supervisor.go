@@ -664,10 +664,20 @@ func (st *stream) run(ctx context.Context) {
 			// Exited on its own. A remuxer can only discover some sources are not
 			// servable once it is reading them (an HLS that turns fMP4 mid-life);
 			// it says so the same way it does at startup.
-			if isUnsupportedExit(proc.Wait()) && st.switchToFallback(src) {
+			werr := proc.Wait()
+			if isUnsupportedExit(werr) && st.switchToFallback(src) {
 				dlog.Logf("monitor", "id=%s source %q became unservable by its command; switching to its fallback", st.id, src.Label)
 				continue
 			}
+			// Why it ended is the first thing an operator asks, and the exit
+			// status is the only evidence there is of it. It used to be dropped:
+			// the state explained the restart only when the run had been too
+			// short to count as healthy.
+			why := "encoder exited"
+			if werr != nil {
+				why = fmt.Sprintf("encoder exited: %v", werr)
+			}
+			st.note(why, 0)
 			st.emit(EventStreamFailed, src.Label)
 			dlog.Logf("monitor", "id=%s process exited; restarting", st.id)
 
@@ -679,7 +689,7 @@ func (st *stream) run(ctx context.Context) {
 			// working backup sits unused. A run that LASTED is a source that
 			// works and merely ended; it keeps the stream where it is.
 			if ranFor < st.minHealthyRun() {
-				st.note(fmt.Sprintf("encoder exited after %s, before the start had proved itself", ranFor.Round(time.Second)), 0)
+				st.note(fmt.Sprintf("%s after %s, before the start had proved itself", why, ranFor.Round(time.Second)), 0)
 				st.advanceAfterFailure()
 				dlog.Logf("monitor", "id=%s exited after %s (short of %s); trying the next source",
 					st.id, ranFor.Round(time.Second), st.minHealthyRun())
@@ -1154,6 +1164,12 @@ func (st *stream) markStarted(p Process, label string) {
 func (st *stream) markConfirmed() {
 	st.mu.Lock()
 	st.confirmed = true
+	// The run of failed starts is over, so the tally the panel reads goes with
+	// it. Leaving it standing reported failures=N for a channel that had been up
+	// for days, and PHP writes "not running WITH failures" as stream_status=1
+	// (failed) — so every later restart gap of a stream that once stumbled on
+	// the way up was recorded as a failure rather than as a start in progress.
+	st.fails = 0
 	st.mu.Unlock()
 }
 
