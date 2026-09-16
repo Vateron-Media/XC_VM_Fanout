@@ -369,6 +369,10 @@ func nextBackoff(cur, ranFor time.Duration) time.Duration {
 	return cur
 }
 
+// killProcessGroup ends a whole process group. A var so a test can watch what
+// the puller asks the kernel to do with a child, and when.
+var killProcessGroup = func(pgid int) error { return syscall.Kill(-pgid, syscall.SIGKILL) }
+
 // ffmpegWaitDelay bounds how long cmd.Wait may spend after the child has been
 // told to go: long enough for an ffmpeg that is flushing on SIGKILL, short
 // enough that a wedged descendant costs one reconnect rather than the stream.
@@ -892,19 +896,29 @@ func runFfmpeg(ctx context.Context, src Source, raw string, stall time.Duration,
 	// source connection that nothing would ever close. Same shape as
 	// internal/supervisor's encoder launcher, for the same reason.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
-			if errors.Is(err, syscall.ESRCH) {
-				// The group is already gone — the ordinary case when the source
-				// ended and ffmpeg exited before our own cancel reached it.
-				// os/exec turns any other error from here into Wait's result, so
-				// say it the way it expects and keep a clean end clean.
-				return os.ErrProcessDone
+	// The group kill runs at most once, and its answer is remembered: os/exec
+	// reads what Cancel returns to decide whether it interrupted the command, so
+	// every caller has to be told the same thing.
+	var (
+		killOnce sync.Once
+		killErr  error
+	)
+	endGroup := func() error {
+		killOnce.Do(func() {
+			if err := killProcessGroup(cmd.Process.Pid); err != nil {
+				if errors.Is(err, syscall.ESRCH) {
+					// The group is already gone. os/exec turns any other error
+					// from here into Wait's result, so say it the way it expects
+					// and keep a clean end clean.
+					killErr = os.ErrProcessDone
+					return
+				}
+				killErr = cmd.Process.Kill()
 			}
-			return cmd.Process.Kill()
-		}
-		return nil
+		})
+		return killErr
 	}
+	cmd.Cancel = endGroup
 	// And a backstop for anything the group kill cannot reach. cmd.Stderr is a
 	// tailBuffer, not an *os.File, so os/exec makes its own pipe and a copy
 	// goroutine, and Wait blocks until every write end is closed — which a
@@ -936,6 +950,15 @@ func runFfmpeg(ctx context.Context, src Source, raw string, stall time.Duration,
 	defer stdoutBounded.Close()
 	copyErr := ingest.Copy(stdoutBounded, chunkSize, publish)
 	ccancel()
+	// End the group HERE rather than leaving it to os/exec. Cancel runs on
+	// os/exec's own goroutine, and Cmd.Wait reaps the pid before it ever waits
+	// for that goroutine — so on an ordinary clean end the kill landed after the
+	// reap, every time, and syscall.Kill(-pid) has none of os.Process.Kill's
+	// done guard to notice. Whatever owns that pid next is what it would signal.
+	// Nothing but this function reaps the child, so asking before Wait is what
+	// makes the pid ours at the moment we ask; os/exec's own call afterwards is
+	// a no-op that returns the same answer.
+	_ = endGroup()
 	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
 		return copyErr // we cancelled it (stream stop/shutdown) — not a fault
