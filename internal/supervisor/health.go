@@ -159,6 +159,16 @@ func (b *fpsBaseline) dropped(now time.Time, fps, threshold float64, frozenFor t
 	if b.peak <= 0 || threshold <= 0 {
 		return false
 	}
+	if fps < 0 {
+		// Not a measurement at all. internal/server derives the rate by
+		// subtracting the previous sample's counters from the hub's, and those
+		// restart at zero when a Stream is torn down and recreated under a
+		// supervised encoder — so the first reading after that goes backwards.
+		// No verdict comes out of arithmetic against counters that are gone,
+		// and the run of zeros starts again from the next honest reading.
+		b.zeroSince = time.Time{}
+		return false
+	}
 	if fps <= 0 {
 		// A rate of 0 means "could not measure" only until this encoder has
 		// shown one: no video PID, or a window too short to divide by. A peak

@@ -259,6 +259,35 @@ func TestOneEmptyFPSWindowIsNotAFreeze(t *testing.T) {
 	}
 }
 
+// TestANegativeFPSIsNeverAVerdict: internal/server derives the rate by
+// subtracting the previous sample's counters from the hub's current ones, and
+// those counters are per-Hub — they restart at zero when a Stream is torn down
+// and recreated while the supervisor still holds the old sample. The first rate
+// after that is negative, which is not a slow stream and not a stopped one: it
+// is arithmetic against counters that no longer exist. Reading it as "no frames"
+// restarts a healthy encoder on the strength of a bookkeeping artefact.
+func TestANegativeFPSIsNeverAVerdict(t *testing.T) {
+	h := Health{StallSec: 60, FPSThreshold: 0.5}
+	base := &fpsBaseline{}
+
+	at := t0.Add(time.Minute)
+	if got := h.check(at, t0, Vitals{FPS: 25, LastData: at}, base); got.failed() {
+		t.Fatalf("a healthy 25fps was condemned: %+v", got)
+	}
+	for _, after := range []time.Duration{5 * time.Second, 65 * time.Second, 10 * time.Minute} {
+		at := t0.Add(time.Minute + after)
+		if got := h.check(at, t0, Vitals{FPS: -1500, LastData: at}, base); got.failed() {
+			t.Fatalf("%s after the counters restarted: condemned on a negative rate: %+v", after, got)
+		}
+	}
+	// And the freeze run starts again from the first honest reading, rather than
+	// carrying the time spent on nonsense.
+	at = t0.Add(12 * time.Minute)
+	if got := h.check(at, t0, Vitals{FPS: 0, LastData: at}, base); got.failed() {
+		t.Fatalf("the first real zero after the reset condemned it: %+v", got)
+	}
+}
+
 // TestZeroHealthJudgesNothing: a spec that carries no Health supervises the
 // process and forms no opinion about its output. That is the safe default for a
 // stream whose panel settings have not been mapped over yet.
