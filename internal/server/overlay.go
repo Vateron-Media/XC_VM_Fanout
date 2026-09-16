@@ -300,7 +300,10 @@ func laterCursor(a, b tsjoin.Cursor) tsjoin.Cursor {
 // feed reached, so there is no gap or duplication across the window — and false
 // ONLY if the viewer connection broke (caller should stop serving). Overlay
 // disabled / ffmpeg failure returns (cur, true) so the caller simply continues
-// raw from where it was: a signal never breaks playback.
+// raw from where it was: a signal never breaks playback. That holds for an
+// ffmpeg that started and then died as much as for one that never started: if
+// nothing reached the viewer the ORIGINAL cursor comes back, however much of the
+// ring ffmpeg read before failing, because none of it was shown.
 //
 // The feed goroutine is the sole reader of the ring for the window and is joined
 // before returning, so the returned cursor is stable and it can never race the
@@ -423,6 +426,7 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 	}()
 
 	ok := true
+	var delivered int64
 	buf := make([]byte, 32*1024)
 	for {
 		n, rerr := stdout.Read(buf)
@@ -442,6 +446,7 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 				cancel()
 				break
 			}
+			delivered += int64(n)
 		}
 		if rerr != nil {
 			break
@@ -453,6 +458,16 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 		// ctx.Err() != nil means our own deadline/kill ended the window (expected);
 		// anything else is a real overlay ffmpeg failure worth surfacing.
 		dlog.Logf("signal", "overlay TS window: ffmpeg exited (%v): %s", err, strings.TrimSpace(errBuf.String()))
+	}
+	if delivered == 0 {
+		// ffmpeg never produced a byte: a codec this build lacks, a colour
+		// drawtext rejects, a filter that would not parse. It had still READ
+		// (probed) whatever the feed pushed at it, so endCur points past bytes
+		// the viewer was never shown — resuming there cut seconds out of its
+		// stream for a banner it never saw. Nothing was delivered, so the window
+		// never happened: carry on raw from exactly where the viewer was.
+		dlog.Logf("signal", "overlay TS window: ffmpeg produced no output, resuming raw from the viewer's own cursor")
+		return cur, ok
 	}
 	return endCur, ok
 }
