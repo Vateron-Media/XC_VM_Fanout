@@ -154,7 +154,7 @@ end-to-end Docker bench in [`test/`](test/) are documented in
 The version number lives in the **`VERSION`** file — the single source of truth:
 
 ```bash
-echo 0.13.4 > VERSION                                # bump
+echo 0.13.5 > VERSION                                # bump
 ./release.sh                                         # test + build dist/* + SHA256SUMS
 git commit -am "release $(cat VERSION)" || true     # skip if VERSION is already committed
 git tag "$(cat VERSION)" && git push --tags         # the tag push triggers the release
