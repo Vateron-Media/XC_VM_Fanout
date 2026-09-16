@@ -335,6 +335,16 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 		return adoptHLS(ctx, final, opt, head, body)
 	}
 	_ = body.Close()
+	if n == 0 {
+		// 200 and then not one byte is a source that is DOWN, not a source in
+		// another container: an origin blip, a backend restart, an account
+		// momentarily over its connection limit. ErrFormat is what moves a
+		// stream onto its ffmpeg fallback for the life of its spec (remux exits
+		// ExitUnsupported and the supervisor's fallback is sticky), and its own
+		// contract says that must never happen for a source that is merely down.
+		// With nothing to classify, there is nothing to refuse on.
+		return nil, fmt.Errorf("%w: %s: empty body", ErrUnsupportedSource, redact(final))
+	}
 	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redact(final))
 }
 
