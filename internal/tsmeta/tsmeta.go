@@ -91,47 +91,68 @@ type esInfo struct {
 	descriptors []byte
 }
 
-// parsePMTPID extracts the first program's PMT PID from a PAT packet.
-func parsePMTPID(pkt []byte) int {
+// sectionOf returns a PSI section's bytes from a payload-unit-start packet,
+// past the pointer_field, or nil when the packet cannot hold one.
+func sectionOf(pkt []byte) []byte {
 	ps := payloadOffset(pkt)
 	if ps < 0 || ps >= len(pkt) {
+		return nil
+	}
+	ps += 1 + int(pkt[ps]) // pointer_field, itself wire-supplied
+	if ps >= len(pkt) {
+		return nil
+	}
+	return pkt[ps:]
+}
+
+// sectionEnd is where a section's content stops. section_length counts the bytes
+// after the length field, the last four of which are the CRC-32 — and a real
+// table is followed by that checksum and then 0xFF stuffing, not by the zeroes a
+// hand-built fixture leaves. A loop that runs to the end of the packet instead
+// reads the first CRC byte as table content.
+func sectionEnd(sec []byte) int {
+	end := 3 + (int(sec[1]&0x0f)<<8 | int(sec[2])) - 4
+	if end > len(sec) {
+		end = len(sec)
+	}
+	return end
+}
+
+// parsePMTPID extracts the first program's PMT PID from a PAT packet.
+func parsePMTPID(pkt []byte) int {
+	sec := sectionOf(pkt)
+	if len(sec) < 12 || sec[0] != 0x00 { // table_id: PAT
 		return -1
 	}
-	p := ps + 1 + int(pkt[ps]) // skip pointer_field
-	prog := p + 8              // past the section header
-	for prog+4 <= len(pkt) {
-		programNumber := (int(pkt[prog]) << 8) | int(pkt[prog+1])
-		pid := ((int(pkt[prog+2]) & 0x1f) << 8) | int(pkt[prog+3])
-		if programNumber != 0 {
+	end := sectionEnd(sec)
+	for prog := 8; prog+4 <= end; prog += 4 { // 8: past the section header
+		programNumber := (int(sec[prog]) << 8) | int(sec[prog+1])
+		pid := ((int(sec[prog+2]) & 0x1f) << 8) | int(sec[prog+3])
+		if programNumber != 0 { // program_number 0 is the NIT, not a program
 			return pid
 		}
-		prog += 4
 	}
 	return -1
 }
 
 // parseES walks a PMT's elementary-stream loop.
 func parseES(pkt []byte) []esInfo {
-	ps := payloadOffset(pkt)
-	if ps < 0 || ps >= len(pkt) {
+	sec := sectionOf(pkt)
+	if len(sec) < 12 || sec[0] != 0x02 { // table_id: PMT
 		return nil
 	}
-	p := ps + 1 + int(pkt[ps])
-	if p+12 > len(pkt) {
-		return nil
-	}
-	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
-	es := p + 12 + pil
+	end := sectionEnd(sec)
+	pil := ((int(sec[10]) & 0x0f) << 8) | int(sec[11]) // program_info_length
 
 	var out []esInfo
-	for es+5 <= len(pkt) {
-		infoLen := ((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4])
+	for es := 12 + pil; es+5 <= end; {
+		infoLen := ((int(sec[es+3]) & 0x0f) << 8) | int(sec[es+4])
 		e := esInfo{
-			streamType: pkt[es],
-			pid:        ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2]),
+			streamType: sec[es],
+			pid:        ((int(sec[es+1]) & 0x1f) << 8) | int(sec[es+2]),
 		}
-		if start := es + 5; start+infoLen <= len(pkt) {
-			e.descriptors = pkt[start : start+infoLen]
+		if start := es + 5; start+infoLen <= end {
+			e.descriptors = sec[start : start+infoLen]
 		}
 		// A stream_type of 0 is the padding a fixture or a short section leaves
 		// behind, not a real stream.
