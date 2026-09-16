@@ -85,6 +85,13 @@ type Stream struct {
 
 	ingestLn   net.Listener // non-nil = push-fed: the producer (ffmpeg tee) connects here
 	ingestSock string       // path of the ingest listener socket (for cleanup)
+	// ingestStat identifies the socket FILE this listener created, so the
+	// teardown unlinks that one and not whatever now answers to the same name.
+	// Unregister removes the stream from the registry before tearing it down, so
+	// a registration racing it can bind <id>.sock on a fresh Stream in between —
+	// and a blind os.Remove here unlinked the live stream's socket, leaving a
+	// channel that the panel is told is listening and no producer can reach.
+	ingestStat os.FileInfo
 
 	// ingestConns are the producer connections accepted on ingestLn. Tracked so a
 	// teardown can close them: closing the listener alone leaves an already-connected
@@ -354,11 +361,20 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 		return err
 	}
 	_ = os.Chmod(sockPath, 0o660)
+	// Close() unlinks the socket path by name, which is not the same thing as
+	// unlinking the socket this listener made: a registration racing a teardown
+	// re-binds <id>.sock on a fresh Stream, and the doomed listener's Close then
+	// took the live one's file away. stopIngestLocked does the unlink instead,
+	// and only for a file it can still identify as its own.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
 	if chunk > 0 {
 		s.chunk = chunk
 	}
 	s.ingestLn = ln
 	s.ingestSock = sockPath
+	s.ingestStat, _ = os.Stat(sockPath) // whose socket file this is; see stopIngestLocked
 	ch := s.chunk
 	s.ingestMu.Lock()
 	s.ingestGen++
@@ -436,9 +452,31 @@ func (s *Stream) stopIngestLocked() {
 		dlog.Logf("ingest", "id=%s closed %d in-flight producer connection(s)", s.id, n)
 	}
 	if s.ingestSock != "" {
-		_ = os.Remove(s.ingestSock)
-		s.ingestSock = ""
+		if s.ownsIngestSock() {
+			_ = os.Remove(s.ingestSock)
+		} else {
+			dlog.Logf("ingest", "id=%s leaving %s alone: it belongs to a newer listener", s.id, s.ingestSock)
+		}
+		s.ingestSock, s.ingestStat = "", nil
 	}
+}
+
+// ownsIngestSock reports whether the file at s.ingestSock is still the one this
+// stream's listener created. Unregister removes the stream from the registry
+// before tearing it down, so a PUT /ingest for the same id can land in that gap,
+// get a fresh Stream and re-bind <id>.sock; unlinking it blindly took the LIVE
+// stream's socket away, and since that stream stays in the registry with
+// ingestLn set, every later registration short-circuits on "already listening"
+// and hands the panel a path no producer can reach. Caller holds s.mu.
+//
+// A path we never managed to stat is removed as before: a socket left behind
+// would block the next listener, and that is the failure this trades against.
+func (s *Stream) ownsIngestSock() bool {
+	if s.ingestStat == nil {
+		return true
+	}
+	fi, err := os.Stat(s.ingestSock)
+	return err == nil && os.SameFile(fi, s.ingestStat)
 }
 
 // Publish feeds one packet-aligned chunk into the fan-out (which also folds it
