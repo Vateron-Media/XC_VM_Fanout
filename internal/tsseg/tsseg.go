@@ -94,6 +94,16 @@ const (
 	// segmentable source to ffmpeg for good. One second per gap still lets a
 	// source that is genuinely delivering video without keyframes reach the
 	// limit, and costs a silent one almost nothing.
+	//
+	// The consequence is worth stating plainly: for a source that arrives in
+	// bursts, MaxNoKeyframe is now counted in DELIVERIES rather than in
+	// seconds. A native HLS pull with a ten-second upstream target duration
+	// charges about one second per segment, so the default limit (3×hls_time +
+	// 6s = 36s at hls_time=10) is reached after ~36 upstream segments — six
+	// minutes of wall clock, not thirty-six seconds. That is the point: the old
+	// behaviour reached it in one silence and moved a segmentable source to
+	// ffmpeg for good. A source genuinely delivering video with no keyframes
+	// still trips it at the old speed, because its packets never stop.
 	deliveryStep = time.Second
 
 	writeBuf = 64 << 10
