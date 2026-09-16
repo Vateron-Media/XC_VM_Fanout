@@ -444,17 +444,25 @@ func (s *Stream) setConfig(src puller.Source, chunk int) {
 		s.chunk = chunk
 	}
 	dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, src.URLs, src.Proxy, s.refs)
-	if s.refs > 0 {
-		// A running puller holds the Source it started with, so an edit made in
-		// the panel (a new URL, a changed user agent) reached a watched channel
-		// only after its audience had been gone for the whole grace period —
-		// never, on a busy one. Restart it when the source really changed; the
-		// panel re-registers on every request, so an identical config must not.
-		if changed && s.running {
-			dlog.Logf("ctl", "id=%s source changed while running: restarting the puller", s.id)
-			s.stopLocked()
-		}
+	// A running puller holds the Source it started with, so an edit made in the
+	// panel (a new URL, a changed user agent) only reaches it through a restart —
+	// and whether the audience happens to be holding a ref is beside the point.
+	// HLS holds none (a playlist or segment request only stamps lastAccess), so a
+	// channel watched over HLS alone runs with refs==0, and a TS channel runs
+	// with refs==0 for the whole grace window after its last viewer leaves. An
+	// edit landing in either of those used to be lost for good: startLocked is a
+	// no-op while running, so no later touch/attach picked it up, and the HLS
+	// polls kept lastAccess fresh so the reaper never idle-stopped the stream
+	// that would have. Restart whenever the source really changed under a running
+	// puller; the panel re-registers on every request, so an identical config
+	// must not.
+	switch {
+	case changed && s.running:
+		dlog.Logf("ctl", "id=%s source changed while running: restarting the puller", s.id)
+		s.stopLocked()
 		s.startLocked()
+	case s.refs > 0:
+		s.startLocked() // viewers are already waiting on a stream that was not pulling
 	}
 }
 
