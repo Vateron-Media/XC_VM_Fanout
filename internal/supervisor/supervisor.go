@@ -567,6 +567,12 @@ func (st *stream) run(ctx context.Context) {
 	defer close(st.done)
 
 	consecutiveFails := 0
+	// shortRuns counts the encoders that came up and were gone again before the
+	// start had proved itself. Each one moves the stream to the next source, so
+	// the count also says how far round the list the flap has been — which is
+	// what stop_failures needs to mean for a stream that half-works: see the
+	// give-up below.
+	shortRuns := 0
 	first := true
 
 	for ctx.Err() == nil {
@@ -706,9 +712,33 @@ func (st *stream) run(ctx context.Context) {
 			// works and merely ended; it keeps the stream where it is.
 			if ranFor < st.minHealthyRun() {
 				st.note(fmt.Sprintf("%s after %s, before the start had proved itself", why, ranFor.Round(time.Second)), 0)
+				shortRuns++
 				st.advanceAfterFailure()
 				dlog.Logf("monitor", "id=%s exited after %s (short of %s); trying the next source",
 					st.id, ranFor.Round(time.Second), st.minHealthyRun())
+
+				// stop_failures is the operator's "stop trying", and a stream
+				// where every source in turn accepts the connection, delivers a
+				// few seconds and drops never reached it: only a start that
+				// produced nothing at all was counted, so the walk went round
+				// and round for ever with GaveUp false whatever the limit said.
+				// It counts here too — but only once the flap has been round the
+				// WHOLE list (each short run moves to the next source, so the
+				// tally says how far it has got), because a stream still looking
+				// for a source that lasts is not flapping yet. Never for a
+				// single source: there is nothing to switch to, and a few
+				// seconds of picture every so often beats none at all.
+				pol, n := st.policy(), st.sourceCount()
+				if pol.StopFailures > 0 && n > 1 && shortRuns >= pol.StopFailures && shortRuns >= n {
+					st.note(fmt.Sprintf("no source lasted %s in %d attempts", st.minHealthyRun(), shortRuns), shortRuns)
+					dlog.Logf("monitor", "id=%s no source lasted %s in %d attempts; giving up",
+						st.id, st.minHealthyRun(), shortRuns)
+					st.giveUp()
+					return
+				}
+			} else {
+				// A start that lasted: the flap tally is about a RUN of them.
+				shortRuns = 0
 			}
 		}
 
@@ -1302,6 +1332,12 @@ func (st *stream) sourceAt(idx int) (Source, bool) {
 		return Source{}, false
 	}
 	return st.spec.Sources[idx], true
+}
+
+func (st *stream) sourceCount() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return len(st.spec.Sources)
 }
 
 func (st *stream) sourceIndex() int {
