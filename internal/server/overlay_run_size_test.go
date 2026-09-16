@@ -65,7 +65,7 @@ func TestOverlayTSWindowFeedsRunsSizedForTheStream(t *testing.T) {
 	st := mgr.GetOrCreate("ov")
 	fillSlowRing(st, 4, 10) // ~1 MB over 30s of stream: ~256 kbit/s
 
-	if got, ceiling := mgr.runBytes(st), joinRunBytes; got >= ceiling {
+	if got, ceiling := mgr.runBytes(st, time.Now()), joinRunBytes; got >= ceiling {
 		t.Fatalf("this stream sizes a run at %d bytes, not below the %d ceiling — the fixture no "+
 			"longer distinguishes the two", got, ceiling)
 	}

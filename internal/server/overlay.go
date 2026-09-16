@@ -442,7 +442,7 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 	// so the feed blocked inside its very first run: the whole pin held, and the
 	// cursor (which only advances on a run written in full) never moved, so the
 	// raw fan-out resumed where the window began and re-sent it.
-	runMax := m.runBytes(st)
+	runMax := m.runBytes(st, time.Now())
 	stopFeed := make(chan struct{})
 	feedDone := make(chan struct{})
 	endCur := cur
