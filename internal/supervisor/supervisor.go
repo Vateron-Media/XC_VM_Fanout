@@ -343,7 +343,11 @@ type stream struct {
 
 	// srcIdx is the source the next start uses; forced is a queued switch from
 	// ForceSource (-1 = none); backupCheckedAt paces the priority-backup probe.
+	// srcTried is how far the current run of failed starts has walked the source
+	// list, so one pass tries every source before the policy picks where the
+	// next pass begins (see advanceAfterFailure).
 	srcIdx          int
+	srcTried        int
 	forced          int
 	backupCheckedAt time.Time
 
@@ -587,6 +591,7 @@ func (st *stream) run(ctx context.Context) {
 		}
 
 		consecutiveFails = 0
+		st.beginSourceWalk() // this source starts: the failure pass is over
 		st.markConfirmed()
 		if first {
 			st.emit(EventStreamStart, src.Label)

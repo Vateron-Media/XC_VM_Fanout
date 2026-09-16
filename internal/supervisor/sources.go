@@ -31,14 +31,17 @@ const probeTimeout = 15 * time.Second
 // implementation to keep in step.
 type Prober func(ctx context.Context, cmd string) bool
 
-// selectNextOnFailure returns the source index to try after a failed start.
+// selectNextOnFailure returns the source index a new failure PASS starts at —
+// where the list is picked up again once every source has been tried once (see
+// advanceAfterFailure, which walks the list within a pass).
 //
 // It mirrors StreamProcess::rotateSourcesPastCurrent, which decides the same
 // thing on the PHP side and whose two modes are the whole of the policy:
 //
-//   - priority backup ON: the list stays in priority order, so a retry starts
-//     again from the top. The highest-priority source is always preferred, and
-//     backupSwitch below is what brings the stream back to it later.
+//   - priority backup ON: the list stays in priority order, so the next pass
+//     starts again from the top. The highest-priority source is always
+//     preferred, and backupSwitch below is what brings the stream back to it
+//     later.
 //   - priority backup OFF: rotate past the current one, so a retry moves on to
 //     the next source instead of hammering the one that just failed.
 func selectNextOnFailure(cur, n int, priorityBackup bool) int {
@@ -109,20 +112,53 @@ func (st *stream) takeForced() int {
 	return idx
 }
 
-// switchTo moves the stream onto a different source for its next start.
+// switchTo moves the stream onto a different source for its next start. The
+// choice was made deliberately (an operator's force, a priority switch), so it
+// also begins a fresh failure pass from there.
 func (st *stream) switchTo(idx int) {
 	st.mu.Lock()
 	if idx >= 0 && idx < len(st.spec.Sources) {
 		st.srcIdx = idx
+		st.srcTried = 0
 	}
 	st.mu.Unlock()
 }
 
+// beginSourceWalk forgets how far the current failure pass had walked, so the
+// next failed start begins a new one. Called when a start worked: the list is
+// only walked to get OFF a source that will not start.
+func (st *stream) beginSourceWalk() {
+	st.mu.Lock()
+	st.srcTried = 0
+	st.mu.Unlock()
+}
+
 // advanceAfterFailure picks the source the next start attempt should use.
+//
+// One failed start does not end the list: a pass tries every source once before
+// selectNextOnFailure decides where the next pass begins. The walk is what makes
+// failover happen at all with priority backup on — that policy answers "the top"
+// for every failure, so without it the same dead source is relaunched forever
+// and the backup is never tried. PHP reached the backup a different way: its
+// startStream probed each source in turn inside ONE start attempt, and the list
+// order (which is all rotateSourcesPastCurrent decides) only chose where that
+// walk began.
 func (st *stream) advanceAfterFailure() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.srcIdx = selectNextOnFailure(st.srcIdx, len(st.spec.Sources), st.spec.Policy.PriorityBackupSec > 0)
+	n := len(st.spec.Sources)
+	if n <= 1 {
+		st.srcIdx = 0
+		return
+	}
+	st.srcTried++
+	if st.srcTried >= n {
+		// Every source has now failed once: hand the choice back to the policy.
+		st.srcTried = 0
+		st.srcIdx = selectNextOnFailure(st.srcIdx, n, st.spec.Policy.PriorityBackupSec > 0)
+		return
+	}
+	st.srcIdx = (st.srcIdx + 1) % n
 }
 
 // dueForBackupCheck reports whether it is time to look for a higher-priority
