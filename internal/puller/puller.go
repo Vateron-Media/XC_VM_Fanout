@@ -251,9 +251,9 @@ func ffmpegStallBound(hls bool) time.Duration {
 //   - the content-type we were actually served, for the very common playlist
 //     under an arbitrary path extension (nativesrc.AdoptHTTP classifies by
 //     content-type and by sniffing, never by extension);
-//   - the native reader's own refusal, which names an HLS source when it
-//     declines one for being encrypted or fMP4 — and those refusals are
-//     precisely why the ffmpeg fallback gets HLS sources at all.
+//   - the native reader's own refusal, which names an HLS source whenever it
+//     declines one — and those refusals are precisely why the ffmpeg fallback
+//     gets HLS sources at all.
 //
 // Guessing from the URL text alone gave an extensionless HLS source the 8s
 // continuous bound and killed it between two healthy segments.
@@ -264,7 +264,36 @@ func isHLSSource(raw string, resp *http.Response, refusal error) bool {
 	if resp != nil && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "mpegurl") {
 		return true
 	}
-	return errors.Is(refusal, nativesrc.ErrHLSIsFMP4) || errors.Is(refusal, nativesrc.ErrHLSEncrypted)
+	return isHLSRefusal(refusal)
+}
+
+// hlsRefusals are every sentinel nativesrc.servable() can refuse a playlist
+// with. They are listed in one place because the list is the contract: each one
+// means "this IS an HLS source, just not one I will serve", so each one has to
+// earn the segment-at-a-time stall bound on the fallback. Two of the four were
+// added to nativesrc after the classifier was written and nobody came back
+// here, so a byte-range or packed-audio source under an extensionless path was
+// still given the 8s continuous bound.
+var hlsRefusals = []error{
+	nativesrc.ErrHLSIsFMP4,
+	nativesrc.ErrHLSEncrypted,
+	nativesrc.ErrHLSByteRange,
+	nativesrc.ErrHLSNotTS,
+}
+
+// isHLSRefusal reports whether err is the native reader declining an HLS source
+// for what it IS. hls.go wraps these before closing the pipe with them, so the
+// test has to be errors.Is, never equality.
+func isHLSRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, s := range hlsRefusals {
+		if errors.Is(err, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // pullOnce tries each URL once: mp2t is streamed directly, anything else goes
@@ -567,9 +596,10 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 	}
 	src.reportPath(PathFfmpegBack)
 	dlog.Logf("puller", "id=%s native declined (%v); falling back to ffmpeg: %s", src.Label, err, redact.URL(raw))
-	// The refusal itself is a classification: ErrHLSEncrypted and ErrHLSIsFMP4
-	// say "this IS an HLS source, just not one I will serve", which is the case
-	// the ffmpeg fallback exists for and the case that needs the wider bound.
+	// The refusal itself is a classification: every one of nativesrc's HLS
+	// refusals says "this IS an HLS source, just not one I will serve", which is
+	// the case the ffmpeg fallback exists for and the case that needs the wider
+	// bound. See hlsRefusals.
 	return runFfmpeg(ctx, src, raw, ffmpegStallBound(isHLSSource(raw, resp, err)), chunkSize, publish)
 }
 

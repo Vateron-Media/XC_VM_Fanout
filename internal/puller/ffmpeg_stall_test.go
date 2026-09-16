@@ -122,7 +122,19 @@ func TestFfmpegStallBoundClassification(t *testing.T) {
 		{"x-mpegurl content-type", "http://h/play/abc123", withCT("application/x-mpegURL"), nil, true},
 		{"encrypted-hls refusal", "http://h/play/abc123", nil, nativesrc.ErrHLSEncrypted, true},
 		{"fmp4-hls refusal", "http://h/play/abc123", nil, nativesrc.ErrHLSIsFMP4, true},
+		// nativesrc.servable() refuses an HLS playlist for FOUR reasons, and
+		// every one of them says "this IS an HLS source, just not one I will
+		// serve" — so every one of them must earn the segment-at-a-time bound.
+		// A byte-range or packed-audio source served under an extensionless
+		// path matched none of the other two signals, got the 8s continuous
+		// bound, and had its ffmpeg killed between two healthy segments.
+		{"byte-range-hls refusal", "http://h/play/abc123", nil, nativesrc.ErrHLSByteRange, true},
+		{"packed-audio-hls refusal", "http://h/play/abc123", nil, nativesrc.ErrHLSNotTS, true},
 		{"wrapped hls refusal", "http://h/play/abc123", nil, fmt.Errorf("native declined: %w", nativesrc.ErrHLSEncrypted), true},
+		// The mid-pull shapes: hls.go wraps its refusals before closing the
+		// pipe with them, so the classifier only ever sees them wrapped.
+		{"wrapped byte-range refusal", "http://h/play/abc123", nil, fmt.Errorf("hls pull: playlist changed: %w", nativesrc.ErrHLSByteRange), true},
+		{"wrapped packed-audio refusal", "http://h/play/abc123", nil, fmt.Errorf("hls pull: %w", nativesrc.ErrHLSNotTS), true},
 		{"continuous mp2t", "http://h/live.ts", withCT("video/mp2t"), nil, false},
 		{"continuous, no hint at all", "http://h/live", nil, nil, false},
 		{"udp", "udp://239.0.0.1:1234", nil, nil, false},
