@@ -1256,13 +1256,6 @@ func (st *stream) awaitData(ctx context.Context, proc Process, exited chan error
 	}
 }
 
-// waitedProcess adapts a process whose Wait is already in flight (started during
-// the confirmation window) so later callers can still wait on it.
-//
-// The result is latched: the channel carries exactly one value, and both the
-// watch loop and the post-kill reap wait on this. Reading the channel directly
-// would let the first caller consume the only value and leave the second blocked
-// forever — which is precisely the deadlock this shape exists to prevent.
 // watchStopper is a Process whose WATCHER can be ended without ending the
 // process. Only an adopted encoder has one to end: it is watched by a goroutine
 // polling its liveness, where a child is watched by a blocking wait that costs
@@ -1276,6 +1269,13 @@ func stopWatching(p Process) {
 	}
 }
 
+// waitedProcess adapts a process whose Wait is already in flight (started during
+// the confirmation window) so later callers can still wait on it.
+//
+// The result is latched: the channel carries exactly one value, and both the
+// watch loop and the post-kill reap wait on this. Reading the channel directly
+// would let the first caller consume the only value and leave the second blocked
+// forever — which is precisely the deadlock this shape exists to prevent.
 type waitedProcess struct {
 	Process
 	wait chan error
