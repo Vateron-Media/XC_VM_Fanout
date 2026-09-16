@@ -131,9 +131,12 @@ stops the puller under the usual idle rule. More on the endpoint itself —
 
 ## Daemon shutdown
 
-The daemon catches `SIGINT`/`SIGTERM` and performs a **graceful shutdown**: it closes both
-HTTP servers with a 2-second timeout and removes the socket files. The external keepalive of
-the XC_VM service restarts the process if needed.
+The daemon catches `SIGINT`/`SIGTERM` and performs a **graceful shutdown**, in the one order
+that cannot orphan an encoder: the **control** surface first, then encoder supervision is
+detached (the encoders are left running for the next daemon to adopt), then the **client**
+surface. Each surface gets its own 2-second drain — the control API empties in milliseconds,
+while the client one is holding live viewers — so the worst case is 4 seconds. The socket files
+are removed last. The external keepalive of the XC_VM service restarts the process if needed.
 
 ## Restart and state recovery
 
