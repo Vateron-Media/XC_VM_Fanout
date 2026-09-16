@@ -706,6 +706,26 @@ func runFfmpeg(ctx context.Context, src Source, raw string, stall time.Duration,
 		// too broken to be one is dropped here rather than passed on: Run has
 		// already refused to start with it, so this can only be a direct caller.
 		if pu, err := proxyURL(src.Proxy); err == nil && pu != nil {
+			// libavformat's http protocol uses -http_proxy ONLY when the value
+			// starts with "http://" (use_proxy = av_strstart(proxy_path,
+			// "http://", NULL)) and drops anything else without a word — no
+			// warning, no non-zero exit, just a direct connection to the
+			// origin. Measured with n7.1.5: `-http_proxy https://127.0.0.1:9`
+			// produces byte-for-byte the same failure as passing no proxy at
+			// all, while `http://127.0.0.1:9` dials the proxy.
+			//
+			// So an https or socks5 proxy — both of which Go's transport
+			// honours, so the probe and the native reader go through it — would
+			// be BYPASSED here and the source pulled from the node's own IP.
+			// That is the one outcome a proxy is configured to prevent, and it
+			// is the hazard nativesrc refuses a fetch over rather than connect
+			// direct. Refuse the same way, naming the value: a stream that
+			// fails loudly can be fixed, a stream that quietly leaves the proxy
+			// cannot even be noticed.
+			if pu.Scheme != "http" {
+				return fmt.Errorf("proxy %q: ffmpeg honours only an http:// proxy, and would pull %s direct instead",
+					proxyForLog(src.Proxy), redact.URL(raw))
+			}
 			args = append(args, "-http_proxy", pu.String())
 		}
 	}
