@@ -1863,8 +1863,15 @@ func (m *Manager) runBytes(st *Stream, now time.Time) int {
 	if timeoutMS <= 0 {
 		return joinRunBytes
 	}
-	if ringBytes, spanMS, _ := st.Hub.RingStats(); ringBytes > 0 && spanMS > 0 {
-		return clampRunBytes(int64(ringBytes) * timeoutMS / (2 * spanMS))
+	// RingStats sums the bytes of all n blocks but spans only the n-1 intervals
+	// between their start times: the newest block's own duration is not in it.
+	// Dividing n blocks of bytes by n-1 blocks of time reads the source as
+	// n/(n-1) times faster than it is — twice as fast on a two-block ring — so
+	// scale the bytes to the blocks the span actually covers. Without this a
+	// short ring (one just refilled after an idle-stop, a zap onto a gated
+	// channel, a source with long GOPs) spent the promised factor of two.
+	if ringBytes, spanMS, gops := st.Hub.RingStats(); ringBytes > 0 && spanMS > 0 && gops > 1 {
+		return clampRunBytes(int64(ringBytes) * int64(gops-1) * timeoutMS / (int64(gops) * 2 * spanMS))
 	}
 	if bps, ok := st.publishRate(now); ok {
 		return clampRunBytes(bps * timeoutMS / 2000)
