@@ -59,6 +59,11 @@ type signalStore struct {
 	n  atomic.Int64 // == len(m); read on the live-TS hot path without the lock
 	mu sync.Mutex
 	m  map[string]pendingSignal
+	// nextExpiry is the earliest moment at which any queued signal CAN expire,
+	// or the zero time when none of them ever will. It is a lower bound, never
+	// an exact one: removing an entry may leave it earlier than the true
+	// minimum, which only costs an extra sweep. Guarded by mu.
+	nextExpiry time.Time
 }
 
 func newSignalStore() *signalStore { return &signalStore{m: make(map[string]pendingSignal)} }
@@ -73,12 +78,15 @@ func (s *signalStore) set(uuid string, sig pendingSignal) {
 	s.sweepLocked(time.Now())
 	sig.uuid = uuid
 	s.m[uuid] = sig
+	if !sig.expires.IsZero() && (s.nextExpiry.IsZero() || sig.expires.Before(s.nextExpiry)) {
+		s.nextExpiry = sig.expires
+	}
 	s.n.Store(int64(len(s.m)))
 	s.mu.Unlock()
 }
 
-// sweepLocked drops every expired entry and re-syncs the atomic count. Callers
-// hold mu.
+// sweepLocked drops every expired entry, re-syncs the atomic count and
+// recomputes nextExpiry. Callers hold mu.
 //
 // A signal is addressed to one viewer, and that viewer may never come back to
 // collect it: the admin messages a uuid that has already disconnected, an HLS
@@ -87,15 +95,30 @@ func (s *signalStore) set(uuid string, sig pendingSignal) {
 // of the process, and while n stayed above zero every live-TS viewer on the node
 // took the mutex below on every chunk it was delivered — the whole point of the
 // atomic count, lost to one ordinary admin action. Sweeping is cheap: signals
-// are a manual action, so the map holds a handful of entries at most, and this
-// only ever runs when a signal is queued or when a lookup already missed.
+// are a manual action, so the map holds a handful of entries at most — but it is
+// still a full scan, so it runs only when a signal is queued or when a lookup
+// missed AND nextExpiry says something can actually have gone.
 func (s *signalStore) sweepLocked(now time.Time) {
+	var next time.Time
 	for u, sig := range s.m {
-		if !sig.expires.IsZero() && now.After(sig.expires) {
+		if sig.expires.IsZero() {
+			continue // never expires; it can only be taken
+		}
+		if now.After(sig.expires) {
 			delete(s.m, u)
+			continue
+		}
+		if next.IsZero() || sig.expires.Before(next) {
+			next = sig.expires
 		}
 	}
-	s.n.Store(int64(len(s.m)))
+	s.nextExpiry = next
+	// Only write when the count really moved. This atomic is what the lock-free
+	// fast path loads, on every chunk of every live-TS viewer on the node, so a
+	// store nobody needed is a write to a cache line all of them are reading.
+	if n := int64(len(s.m)); n != s.n.Load() {
+		s.n.Store(n)
+	}
 }
 
 // peek reports whether a live (non-expired) signal is queued for uuid, without
@@ -116,7 +139,17 @@ func (s *signalStore) peek(uuid string) bool {
 	// Nothing for this viewer. We are already holding the lock the fast path is
 	// trying to avoid, so clear out anything nobody is coming back for — that,
 	// and not this uuid's own miss, is what keeps the lock hot for everyone.
-	s.sweepLocked(now)
+	//
+	// But only when something CAN have expired. A miss is the common case on
+	// this path — once per chunk for every live-TS viewer on the node, for as
+	// long as any one signal is pending — and sweeping it unconditionally walked
+	// the whole map and re-stored the atomic count every time, for a map in
+	// which nothing had changed. The watermark is a lower bound on every queued
+	// signal's expiry, so skipping below it cannot strand one: this uuid's own
+	// entry, if it has expired, is at or after the watermark too.
+	if !s.nextExpiry.IsZero() && !now.Before(s.nextExpiry) {
+		s.sweepLocked(now)
+	}
 	return false
 }
 
