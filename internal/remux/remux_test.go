@@ -359,3 +359,74 @@ func TestAlignerResyncs(t *testing.T) {
 		t.Errorf("aligned output is %d bytes / not the three packets", len(out))
 	}
 }
+
+// TestRedactKeepsCredentialsOutOfTheStreamLog: Redact feeds the inspector's
+// always-on "Input #0 … from '…'" line, which the panel writes to <id>.errors.
+// The hand-rolled scan it used split on the FIRST '@' after "://" while net/url
+// takes the LAST one, so a password containing '@' leaked its tail and a '@' in
+// a path ate the host name. Neither the userinfo password nor the XC path
+// credentials may survive, and the host and stream id must.
+func TestRedactKeepsCredentialsOutOfTheStreamLog(t *testing.T) {
+	for _, c := range []struct {
+		name, raw string
+		gone      []string // must not appear
+		kept      []string // must still appear
+	}{
+		{
+			name: "password containing @",
+			raw:  "http://user:p@ss@host/live.ts",
+			gone: []string{"p@ss", "ss@host"},
+			kept: []string{"host", "live.ts"},
+		},
+		{
+			name: "@ in the path only",
+			raw:  "http://host:8080/live/ch@720p.ts",
+			kept: []string{"host:8080", "ch@720p.ts"},
+		},
+		{
+			name: "xc path credentials",
+			raw:  "http://host:8080/live/joe/s3cret/123.ts",
+			gone: []string{"joe", "s3cret"},
+			kept: []string{"host:8080", "123.ts"},
+		},
+		{
+			name: "no credentials at all",
+			raw:  "udp://239.0.0.1:1234",
+			kept: []string{"239.0.0.1:1234"},
+		},
+	} {
+		got := Redact(c.raw)
+		for _, g := range c.gone {
+			if strings.Contains(got, g) {
+				t.Errorf("%s: Redact(%q) = %q, still carries %q", c.name, c.raw, got, g)
+			}
+		}
+		for _, k := range c.kept {
+			if !strings.Contains(got, k) {
+				t.Errorf("%s: Redact(%q) = %q, lost %q — the line no longer says which source failed", c.name, c.raw, got, k)
+			}
+		}
+	}
+}
+
+// TestCheckSchemeDoesNotEchoCredentials: a URL url.Parse refuses (an unescaped
+// '%' in the password is enough) used to be wrapped RAW into ErrUnsupported,
+// and runRemux prints that error through notef, which is on at every log level.
+// The whole password landed in <id>.errors.
+func TestCheckSchemeDoesNotEchoCredentials(t *testing.T) {
+	err := checkScheme("http://u:p%zz@host/x.ts")
+	if err == nil {
+		t.Fatal("an unparseable input was accepted")
+	}
+	if strings.Contains(err.Error(), "p%zz") {
+		t.Errorf("checkScheme leaked the password: %v", err)
+	}
+	if !errors.Is(err, ErrUnsupported) {
+		t.Errorf("err = %v, want ErrUnsupported so the supervisor falls back", err)
+	}
+	// A bare local path is not a credential: it must still be named, or the
+	// operator cannot see the typo they made.
+	if err := checkScheme("/srv/media/film.mp4"); err == nil || !strings.Contains(err.Error(), "/srv/media/film.mp4") {
+		t.Errorf("checkScheme(%q) = %v, want a refusal naming the input", "/srv/media/film.mp4", err)
+	}
+}
