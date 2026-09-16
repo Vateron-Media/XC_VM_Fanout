@@ -119,7 +119,14 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		if variant == nil {
 			return refuse(fmt.Errorf("%w: master playlist has no usable variant", ErrFormat))
 		}
-		body, finalURL, err := hlsFetch(ctx, variant, opt, client)
+		// A variant whose audio is a separate EXT-X-MEDIA rendition has
+		// video-only segments, and this package passes segment bytes through
+		// unread — so taking it would fan out a silent channel with nothing to
+		// say anything was wrong. Refuse: ffmpeg maps the rendition back in.
+		if pl.DemuxedAudio[variant.Audio] {
+			return refuse(fmt.Errorf("%w: hls audio is a separate rendition (EXT-X-MEDIA group %q)", ErrFormat, variant.Audio))
+		}
+		body, finalURL, err := hlsFetch(ctx, variant.URI, opt, client)
 		if err != nil {
 			return refuse(err)
 		}
@@ -438,6 +445,11 @@ type hlsPlaylist struct {
 	MapURI         *url.URL // EXT-X-MAP target (fMP4 init)
 	Segments       []hlsSegment
 	Variants       []hlsVariant
+	// DemuxedAudio holds the GROUP-IDs of #EXT-X-MEDIA TYPE=AUDIO renditions
+	// that carry their OWN URI. Per RFC 8216 such a rendition lives outside the
+	// variant, so a variant referencing one has video-only segments. A rendition
+	// with no URI is muxed into the variant and is not listed here.
+	DemuxedAudio map[string]bool
 }
 
 type hlsSegment struct {
@@ -448,6 +460,7 @@ type hlsSegment struct {
 type hlsVariant struct {
 	URI       *url.URL
 	Bandwidth int
+	Audio     string // AUDIO="<group-id>", empty when the variant names none
 }
 
 func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
@@ -461,6 +474,7 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	var pendingDur float64
 	var pendingBW int
+	var pendingAudio string
 	expectVariantURI := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -492,6 +506,19 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 					}
 				}
 			}
+		case strings.HasPrefix(line, "#EXT-X-MEDIA:"):
+			// Only a rendition with a URI matters here: that is the one whose
+			// media is NOT in the variant's own segments.
+			attrs := splitAttrs(strings.TrimPrefix(line, "#EXT-X-MEDIA:"))
+			if !strings.EqualFold(attrValue(attrs, "TYPE"), "AUDIO") || attrValue(attrs, "URI") == "" {
+				continue
+			}
+			if g := attrValue(attrs, "GROUP-ID"); g != "" {
+				if pl.DemuxedAudio == nil {
+					pl.DemuxedAudio = map[string]bool{}
+				}
+				pl.DemuxedAudio[g] = true
+			}
 		case strings.HasPrefix(line, "#EXTINF:"):
 			rest := strings.TrimPrefix(line, "#EXTINF:")
 			if comma := strings.IndexByte(rest, ','); comma >= 0 {
@@ -500,7 +527,9 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 			pendingDur, _ = strconv.ParseFloat(rest, 64)
 		case strings.HasPrefix(line, "#EXT-X-STREAM-INF:"):
 			pl.IsMaster = true
-			pendingBW = parseBandwidth(line)
+			attrs := splitAttrs(strings.TrimPrefix(line, "#EXT-X-STREAM-INF:"))
+			pendingBW = atoiSafe(attrValue(attrs, "BANDWIDTH"))
+			pendingAudio = attrValue(attrs, "AUDIO")
 			expectVariantURI = true
 		case strings.HasPrefix(line, "#"):
 			// Other tag we don't model — keep walking.
@@ -511,9 +540,10 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 				continue
 			}
 			if expectVariantURI {
-				pl.Variants = append(pl.Variants, hlsVariant{URI: u, Bandwidth: pendingBW})
+				pl.Variants = append(pl.Variants, hlsVariant{URI: u, Bandwidth: pendingBW, Audio: pendingAudio})
 				expectVariantURI = false
 				pendingBW = 0
+				pendingAudio = ""
 				continue
 			}
 			// Detect fMP4 by extension as a fallback for upstreams
@@ -532,33 +562,31 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 	return pl, nil
 }
 
-func pickVariant(pl *hlsPlaylist) *url.URL {
-	var best *url.URL
+func pickVariant(pl *hlsPlaylist) *hlsVariant {
+	var best *hlsVariant
 	bestBW := -1
-	for _, v := range pl.Variants {
+	for i := range pl.Variants {
+		v := &pl.Variants[i]
 		if v.URI == nil {
 			continue
 		}
 		if v.Bandwidth > bestBW {
 			bestBW = v.Bandwidth
-			best = v.URI
+			best = v
 		}
-	}
-	if best == nil && len(pl.Variants) > 0 {
-		return pl.Variants[0].URI
 	}
 	return best
 }
 
-func parseBandwidth(line string) int {
-	// EXT-X-STREAM-INF:BANDWIDTH=1234567,RESOLUTION=...
-	rest := strings.TrimPrefix(line, "#EXT-X-STREAM-INF:")
-	for _, kv := range splitAttrs(rest) {
-		if strings.HasPrefix(kv, "BANDWIDTH=") {
-			return atoiSafe(kv[len("BANDWIDTH="):])
+// attrValue reads one value out of a tokenised HLS attribute list, dropping the
+// quotes an enumerated-string value carries.
+func attrValue(attrs []string, key string) string {
+	for _, kv := range attrs {
+		if v, ok := strings.CutPrefix(kv, key+"="); ok {
+			return strings.Trim(v, `"`)
 		}
 	}
-	return 0
+	return ""
 }
 
 // splitAttrs tokenises an HLS attribute list (k=v,k="v with comma",…).
