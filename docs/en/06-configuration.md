@@ -54,7 +54,8 @@ For isolated testing — feed a single stream directly at startup, without the c
 The operator tuning lives in a small JSON file (`-config`, default
 `/home/xc_vm/bin/xc_fanout/config.json`), owned by [`internal/config`](../../internal/config/config.go).
 An admin edits the values in the panel; the panel writes them to this file; the daemon polls it
-and applies the changes **at runtime — no restart, no viewer drop**.
+and applies the changes **at runtime — no restart, and no viewer dropped** (with one exception,
+below: shrinking `prebuffer_max_sec`).
 
 ### Self-maintaining
 
@@ -86,7 +87,12 @@ changed since the last check (a stat, not a full parse, on a quiet tick). A chan
 - `write_timeout_sec` / `source_insecure` become atomic (they are read on hot paths);
 - `chunk_bytes` / `max_gop_bytes` take effect for **newly created** streams.
 
-No stream is dropped and no viewer is disconnected when the config changes.
+No stream is dropped and no viewer is disconnected when the config changes — with one exception.
+Because the ring is the live tail ([ADR 0004](../adr/0004-ring-is-the-live-tail.md)), **lowering**
+`prebuffer_max_sec` prunes everything older than the new window on the spot, so a viewer sitting
+deeper than it — one that joined with a large `?prebuffer` and is still catching up, or a player
+that stopped reading ahead once its own buffer filled — is dropped and reconnects into the new,
+shorter ring. Everything within the new window plays on untouched, and raising it costs nothing.
 
 ### The keys
 
@@ -102,7 +108,7 @@ never push the daemon into a pathological state.
 | `grace_sec` | `10` | `1…3600` | Idle-stop grace for control-managed streams: how long a source stays alive after the last viewer leaves (the reaper window). |
 | `write_timeout_sec` | `15` | `1…600` | Per-write deadline for a live-TS viewer before a stalled connection is dropped. |
 | `chunk_bytes` | `12032` | `188…4 MiB` | Source read size for daemon-pulled streams (rounded down to a multiple of 188). |
-| `max_gop_bytes` | `10528000` | `188…256 MiB` | Cap on a single ring block. A source that gives no keyframe within this many bytes has a block **cut** here (see [Sources without keyframes](04-internals.md#sources-without-keyframes)). |
+| `max_gop_bytes` | `10528000` | `1 MiB…256 MiB` | Cap on a single ring block. A source that gives no keyframe within this many bytes has a block **cut** here (see [Sources without keyframes](04-internals.md#sources-without-keyframes)). |
 | `source_insecure` | `true` | — | Skip upstream TLS verification when pulling HTTPS sources. `true` because the panel commonly pulls upstreams with self-signed / mismatched certs; set `false` to require valid certificates. |
 | `idle_buffer_grace_sec` | `30` | `0…3600` | No-viewer window before the ring collapses (`0` = the idle gate is off). See [The idle-buffer gate](#the-idle-buffer-gate). |
 | `idle_buffer_ratio` | `0.5` | `0.1…1` | Fraction of the buffer kept while a stream is unwatched. HLS is still cut from the reduced ring, so the channel stays openable. |
@@ -147,8 +153,11 @@ one number drives both the live-TS prebuffer and how deep the HLS window can rea
 - **`max_gop_bytes`** — the size limit of a single ring block. Normally never reached: blocks are
   cut on keyframes, which arrive far more often. It is what bounds a source whose keyframes are
   rare or absent — reaching it forces a block boundary, so the ring keeps rolling instead of
-  freezing. (Before 0.11.4 it was a discard threshold: everything past it was thrown away and the
-  stream stalled at one block. See
+  freezing. The floor is 1 MiB, not a packet: a cap too small to hold a GOP is not a small buffer
+  but a different data structure — the block is full after one packet, so every further packet
+  opens a new block and prunes the ring, under the lock every viewer waits on. (Before 0.11.4 it
+  was a discard threshold: everything past it was thrown away and the stream stalled at one block.
+  See
   [04, "Sources without keyframes"](04-internals.md#sources-without-keyframes).)
 - **`chunk_bytes`** — the size of source read chunks. Rounded down to a multiple of 188.
 
@@ -257,8 +266,11 @@ reload.
 ### Paths and access
 
 - **`-sock` / `-ctl` / `-ingestdir`** — the placement of the unix sockets. At startup the daemon
-  creates the directories, removes old socket files, and listens with `0660` permissions. If
-  `-ctl` is empty, the control API is not brought up at all (the daemon only serves).
+  creates the directories, removes old socket files, and listens with `0660` permissions. A socket
+  file left over from a crash is removed; one another daemon is **actively listening on** is not —
+  the daemon says so and exits non-zero rather than unlinking a live socket and taking nginx's
+  traffic from the instance already serving it. If `-ctl` is empty, the control API is not brought
+  up at all (the daemon only serves).
 
 ## What happens at startup
 
