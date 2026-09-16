@@ -18,9 +18,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
@@ -188,6 +190,11 @@ func nextBackoff(cur, ranFor time.Duration) time.Duration {
 	}
 	return cur
 }
+
+// ffmpegWaitDelay bounds how long cmd.Wait may spend after the child has been
+// told to go: long enough for an ffmpeg that is flushing on SIGKILL, short
+// enough that a wedged descendant costs one reconnect rather than the stream.
+const ffmpegWaitDelay = 5 * time.Second
 
 // ffmpegStallBound is how long the ffmpeg path may deliver nothing before it is
 // treated as stalled: the native path's bound, and room for a segment-at-a-time
@@ -490,6 +497,35 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 	cctx, ccancel := context.WithCancel(ctx)
 	defer ccancel()
 	cmd := exec.CommandContext(cctx, bin, args...)
+	// Give the command its OWN process group and kill the whole group, not just
+	// the direct child. FfmpegBin is operator-supplied and a wrapper script (a
+	// ulimit shim, cpulimit, a logging wrapper) is an ordinary deployment: then
+	// the daemon's child is the shell and ffmpeg is its grandchild. Killing only
+	// the shell left ffmpeg orphaned, still holding the inherited stdout pipe and
+	// still pulling the provider — so ingest.Copy below never saw EOF, runFfmpeg
+	// never returned, and every stopped stream leaked a puller goroutine and a
+	// source connection that nothing would ever close. Same shape as
+	// internal/supervisor's encoder launcher, for the same reason.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				// The group is already gone — the ordinary case when the source
+				// ended and ffmpeg exited before our own cancel reached it.
+				// os/exec turns any other error from here into Wait's result, so
+				// say it the way it expects and keep a clean end clean.
+				return os.ErrProcessDone
+			}
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	// And a backstop for anything the group kill cannot reach. cmd.Stderr is a
+	// tailBuffer, not an *os.File, so os/exec makes its own pipe and a copy
+	// goroutine, and Wait blocks until every write end is closed — which a
+	// descendant that gave itself a new session still holds. With no WaitDelay
+	// that wait is unbounded; with one, Wait gives up and the puller reconnects.
+	cmd.WaitDelay = ffmpegWaitDelay
 	stderr := &tailBuffer{max: 4096}
 	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
@@ -510,7 +546,16 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 	if ctx.Err() != nil {
 		return copyErr // we cancelled it (stream stop/shutdown) — not a fault
 	}
-	if waitErr != nil {
+	// A context.Canceled out of Wait is our own teardown, never ffmpeg's doing.
+	// os/exec reports ctx.Err() whenever the Cancel func above says it
+	// successfully interrupted the command, and a process-group kill says that
+	// even when the child has already exited and is only waiting to be reaped —
+	// so the ordinary clean source end (ffmpeg exits 0, ccancel fires, Wait
+	// reaps) would otherwise surface as a phantom "ffmpeg: context canceled"
+	// fault and be backed off on. ccancel() always runs before Wait and parent
+	// cancellation is handled just above, so there is no other way to get here;
+	// a real ffmpeg failure is a non-zero *ExitError and is still caught below.
+	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 		if tail := stderr.String(); tail != "" {
 			dlog.Logf("puller", "id=%s ffmpeg exited (%v): %s", src.Label, waitErr, tail)
 		} else {
