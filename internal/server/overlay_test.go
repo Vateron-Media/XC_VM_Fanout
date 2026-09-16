@@ -55,14 +55,35 @@ func TestParseXY(t *testing.T) {
 	}
 }
 
+// TestEscapeDrawtext pins the shape of the two-pass escaping. A -vf value is
+// unescaped twice on its way to drawtext — by the filtergraph parser and then by
+// the option parser — and each pass eats one layer of backslashes, so a character
+// the inner pass cares about needs two. TestDrawtextFilterDrawsTheMessageVerbatim
+// is what proves these strings are the RIGHT ones; this is the cheap unit-level
+// record of them.
 func TestEscapeDrawtext(t *testing.T) {
-	got := escapeDrawtext(`a:b'c\d%e`)
-	// A single quote becomes the '\'' break-out sequence (it cannot be escaped
-	// inside the surrounding single quotes); the colon keeps its \: escape, which
-	// ffmpeg's filtergraph parser requires and consumes even inside quotes.
-	want := `a\:b'\''c\\d\%e`
-	if got != want {
-		t.Fatalf("escapeDrawtext = %q; want %q", got, want)
+	cases := map[string]string{
+		// ':' matters to the option parser only: escaped on the inner pass, and
+		// that backslash then escaped on the outer one.
+		`3:00`: `3\\:00`,
+		// '\' and '\'' matter to both passes, so they come out doubled twice.
+		`a'b`: `a\\\'b`,
+		`a\b`: `a\\\\b`,
+		// ',' ';' '[' ']' end a filter or open a link label: outer pass only.
+		`a,b;c[d]e`: `a\,b\;c\[d\]e`,
+		// '%' is drawtext's own expansion, which drawtextFilter turns off; the
+		// escaper must leave it alone or the banner draws a backslash.
+		`50% off`: `50% off`,
+		// drawtext draws one line.
+		"two\nlines": "two lines",
+		"cr\rlf":     "cr lf",
+		// Plain text is untouched.
+		`channel back at 9`: `channel back at 9`,
+	}
+	for in, want := range cases {
+		if got := escapeDrawtext(in); got != want {
+			t.Errorf("escapeDrawtext(%q) = %q; want %q", in, got, want)
+		}
 	}
 }
 

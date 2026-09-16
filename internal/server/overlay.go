@@ -125,28 +125,43 @@ func parseXY(offset string) (int, int) {
 }
 
 // escapeDrawtext escapes a user-supplied message for ffmpeg's drawtext `text=`
-// option (which treats \ : ' % specially, and must stay single-line). The value
-// is passed to ffmpeg as one argv element, so there is no shell involved — this
-// is purely filtergraph-syntax safety.
+// option. The value is passed to ffmpeg as one argv element, so no shell is
+// involved — this is purely filtergraph syntax. Newlines collapse to spaces:
+// drawtext takes one line.
 //
-// The whole value is wrapped in single quotes by the caller (…:text='…':…), and
-// a single quote CANNOT be escaped inside a single-quoted ffmpeg token: the only
-// way to include one is to close the quote, emit an escaped quote, and reopen —
-// the shell-style '\'' sequence. The previous \' broke the filtergraph parse for
-// any message carrying an apostrophe ("it's back"), so the whole re-encode failed
-// and — being best-effort — the overlay silently served plain video instead. The
-// colon still needs \: even inside the quotes: ffmpeg's filtergraph parser splits
-// options on a bare ':' regardless of quoting, and consumes the backslash, so it
-// renders clean.
+// Combined with the `expansion=none` drawtextFilter sets, the message is drawn
+// exactly as typed. Without it drawtext runs its own %{…} expansion over the
+// text, so "50% off" logged "Stray %" and drew NOTHING (the banner silently
+// vanished), a backslash was eaten, and "%{e:…}" was evaluated as an expression —
+// %{e:while(1,1)} would have spun a per-viewer ffmpeg until its kill timeout.
 func escapeDrawtext(s string) string {
+	return escapeFilterArg(strings.NewReplacer("\n", " ", "\r", " ").Replace(s))
+}
+
+// escapeFilterArg escapes one value for a -vf filter option, for BOTH of the
+// passes ffmpeg unescapes it in: the option parser (av_opt_set, which splits
+// options on ':') and, before that, the filtergraph parser (which ends a filter
+// on ',' or ';' and reads '[' ']' as link labels). Each pass consumes one layer
+// of backslashes, so a character that matters to the inner one has to survive the
+// outer one too — hence escaping twice rather than once.
+//
+// The value used to be wrapped in single quotes, with an apostrophe written as
+// the shell's close-escape-reopen sequence instead. That survives only the first
+// pass: the option parser then saw a bare quote, and swallowed the REST of the
+// filter into the text. A viewer fingerprinted by username saw
+// "obrien:fontsize=20:x=10:y=10:..." drawn at the default size, position and
+// colour — an unreadable non-fingerprint — while "it's Bob's" simply lost its
+// apostrophes. Quoting cannot express this, so nothing is quoted any more.
+func escapeFilterArg(s string) string {
+	optionLevel := strings.NewReplacer(`\`, `\\`, `'`, `\'`, `:`, `\:`).Replace(s)
 	return strings.NewReplacer(
 		`\`, `\\`,
-		`:`, `\:`,
-		`'`, `'\''`,
-		`%`, `\%`,
-		"\n", " ",
-		"\r", " ",
-	).Replace(s)
+		`'`, `\'`,
+		`,`, `\,`,
+		`;`, `\;`,
+		`[`, `\[`,
+		`]`, `\]`,
+	).Replace(optionLevel)
 }
 
 // sanitizeColor keeps only characters valid in an ffmpeg colour (a hex like
@@ -165,6 +180,29 @@ func sanitizeColor(c string) string {
 	return b.String()
 }
 
+// drawtextFilter builds the -vf value that burns sig's banner onto the video.
+// One builder for both the HLS-segment and the live-TS overlay: they must draw
+// the same thing, and a divergence here is invisible until a viewer sees it.
+//
+// expansion=none makes the message literal text rather than a drawtext template.
+// The panel sends a viewer's uuid, a viewer's username or an admin's free text —
+// never a template — so expansion only ever mangled a legitimate message ('%' put
+// the whole banner out) or ran something it should not have.
+//
+// The font path is operator config, not viewer input, but it lands in the same
+// filtergraph and needs the same escaping: a directory holding a ',' or a ':' made
+// ffmpeg exit before it drew anything, so every signal on the node silently did
+// nothing.
+func drawtextFilter(fontPath string, sig pendingSignal) string {
+	return "drawtext=fontfile=" + escapeFilterArg(fontPath) +
+		":text=" + escapeDrawtext(sig.text) +
+		":fontsize=" + strconv.Itoa(sig.fontSize) +
+		":x=" + strconv.Itoa(sig.x) +
+		":y=" + strconv.Itoa(sig.y) +
+		":fontcolor=" + sanitizeColor(sig.color) +
+		":expansion=none"
+}
+
 // overlaySegment re-encodes a self-contained MPEG-TS segment with a drawtext
 // banner (the admin "send message" feature). It mirrors the legacy PHP byte-path overlay's
 // ffmpeg invocation but pipes the segment in and out in memory. On ANY error it
@@ -176,12 +214,7 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 	if codec == "" {
 		codec = defaults.OverlayDefaultCodec
 	}
-	filter := "drawtext=fontfile=" + m.fontPath +
-		":text='" + escapeDrawtext(sig.text) + "'" +
-		":fontsize=" + strconv.Itoa(sig.fontSize) +
-		":x=" + strconv.Itoa(sig.x) +
-		":y=" + strconv.Itoa(sig.y) +
-		":fontcolor=" + sanitizeColor(sig.color)
+	filter := drawtextFilter(m.fontPath, sig)
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaults.OverlaySegmentTimeout)
 	defer cancel()
@@ -246,12 +279,7 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 	if codec == "" {
 		codec = defaults.OverlayDefaultCodec
 	}
-	filter := "drawtext=fontfile=" + m.fontPath +
-		":text='" + escapeDrawtext(sig.text) + "'" +
-		":fontsize=" + strconv.Itoa(sig.fontSize) +
-		":x=" + strconv.Itoa(sig.x) +
-		":y=" + strconv.Itoa(sig.y) +
-		":fontcolor=" + sanitizeColor(sig.color)
+	filter := drawtextFilter(m.fontPath, sig)
 
 	ctx, cancel := context.WithTimeout(context.Background(), overlayTSDuration+defaults.OverlayTSWindowGrace)
 	defer cancel()
