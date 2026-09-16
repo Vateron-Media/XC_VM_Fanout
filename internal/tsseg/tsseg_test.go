@@ -23,14 +23,18 @@ import (
 
 const vpid = 0x101
 
-// pmtWithPCR is the fixture PMT with its PCR_PID pointing at the video PID, so
-// segment timing runs off the PCR like a real broadcast stream.
-func pmtWithPCR() []byte {
-	p := tsfixture.PMT(0x100, vpid)
-	p[13] = byte(0xe0 | (vpid>>8)&0x1f) // section byte 8: PCR_PID
-	p[14] = byte(vpid & 0xff)
+// pmtFor is the fixture PMT announcing video on videoPID, with its PCR_PID
+// pointing at the same PID, so segment timing runs off the PCR like a real
+// broadcast stream.
+func pmtFor(videoPID int) []byte {
+	p := tsfixture.PMT(0x100, videoPID)
+	p[13] = byte(0xe0 | (videoPID>>8)&0x1f) // section byte 8: PCR_PID
+	p[14] = byte(videoPID & 0xff)
 	return p
 }
+
+// pmtWithPCR is that table for the stream these tests feed.
+func pmtWithPCR() []byte { return pmtFor(vpid) }
 
 type rig struct {
 	t   *testing.T
@@ -62,15 +66,18 @@ func (r *rig) feed(pkts ...[]byte) {
 	}
 }
 
-// gop feeds one GOP starting at t seconds: a flagged keyframe with PCR, then a
-// few fill packets.
-func (r *rig) gop(sec float64) {
+// gopOn feeds one GOP on pid starting at sec seconds: a flagged keyframe with
+// PCR, then a few fill packets.
+func (r *rig) gopOn(pid int, sec float64) {
 	ticks := int64(sec * 90000)
-	r.feed(tsfixture.KeyframePCR(vpid, ticks, ticks))
+	r.feed(tsfixture.KeyframePCR(pid, ticks, ticks))
 	for i := 0; i < 5; i++ {
-		r.feed(tsfixture.Fill(vpid))
+		r.feed(tsfixture.Fill(pid))
 	}
 }
+
+// gop feeds one GOP on the stream's video PID.
+func (r *rig) gop(sec float64) { r.gopOn(vpid, sec) }
 
 func (r *rig) playlist() string {
 	b, err := os.ReadFile(filepath.Join(r.dir, "12_.m3u8"))
@@ -531,5 +538,61 @@ func TestForwardTimelineJumpIsASplice(t *testing.T) {
 	}
 	if !strings.Contains(r.playlist(), "#EXT-X-TARGETDURATION:2\n") {
 		t.Errorf("TARGETDURATION is not the real 2s target, so every player slows its reload:\n%s", r.playlist())
+	}
+}
+
+// TestVideoPIDChangeIsFollowed: the PMT is re-read every time it arrives, not
+// once. An upstream that restarts mid-connection — an HLS source whose encoder
+// comes back, a multicast feed re-provisioned — can return with its video on a
+// different PID. The segmenter kept hunting keyframes on the old one, found
+// none, and after 3×hls_time+6s returned ErrNoKeyframe, which the remuxer turns
+// into ErrUnsupported: in auto mode a permanent ffmpeg fallback for a source
+// that is perfectly segmentable.
+func TestVideoPIDChangeIsFollowed(t *testing.T) {
+	const newPID = 0x102
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), pmtFor(vpid))
+	for g := 0; g < 5; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gopOn(vpid, float64(g)*2)
+	}
+	before := strings.Count(r.playlist(), "#EXTINF:")
+
+	// The encoder restarts and comes back with its video on another PID; the
+	// PMT, on the PID the PAT still names, says so.
+	r.feed(tsfixture.PAT(0x100), pmtFor(newPID))
+	for g := 0; g < 8; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gopOn(newPID, 1000+float64(g)*2)
+	}
+	if got := strings.Count(r.playlist(), "#EXTINF:"); got <= before {
+		t.Fatalf("%d segments listed, %d before the video moved to pid %#x: the segmenter is still looking for keyframes on %#x:\n%s",
+			got, before, newPID, vpid, r.playlist())
+	}
+}
+
+// TestDamagedPMTIsNotTrusted: a packet whose transport_error_indicator is set
+// reached the daemon with at least one uncorrectable bit error. Its bytes still
+// go into the segment verbatim — that is this segmenter's whole contract — but
+// nothing is decided from them. A PMT whose elementary_PID bits were flipped
+// used to be believed, and since the table was read only once, believed
+// permanently: no keyframe was ever seen again.
+func TestDamagedPMTIsNotTrusted(t *testing.T) {
+	bad := pmtFor(0x1fe) // the same table with its video PID corrupted...
+	bad[1] |= 0x80       // ...and flagged by the demodulator that saw the error
+
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), bad, pmtWithPCR())
+	for g := 0; g < 3; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gop(float64(g) * 2)
+	}
+	r.feed(bad) // the damaged table comes round again, and is not corrected after
+	for g := 3; g < 8; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gop(float64(g) * 2)
+	}
+	if got := strings.Count(r.playlist(), "#EXTINF:"); got < 6 {
+		t.Fatalf("%d segments from 8 GOPs: a PMT flagged as bit-damaged was taken for the programme's:\n%s", got, r.playlist())
 	}
 }

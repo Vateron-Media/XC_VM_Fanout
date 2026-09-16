@@ -235,23 +235,28 @@ func (s *Segmenter) Feed(pkt []byte) error {
 	}
 	pid := tspes.PID(pkt)
 	pusi := tspes.PUSI(pkt)
+	// transport_error_indicator: this packet arrived with at least one
+	// uncorrectable bit error. Its bytes still go into the segment verbatim —
+	// that is this segmenter's whole contract — but nothing is DECIDED from
+	// them: a table whose PID bits were flipped would send the segmenter after
+	// an elementary stream that does not exist.
+	tei := pkt[1]&0x80 != 0
 
 	switch {
-	case pid == 0x0000 && pusi:
+	case pid == 0x0000 && pusi && !tei:
 		s.pat = append(s.pat[:0], pkt...)
-		if !s.havePMT {
-			if p := tspes.PMTPID(pkt); p != 0 {
-				s.pmtPID = p
-			}
+		if p := tspes.PMTPID(pkt); p != 0 && p != s.pmtPID {
+			// The programme moved to another PMT PID. Drop the table cached
+			// under the old one: re-emitting it at every segment head would pair
+			// a live PAT with a PMT the PAT no longer points at.
+			s.pmtPID, s.pmt = p, s.pmt[:0]
 		}
-	case pid == 0x0011 && pusi: // SDT — carried for players that show the service name
+	case pid == 0x0011 && pusi && !tei: // SDT — carried for players that show the service name
 		s.sdt = append(s.sdt[:0], pkt...)
-	case s.pmtPID != 0 && pid == s.pmtPID && pusi:
+	case s.pmtPID != 0 && pid == s.pmtPID && pusi && !tei:
 		s.pmt = append(s.pmt[:0], pkt...)
-		if !s.havePMT {
-			if m, ok := tspes.ParsePMT(pkt); ok {
-				s.videoPID, s.pcrPID, s.videoType, s.havePMT = m.VideoPID, m.PCRPID, m.VideoType, true
-			}
+		if m, ok := tspes.ParsePMT(pkt); ok {
+			s.adoptPMT(m)
 		}
 	}
 
@@ -312,6 +317,33 @@ func (s *Segmenter) Feed(pkt []byte) error {
 		s.write(pkt)
 	}
 	return nil
+}
+
+// adoptPMT takes what a freshly parsed PMT says. Every PMT is read, not just
+// the first: an upstream that restarts mid-connection can come back with its
+// video on a different PID, and a segmenter still hunting keyframes on the old
+// one finds none for MaxNoKeyframe and returns ErrNoKeyframe — which the remuxer
+// reads as "this source needs ffmpeg", permanently, for a source that is
+// perfectly segmentable. tsjoin has always re-read the table; only this did not.
+func (s *Segmenter) adoptPMT(m tspes.PMT) {
+	if s.havePMT && m.VideoPID == s.videoPID && m.PCRPID == s.pcrPID && m.VideoType == s.videoType {
+		return
+	}
+	if s.havePMT {
+		s.cfg.Logf("pmt changed: video pid 0x%04x→0x%04x type 0x%02x→0x%02x, pcr pid 0x%04x→0x%04x",
+			s.videoPID, m.VideoPID, s.videoType, m.VideoType, s.pcrPID, m.PCRPID)
+		// The open segment holds the old elementary stream and none of the new
+		// one. Close it here, while its clock is still the one it was measured
+		// against, and mark the segment that opens on the new stream: the PIDs
+		// changing under a player is exactly what EXT-X-DISCONTINUITY is for.
+		s.finalize()
+		s.startPCR, s.startPTS = -1, -1
+		s.lastPCR, s.lastPTS = -1, -1
+		s.keyPCR, s.keyPTS = -1, -1
+		s.havePTS, s.haveHi = false, false
+		s.pendingDisc = true
+	}
+	s.videoPID, s.pcrPID, s.videoType, s.havePMT = m.VideoPID, m.PCRPID, m.VideoType, true
 }
 
 // chargeGap keeps the no-keyframe limit measured on stream that arrived rather
