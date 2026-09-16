@@ -311,3 +311,58 @@ func TestReleaseStillKills(t *testing.T) {
 		t.Fatal("Release did not stop the encoder")
 	}
 }
+
+// TestAdoptedEncoderIsConfirmedOnlyByItsOwnData: Confirmed means the running
+// producer has delivered bytes TO THIS DAEMON, and the panel writes it as
+// stream_status=0 ("on air"). An adopted survivor was reported confirmed the
+// instant it was found, without a byte having arrived — and the runbook's own
+// case says that is exactly what a daemon restart breaks: an ffmpeg whose tee
+// slave feeds our ingest with onfail=ignore keeps running with its feed dead.
+// The panel then showed the channel on air while nothing reached the daemon.
+func TestAdoptedEncoderIsConfirmedOnlyByItsOwnData(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(t)
+	h.setData(false) // the survivor runs, but its feed into this daemon is dead
+
+	vit := &vitalsStub{}
+	vit.set(Vitals{LastData: time.Now()})
+	h.sup.WithVitals(vit.get)
+	h.sup.healthTick = 10 * time.Millisecond
+
+	w := newWorld()
+	const survivor = 9004
+	w.add(survivor, "ffmpeg /home/xc_vm/streams/5_.m3u8")
+	h.sup.find = w.find
+	h.sup.killPID = w.kill
+
+	spec := baseSpec(dir)
+	spec.AdoptMatch = "/streams/5_"
+	spec.Policy.StartTimeoutSec = 1
+	writePID(t, spec.PIDPath, survivor)
+	if err := h.sup.Supervise("5", spec); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "adoption", func() bool { return h.sup.State("5").Adopted })
+
+	if st := h.sup.State("5"); st.Confirmed {
+		t.Error("an adopted encoder is reported as having delivered bytes before any arrived")
+	}
+
+	// The start window closes. The survivor is still the only encoder on this
+	// source, so it is left alone and kept supervised — just not called on air.
+	time.Sleep(1200 * time.Millisecond)
+	st := h.sup.State("5")
+	if !st.Running || st.PID != survivor {
+		t.Fatalf("state = %+v, want the survivor still supervised", st)
+	}
+	if st.Confirmed {
+		t.Error("an adopted encoder that never fed this daemon is still reported as confirmed")
+	}
+	if len(w.killed()) != 0 {
+		t.Errorf("the survivor was killed (%v); nothing else is feeding this source", w.killed())
+	}
+
+	// And when its bytes do reach us, late, the start IS confirmed.
+	h.setData(true)
+	waitFor(t, "a late confirmation", func() bool { return h.sup.State("5").Confirmed })
+}

@@ -567,7 +567,7 @@ func (st *stream) run(ctx context.Context) {
 		}
 		src := st.currentSource()
 
-		proc, err := st.startOnce(ctx, src)
+		proc, confirmed, err := st.startOnce(ctx, src)
 		if err != nil {
 			// WE ended the start — a DELETE, a re-PUT after a source change, or a
 			// shutdown — so there is no failure here to report or to act on.
@@ -613,7 +613,9 @@ func (st *stream) run(ctx context.Context) {
 
 		consecutiveFails = 0
 		st.beginSourceWalk() // this source starts: the failure pass is over
-		st.markConfirmed()
+		if confirmed {
+			st.markConfirmed()
+		}
 		if first {
 			st.emit(EventStreamStart, src.Label)
 			first = false
@@ -721,6 +723,12 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 		}
 
 		now := sup.now()
+
+		// A start whose data arrived late — an adopted survivor whose feed into
+		// this daemon came back after the start window closed — is a confirmed
+		// start all the same. Without this it would stay "starting" to the panel
+		// for as long as it ran.
+		st.confirmLate()
 
 		// The scheduled restart is not a fault, but it is a restart, and the
 		// panel logs it as its own action. Once per window: see autoRestartAt.
@@ -906,7 +914,11 @@ func limitOrOff(sec int) string {
 // not a running stream — the panel learned this by waiting for a playlist file
 // to appear; here the daemon asks whether bytes arrived, which is the same
 // question without the filesystem in the middle.
-func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
+//
+// The second result says whether the start was CONFIRMED by data. It is always
+// true for a launch that returns without an error; an adopted encoder can come
+// back unconfirmed, because it is not ours to shoot for failing to reach us.
+func (st *stream) startOnce(ctx context.Context, src Source) (Process, bool, error) {
 	spec := st.spec_()
 
 	// An encoder that outlived a previous daemon is resumed rather than
@@ -924,8 +936,29 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 		}
 		st.markAdopted(true)
 		st.markFallback(false)
+		adoptedAt := st.sup.now()
 		st.markStarted(proc, src.Label)
-		return proc, nil
+
+		exited := make(chan error, 1)
+		go func() { exited <- proc.Wait() }()
+
+		// A survivor is confirmed by the same evidence as any other start: bytes
+		// arriving HERE. A daemon restart is exactly what breaks that feed —
+		// buildLive's tee slave into our ingest carries onfail=ignore, so the
+		// encoder keeps running with its output to us dead — and calling it
+		// confirmed told the panel the channel was on air while nothing reached
+		// this daemon at all. What must NOT follow is killing it over that: it is
+		// still the only encoder on this source, and the health rules judge it
+		// from here like any other.
+		confirmed, err := st.awaitData(ctx, proc, exited, adoptedAt, spec.Policy.StartTimeoutSec, false)
+		if err != nil {
+			return nil, false, err
+		}
+		if !confirmed {
+			dlog.Logf("monitor", "id=%s adopted encoder pid=%d has not fed this daemon within %ds; supervising it unconfirmed",
+				st.id, pid, spec.Policy.StartTimeoutSec)
+		}
+		return newWaitedProcess(proc, exited), confirmed, nil
 	}
 	st.markAdopted(false)
 
@@ -933,7 +966,7 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	launchedAt := st.sup.now()
 	proc, err := st.sup.launch(ctx, cmd, spec.ErrorsPath)
 	if err != nil {
-		return nil, fmt.Errorf("launch: %w", err)
+		return nil, false, fmt.Errorf("launch: %w", err)
 	}
 	st.markFallback(fallback)
 
@@ -949,6 +982,24 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	exited := make(chan error, 1)
 	go func() { exited <- proc.Wait() }()
 
+	if _, err := st.awaitData(ctx, proc, exited, launchedAt, spec.Policy.StartTimeoutSec, true); err != nil {
+		return nil, false, err
+	}
+	// Hand the already-running Wait to the caller rather than starting a second
+	// one on the underlying process.
+	return newWaitedProcess(proc, exited), true, nil
+}
+
+// awaitData waits for a start to prove itself: bytes that arrived after since.
+// exited carries the process's own Wait, so an encoder that dies inside the
+// window is reported as the failed start it is rather than waited out.
+//
+// killOnTimeout says what a start that never produced anything means. For an
+// encoder we launched it is a failed start: the process is ended, reaped and
+// reported. For an adopted survivor it is not — killing it would take the
+// channel off air on the strength of a feed this daemon cannot see — so it comes
+// back unconfirmed and the caller goes on supervising it.
+func (st *stream) awaitData(ctx context.Context, proc Process, exited chan error, since time.Time, timeoutSec int, killOnTimeout bool) (bool, error) {
 	// cancelled ends a start the daemon itself gave up on. Whether the encoder
 	// dies with it is the SAME question the watch loop asks on its way out: a
 	// stop kills it, a detach leaves it running for the next daemon to adopt.
@@ -958,38 +1009,39 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	// could not adopt it either. And a kill must be followed by the reap, or
 	// stop() returns while the encoder it condemned is still alive and the
 	// replacement comes up beside it.
-	cancelled := func() (Process, error) {
+	cancelled := func() (bool, error) {
 		if st.killOnExit.Load() {
 			proc.Kill()
 			<-exited
 		}
-		return nil, ctx.Err()
+		return false, ctx.Err()
 	}
 
-	deadline := st.sup.now().Add(time.Duration(spec.Policy.StartTimeoutSec) * time.Second)
+	deadline := st.sup.now().Add(time.Duration(timeoutSec) * time.Second)
 	for {
 		select {
 		case werr := <-exited:
 			st.markStopped(werr)
 			if isUnsupportedExit(werr) {
-				return nil, fmt.Errorf("%w (exited during startup: %v)", errUnsupported, werr)
+				return false, fmt.Errorf("%w (exited during startup: %v)", errUnsupported, werr)
 			}
-			return nil, fmt.Errorf("exited during startup: %v", werr)
+			return false, fmt.Errorf("exited during startup: %v", werr)
 		case <-ctx.Done():
 			return cancelled()
 		default:
 		}
 
-		if st.sup.hasData(st.id, launchedAt) {
-			// Hand the already-running Wait to the caller rather than starting a
-			// second one on the underlying process.
-			return newWaitedProcess(proc, exited), nil
+		if st.sup.hasData(st.id, since) {
+			return true, nil
 		}
 		if !st.sup.now().Before(deadline) {
+			if !killOnTimeout {
+				return false, nil
+			}
 			proc.Kill()
 			<-exited
 			st.markStopped(nil)
-			return nil, fmt.Errorf("no data within %ds of start", spec.Policy.StartTimeoutSec)
+			return false, fmt.Errorf("no data within %ds of start", timeoutSec)
 		}
 		if !st.sup.sleep(ctx, 200*time.Millisecond) {
 			return cancelled()
@@ -1077,6 +1129,22 @@ func (st *stream) markConfirmed() {
 	st.mu.Lock()
 	st.confirmed = true
 	st.mu.Unlock()
+}
+
+// confirmLate confirms a running-but-unconfirmed producer once its bytes do
+// reach this daemon. Only an adopted encoder can be in that state — a launched
+// one that produced nothing inside its window is a failed start and is gone —
+// and its feed can come back after the window closed.
+func (st *stream) confirmLate() {
+	st.mu.Lock()
+	pending, since := st.running && !st.confirmed, st.started
+	st.mu.Unlock()
+	if !pending {
+		return
+	}
+	if st.sup.hasData(st.id, since) {
+		st.markConfirmed()
+	}
 }
 
 func (st *stream) markStopped(err error) {
