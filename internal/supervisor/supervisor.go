@@ -254,7 +254,17 @@ type Supervisor struct {
 	// coarsest it may be: the panel's scheduled auto-restart matches on HH:MM, so
 	// a slower tick would step over the minute it is meant to fire in.
 	healthTick time.Duration
+	// audioLossRetry is the shortest interval between two AUDIO_LOSS restarts of
+	// the same stream. See stream.audioLossDue.
+	audioLossRetry time.Duration
 }
+
+// audioLossRetryDefault paces repeated AUDIO_LOSS restarts at the rate the panel
+// re-probed for audio: MonitorCommand.php only looked again once 300s had passed
+// since the last look, so a channel whose audio never comes back cost one
+// restart per five minutes there. Detecting the loss stays as fast as
+// audio_restart_loss asks for; only doing it AGAIN is paced.
+const audioLossRetryDefault = 300 * time.Second
 
 // New returns a Supervisor. hasData is how a start is confirmed — the daemon
 // asks its own registry whether the stream has produced bytes, which is the
@@ -272,12 +282,13 @@ func New(launch Launcher, hasData func(id string, since time.Time) bool) *Superv
 		idLocks:    make(map[string]*sync.Mutex),
 		launch:     launch,
 		hasData:    hasData,
-		now:        time.Now,
-		sleep:      sleepCtx,
-		healthTick: 5 * time.Second,
-		probe:      shellProber,
-		find:       findProcess,
-		killPID:    killProcess,
+		now:            time.Now,
+		sleep:          sleepCtx,
+		healthTick:     5 * time.Second,
+		audioLossRetry: audioLossRetryDefault,
+		probe:          shellProber,
+		find:           findProcess,
+		killPID:        killProcess,
 	}
 }
 
@@ -324,6 +335,11 @@ type stream struct {
 	spec Spec
 	proc Process
 	pid  int
+	// audioLossAt is when an AUDIO_LOSS verdict last restarted this stream. It
+	// outlives the encoder it condemned, because the fault it paces — a channel
+	// that declares an audio PID and carries nothing on it — outlives it too.
+	audioLossAt time.Time
+
 	// autoRestartAt is when the scheduled restart last fired. The schedule
 	// matches on HH:MM, so without this it keeps matching for the rest of that
 	// minute and the stream restarts in a tight loop until the clock moves on.
@@ -784,7 +800,21 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 			continue // the stream is not registered with the daemon (yet)
 		}
 		st.recordTick(now, v, base.peak)
+		if v.LastAudio.After(startedAt) {
+			// Audio is flowing under THIS encoder, so a later silence is a fresh
+			// fault rather than the same permanently-silent channel: the pacing
+			// below starts again from nothing.
+			st.clearAudioLoss()
+		}
 		if verdict := health.check(now, startedAt, v, base); verdict.failed() {
+			// A restart that does not bring the audio back must not be repeated
+			// every audio window, or a channel whose audio is broken upstream is
+			// taken off air every ~40s for ever. See stream.audioLossDue.
+			if verdict.event == EventAudioLoss && !st.audioLossDue(now, sup.audioLossRetry) {
+				dlog.Logf("monitor", "id=%s %s, but the last AUDIO_LOSS restart did not help; leaving it up",
+					st.id, verdict.reason)
+				continue
+			}
 			return verdict
 		}
 	}
@@ -827,6 +857,37 @@ func (st *stream) switchToFallback(src Source) bool {
 	}
 	st.fallback[st.srcIdx] = true
 	return true
+}
+
+// audioLossDue reports whether an AUDIO_LOSS verdict may restart this stream
+// now, and records that it did.
+//
+// The first one always may: a channel that loses its audio is restarted as fast
+// as audio_restart_loss asks. What is paced is doing it AGAIN when the restart
+// changed nothing. A stream whose PMT declares an audio PID that carries no
+// packets — audio broken upstream, an encoder that lost the track — fires this
+// verdict every audio_loss_sec (the panel hardcodes 30) for the whole life of
+// every replacement, and each restart is a real outage: the ring is reset and
+// every viewer rebuffers. The panel had the same fault at a twentieth of the
+// rate, because MonitorCommand.php only re-probed a segment for audio once 300s
+// had passed. This keeps its detection speed and its restart rate.
+//
+// clearAudioLoss undoes it as soon as audio is seen flowing under the current
+// encoder, so a channel that really did recover is judged fresh.
+func (st *stream) audioLossDue(now time.Time, every time.Duration) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if every > 0 && !st.audioLossAt.IsZero() && now.Sub(st.audioLossAt) < every {
+		return false
+	}
+	st.audioLossAt = now
+	return true
+}
+
+func (st *stream) clearAudioLoss() {
+	st.mu.Lock()
+	st.audioLossAt = time.Time{}
+	st.mu.Unlock()
 }
 
 // markFallback records whether the RUNNING process is a fallback command.
