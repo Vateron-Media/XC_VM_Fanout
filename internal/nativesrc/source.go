@@ -159,7 +159,7 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 	}
 	// Bare path → file.
 	if strings.HasPrefix(rawURL, "/") || strings.HasPrefix(rawURL, "./") || strings.HasPrefix(rawURL, "../") {
-		return os.Open(rawURL)
+		return openFile(rawURL)
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -167,7 +167,7 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "file":
-		return os.Open(u.Path)
+		return openFile(u.Path)
 	case "http", "https":
 		// HLS playlists are routed through the pull client, which returns a pipe
 		// whose reader yields concatenated MPEG-TS bytes from the live segment
@@ -181,6 +181,40 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 		return openUDP(ctx, u)
 	}
 	return nil, fmt.Errorf("%w: scheme %q", ErrFormat, u.Scheme)
+}
+
+// openFile reads a local source, sniffed exactly as an HTTP body is.
+//
+// Handing back os.Open unchecked was the one place a source reached viewers
+// without proving what it was. The daemon routes a bare path and file:// past
+// the HTTP probe straight into Open, so a stream registered with
+// /home/xc_vm/content/movie.mp4 — or with a local <id>_.m3u8 — opened fine,
+// reported itself as running natively, and fanned out MP4 boxes (or playlist
+// text) as if they were MPEG-TS. Nothing ever refused, so the ffmpeg fallback,
+// which reads both of those correctly, was never reached.
+func openFile(name string) (io.ReadCloser, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	head := make([]byte, tsSyncProbePackets*tsPacketSize)
+	n, err := io.ReadFull(f, head)
+	head = head[:n]
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, name, err)
+	}
+	if looksLikeTS(head) {
+		return &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), f), c: f}, nil
+	}
+	_ = f.Close()
+	if n == 0 {
+		// An empty file says nothing about WHAT it is — a producer that has not
+		// written yet looks exactly like this — so it stays an ordinary failure
+		// rather than the format refusal that pins a stream to ffmpeg for good.
+		return nil, fmt.Errorf("%w: %s: empty", ErrUnsupportedSource, name)
+	}
+	return nil, fmt.Errorf("%w: %s: not an mpegts stream", ErrFormat, name)
 }
 
 // newStreamClient opens a CONTINUOUS live source body. Unlike the pull client it
