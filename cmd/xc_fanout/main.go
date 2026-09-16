@@ -227,22 +227,51 @@ func main() {
 
 	<-ctx.Done()
 
-	// Stop watching the encoders but LEAVE THEM RUNNING. They are orphaned, not
-	// killed, and the next daemon adopts them (internal/supervisor/adopt.go), so a
-	// restart or an upgrade costs the viewers nothing. Killing them here would take
-	// every channel on this node off air for the length of the restart.
-	if n := mgr.DetachSupervision(); n > 0 {
-		log.Printf("monitor: detached %d encoder(s), left running for the next daemon to adopt", n)
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = clientSrv.Shutdown(shutdownCtx)
-	if ctlSrv != nil {
-		_ = ctlSrv.Shutdown(shutdownCtx)
-	}
+	shutdownDaemon(ctlSrv, clientSrv, func() {
+		// Stop watching the encoders but LEAVE THEM RUNNING. They are orphaned, not
+		// killed, and the next daemon adopts them (internal/supervisor/adopt.go), so a
+		// restart or an upgrade costs the viewers nothing. Killing them here would take
+		// every channel on this node off air for the length of the restart.
+		if n := mgr.DetachSupervision(); n > 0 {
+			log.Printf("monitor: detached %d encoder(s), left running for the next daemon to adopt", n)
+		}
+	}, shutdownGrace)
 	cleanupClient()
 	cleanupCtl()
+}
+
+// shutdownGrace is how long each HTTP surface is given to drain on the way out.
+const shutdownGrace = 2 * time.Second
+
+// shutdownDaemon stops the two HTTP surfaces and detaches encoder supervision,
+// in the one order that cannot orphan an encoder: the CONTROL surface first,
+// then supervision, then the client surface.
+//
+// Detaching first left the control socket accepting for as long as the rest of
+// the shutdown took — the full grace period on a node with viewers, because a
+// live-TS viewer is never idle. A DELETE /monitor/<id> arriving in that window
+// found an already-emptied process table, so Release returned false and the
+// handler still answered 204. The encoder is its own process group and is not
+// tied to the daemon's context, so it kept running, with its pid file; the
+// panel took the 204 for a stop and never handed the channel to the next
+// daemon, and nothing adopted or reaped the process while it held the provider
+// connection and went on writing HLS for a "stopped" channel.
+//
+// Each surface gets its own grace: the control API drains in milliseconds (the
+// panel's requests are short), and giving it a share of the client's budget
+// would only cut the drain viewers actually benefit from.
+func shutdownDaemon(ctlSrv, clientSrv *http.Server, detach func(), grace time.Duration) {
+	shutdown := func(srv *http.Server) {
+		if srv == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), grace)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}
+	shutdown(ctlSrv)
+	detach()
+	shutdown(clientSrv)
 }
 
 // pollConfig re-reads the operator-tuning file every `every` and applies it when
