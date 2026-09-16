@@ -613,7 +613,22 @@ func (st *stream) run(ctx context.Context) {
 			st.emit(EventStreamStartFail, src.Label)
 			// Try a different feed next time rather than hammering the one that
 			// just failed — which of them depends on the priority-backup mode.
-			st.advanceAfterFailure()
+			//
+			// Except for the FIRST failure of a run on a source that still
+			// answers its probe. The walk is what makes failover work, but it
+			// moves on the strength of one launch error, and under priority
+			// backup that costs a stream five minutes on a lesser feed plus two
+			// extra restarts for a blip the primary has already recovered from.
+			// PHP did not pay that: startStream probed each source in turn
+			// inside one attempt, so a primary that answered again was used on
+			// the very next retry. A source with no probe command cannot be
+			// asked, and one that does not answer is walked past at once.
+			if consecutiveFails == 1 && st.sourceStillProbes(ctx, src) {
+				dlog.Logf("monitor", "id=%s source %q still answers its probe; retrying it before walking the list",
+					st.id, src.Label)
+			} else {
+				st.advanceAfterFailure()
+			}
 			dlog.Logf("monitor", "id=%s start failed (%d): %v", st.id, consecutiveFails, err)
 
 			pol := st.policy()

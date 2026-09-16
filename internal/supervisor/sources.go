@@ -172,6 +172,22 @@ func (st *stream) advanceAfterFailure() {
 	st.srcIdx = (st.srcIdx + 1) % n
 }
 
+// sourceStillProbes asks whether src is reachable RIGHT NOW, for a start that
+// has just failed on it. A source with no probe command cannot be asked — the
+// panel supplies one per source, and its absence means "do not test this
+// speculatively" — and without a prober the answer is no, which is the walk this
+// question exists to skip.
+//
+// The probe is bounded by the prober itself (probeTimeout) and by ctx, so a hung
+// origin delays the next attempt by at most one probe and never wedges the loop.
+func (st *stream) sourceStillProbes(ctx context.Context, src Source) bool {
+	probe := st.sup.probe
+	if probe == nil || src.ProbeCmd == "" {
+		return false
+	}
+	return probe(ctx, src.ProbeCmd)
+}
+
 // dueForBackupCheck reports whether it is time to look for a higher-priority
 // source, and records that we looked. Off entirely when the interval is 0.
 func (st *stream) dueForBackupCheck(now time.Time) bool {
