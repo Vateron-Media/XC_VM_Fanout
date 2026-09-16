@@ -25,17 +25,21 @@ network, were the ceiling.
 
 `xc_fanout` moves that hot path into a single native daemon. It pulls each live source exactly
 once, holds a small in-memory ring, and serves every viewer from it as a cheap connection.
+Viewers do not get a copy each: every one of them _follows the same ring by cursor_, for its
+whole session, so a published chunk is written to memory once no matter how many are watching.
 The PHP panel only _controls_ the daemon; it never carries video. Scaling becomes a function
 of network and memory, not of worker count.
 
 ## Highlights
 
-- **Pull once, fan out to many** — a viewer is a connection, not a pinned worker.
+- **Pull once, fan out to many** — a viewer is a connection, not a pinned worker, and it reads the one shared ring rather than a per-viewer copy.
 - **HLS in memory** — `.m3u8` + segments produced on the fly, including **AES-128** encryption, with no on-disk segment store.
+- **Pull, push or launch** — the daemon pulls the source itself, or takes a stream a producer pushes into an ingest socket, or feeds one stream straight from flags for testing.
 - **No transcoding for the common case** — an in-process native remuxer serves plain MPEG-TS / HLS sources with **no per-stream `ffmpeg` child**; unsupported sources degrade cleanly to `ffmpeg`.
 - **On-demand lifecycle** — the puller starts on the first viewer and stops after the last one leaves; an idle reaper reclaims resources.
 - **Live, self-healing configuration** — buffer / HLS / idle tuning lives in a JSON file the daemon self-creates, backfills, polls, and applies without a restart.
 - **Bounded memory** — a soft `GOMEMLIMIT` derived from the cgroup or host budget, plus periodic idle-heap scavenging back to the OS.
+- **Encoder supervision, if you want it** — one supervisor per node can start, watch and restart stream encoders, judging health from the bytes it is already fanning out and failing over between sources. Off until you turn it on.
 - **Single static binary** — pure Go, `CGO_ENABLED=0`; one self-contained binary per architecture runs on any Linux distro.
 
 ## How it works
@@ -55,10 +59,10 @@ flowchart LR
 
 The daemon exposes **two HTTP surfaces on separate unix sockets**:
 
-| Surface     | Socket  | Audience               | Purpose                                                                                   |
-| ----------- | ------- | ---------------------- | ----------------------------------------------------------------------------------------- |
-| **Client**  | `-sock` | nginx-facing (viewers) | `GET /live/<id>`, `GET /hls/<id>/index.m3u8`, `GET /hls/<id>/<seq>.ts`                    |
-| **Control** | `-ctl`  | PHP panel only         | `PUT` / `DELETE /streams/<id>` to register / unregister a source; status & reconciliation |
+| Surface     | Socket  | Audience               | Purpose                                                                                                       |
+| ----------- | ------- | ---------------------- | ------------------------------------------------------------------------------------------------------------- |
+| **Client**  | `-sock` | nginx-facing (viewers) | `GET /live/<id>`, `GET /hls/<id>/index.m3u8`, `GET /hls/<id>/<seq>.ts`, `GET /healthz`                        |
+| **Control** | `-ctl`  | PHP panel only         | Sources (`/streams/<id>` pull, `/ingest/<id>` push), status and off-air warm-up (`/probe/<id>`), viewer reconciliation and telemetry (`/connections`, `/rates`, `/memory`), the admin overlay (`/signal/<uuid>`) and encoder supervision (`/monitor/<id>`, `/monitors`) |
 
 ## Installation
 
@@ -150,7 +154,7 @@ end-to-end Docker bench in [`test/`](test/) are documented in
 The version number lives in the **`VERSION`** file — the single source of truth:
 
 ```bash
-echo 0.13.1 > VERSION                                # bump
+echo 0.13.6 > VERSION                                # bump
 ./release.sh                                         # test + build dist/* + SHA256SUMS
 git commit -am "release $(cat VERSION)" || true     # skip if VERSION is already committed
 git tag "$(cat VERSION)" && git push --tags         # the tag push triggers the release

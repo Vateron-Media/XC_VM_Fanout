@@ -76,11 +76,12 @@ type hlsSeg struct {
 // State accumulates join information from a packet-aligned byte stream.
 // It is not safe for concurrent use; the caller (Hub) serialises access.
 type State struct {
-	lastPAT  []byte // one 188-byte PAT packet, or nil
-	lastPMT  []byte // one 188-byte PMT packet, or nil
-	pmtPID   int    // PID carrying the PMT, or -1 if unknown
-	videoPID int    // PID carrying the video ES (for HLS segment PTS), or -1
-	audioPID int    // PID carrying the audio ES, or -1 when the source has none
+	lastPAT  []byte                 // one 188-byte PAT packet, or nil
+	lastPMT  []byte                 // one 188-byte PMT packet, or nil
+	pmtPID   int                    // PID carrying the PMT, or -1 if unknown
+	pmtAsm   tspes.SectionAssembler // folds a PMT section that spans several packets
+	videoPID int                    // PID carrying the video ES (for HLS segment PTS), or -1
+	audioPID int                    // PID carrying the audio ES, or -1 when the source has none
 	// videoType is the PMT stream_type of videoPID. It decides whether a PES
 	// start on that PID can be recognised as a keyframe from its own bytes when
 	// the source sets no random_access_indicator (see tspes.StartsKeyframe).
@@ -143,10 +144,22 @@ type State struct {
 	segs        []hlsSeg // closed segments, oldest→newest
 	nextSeq     int      // next HLS media sequence number
 	segStartID  int64    // open segment's first GOP id, or -1 = none open
-	segStartPTS int64    // open segment's start HLS clock (90 kHz)
-	segStartT   int64    // open segment's start on the ring clock, or -1
+	segLastPTS  int64    // HLS clock of the newest keyframe in the open segment, or -1
+	segSpan     int64    // media the open segment holds so far (90 kHz), gaps excluded
 	segDisc     bool     // the open segment starts after a timeline jump
 	discDropped int      // discontinuities in segments pruned out of s.segs
+	// hlsStep is the last keyframe-to-keyframe step a cadence explains (90 kHz):
+	// this source's GOP length as observed. It is what the next step is judged
+	// against, and what the final GOP of a segment cut short by a jump is timed
+	// at. 0 until the stream has shown two keyframes.
+	hlsStep int64
+	// hlsMaxDur is the largest #EXT-X-TARGETDURATION this configuration has
+	// published (seconds). RFC 8216 requires the tag not to change for the life
+	// of the playlist, and rendering it from the window alone moved it every time
+	// a longer-than-usual segment slid out — the same client saw it change
+	// between two reloads of the same URL. Cleared when the target changes
+	// (Configure) or the stream is torn down (Reset).
+	hlsMaxDur int
 
 	// plCache is the last rendered playlist, valid until the segment list changes.
 	// Every HLS viewer polls index.m3u8 on its own schedule, so an audience of a few
@@ -174,7 +187,7 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, prunedID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, segLastPTS: -1, prunedID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
@@ -243,6 +256,11 @@ func (s *State) Configure(prebufMS, hlsTargetMS int64, hlsWindow int) {
 	if hlsWindow < 0 {
 		hlsWindow = 0
 	}
+	if hlsTargetMS != s.hlsTargetMS {
+		// A new target means a new playlist: the published target duration is
+		// free to move to it, and must not stay pinned to the old segment length.
+		s.hlsMaxDur = 0
+	}
 	s.prebufMS, s.hlsTargetMS, s.hlsWindow = prebufMS, hlsTargetMS, hlsWindow
 	s.plValid = false // the window (and whether HLS runs at all) may have changed
 	s.recompute()
@@ -290,8 +308,11 @@ func (s *State) Update(chunk []byte) {
 		if hasAdaptation && pkt[4] > 0 {
 			flags := pkt[5]
 			// PCR_flag: refresh the stream clock — from the programme's own PCR
-			// PID once that has shown one, from any PID until then.
-			if flags&0x10 != 0 && (pid == s.pcrPID || !s.pcrOnPID) {
+			// PID once that has shown one, from any PID until then. The field
+			// must be long enough to HOLD the PCR (1 flags byte + 6): a corrupt
+			// or truncated adaptation field otherwise had its payload read as a
+			// clock, and one such packet moves the whole ring's timeline.
+			if flags&0x10 != 0 && pkt[4] >= 7 && (pid == s.pcrPID || !s.pcrOnPID) {
 				if pid == s.pcrPID {
 					s.pcrOnPID = true
 				}
@@ -318,16 +339,49 @@ func (s *State) Update(chunk []byte) {
 			if p := parsePMTPID(pkt); p >= 0 {
 				s.pmtPID = p
 			}
+		// A section is read only from the packet that STARTS it. A PMT too long
+		// for one packet continues in the next, which carries no PUSI; parsing
+		// those continuation bytes as a section of their own read them as
+		// pointer_field and ES entries, which could move videoPID or audioPID to
+		// whatever they happened to spell — and left lastPMT holding a packet that
+		// is not a table, which is then the packet every join burst and every HLS
+		// segment starts with. Multi-packet PMTs are ordinary on DVB passthrough.
 		case s.pmtPID >= 0 && pid == s.pmtPID:
-			s.lastPMT = cloneInto(s.lastPMT, pkt)
-			if v, t := parseVideoPID(pkt); v >= 0 {
-				s.videoPID, s.videoType = v, t
+			if pusi {
+				s.lastPMT = cloneInto(s.lastPMT, pkt)
 			}
-			if m, ok := tspes.ParsePMT(pkt); ok && int(m.PCRPID) != s.pcrPID {
-				s.pcrPID, s.pcrOnPID = int(m.PCRPID), false
-			}
-			if a := parseAudioPID(pkt); a >= 0 {
-				s.audioPID = a
+			// Decide only from a COMPLETE table. A PMT too long for one packet
+			// continues in packets carrying no PUSI, and reading either half as a
+			// section of its own gets the stream wrong in both directions: the
+			// continuation's bytes parse as pointer_field and ES entries, and the
+			// opening packet parses as a table that simply lists fewer streams
+			// than it has. The declarations below are mirrors of the table, so a
+			// half-read one withdraws streams the source is still sending.
+			if sec := s.pmtAsm.Feed(pkt); sec != nil {
+				if es, ok := tspes.PMTStreamsSection(sec); ok {
+					// The stream carries what its PMT says it carries, no more and
+					// no longer. Left sticky, "this stream has audio" outlived the
+					// source it was true for: the supervisor's audio-loss rule
+					// restarts a channel that carries video and no audio, so a
+					// failover to a genuinely video-only backup was restarted
+					// every audio_loss_sec for ever, each restart landing back on
+					// the same silent source. The same applies to video, where a
+					// stale PID means keyframes are looked for on a stream that is
+					// no longer there.
+					video, audio, vtype := -1, -1, byte(0)
+					for _, e := range es {
+						if video < 0 && isVideoStreamType(e.Type) {
+							video, vtype = int(e.PID), e.Type
+						}
+						if audio < 0 && isAudioStreamType(e.Type) {
+							audio = int(e.PID)
+						}
+					}
+					s.videoPID, s.videoType, s.audioPID = video, vtype, audio
+				}
+				if m, ok := tspes.ParsePMTSection(sec); ok && int(m.PCRPID) != s.pcrPID {
+					s.pcrPID, s.pcrOnPID = int(m.PCRPID), false
+				}
 			}
 		}
 
@@ -350,7 +404,7 @@ func (s *State) Update(chunk []byte) {
 			if s.videoPID >= 0 && pid == s.videoPID {
 				if p, ok := parsePTS(pkt); ok {
 					pts = p
-					s.hlsOnKeyframe(id, pts, t)
+					s.hlsOnKeyframe(id, pts)
 				}
 			}
 			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: t, pts: pts, video: onVideo})
@@ -378,6 +432,15 @@ func (s *State) Update(chunk []byte) {
 			if len(s.gops) > 0 {
 				s.noKeyframeCuts++
 			}
+			// A cadence is only a cadence while the source still produces the
+			// blocks it was measured between. This block was cut by the byte cap,
+			// not by a random-access point, and such a block can span minutes;
+			// capping its step at the keyframe cadence the source USED to have
+			// froze the ring clock against real elapsed time, so the ring stopped
+			// ageing and grew until the byte backstop caught it. Forgetting the
+			// cadence here puts this source back in the case ringClock already
+			// documents: no cadence known, so a forward step is taken in full.
+			s.clockStep = 0
 			id := s.nextGOPID
 			s.nextGOPID++
 			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: s.ringClock(), pts: -1})
@@ -386,10 +449,11 @@ func (s *State) Update(chunk []byte) {
 	}
 }
 
-// maxCadence bounds the step ringClock remembers as the stream's cadence — what
-// it advances by across a discontinuity. A GOP is seconds; a longer step (a
-// maxGOP cut on a slow source with no detectable keyframes, or a forward splice)
-// still counts as time passing, it just is not a cadence to repeat.
+// maxCadence bounds the step ringClock takes at face value, and so the one it
+// remembers as the stream's cadence — what it advances by across a
+// discontinuity. A GOP is seconds; a longer step is a timeline jump, not time
+// passing, unless no cadence is known yet (a slow source with no detectable
+// keyframes, whose maxGOP-cut blocks can each span minutes).
 const maxCadence = 60 * 90000
 
 // maxWrap is how far past the 33-bit rollover a backwards step may land and
@@ -408,34 +472,54 @@ const maxWrap = 10 * 60 * 90000
 // had been pushed out. On a node restarting producers or carrying a source with
 // two interleaved PCR clocks, that was most of the daemon's memory.
 //
-// Here a FORWARD step is taken as time passing, whatever its size: a slow
-// source's long block must advance the clock (capping it froze the clock on
-// keyframe-less radio, whose maxGOP-cut blocks each span minutes), and a forward
-// splice can only make the ring prune sooner, never grow. A backwards step that
-// is the 33-bit wrap is unwrapped. Any other backwards step — a restart, a
-// failover — advances by the last plausible cadence, so the window stays a
-// window. -1 until the stream has shown a PCR.
+// A backwards step that is the 33-bit wrap is unwrapped. Any other step no
+// cadence can explain — a restart, a failover, a splice, in EITHER direction —
+// advances by the last plausible cadence instead, so the window stays a window:
+// under ADR 0004 the ring is the live tail, and an hour's forward jump aged the
+// whole of it out in one Update, dropping every follower and emptying the HLS
+// playlist. (It used only to cost memory, hence the old "a forward splice can
+// only make the ring prune sooner".) The HLS segment clock already reads a jump
+// this way; this is the ring clock agreeing with it.
+//
+// Until a cadence is known (clockStep == 0) a forward step is taken in full
+// whatever its size, which is what keeps keyframe-less radio moving: its
+// maxGOP-cut blocks each span minutes, more than any cadence, and capping them
+// froze the clock so nothing was ever pruned. -1 until the stream has shown a
+// PCR; the blocks opened before that are stamped when it starts.
 func (s *State) ringClock() int64 {
 	if s.lastPCR < 0 {
 		return -1
 	}
 	if s.clockPCR < 0 {
 		s.clockPCR, s.clockT = s.lastPCR, 0
+		// The clock starts HERE, so the blocks already in the ring — the pre-roll
+		// opened before the stream showed a PCR, carrying t=-1 — happened at its
+		// origin, not before the beginning of time. Left at -1 they read as older
+		// than any window, and prune dropped them in the very Update that had just
+		// appended to them: on a cold channel (the puller starts on the first
+		// viewer's attach) that is the block the first viewer is reading, and it
+		// was dropped as behind at the stream's first keyframe, 0 bytes sent.
+		// lastPCR is never unset, so this backfill runs at most once per stream.
+		for i := range s.gops {
+			if s.gops[i].t < 0 {
+				s.gops[i].t = 0
+			}
+		}
 		return 0
 	}
 	d := s.lastPCR - s.clockPCR
+	if d < 0 && d+ptsWrap <= maxWrap {
+		d += ptsWrap // the 33-bit PCR wrap: a forward step after all
+	}
 	switch {
-	case d >= 0:
-		if d > 0 && d <= maxCadence {
-			s.clockStep = d
-		}
-	case d+ptsWrap <= maxWrap:
-		d += ptsWrap // the 33-bit PCR wrap
-		if d <= maxCadence {
-			s.clockStep = d
-		}
-	default:
+	case d < 0:
 		d = s.clockStep // a discontinuity: carry on at the last known cadence
+	case d <= maxCadence:
+		if d > 0 {
+			s.clockStep = d
+		}
+	case s.clockStep > 0:
+		d = s.clockStep // a jump forward no cadence explains: another discontinuity
 	}
 	s.clockPCR = s.lastPCR
 	s.clockT += d
@@ -476,7 +560,26 @@ func (s *State) prune() {
 	for i := range s.gops {
 		total += len(s.gops[i].data)
 	}
-	for total > s.maxRing && len(s.gops) > 1 {
+	// The backstop is sized from an ASSUMED bitrate (JoinRingBytesPerMS, ~24
+	// Mbit/s). A stream that actually runs faster than that hit it before the
+	// window it is supposed to hold was full, so the ring kept less than the two
+	// segments the HLS view needs and the playlist went empty — a manifest 404,
+	// which is fatal to a player, where losing a segment is not. Where the ring
+	// HAS a clock, duration pruning above is the real bound and this is only a
+	// backstop, so let the stream's own measured rate raise it. Where it has no
+	// clock there is no rate to measure and the assumption stands, which is the
+	// unbounded-growth case the backstop exists for.
+	limit := s.maxRing
+	if n := len(s.gops); n > 1 {
+		if span := (s.gops[n-1].t - s.gops[0].t) / pcrHz; span > 0 && s.gops[0].t >= 0 {
+			if need := s.ring90 / pcrHz; need > 0 {
+				if want := int(int64(total) * need / span); want > limit {
+					limit = want
+				}
+			}
+		}
+	}
+	for total > limit && len(s.gops) > 1 {
 		total -= len(s.gops[0].data)
 		s.release(s.gops[0])
 		s.gops = append(s.gops[:0], s.gops[1:]...)
@@ -485,51 +588,70 @@ func (s *State) prune() {
 }
 
 // hlsOnKeyframe advances the HLS segment view when a new keyframe (a new GOP,
-// id=newID, opening at newPCR) arrives. If the currently-open segment now spans
-// at least hlsTargetMS, it is closed — ending at the previous last GOP — and this
-// keyframe opens the next one. Called before the new GOP is appended, so
-// s.gops[last] is the closing segment's final GOP. No-op unless the HLS view is
-// enabled and PCR timing is available.
-func (s *State) hlsOnKeyframe(newID, newPTS, newT int64) {
+// id=newID, carrying PES PTS newPTS) arrives. If the currently-open segment now
+// holds at least hlsTargetMS of media, it is closed — ending at the previous last
+// GOP — and this keyframe opens the next one. Called before the new GOP is
+// appended, so s.gops[last] is the closing segment's final GOP. No-op unless the
+// HLS view is enabled and a PES clock is available.
+//
+// A segment is timed KEYFRAME BY KEYFRAME, not by the span from its first
+// keyframe to the one that closes it. The two agree while the stream is
+// continuous, and differ by exactly the gap when it is not: a source reconnect,
+// an upstream HLS source skipping segments, an ffmpeg -copyts restart all step
+// the PTS forward with no media in between. Measured across the whole span, the
+// segment straddling such a gap was listed with #EXTINF (and so
+// #EXT-X-TARGETDURATION) of media PLUS gap — 16 s of #EXTINF for 6 s of video
+// after a 10 s gap — and with no #EXT-X-DISCONTINUITY, so a player buffered
+// against a duration the segment could not fill and nothing told it the timeline
+// had moved. Per step, the gap is visible as one step far outside the cadence:
+// the segment closes on the media it holds and the next one is a discontinuity.
+func (s *State) hlsOnKeyframe(newID, newPTS int64) {
 	if s.hlsTargetMS <= 0 {
 		return
 	}
-	if s.segStartID < 0 {
-		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+	if newPTS < 0 {
+		return // cannot time a segment without a clock on this end
+	}
+	if s.segStartID < 0 || s.segLastPTS < 0 {
+		s.segStartID, s.segLastPTS, s.segSpan = newID, newPTS, 0
 		return
 	}
-	if newPTS < 0 || s.segStartPTS < 0 {
-		return // cannot measure duration without a clock on both ends
+	step := newPTS - s.segLastPTS
+	if step < 0 && step+ptsWrap <= maxWrap {
+		step += ptsWrap // straddled the 33-bit wrap: a forward step after all
 	}
-	d := newPTS - s.segStartPTS
-	switch {
-	case d >= 0 && d <= maxCadence:
-		// time moved on by a plausible amount: the segment clock
-	case d < 0 && d+ptsWrap <= maxWrap:
-		d += ptsWrap // straddled the 33-bit wrap
-	default:
-		// The timeline jumped: a producer restart starts its PTS over, a
-		// failover lands on another clock, a splice skips ahead. Adding 2^33 to
-		// every backwards step read a restart as the wrap and closed a segment of
-		// ~26 hours — #EXTINF and #EXT-X-TARGETDURATION of ~95000 s, and players
-		// broken until it left the window. The open segment ends here instead (a
-		// segment must not span two timelines), timed on the ring clock, which is
-		// monotonic by construction; the next one is marked a discontinuity.
-		dur := int64(-1)
-		if newT >= 0 && s.segStartT >= 0 {
-			dur = (newT - s.segStartT) / pcrHz
-		}
+	// A step no cadence explains is a jump, not time passing: a producer restart
+	// starts its PTS over, a failover lands on another clock, a splice skips
+	// ahead. (Adding 2^33 to every backwards step read a restart as the wrap and
+	// closed a segment of ~26 hours — #EXTINF and #EXT-X-TARGETDURATION of
+	// ~95000 s, and players broken until it left the window.) Until the stream
+	// has shown a cadence any forward step is taken at face value, which is what
+	// keeps a source whose keyframes are further apart than the target — one long
+	// GOP per segment — reading as media rather than as a jump.
+	jump := step < 0 || step > maxCadence ||
+		(s.hlsStep > 0 && step > 2*s.hlsStep+s.hlsTargetMS*pcrHz)
+	if jump {
+		// The open segment ends here — a segment must not span two timelines —
+		// timed on the media it actually holds: every step up to its last
+		// keyframe, plus one cadence for that last GOP, whose own end is what the
+		// jump swallowed.
+		dur := (s.segSpan + s.hlsStep) / pcrHz
 		if dur <= 0 {
 			dur = s.hlsTargetMS
 		}
 		s.closeSegment(newID, dur)
 		s.segDisc = true
-		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+		s.segStartID, s.segLastPTS, s.segSpan = newID, newPTS, 0
 		return
 	}
-	if d >= s.hlsTargetMS*pcrHz {
-		s.closeSegment(newID, d/pcrHz)
-		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+	if step > 0 {
+		s.hlsStep = step
+	}
+	s.segLastPTS = newPTS
+	s.segSpan += step
+	if s.segSpan >= s.hlsTargetMS*pcrHz {
+		s.closeSegment(newID, s.segSpan/pcrHz)
+		s.segStartID, s.segLastPTS, s.segSpan = newID, newPTS, 0
 	}
 }
 
@@ -545,15 +667,25 @@ func (s *State) closeSegment(newID, durMS int64) {
 	s.plValid = false
 }
 
-// hlsPrune drops segments whose GOPs have fully aged out of the ring, so the
-// playlist only ever lists segments Segment can still assemble.
+// hlsPrune drops segments the ring can no longer assemble, so the playlist only
+// ever lists segments HLSSegmentPin will serve.
+//
+// The test is the same one HLSSegmentPin applies: the segment's FIRST GOP must
+// still be in the ring, since a segment handed over without its own keyframe is
+// a decode error rather than a skip. Dropping only when the LAST GOP had gone
+// left every partially-pruned segment listed and 404ing for as long as it took
+// the ring to pass its end — the steady state on a ring shorter than the HLS
+// floor, which is what the byte backstop (defaults.JoinRingBytesPerMS, ≈24
+// Mbit/s) makes of a higher-bitrate channel: four listed segments in five
+// returned nothing. The one-segment case was not covered by HLSPlaylist's fetch
+// margin either, which only holds a segment back when there is more than one.
 func (s *State) hlsPrune() {
 	if len(s.segs) == 0 || len(s.gops) == 0 {
 		return
 	}
 	oldest := s.gops[0].id
 	drop := 0
-	for drop < len(s.segs) && s.segs[drop].endID < oldest {
+	for drop < len(s.segs) && s.segs[drop].startID < oldest {
 		drop++
 	}
 	if drop > 0 {
@@ -598,15 +730,24 @@ func (s *State) HLSPlaylist() string {
 			discSeq++
 		}
 	}
+	// #EXT-X-TARGETDURATION must not change for the life of the playlist (RFC
+	// 8216): a player sizes its reload timer and its startup buffer from it.
+	// Taken from the window alone it moved every time a longer-than-usual segment
+	// slid out, so the same client saw it change between two reloads of the same
+	// URL. It only ever rises here, and is cleared when the target itself changes
+	// (Configure) or the stream is torn down (Reset).
 	maxDur := 0.0
 	for _, sg := range win {
 		if d := float64(sg.durMS) / 1000.0; d > maxDur {
 			maxDur = d
 		}
 	}
+	if td := int(math.Ceil(maxDur)); td > s.hlsMaxDur {
+		s.hlsMaxDur = td
+	}
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
-	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(maxDur)))
+	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", s.hlsMaxDur)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", win[0].seq)
 	if discSeq > 0 {
 		fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
@@ -817,7 +958,31 @@ func (s *State) JoinStart(dst []byte, reqMS int64) ([]byte, Cursor) {
 // then subscribes to the live tail. The live tail used to queue behind the whole
 // burst instead, and a queue short enough to be cheap dropped every viewer whose
 // link could not take a 30 s burst in ~5 s. Caller (Hub) serialises access.
+//
+// It allocates the returned parts slice on every call. A follower at the live
+// edge reads once per published chunk for its whole session, so it should own
+// one slice and use ReadFromInto instead.
 func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool, pin Pin) {
+	return s.ReadFromInto(nil, c, max)
+}
+
+// ReadFromInto is ReadFrom appending the run's slices into dst (its contents are
+// overwritten; it grows only when the run has more slices than it holds). The
+// returned parts alias dst when they fit.
+//
+// It exists for the follower loop: under ADR 0004 a viewer parked at the live
+// edge wakes and reads once per published chunk — about 80 times a second on an
+// 8 Mbit/s stream in 12 KB chunks — and building the parts slice by appending to
+// nil made that one allocation per viewer per chunk. Past a hundred or so
+// followers on a stream that is more garbage per chunk than the single broadcast
+// buffer ADR 0004 removed. A follower that keeps one slice across its session
+// pays none of it.
+//
+// dst must not be a slice whose previous run is still being written: the parts
+// are the ring's own buffers and are handed back in place. Caller (Hub)
+// serialises access.
+func (s *State) ReadFromInto(dst [][]byte, c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool, pin Pin) {
+	parts = dst[:0]
 	if len(s.gops) == 0 {
 		return nil, c, true, false, Pin{}
 	}
@@ -929,10 +1094,11 @@ func (s *State) Reset() {
 	s.gops = nil
 	s.segs = nil
 	s.freeBufs = nil
-	s.segStartID, s.segStartPTS, s.segStartT = -1, -1, -1
+	s.segStartID, s.segLastPTS, s.segSpan = -1, -1, 0
 	// Whatever the producer sends next follows a gap: its first segment is a
 	// discontinuity to anyone who saw the ones before.
 	s.segDisc = s.nextSeq > 0
+	s.hlsStep, s.hlsMaxDur = 0, 0
 	s.plCache, s.plValid = "", false
 }
 
@@ -990,8 +1156,9 @@ func (s *State) Unpin(p Pin) {
 func (s *State) NoKeyframeCuts() int64 { return s.noKeyframeCuts }
 
 // readPCR extracts the 33-bit PCR base (90 kHz) from a packet whose adaptation
-// field carries it. The caller has verified afc has adaptation, pkt[4] > 0 and
-// the PCR_flag is set, so bytes 6..10 hold the base.
+// field carries it. The caller has verified afc has adaptation, the PCR_flag is
+// set and adaptation_field_length is at least 7 — the flags byte plus the six
+// PCR bytes — so bytes 6..10 hold the base.
 func readPCR(pkt []byte) int64 {
 	return int64(pkt[6])<<25 | int64(pkt[7])<<17 | int64(pkt[8])<<9 |
 		int64(pkt[9])<<1 | int64(pkt[10])>>7
@@ -1094,29 +1261,6 @@ func (s *State) Counters() (audioPkts, videoFrames int64, hasAudio bool) {
 	return s.audioPkts, s.videoFrames, s.audioPID >= 0
 }
 
-// parseAudioPID reads the first audio elementary-stream PID out of a PMT packet,
-// or -1. Mirrors parseVideoPID; the two differ only in the stream types they
-// accept.
-func parseAudioPID(pkt []byte) int {
-	ps := payloadOffset(pkt)
-	if ps < 0 || ps >= len(pkt) {
-		return -1
-	}
-	p := ps + 1 + int(pkt[ps]) // skip pointer_field
-	if p+12 > len(pkt) {
-		return -1
-	}
-	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
-	es := p + 12 + pil
-	for es+5 <= len(pkt) {
-		if isAudioStreamType(pkt[es]) {
-			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2])
-		}
-		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
-	}
-	return -1
-}
-
 // isAudioStreamType covers the audio codecs an IPTV source realistically
 // carries: MPEG-1/2 audio, AAC (ADTS and LATM), AC-3 and E-AC-3 — including the
 // 0x06 private-stream form the latter two are usually signalled as in DVB.
@@ -1126,29 +1270,6 @@ func isAudioStreamType(t byte) bool {
 		return true
 	}
 	return false
-}
-
-// parseVideoPID reads the first video elementary-stream PID out of a PMT packet,
-// with its stream_type, or -1. Used to locate the PES that carries the HLS
-// segment clock (PTS), and to know how to read a keyframe off that PES.
-func parseVideoPID(pkt []byte) (int, byte) {
-	ps := payloadOffset(pkt)
-	if ps < 0 || ps >= len(pkt) {
-		return -1, 0
-	}
-	p := ps + 1 + int(pkt[ps]) // skip pointer_field
-	if p+12 > len(pkt) {
-		return -1, 0
-	}
-	pil := ((int(pkt[p+10]) & 0x0f) << 8) | int(pkt[p+11]) // program_info_length
-	es := p + 12 + pil
-	for es+5 <= len(pkt) {
-		if isVideoStreamType(pkt[es]) {
-			return ((int(pkt[es+1]) & 0x1f) << 8) | int(pkt[es+2]), pkt[es]
-		}
-		es += 5 + (((int(pkt[es+3]) & 0x0f) << 8) | int(pkt[es+4]))
-	}
-	return -1, 0
 }
 
 func isVideoStreamType(t byte) bool {

@@ -254,7 +254,17 @@ type Supervisor struct {
 	// coarsest it may be: the panel's scheduled auto-restart matches on HH:MM, so
 	// a slower tick would step over the minute it is meant to fire in.
 	healthTick time.Duration
+	// audioLossRetry is the shortest interval between two AUDIO_LOSS restarts of
+	// the same stream. See stream.audioLossDue.
+	audioLossRetry time.Duration
 }
+
+// audioLossRetryDefault paces repeated AUDIO_LOSS restarts at the rate the panel
+// re-probed for audio: MonitorCommand.php only looked again once 300s had passed
+// since the last look, so a channel whose audio never comes back cost one
+// restart per five minutes there. Detecting the loss stays as fast as
+// audio_restart_loss asks for; only doing it AGAIN is paced.
+const audioLossRetryDefault = 300 * time.Second
 
 // New returns a Supervisor. hasData is how a start is confirmed — the daemon
 // asks its own registry whether the stream has produced bytes, which is the
@@ -272,12 +282,13 @@ func New(launch Launcher, hasData func(id string, since time.Time) bool) *Superv
 		idLocks:    make(map[string]*sync.Mutex),
 		launch:     launch,
 		hasData:    hasData,
-		now:        time.Now,
-		sleep:      sleepCtx,
-		healthTick: 5 * time.Second,
-		probe:      shellProber,
-		find:       findProcess,
-		killPID:    killProcess,
+		now:            time.Now,
+		sleep:          sleepCtx,
+		healthTick:     5 * time.Second,
+		audioLossRetry: audioLossRetryDefault,
+		probe:          shellProber,
+		find:           findProcess,
+		killPID:        killProcess,
 	}
 }
 
@@ -324,6 +335,11 @@ type stream struct {
 	spec Spec
 	proc Process
 	pid  int
+	// audioLossAt is when an AUDIO_LOSS verdict last restarted this stream. It
+	// outlives the encoder it condemned, because the fault it paces — a channel
+	// that declares an audio PID and carries nothing on it — outlives it too.
+	audioLossAt time.Time
+
 	// autoRestartAt is when the scheduled restart last fired. The schedule
 	// matches on HH:MM, so without this it keeps matching for the rest of that
 	// minute and the stream restarts in a tight loop until the clock moves on.
@@ -343,7 +359,11 @@ type stream struct {
 
 	// srcIdx is the source the next start uses; forced is a queued switch from
 	// ForceSource (-1 = none); backupCheckedAt paces the priority-backup probe.
+	// srcTried is how far the current run of failed starts has walked the source
+	// list, so one pass tries every source before the policy picks where the
+	// next pass begins (see advanceAfterFailure).
 	srcIdx          int
+	srcTried        int
 	forced          int
 	backupCheckedAt time.Time
 
@@ -547,13 +567,48 @@ func (st *stream) run(ctx context.Context) {
 	defer close(st.done)
 
 	consecutiveFails := 0
+	// shortRuns counts the encoders that came up and were gone again before the
+	// start had proved itself. Each one moves the stream to the next source, so
+	// the count also says how far round the list the flap has been — which is
+	// what stop_failures needs to mean for a stream that half-works: see the
+	// give-up below.
+	shortRuns := 0
 	first := true
 
 	for ctx.Err() == nil {
+		// An operator's forced source outranks the loop's own failover choice,
+		// and has to be honoured HERE as well as in watch(): watch is reached
+		// only once a start has worked, so a stream that cannot start — exactly
+		// when the manual rescue is reached for — would never look at it.
+		//
+		// Only when it CHANGES something, the same guard watch() has. A force
+		// naming the index the failing loop is already sitting on is queued on
+		// purpose (the walk would otherwise carry the stream off it), but acting
+		// on it writes a FORCE_SOURCE into the panel's log for a switch that did
+		// not happen, and restarts the failure pass.
+		forced := -1
+		if idx := st.takeForced(); idx >= 0 && idx != st.sourceIndex() {
+			forced = idx
+			st.switchTo(idx)
+			if next, ok := st.sourceAt(idx); ok {
+				st.emit(EventForceSource, next.Label)
+			}
+			dlog.Logf("monitor", "id=%s operator forced source %d for the next start", st.id, idx)
+		}
 		src := st.currentSource()
 
-		proc, err := st.startOnce(ctx, src)
+		proc, confirmed, err := st.startOnce(ctx, src)
 		if err != nil {
+			// WE ended the start — a DELETE, a re-PUT after a source change, or a
+			// shutdown — so there is no failure here to report or to act on.
+			// Charging it walked the source list, counted towards stop_failures
+			// (with on_demand_failure_exit, gave up on the spot) and wrote a
+			// STREAM_START_FAIL into the panel's stream log, which its cron copies
+			// into the database: every stop of a stream that was still starting
+			// left the operator a failed start that never happened.
+			if ctx.Err() != nil {
+				return
+			}
 			// The command could not serve this source at all, and the panel gave
 			// it a fallback: that is a choice of pipeline, not a failed start, so
 			// it neither counts towards stop_failures nor waits out the fail sleep.
@@ -566,7 +621,22 @@ func (st *stream) run(ctx context.Context) {
 			st.emit(EventStreamStartFail, src.Label)
 			// Try a different feed next time rather than hammering the one that
 			// just failed — which of them depends on the priority-backup mode.
-			st.advanceAfterFailure()
+			//
+			// Except for the FIRST failure of a run on a source that still
+			// answers its probe. The walk is what makes failover work, but it
+			// moves on the strength of one launch error, and under priority
+			// backup that costs a stream five minutes on a lesser feed plus two
+			// extra restarts for a blip the primary has already recovered from.
+			// PHP did not pay that: startStream probed each source in turn
+			// inside one attempt, so a primary that answered again was used on
+			// the very next retry. A source with no probe command cannot be
+			// asked, and one that does not answer is walked past at once.
+			if consecutiveFails == 1 && st.sourceStillProbes(ctx, src) {
+				dlog.Logf("monitor", "id=%s source %q still answers its probe; retrying it before walking the list",
+					st.id, src.Label)
+			} else {
+				st.advanceAfterFailure()
+			}
 			dlog.Logf("monitor", "id=%s start failed (%d): %v", st.id, consecutiveFails, err)
 
 			pol := st.policy()
@@ -587,7 +657,24 @@ func (st *stream) run(ctx context.Context) {
 		}
 
 		consecutiveFails = 0
-		st.markConfirmed()
+		// An adopted encoder may be serving a different source from the one this
+		// attempt picked — its command line is what decided — so take the source
+		// back from the stream before anything is logged against it.
+		src = st.currentSource()
+		if forced >= 0 && st.sourceIndex() != forced {
+			// Adoption overruled the operator: the survivor is on the source it
+			// is on, and killing it to obey would take the channel off air
+			// before anything else had been tried. The choice is not dropped
+			// either — it goes back on the queue, and watch() carries it out on
+			// its next tick, by which time the stream is up to be switched.
+			st.requeueForce(forced)
+			dlog.Logf("monitor", "id=%s adoption landed on source %d; the forced switch to %d is still queued",
+				st.id, st.sourceIndex(), forced)
+		}
+		st.beginSourceWalk() // this source starts: the failure pass is over
+		if confirmed {
+			st.markConfirmed()
+		}
 		if first {
 			st.emit(EventStreamStart, src.Label)
 			first = false
@@ -598,14 +685,20 @@ func (st *stream) run(ctx context.Context) {
 
 		// Watch until the encoder exits or a health rule condemns it.
 		verdict := st.watch(ctx, proc)
+		ranFor := st.sup.now().Sub(st.startTime())
 		st.markStopped(nil)
 
 		if ctx.Err() != nil {
 			// We ended it (Release / shutdown), not a fault. A stop ends the
-			// encoder with it; a detach leaves it for the next daemon to adopt.
+			// encoder with it; a detach leaves it for the next daemon to adopt,
+			// and stops watching it — an adopted encoder is watched by a
+			// goroutine polling its liveness, which would otherwise outlive the
+			// supervision it belonged to.
 			if st.killOnExit.Load() {
 				proc.Kill()
 				proc.Wait()
+			} else {
+				stopWatching(proc)
 			}
 			return
 		}
@@ -631,12 +724,60 @@ func (st *stream) run(ctx context.Context) {
 			// Exited on its own. A remuxer can only discover some sources are not
 			// servable once it is reading them (an HLS that turns fMP4 mid-life);
 			// it says so the same way it does at startup.
-			if isUnsupportedExit(proc.Wait()) && st.switchToFallback(src) {
+			werr := proc.Wait()
+			if isUnsupportedExit(werr) && st.switchToFallback(src) {
 				dlog.Logf("monitor", "id=%s source %q became unservable by its command; switching to its fallback", st.id, src.Label)
 				continue
 			}
+			// Why it ended is the first thing an operator asks, and the exit
+			// status is the only evidence there is of it. It used to be dropped:
+			// the state explained the restart only when the run had been too
+			// short to count as healthy.
+			why := "encoder exited"
+			if werr != nil {
+				why = fmt.Sprintf("encoder exited: %v", werr)
+			}
+			st.note(why, 0)
 			st.emit(EventStreamFailed, src.Label)
 			dlog.Logf("monitor", "id=%s process exited; restarting", st.id)
+
+			// It ended before the run could be called healthy: an ordinary
+			// failure, which walks the source list exactly as a failed start
+			// does. Without this, a source that accepts the connection, sends a
+			// few seconds of TS and drops — an upstream connection limit, a
+			// short error clip — flaps on that one source forever while a
+			// working backup sits unused. A run that LASTED is a source that
+			// works and merely ended; it keeps the stream where it is.
+			if ranFor < st.minHealthyRun() {
+				st.note(fmt.Sprintf("%s after %s, before the start had proved itself", why, ranFor.Round(time.Second)), 0)
+				shortRuns++
+				st.advanceAfterFailure()
+				dlog.Logf("monitor", "id=%s exited after %s (short of %s); trying the next source",
+					st.id, ranFor.Round(time.Second), st.minHealthyRun())
+
+				// stop_failures is the operator's "stop trying", and a stream
+				// where every source in turn accepts the connection, delivers a
+				// few seconds and drops never reached it: only a start that
+				// produced nothing at all was counted, so the walk went round
+				// and round for ever with GaveUp false whatever the limit said.
+				// It counts here too — but only once the flap has been round the
+				// WHOLE list (each short run moves to the next source, so the
+				// tally says how far it has got), because a stream still looking
+				// for a source that lasts is not flapping yet. Never for a
+				// single source: there is nothing to switch to, and a few
+				// seconds of picture every so often beats none at all.
+				pol, n := st.policy(), st.sourceCount()
+				if pol.StopFailures > 0 && n > 1 && shortRuns >= pol.StopFailures && shortRuns >= n {
+					st.note(fmt.Sprintf("no source lasted %s in %d attempts", st.minHealthyRun(), shortRuns), shortRuns)
+					dlog.Logf("monitor", "id=%s no source lasted %s in %d attempts; giving up",
+						st.id, st.minHealthyRun(), shortRuns)
+					st.giveUp()
+					return
+				}
+			} else {
+				// A start that lasted: the flap tally is about a RUN of them.
+				shortRuns = 0
+			}
 		}
 
 		if !st.sup.sleep(ctx, time.Duration(st.policy().StreamFailSleepSec)*time.Second) {
@@ -681,6 +822,12 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 
 		now := sup.now()
 
+		// A start whose data arrived late — an adopted survivor whose feed into
+		// this daemon came back after the start window closed — is a confirmed
+		// start all the same. Without this it would stay "starting" to the panel
+		// for as long as it ran.
+		st.confirmLate()
+
 		// The scheduled restart is not a fault, but it is a restart, and the
 		// panel logs it as its own action. Once per window: see autoRestartAt.
 		if health.AutoRestart.due(now) && !st.autoRestartedIn(now) {
@@ -689,8 +836,12 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 		}
 
 		// An operator asked for a specific source: that outranks everything,
-		// including whether the current one looks healthy.
-		if idx := st.takeForced(); idx >= 0 {
+		// including whether the current one looks healthy. A choice the stream
+		// has since landed on by itself — the failover walk reached it while the
+		// starts were failing — is dropped instead: killing a healthy encoder to
+		// restart the same command is an outage for nothing, and the panel would
+		// be told it was a FORCE_SOURCE.
+		if idx := st.takeForced(); idx >= 0 && idx != st.sourceIndex() {
 			return healthVerdict{
 				event:        EventForceSource,
 				reason:       fmt.Sprintf("forced switch to source %d", idx),
@@ -717,7 +868,33 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 			continue // the stream is not registered with the daemon (yet)
 		}
 		st.recordTick(now, v, base.peak)
+		if v.LastAudio.After(startedAt) {
+			// Audio is flowing under THIS encoder, so a later silence is a fresh
+			// fault rather than the same permanently-silent channel: the pacing
+			// below starts again from nothing.
+			st.clearAudioLoss()
+		}
 		if verdict := health.check(now, startedAt, v, base); verdict.failed() {
+			// A restart that does not bring the audio back must not be repeated
+			// every audio window, or a channel whose audio is broken upstream is
+			// taken off air every ~40s for ever. See stream.audioLossDue.
+			if verdict.event == EventAudioLoss && !st.audioLossDue(now, sup.audioLossRetry) {
+				dlog.Logf("monitor", "id=%s %s, but the last AUDIO_LOSS restart did not help; leaving it up",
+					st.id, verdict.reason)
+				// Only the audio rule is paced. check returns the FIRST rule
+				// that fires, and on a permanently silent channel that is this
+				// one on every tick — so skipping the tick would switch off the
+				// rules behind it (the frame rate, and the baseline it is judged
+				// against) for as long as the silence lasted. A silent channel
+				// that then freezes is still a frozen channel. Judge it again
+				// with the paced rule taken out.
+				muted := health
+				muted.AudioLossSec = 0
+				if verdict := muted.check(now, startedAt, v, base); verdict.failed() {
+					return verdict
+				}
+				continue
+			}
 			return verdict
 		}
 	}
@@ -762,10 +939,56 @@ func (st *stream) switchToFallback(src Source) bool {
 	return true
 }
 
+// audioLossDue reports whether an AUDIO_LOSS verdict may restart this stream
+// now, and records that it did.
+//
+// The first one always may: a channel that loses its audio is restarted as fast
+// as audio_restart_loss asks. What is paced is doing it AGAIN when the restart
+// changed nothing. A stream whose PMT declares an audio PID that carries no
+// packets — audio broken upstream, an encoder that lost the track — fires this
+// verdict every audio_loss_sec (the panel hardcodes 30) for the whole life of
+// every replacement, and each restart is a real outage: the ring is reset and
+// every viewer rebuffers. The panel had the same fault at a twentieth of the
+// rate, because MonitorCommand.php only re-probed a segment for audio once 300s
+// had passed. This keeps its detection speed and its restart rate.
+//
+// clearAudioLoss undoes it as soon as audio is seen flowing under the current
+// encoder, so a channel that really did recover is judged fresh.
+func (st *stream) audioLossDue(now time.Time, every time.Duration) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if every > 0 && !st.audioLossAt.IsZero() && now.Sub(st.audioLossAt) < every {
+		return false
+	}
+	st.audioLossAt = now
+	return true
+}
+
+func (st *stream) clearAudioLoss() {
+	st.mu.Lock()
+	st.audioLossAt = time.Time{}
+	st.mu.Unlock()
+}
+
 // markFallback records whether the RUNNING process is a fallback command.
 func (st *stream) markFallback(v bool) {
 	st.mu.Lock()
 	st.usingFallback = v
+	st.mu.Unlock()
+}
+
+// rememberFallback leaves the same sticky note switchToFallback does — source
+// idx is served by its FallbackCmd from now on — for a conclusion reached
+// another way. A survivor found running a source's FallbackCmd is proof that the
+// previous daemon had already run that source's own Cmd and been told, with
+// ExitUnsupported, that it cannot serve it; that does not become untrue because
+// this daemon did not witness it.
+func (st *stream) rememberFallback(idx int) {
+	st.mu.Lock()
+	if st.fallback == nil {
+		st.fallback = make(map[int]bool)
+	}
+	st.fallback[idx] = true
 	st.mu.Unlock()
 }
 
@@ -865,14 +1088,18 @@ func limitOrOff(sec int) string {
 // not a running stream — the panel learned this by waiting for a playlist file
 // to appear; here the daemon asks whether bytes arrived, which is the same
 // question without the filesystem in the middle.
-func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
+//
+// The second result says whether the start was CONFIRMED by data. It is always
+// true for a launch that returns without an error; an adopted encoder can come
+// back unconfirmed, because it is not ours to shoot for failing to reach us.
+func (st *stream) startOnce(ctx context.Context, src Source) (Process, bool, error) {
 	spec := st.spec_()
 
 	// An encoder that outlived a previous daemon is resumed rather than
 	// duplicated. Launching alongside it would put two encoders on one source,
 	// and killing it on sight would take the channel off air for the length of
 	// every daemon restart.
-	if pid, ok := adoptable(spec, st.sup.find); ok {
+	if pid, cmdline, ok := adoptable(spec, st.sup.find); ok {
 		dlog.Logf("monitor", "id=%s adopting encoder pid=%d that outlived the daemon", st.id, pid)
 		proc := &adoptedProcess{
 			pid:   pid,
@@ -882,9 +1109,46 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 			done:  make(chan struct{}),
 		}
 		st.markAdopted(true)
-		st.markFallback(false)
+		// The survivor may be on a source the previous daemon failed it over to,
+		// not on the one this spec starts at. Its command line says which.
+		if idx, fb, ok := matchRunningSource(cmdline, spec.Sources); ok {
+			st.switchTo(idx)
+			st.markFallback(fb)
+			if fb {
+				// Not just "this process is a fallback": the source itself is
+				// one from here on, or the next restart relaunches the command
+				// the previous daemon had already proved cannot serve it.
+				st.rememberFallback(idx)
+			}
+			if s, ok := st.sourceAt(idx); ok {
+				src = s
+			}
+		} else {
+			st.markFallback(false)
+		}
+		adoptedAt := st.sup.now()
 		st.markStarted(proc, src.Label)
-		return proc, nil
+
+		exited := make(chan error, 1)
+		go func() { exited <- proc.Wait() }()
+
+		// A survivor is confirmed by the same evidence as any other start: bytes
+		// arriving HERE. A daemon restart is exactly what breaks that feed —
+		// buildLive's tee slave into our ingest carries onfail=ignore, so the
+		// encoder keeps running with its output to us dead — and calling it
+		// confirmed told the panel the channel was on air while nothing reached
+		// this daemon at all. What must NOT follow is killing it over that: it is
+		// still the only encoder on this source, and the health rules judge it
+		// from here like any other.
+		confirmed, err := st.awaitData(ctx, proc, exited, adoptedAt, spec.Policy.StartTimeoutSec, false)
+		if err != nil {
+			return nil, false, err
+		}
+		if !confirmed {
+			dlog.Logf("monitor", "id=%s adopted encoder pid=%d has not fed this daemon within %ds; supervising it unconfirmed",
+				st.id, pid, spec.Policy.StartTimeoutSec)
+		}
+		return newWaitedProcess(proc, exited), confirmed, nil
 	}
 	st.markAdopted(false)
 
@@ -892,7 +1156,7 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	launchedAt := st.sup.now()
 	proc, err := st.sup.launch(ctx, cmd, spec.ErrorsPath)
 	if err != nil {
-		return nil, fmt.Errorf("launch: %w", err)
+		return nil, false, fmt.Errorf("launch: %w", err)
 	}
 	st.markFallback(fallback)
 
@@ -908,37 +1172,100 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	exited := make(chan error, 1)
 	go func() { exited <- proc.Wait() }()
 
-	deadline := st.sup.now().Add(time.Duration(spec.Policy.StartTimeoutSec) * time.Second)
+	if _, err := st.awaitData(ctx, proc, exited, launchedAt, spec.Policy.StartTimeoutSec, true); err != nil {
+		return nil, false, err
+	}
+	// Hand the already-running Wait to the caller rather than starting a second
+	// one on the underlying process.
+	return newWaitedProcess(proc, exited), true, nil
+}
+
+// awaitData waits for a start to prove itself: bytes that arrived after since.
+// exited carries the process's own Wait, so an encoder that dies inside the
+// window is reported as the failed start it is rather than waited out.
+//
+// killOnTimeout says what a start that never produced anything means. For an
+// encoder we launched it is a failed start: the process is ended, reaped and
+// reported. For an adopted survivor it is not — killing it would take the
+// channel off air on the strength of a feed this daemon cannot see — so it comes
+// back unconfirmed and the caller goes on supervising it.
+func (st *stream) awaitData(ctx context.Context, proc Process, exited chan error, since time.Time, timeoutSec int, killOnTimeout bool) (bool, error) {
+	// cancelled ends a start the daemon itself gave up on. Whether the encoder
+	// dies with it is the SAME question the watch loop asks on its way out: a
+	// stop kills it, a detach leaves it running for the next daemon to adopt.
+	// Killing unconditionally broke that contract for every stream inside its
+	// confirmation window — a daemon upgrade that landed on a slow start took the
+	// channel off air and left a pid file naming a dead pid, so the next daemon
+	// could not adopt it either. And a kill must be followed by the reap, or
+	// stop() returns while the encoder it condemned is still alive and the
+	// replacement comes up beside it.
+	cancelled := func() (bool, error) {
+		if st.killOnExit.Load() {
+			proc.Kill()
+			<-exited
+		} else {
+			// A detach leaves the encoder running, so nothing here waits for it
+			// — but an adopted one is watched by a goroutine polling its
+			// liveness, and that goroutine has nobody to report to any more.
+			stopWatching(proc)
+		}
+		return false, ctx.Err()
+	}
+
+	deadline := st.sup.now().Add(time.Duration(timeoutSec) * time.Second)
 	for {
 		select {
 		case werr := <-exited:
 			st.markStopped(werr)
 			if isUnsupportedExit(werr) {
-				return nil, fmt.Errorf("%w (exited during startup: %v)", errUnsupported, werr)
+				return false, fmt.Errorf("%w (exited during startup: %v)", errUnsupported, werr)
 			}
-			return nil, fmt.Errorf("exited during startup: %v", werr)
+			if werr == nil {
+				// No error to report. One we launched exited cleanly without
+				// producing anything; an adopted survivor never had a status to
+				// give — its exit belongs to init, not to us — so its Wait
+				// always says nil. Either way "<nil>" is not an explanation, and
+				// an operator reading /monitor/<id> gets one sentence about this
+				// start and it had better be true.
+				if killOnTimeout {
+					return false, errors.New("exited during startup without producing anything")
+				}
+				return false, errors.New("the adopted encoder is gone")
+			}
+			return false, fmt.Errorf("exited during startup: %v", werr)
 		case <-ctx.Done():
-			proc.Kill()
-			return nil, ctx.Err()
+			return cancelled()
 		default:
 		}
 
-		if st.sup.hasData(st.id, launchedAt) {
-			// Hand the already-running Wait to the caller rather than starting a
-			// second one on the underlying process.
-			return newWaitedProcess(proc, exited), nil
+		if st.sup.hasData(st.id, since) {
+			return true, nil
 		}
 		if !st.sup.now().Before(deadline) {
+			if !killOnTimeout {
+				return false, nil
+			}
 			proc.Kill()
 			<-exited
 			st.markStopped(nil)
-			return nil, fmt.Errorf("no data within %ds of start", spec.Policy.StartTimeoutSec)
+			return false, fmt.Errorf("no data within %ds of start", timeoutSec)
 		}
 		if !st.sup.sleep(ctx, 200*time.Millisecond) {
-			proc.Kill()
-			<-exited
-			return nil, ctx.Err()
+			return cancelled()
 		}
+	}
+}
+
+// watchStopper is a Process whose WATCHER can be ended without ending the
+// process. Only an adopted encoder has one to end: it is watched by a goroutine
+// polling its liveness, where a child is watched by a blocking wait that costs
+// nothing. stopWatching is the detach path's way of saying so through the
+// Process interface, which deliberately knows nothing about either.
+type watchStopper interface{ stopWatching() }
+
+func stopWatching(p Process) {
+	if s, ok := p.(watchStopper); ok {
+		s.stopWatching()
 	}
 }
 
@@ -961,6 +1288,10 @@ type waitedProcess struct {
 func newWaitedProcess(p Process, wait chan error) *waitedProcess {
 	return &waitedProcess{Process: p, wait: wait, done: make(chan struct{})}
 }
+
+// stopWatching passes the detach through to the process underneath: the wrapper
+// exists to share one Wait, and it is that Wait's watcher being ended.
+func (w *waitedProcess) stopWatching() { stopWatching(w.Process) }
 
 func (w *waitedProcess) Wait() error {
 	w.once.Do(func() {
@@ -985,6 +1316,20 @@ func (st *stream) policy() Policy {
 	return st.spec.Policy
 }
 
+// minHealthyRun is how long an encoder has to stay up for its start to count as
+// having worked. An exit before that walks the source list, the same as a start
+// that never produced anything; an exit after it leaves the stream on a source
+// that was plainly working.
+//
+// It is the start timeout because that is the daemon's existing statement of how
+// long a start may take to prove itself: a process that confirmed inside that
+// window and was gone again before it closed never delivered a stream, it
+// delivered a few seconds of one. No new setting — the panel already tunes this
+// through start_timeout_sec.
+func (st *stream) minHealthyRun() time.Duration {
+	return time.Duration(st.policy().StartTimeoutSec) * time.Second
+}
+
 // currentSource is the source the next start should use.
 func (st *stream) currentSource() Source {
 	st.mu.Lock()
@@ -1000,6 +1345,14 @@ func (st *stream) markStarted(p Process, label string) {
 	st.proc, st.pid, st.source = p, p.Pid(), label
 	st.started, st.running, st.confirmed = st.sup.now(), true, false
 	st.starts++
+	// Landing on anything but the top source starts the priority-backup clock,
+	// exactly as MonitorCommand.php stamped $rBackupsChecked at every (re)start.
+	// Without it the clock was still zero when an operator forced a backup, so
+	// the first health tick probed the preferred source, found it answering and
+	// undid the force within seconds of a 300s interval.
+	if st.srcIdx > 0 {
+		st.backupCheckedAt = st.started
+	}
 	st.mu.Unlock()
 }
 
@@ -1007,7 +1360,29 @@ func (st *stream) markStarted(p Process, label string) {
 func (st *stream) markConfirmed() {
 	st.mu.Lock()
 	st.confirmed = true
+	// The run of failed starts is over, so the tally the panel reads goes with
+	// it. Leaving it standing reported failures=N for a channel that had been up
+	// for days, and PHP writes "not running WITH failures" as stream_status=1
+	// (failed) — so every later restart gap of a stream that once stumbled on
+	// the way up was recorded as a failure rather than as a start in progress.
+	st.fails = 0
 	st.mu.Unlock()
+}
+
+// confirmLate confirms a running-but-unconfirmed producer once its bytes do
+// reach this daemon. Only an adopted encoder can be in that state — a launched
+// one that produced nothing inside its window is a failed start and is gone —
+// and its feed can come back after the window closed.
+func (st *stream) confirmLate() {
+	st.mu.Lock()
+	pending, since := st.running && !st.confirmed, st.started
+	st.mu.Unlock()
+	if !pending {
+		return
+	}
+	if st.sup.hasData(st.id, since) {
+		st.markConfirmed()
+	}
 }
 
 func (st *stream) markStopped(err error) {
@@ -1041,6 +1416,12 @@ func (st *stream) sourceAt(idx int) (Source, bool) {
 		return Source{}, false
 	}
 	return st.spec.Sources[idx], true
+}
+
+func (st *stream) sourceCount() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return len(st.spec.Sources)
 }
 
 func (st *stream) sourceIndex() int {

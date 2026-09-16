@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/nativesrc"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tspes"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsseg"
 )
@@ -191,14 +192,13 @@ func classify(ctx context.Context, err error) error {
 }
 
 // Redact keeps source credentials out of the logs the panel shows operators.
-func Redact(raw string) string {
-	if i := strings.Index(raw, "://"); i >= 0 {
-		if at := strings.Index(raw[i+3:], "@"); at >= 0 {
-			return raw[:i+3] + "***@" + raw[i+3+at+1:]
-		}
-	}
-	return raw
-}
+// It is the shared internal/redact rule, not a local one: the scan this used to
+// do split on the FIRST "@" after "://" while net/url takes the LAST, so a
+// password containing "@" kept its tail in the log and a "@" anywhere in the
+// path swallowed the host name. It also never touched the XC path shape
+// (/live/<user>/<pass>/<id>.ts), which is how nearly every source here carries
+// its account.
+func Redact(raw string) string { return redact.URL(raw) }
 
 // checkScheme refuses up front what nativesrc cannot read, so the fallback is
 // reached without a network round trip. A bare path is refused too: nativesrc
@@ -206,7 +206,10 @@ func Redact(raw string) string {
 func checkScheme(raw string) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Scheme == "" {
-		return fmt.Errorf("%w: input %q is not a URL", ErrUnsupported, raw)
+		// Never echo raw: an unescaped "%" in a password is enough to make
+		// url.Parse fail, and this error is printed through notef, which is on
+		// at every log level and lands in <id>.errors.
+		return fmt.Errorf("%w: input %q is not a URL", ErrUnsupported, Redact(raw))
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https", "udp", "rtp":

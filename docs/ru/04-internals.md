@@ -77,7 +77,11 @@ Publish(chunk):
 | `http(s)` отдаёт MPEG-TS | нативно (и раньше тоже — это прямой путь) |
 | `http(s)` отдаёт `m3u8` с **TS**-сегментами | **нативно** |
 | `udp://`, `rtp://` | нативно |
+| `file://` или голый путь, отдающий MPEG-TS | нативно |
 | HLS с сегментами **fMP4/CMAF** | ffmpeg |
+| HLS с сегментами **packed audio** (`.aac`, `.ac3`, `.mp3`) | ffmpeg |
+| HLS, где звук — **отдельная дорожка** (`EXT-X-MEDIA`) | ffmpeg |
+| HLS, использующий **`EXT-X-BYTERANGE`** | ffmpeg |
 | RTMP / SRT / RTSP | ffmpeg |
 | HLS-**источник** с шифрованием AES-128 | ffmpeg |
 | всё, что не удалось уверенно опознать | ffmpeg |

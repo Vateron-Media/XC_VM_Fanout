@@ -79,7 +79,11 @@ stream**; natively it is a goroutine and a pipe. It also removes the process spa
 | `http(s)` serving MPEG-TS | native (and already was — this is the direct path) |
 | `http(s)` serving `m3u8` with **TS** segments | **native** |
 | `udp://`, `rtp://` | native |
+| `file://` or a bare path serving MPEG-TS | native |
 | HLS with **fMP4/CMAF** segments | ffmpeg |
+| HLS with **packed-audio** segments (`.aac`, `.ac3`, `.mp3`) | ffmpeg |
+| HLS whose audio is a **separate rendition** (`EXT-X-MEDIA`) | ffmpeg |
+| HLS using **`EXT-X-BYTERANGE`** | ffmpeg |
 | RTMP / SRT / RTSP | ffmpeg |
 | AES-128 encrypted HLS **source** | ffmpeg |
 | anything it cannot positively identify | ffmpeg |

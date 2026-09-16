@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -38,6 +39,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/supervisor"
 )
 
@@ -69,14 +71,32 @@ type Stream struct {
 	// nothing else records it.
 	lastBackend string
 	chunk       int
-	grace       time.Duration
-	running     bool
-	cancel      context.CancelFunc
-	refs        int  // live TS viewers currently connected
-	buffered    bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
+	// grace is the idle-stop window this stream is reaped on, read by the reaper
+	// under s.mu. Copied from Manager.grace when the stream is created AND
+	// re-copied by ApplyConfig, so lowering grace_sec in the panel also reaches
+	// the channels the panel registered before the change.
+	grace    time.Duration
+	running  bool
+	cancel   context.CancelFunc
+	refs     int  // live TS viewers currently connected
+	buffered bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
+	// removed is set by Unregister once this Stream has left the registry, and is
+	// never cleared: a Stream is single-use. Register and RegisterIngest look a
+	// stream up and configure it in two steps, so a teardown landing in between
+	// left them holding a pointer the registry no longer contained — and a puller
+	// or ingest listener started on it was unreachable by the reaper, by DELETE
+	// and by /connections, i.e. leaked for the life of the daemon.
+	removed bool
 
 	ingestLn   net.Listener // non-nil = push-fed: the producer (ffmpeg tee) connects here
 	ingestSock string       // path of the ingest listener socket (for cleanup)
+	// ingestStat identifies the socket FILE this listener created, so the
+	// teardown unlinks that one and not whatever now answers to the same name.
+	// Unregister removes the stream from the registry before tearing it down, so
+	// a registration racing it can bind <id>.sock on a fresh Stream in between —
+	// and a blind os.Remove here unlinked the live stream's socket, leaving a
+	// channel that the panel is told is listening and no producer can reach.
+	ingestStat os.FileInfo
 
 	// ingestConns are the producer connections accepted on ingestLn. Tracked so a
 	// teardown can close them: closing the listener alone leaves an already-connected
@@ -101,6 +121,15 @@ type Stream struct {
 	// ffprobing a segment. Atomic: it is written on the publish hot path.
 	publishedBytes atomic.Int64
 	lastAccess     atomic.Int64 // UnixNano of the last viewer touch (TS attach or HLS request)
+
+	// rateMu guards the publish-rate samples below. rateOld is the oldest
+	// reading still inside the measurement horizon and rateNew the most recent
+	// roll point; publishRate differences publishedBytes against rateOld, so the
+	// horizon is always rateSampleEvery..2*rateSampleEvery of real seconds and
+	// never collapses to nothing just after a roll. See publishRate.
+	rateMu  sync.Mutex
+	rateOld rateSample
+	rateNew rateSample
 
 	connMu sync.Mutex           // guards conns (map + each connStat's refs/since)
 	conns  map[string]*connStat // active live-TS viewer uuids (from the ?c= param)
@@ -322,6 +351,9 @@ func (s *Stream) connRates() map[string]int {
 // (the stream's ffmpeg `-f tee … unix:<sockPath>` output) connects; the daemon
 // accepts and reads. Idempotent. Caller holds s.mu.
 func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
+	if s.removed {
+		return errStreamRemoved // nothing could reach what this listener would feed
+	}
 	if s.ingestLn != nil {
 		return nil // already listening
 	}
@@ -334,11 +366,20 @@ func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
 		return err
 	}
 	_ = os.Chmod(sockPath, 0o660)
+	// Close() unlinks the socket path by name, which is not the same thing as
+	// unlinking the socket this listener made: a registration racing a teardown
+	// re-binds <id>.sock on a fresh Stream, and the doomed listener's Close then
+	// took the live one's file away. stopIngestLocked does the unlink instead,
+	// and only for a file it can still identify as its own.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
 	if chunk > 0 {
 		s.chunk = chunk
 	}
 	s.ingestLn = ln
 	s.ingestSock = sockPath
+	s.ingestStat, _ = os.Stat(sockPath) // whose socket file this is; see stopIngestLocked
 	ch := s.chunk
 	s.ingestMu.Lock()
 	s.ingestGen++
@@ -416,9 +457,31 @@ func (s *Stream) stopIngestLocked() {
 		dlog.Logf("ingest", "id=%s closed %d in-flight producer connection(s)", s.id, n)
 	}
 	if s.ingestSock != "" {
-		_ = os.Remove(s.ingestSock)
-		s.ingestSock = ""
+		if s.ownsIngestSock() {
+			_ = os.Remove(s.ingestSock)
+		} else {
+			dlog.Logf("ingest", "id=%s leaving %s alone: it belongs to a newer listener", s.id, s.ingestSock)
+		}
+		s.ingestSock, s.ingestStat = "", nil
 	}
+}
+
+// ownsIngestSock reports whether the file at s.ingestSock is still the one this
+// stream's listener created. Unregister removes the stream from the registry
+// before tearing it down, so a PUT /ingest for the same id can land in that gap,
+// get a fresh Stream and re-bind <id>.sock; unlinking it blindly took the LIVE
+// stream's socket away, and since that stream stays in the registry with
+// ingestLn set, every later registration short-circuits on "already listening"
+// and hands the panel a path no producer can reach. Caller holds s.mu.
+//
+// A path we never managed to stat is removed as before: a socket left behind
+// would block the next listener, and that is the failure this trades against.
+func (s *Stream) ownsIngestSock() bool {
+	if s.ingestStat == nil {
+		return true
+	}
+	fi, err := os.Stat(s.ingestSock)
+	return err == nil && os.SameFile(fi, s.ingestStat)
 }
 
 // Publish feeds one packet-aligned chunk into the fan-out (which also folds it
@@ -426,36 +489,131 @@ func (s *Stream) stopIngestLocked() {
 // off-air detection via status()).
 func (s *Stream) Publish(chunk []byte) {
 	if len(chunk) > 0 {
-		s.lastData.Store(time.Now().UnixNano())
-		s.publishedBytes.Add(int64(len(chunk)))
+		now := time.Now()
+		s.lastData.Store(now.UnixNano())
+		total := s.publishedBytes.Add(int64(len(chunk)))
+		s.noteRate(total-int64(len(chunk)), now)
 	}
 	s.Hub.Publish(chunk)
 }
 
-// setConfig registers/updates the pull config; if viewers are already waiting it
-// starts the puller immediately.
-func (s *Stream) setConfig(src puller.Source, chunk int) {
+// rateSample is one reading of publishedBytes and the wall time it was taken at.
+type rateSample struct {
+	bytes int64
+	at    time.Time
+}
+
+// rateSampleEvery is how often the publish-rate horizon is rolled forward, so a
+// rate is always measured over the last rateSampleEvery..2*rateSampleEvery.
+//
+// It is long on purpose. A source does not arrive evenly: an upstream HLS
+// playlist hands the puller a whole 6 s segment in one burst and then nothing,
+// and a window short enough to land inside one burst reads several times the
+// channel's real rate — which is the dangerous direction, because runBytes turns
+// a rate into how much a viewer must drain inside one write deadline. Averaged
+// over half a minute any delivery pattern flattens out. A var so a test can
+// shorten it.
+var rateSampleEvery = 15 * time.Second
+
+// noteRate folds one published chunk into the stream's rate measurement. base is
+// publishedBytes as it stood BEFORE the chunk, so the first sample counts the
+// first chunk rather than skipping it. Called from Publish, i.e. once per source
+// read (tens of times a second at most), and the lock is otherwise untaken.
+func (s *Stream) noteRate(base int64, now time.Time) {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	switch {
+	case s.rateNew.at.IsZero():
+		s.rateOld = rateSample{bytes: base, at: now}
+		s.rateNew = s.rateOld
+	case now.Sub(s.rateNew.at) >= rateSampleEvery:
+		s.rateOld, s.rateNew = s.rateNew, rateSample{bytes: base, at: now}
+	}
+}
+
+// publishRate reports how fast the source is feeding this stream, in bytes per
+// second, and whether there is a measurement at all. It differences
+// publishedBytes against the oldest sample still in the horizon, so it needs
+// neither a PCR nor a keyframe — which is the whole point: a source that never
+// signals a random-access point gives the ring no clock of its own (tsjoin cuts
+// it only on the max_gop_bytes backstop, leaving a single block, and a single
+// block spans nothing), and that is precisely the low-bitrate class whose
+// viewers a bitrate-blind run size drops. See runBytes.
+//
+// ok is false only while nothing has been published yet, or while the sample is
+// too young to divide by. A stream that IS publishing nothing measures 0, which
+// is a real answer and a different one.
+func (s *Stream) publishRate(now time.Time) (int64, bool) {
+	total := s.publishedBytes.Load()
+	s.rateMu.Lock()
+	old := s.rateOld
+	s.rateMu.Unlock()
+	if old.at.IsZero() {
+		return 0, false
+	}
+	elapsed := now.Sub(old.at)
+	if elapsed < rateSampleMin {
+		return 0, false
+	}
+	if total <= old.bytes {
+		return 0, true // publishing nothing: a run of one packet is the right answer
+	}
+	return int64(float64(total-old.bytes) / elapsed.Seconds()), true
+}
+
+// rateSampleMin is the shortest span publishRate will divide by; below it one
+// source read dominates the answer. meta.go's minBitrateWindow makes the same
+// call for the bitrate the panel is shown.
+const rateSampleMin = minBitrateWindow
+
+// setConfig registers/updates the pull config; if viewers are already waiting,
+// or a puller is already running on a source that just changed, it (re)starts the
+// puller. It reports false — applying nothing — when the stream has already left
+// the registry, so the caller can retry on a fresh one.
+func (s *Stream) setConfig(src puller.Source, chunk int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.removed {
+		return false
+	}
+	first := s.cfg == nil
 	changed := s.cfg != nil && !sameSource(*s.cfg, src)
 	c := src
 	s.cfg = &c
 	if chunk > 0 {
 		s.chunk = chunk
 	}
-	dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, src.URLs, src.Proxy, s.refs)
-	if s.refs > 0 {
-		// A running puller holds the Source it started with, so an edit made in
-		// the panel (a new URL, a changed user agent) reached a watched channel
-		// only after its audience had been gone for the whole grace period —
-		// never, on a busy one. Restart it when the source really changed; the
-		// panel re-registers on every request, so an identical config must not.
-		if changed && s.running {
-			dlog.Logf("ctl", "id=%s source changed while running: restarting the puller", s.id)
-			s.stopLocked()
-		}
-		s.startLocked()
+	// Log the source only when it is actually new or edited, and never with the
+	// account in it. The panel re-registers a stream on EVERY viewer request (HLS
+	// playlist polls included), so this line used to write the provider's user and
+	// password — as userinfo or as the /live/<user>/<pass>/ path an XC panel hands
+	// out — plus the proxy's, into the journal hundreds of times a minute, in logs
+	// support reads and ships off the box. redact keeps the host, the stream id
+	// and the query shape, which is all the line was ever read for.
+	if first || changed {
+		dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, redact.URLs(src.URLs), redact.URL(src.Proxy), s.refs)
 	}
+	// A running puller holds the Source it started with, so an edit made in the
+	// panel (a new URL, a changed user agent) only reaches it through a restart —
+	// and whether the audience happens to be holding a ref is beside the point.
+	// HLS holds none (a playlist or segment request only stamps lastAccess), so a
+	// channel watched over HLS alone runs with refs==0, and a TS channel runs
+	// with refs==0 for the whole grace window after its last viewer leaves. An
+	// edit landing in either of those used to be lost for good: startLocked is a
+	// no-op while running, so no later touch/attach picked it up, and the HLS
+	// polls kept lastAccess fresh so the reaper never idle-stopped the stream
+	// that would have. Restart whenever the source really changed under a running
+	// puller; the panel re-registers on every request, so an identical config
+	// must not.
+	switch {
+	case changed && s.running:
+		dlog.Logf("ctl", "id=%s source changed while running: restarting the puller", s.id)
+		s.stopLocked()
+		s.startLocked()
+	case s.refs > 0:
+		s.startLocked() // viewers are already waiting on a stream that was not pulling
+	}
+	return true
 }
 
 // sameSource reports whether two registrations describe the same pull — every
@@ -467,7 +625,7 @@ func sameSource(a, b puller.Source) bool {
 }
 
 func (s *Stream) startLocked() {
-	if s.running || s.cfg == nil {
+	if s.removed || s.running || s.cfg == nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -595,15 +753,6 @@ func (s *Stream) touch() {
 	s.mu.Unlock()
 }
 
-// restoreBuffer pumps a gated ring back to the full prebuffer + HLS view. It is
-// ensureBufferedLocked's locking wrapper, for the one caller that needs the ring
-// restored before it takes a join snapshot.
-func (s *Stream) restoreBuffer() {
-	s.mu.Lock()
-	s.ensureBufferedLocked()
-	s.mu.Unlock()
-}
-
 // ensureBufferedLocked pumps the ring back to the full prebuffer + HLS view if
 // the stream was gated down to the idle floor. Called when a viewer returns (TS
 // attach or HLS touch) so the audience gets the configured buffer depth again —
@@ -726,8 +875,12 @@ type Manager struct {
 	// maxPrebufMS/writeTimeout/hlsTargetMS/hlsWindow/idleBuffer* are read off m.mu
 	// on hot paths (the client handler, the reaper's buffer gate, the attach/touch
 	// buffer restore), so they are atomic — ApplyConfig retunes them live without a
-	// lock. grace is read only under m.mu (stream creation), so it stays a plain
-	// field guarded by it.
+	// lock. grace is off every hot path, so it stays a plain field guarded by
+	// m.mu: it is read under m.mu at stream creation and on each reaper tick
+	// (reapInterval, so a retuned grace_sec changes the sweep cadence), and
+	// written under m.mu by ApplyConfig — which then carries the new value to
+	// each live Stream.grace under that stream's own st.mu. Creation is no
+	// longer the only place it is touched; the locking is what makes that safe.
 	maxPrebufMS     atomic.Int64 // the buffer/ring size (ms of TS history) + ceiling for a per-viewer burst
 	defaultPrebufMS atomic.Int64 // per-viewer join burst (ms) fallback ONLY when the panel passes no ?prebuffer=
 	hlsTargetMS     atomic.Int64 // HLS target segment duration (ms); HLS is cut from the ring, not sized by it
@@ -850,8 +1003,18 @@ func (m *Manager) resolvePrebufMS(param string) int64 {
 // ApplyConfig live-applies operator tuning (from the polled config file) to the
 // running daemon. New streams pick up the new values at creation; every existing
 // stream's prebuffer ring and HLS window are reconfigured in place, so lowering
-// them frees memory within one poll — no restart, no viewer drop. Safe to call
-// from the config-poll goroutine while streams are serving.
+// them frees memory within one poll, with no restart and no stream dropped. Safe
+// to call from the config-poll goroutine while streams are serving.
+//
+// One caveat, with the ring as the live tail (ADR 0004): a viewer holds a cursor
+// INTO the ring, and LOWERING prebuffer_max_sec prunes on the spot everything
+// older than the new window. A viewer sitting deeper than that — one that joined
+// with a large ?prebuffer and is still catching up, or a player that stopped
+// reading ahead once its own buffer filled — has its block pruned and is dropped
+// as behind on its next read, then reconnects into the new, shorter ring.
+// Everything within the new window plays on untouched. Shrinking the ring is the
+// one config change that costs those viewers a reconnect; raising it, and every
+// other key, costs none.
 func (m *Manager) ApplyConfig(v config.Values) {
 	m.maxPrebufMS.Store(int64(v.PrebufferMaxSec) * 1000)
 	m.defaultPrebufMS.Store(int64(v.DefaultPrebufferSec) * 1000)
@@ -870,8 +1033,9 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	// holding m.mu across all of them would block GetOrCreate needlessly).
 	// maxGOP/defaultChunk apply to streams created after this point (existing
 	// hubs keep the join cap they were built with); prebuffer/HLS retune live.
+	grace := time.Duration(v.GraceSec) * time.Second
 	m.mu.Lock()
-	m.grace = time.Duration(v.GraceSec) * time.Second
+	m.grace = grace
 	m.maxGOP = v.MaxGOPBytes
 	m.defaultChunk = v.ChunkBytes
 	streams := make([]*Stream, 0, len(m.streams))
@@ -884,8 +1048,15 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	// fully-buffered (watched) stream to the new full prebuffer/HLS, a gated
 	// (idle) one to the new idle floor — so a config change never un-gates an
 	// unwatched stream. st.mu orders before the hub lock everywhere.
+	// The idle-stop window travels with the stream (it is read by the reaper under
+	// st.mu), and it was copied at creation and never updated: a node booted with
+	// grace_sec=3600 to keep channels warm went on holding every already-registered
+	// channel's puller for an hour after the operator lowered grace_sec, since the
+	// panel keeps streams registered indefinitely. grace_sec is one of the keys
+	// documented as applying live to existing streams, so carry it to them.
 	for _, st := range streams {
 		st.mu.Lock()
+		st.grace = grace
 		m.applyBufferLocked(st)
 		st.mu.Unlock()
 	}
@@ -901,17 +1072,48 @@ func (m *Manager) applyBufferLocked(st *Stream) {
 	st.Hub.SetGated(!st.buffered)
 }
 
+// reapMinInterval / reapMaxInterval bound the sweep cadence. The floor keeps a
+// tiny grace_sec from spinning the sweep; the ceiling keeps a large one (up to
+// an hour is allowed) from parking it for half of that, which is both how the
+// idle-buffer gate ran half an hour late on a warm node and why a live grace_sec
+// change went unseen for as long.
+const (
+	reapMinInterval = time.Second
+	reapMaxInterval = 5 * time.Second
+)
+
+// reapInterval is how often the sweep runs: half the SHORTER of the two windows
+// it enforces — the idle-stop grace and the idle-buffer gate — bounded to
+// [reapMinInterval, reapMaxInterval] and re-read on every tick, so an operator
+// lowering grace_sec in the panel gets the new cadence with the next sweep. It
+// used to be m.grace/2, computed once when the reaper started: a node booted
+// with grace_sec=3600 swept every 30 minutes, so unwatched rings held their
+// memory for that long past the 30 s idle-buffer grace, and lowering grace_sec
+// later changed nothing until a restart.
+func (m *Manager) reapInterval() time.Duration {
+	m.mu.Lock()
+	iv := m.grace
+	m.mu.Unlock()
+	if g := time.Duration(m.idleBufferGraceNS.Load()); g > 0 && g < iv {
+		iv = g
+	}
+	iv /= 2
+	if iv < reapMinInterval {
+		return reapMinInterval
+	}
+	if iv > reapMaxInterval {
+		return reapMaxInterval
+	}
+	return iv
+}
+
 // StartReaper runs the idle-stop sweep until ctx is cancelled: control-managed
 // streams with no live viewers and no HLS access within the grace window get
 // their puller stopped. This is the single idle-stop path for both TS and HLS
 // audiences. Call once from main; tests that don't need reaping omit it.
 func (m *Manager) StartReaper(ctx context.Context) {
-	interval := m.grace / 2
-	if interval < time.Second {
-		interval = time.Second
-	}
 	go func() {
-		t := time.NewTicker(interval)
+		t := time.NewTimer(m.reapInterval())
 		defer t.Stop()
 		for {
 			select {
@@ -941,7 +1143,7 @@ func (m *Manager) StartReaper(ctx context.Context) {
 				// garbage, but Go hands freed pages back to the OS only lazily, so
 				// RSS would sit flat for minutes. Hand that fact to the memory
 				// scavenger rather than forcing a full stop-the-world GC here: this
-				// sweep runs every grace/2 (5 s at the default grace), and calling
+				// sweep runs every few seconds (see reapInterval), and calling
 				// FreeOSMemory from it put the daemon in near-continuous full
 				// collections, re-faulting the pages it had just returned. The
 				// scavenger owns the release, and this flag lets it skip its rate
@@ -949,6 +1151,7 @@ func (m *Manager) StartReaper(ctx context.Context) {
 				if freed {
 					m.gatedSinceScavenge.Store(true)
 				}
+				t.Reset(m.reapInterval()) // re-read: grace_sec is retunable live
 			}
 		}
 	}()
@@ -1025,10 +1228,16 @@ func (m *Manager) startMemoryScavenger(ctx context.Context, interval time.Durati
 // push-fed via ingest), how many live-TS viewers hold a ref, the hub subscriber
 // count, tracked viewer uuids, and the age of the last data (a growing data_age
 // on a running stream is the off-air signal). This is the "what is the daemon
-// doing right now" view. No-op when debug is off or every <= 0, so it costs
-// nothing in normal operation. Call once from main.
+// doing right now" view. No-op when every <= 0 or neither category it writes is
+// enabled, so it costs nothing in normal operation. Call once from main.
+//
+// It gates on the CATEGORIES it writes, not on dlog.On(): an operator narrowing
+// debug to one subsystem (-debug-cats=puller, which is what the filter is for)
+// had this loop go on waking every few seconds to take every stream's mu and
+// connMu and its hub lock (NoKeyframeCuts) and format a line per stream — on a
+// 500-channel node, all of it thrown away by Logf's filter.
 func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
-	if !dlog.On() || every <= 0 {
+	if every <= 0 || (!dlog.OnCat("stats") && !dlog.OnCat("monitor")) {
 		return
 	}
 	go func() {
@@ -1039,12 +1248,6 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				m.mu.Lock()
-				streams := make([]*Stream, 0, len(m.streams))
-				for _, st := range m.streams {
-					streams = append(streams, st)
-				}
-				m.mu.Unlock()
 				// Supervision first: it is a different question from "what are
 				// the streams doing", and on a node that supervises nothing the
 				// single line saying so is itself the answer.
@@ -1057,6 +1260,18 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 						dlog.Logf("monitor", "%s", l)
 					}
 				}
+				// Everything below feeds the "stats" category alone: skip the
+				// registry snapshot, the per-stream locks and the formatting when
+				// only "monitor" is selected.
+				if !dlog.OnCat("stats") {
+					continue
+				}
+				m.mu.Lock()
+				streams := make([]*Stream, 0, len(m.streams))
+				for _, st := range m.streams {
+					streams = append(streams, st)
+				}
+				m.mu.Unlock()
 				if len(streams) == 0 {
 					dlog.Logf("stats", "no streams registered")
 					continue
@@ -1132,13 +1347,42 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 // that was registered before it. What is recorded here is whether the panel
 // pinned a backend for this one stream, which is the only thing registration
 // can know that the start cannot.
-func (m *Manager) Register(id string, src puller.Source, chunk int) {
-	st := m.GetOrCreate(id)
-	st.mu.Lock()
-	st.pinnedBackend = src.Backend
-	st.mu.Unlock()
-	st.setConfig(src, chunk)
+//
+// The lookup and the config are two steps, so a DELETE for the same id can tear
+// the stream down in between — the panel re-registers on every request, so the
+// two really do overlap. setConfig refuses the stream it took out of the
+// registry; registering again picks up the fresh one GetOrCreate then makes.
+//
+// It reports whether the registration landed. The retry is bounded, so it can
+// run out, and a registration that never landed means the channel has no source
+// on this node: the caller has to say so rather than let the panel believe a
+// registration it never got. The give-up goes to the ordinary log, not dlog — it
+// is not debug narration, it is a request the daemon dropped.
+func (m *Manager) Register(id string, src puller.Source, chunk int) bool {
+	for attempt := 0; attempt < registerAttempts; attempt++ {
+		st := m.GetOrCreate(id)
+		st.mu.Lock()
+		st.pinnedBackend = src.Backend
+		st.mu.Unlock()
+		if st.setConfig(src, chunk) {
+			return true
+		}
+	}
+	log.Printf("server: id=%s registration lost to concurrent teardowns %d times: not registered", id, registerAttempts)
+	return false
 }
+
+// registerAttempts bounds the Register/RegisterIngest retry when a teardown takes
+// the stream out of the registry between the lookup and the start. A single
+// racing DELETE needs one retry; the bound is what keeps a storm of them from
+// spinning here instead of answering the request.
+const registerAttempts = 4
+
+// errStreamRemoved reports that a Stream has left the registry, so nothing may be
+// started on it: whatever it started — a puller holding a provider connection, an
+// ingest listener feeding a closed hub — would be unreachable for the life of the
+// daemon.
+var errStreamRemoved = errors.New("stream was unregistered")
 
 // backend returns the node-wide source backend.
 func (m *Manager) backend() string {
@@ -1192,16 +1436,26 @@ func (m *Manager) RegisterIngest(id string, chunk int) (string, error) {
 		return "", errors.New("ingest dir not set")
 	}
 	sock := filepath.Join(m.ingestDir, id+".sock")
-	st := m.GetOrCreate(id)
-	st.mu.Lock()
-	err := st.startIngestLocked(sock, chunk)
-	st.mu.Unlock()
-	if err != nil {
-		dlog.Logf("ingest", "id=%s listen failed on %s: %v", id, sock, err)
-		return "", err
+	// Same two-step window as Register: a DELETE between the lookup and the
+	// listen used to re-open <id>.sock on a Stream the registry had just dropped,
+	// so the producer connected to an orphan and its accept goroutine leaked.
+	for attempt := 0; attempt < registerAttempts; attempt++ {
+		st := m.GetOrCreate(id)
+		st.mu.Lock()
+		err := st.startIngestLocked(sock, chunk)
+		st.mu.Unlock()
+		if errors.Is(err, errStreamRemoved) {
+			continue // torn down under us; the next GetOrCreate makes a fresh one
+		}
+		if err != nil {
+			dlog.Logf("ingest", "id=%s listen failed on %s: %v", id, sock, err)
+			return "", err
+		}
+		dlog.Logf("ingest", "id=%s listening on %s", id, sock)
+		return sock, nil
 	}
-	dlog.Logf("ingest", "id=%s listening on %s", id, sock)
-	return sock, nil
+	dlog.Logf("ingest", "id=%s listen lost to concurrent teardowns %d times: not listening", id, registerAttempts)
+	return "", errStreamRemoved
 }
 
 // Unregister stops and removes a control-managed stream (pull or ingest).
@@ -1213,9 +1467,24 @@ func (m *Manager) RegisterIngest(id string, chunk int) (string, error) {
 // never publish again, pinning the Stream, its hub and its whole ring. Waking the
 // followers (CloseAll) lets each serveLive return and run its deferred cleanup, so
 // the viewer reconnects (and re-authorises) instead of freezing on an orphan.
+//
+// The stream leaves the registry FIRST, in one step under m.mu, and is only then
+// torn down. Deleting it last left two holes. A Register that had already looked
+// the id up went on to configure and start the doomed Stream, so a puller kept an
+// upstream connection open on something the reaper, DELETE and /connections can
+// no longer see; the `removed` flag is what closes that, and the delete-first
+// order is what makes it reliable — by the time the flag is set the entry is
+// already gone, so the racing Register's retry cannot find the corpse again. And
+// a second teardown of the same id could delete an entry that a PUT had created
+// after it started, dropping a live registration nobody had torn down.
 func (m *Manager) Unregister(id string) {
-	if st := m.Get(id); st != nil {
+	m.mu.Lock()
+	st := m.streams[id]
+	delete(m.streams, id)
+	m.mu.Unlock()
+	if st != nil {
 		st.mu.Lock()
+		st.removed = true
 		st.cfg = nil
 		st.stopLocked()
 		st.stopIngestLocked()
@@ -1227,9 +1496,6 @@ func (m *Manager) Unregister(id string) {
 		}
 		st.dropSegCache()
 	}
-	m.mu.Lock()
-	delete(m.streams, id)
-	m.mu.Unlock()
 	dlog.Logf("ctl", "id=%s unregistered and removed", id)
 }
 
@@ -1516,6 +1782,16 @@ type streamConfig struct {
 	Chunk  int      `json:"chunk"`
 	Key    string   `json:"key"` // hex AES-128 key for encrypted HLS (optional)
 	IV     string   `json:"iv"`  // hex AES-128-CBC IV
+	// Headers are extra request headers as raw "Key: value" lines, for an
+	// upstream that needs more than a User-Agent and a Cookie to answer (a
+	// Referer gate, a vhost Host, a provider's own token header). puller.Source
+	// has carried them down every path — probe, native reader and ffmpeg child —
+	// since it was written, but nothing could ever set them: this field is the
+	// missing wire. Omitted by a panel that has none, like every other optional
+	// key here. sameSource compares them, so changing them restarts the pull —
+	// which is right: a source fetched with different headers is a different
+	// source.
+	Headers []string `json:"headers"`
 	// Backend pins how THIS stream's non-mp2t source is converted, overriding
 	// source_backend from the config file: "auto", "ffmpeg" or "native". Empty
 	// (the usual case) takes the node-wide setting, so the panel only has to
@@ -1566,14 +1842,22 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad config", http.StatusBadRequest)
 			return
 		}
-		m.Register(id, puller.Source{
+		if !m.Register(id, puller.Source{
 			URLs:      c.URLs,
 			UserAgent: c.UA,
 			Proxy:     c.Proxy,
 			Cookie:    c.Cookie,
+			Headers:   c.Headers,
 			FfmpegBin: c.Ffmpeg,
 			Backend:   normalizeBackend(c.Backend),
-		}, c.Chunk)
+		}, c.Chunk) {
+			// Teardowns beat every attempt, so this channel has no source here.
+			// Saying 204 would tell the panel the opposite; 503 is transient by
+			// definition, so its next request — it re-registers on every one —
+			// retries instead of trusting a registration that never happened.
+			http.Error(w, "registration lost to a concurrent teardown", http.StatusServiceUnavailable)
+			return
+		}
 		m.GetOrCreate(id).setEnc(c.Key, c.IV)
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodGet:
@@ -1593,11 +1877,79 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// joinRunBytes is how much join history a viewer is written per pinned run
-// while it catches up to the live edge: big enough to keep lock round-trips
-// rare, small enough that a slow viewer never holds a pin — which suspends GOP
-// recycling for the whole stream — for more than a moment.
+// joinRunBytes is the CEILING on how much join history a viewer is written per
+// pinned run while it catches up to the live edge: big enough to keep lock
+// round-trips rare, small enough that a slow viewer never holds a pin — which
+// suspends GOP recycling for the whole stream — for more than a moment. What a
+// live viewer actually gets per run is sized from the stream's own rate; see
+// runBytes.
 const joinRunBytes = 1 << 20
+
+// minRunBytes floors a sized run at 64 packets, so a very low-bitrate stream
+// (or a very short write timeout) still moves the ring in useful steps instead
+// of a packet at a time, which would put the hub lock on the per-packet path.
+const minRunBytes = 64 * 188
+
+// runResizeEvery is how often a live session re-measures the stream's rate. The
+// bitrate barely moves, and a stream that was cold when the viewer joined has no
+// rate to measure yet — re-measuring is what lets that session settle onto a real
+// run size instead of keeping the cold-start ceiling for hours.
+const runResizeEvery = 5 * time.Second
+
+// runBytes sizes ONE Follow run for st. writeRun deadlines the whole run, so the
+// run — not the stream — is what sets the throughput a viewer must sustain to
+// survive: a fixed 1 MiB run demanded ~533 kbit/s at the default 15 s timeout
+// whatever the channel's bitrate, so a 500 kbit/s channel joined with a deep
+// prebuffer dropped viewers whose link was several times faster than its source,
+// on every reconnect. Size the run in stream time instead — the bytes the source
+// itself produces in half a write deadline, measured off the ring (what it holds
+// over the stream time it spans) — so the bar a viewer must clear is "keep up
+// with the stream, with a factor of two to spare".
+//
+// The ring's own clock is the first choice: it measures the source in STREAM
+// time, so a bursty delivery (a whole HLS segment at once) cannot fool it. Not
+// every source has one, though — one that never signals a random-access point
+// gives tsjoin nothing to cut on but the max_gop_bytes backstop, so its ring
+// holds a single block, and a single block spans 0 ms for as long as the stream
+// runs. That is not "a cold start with no backlog to drain": the block can hold
+// megabytes, and it is exactly the low-bitrate class (radio, low-res) whose
+// viewers the fixed run dropped. So fall back to the stream's published bytes
+// over wall time, which needs neither PCR nor keyframe.
+//
+// Clamped to [minRunBytes, joinRunBytes]. Only a stream that has published
+// nothing measurable — where there is genuinely no backlog to drain — keeps the
+// ceiling.
+func (m *Manager) runBytes(st *Stream, now time.Time) int {
+	timeoutMS := int64(time.Duration(m.writeTimeout.Load()) / time.Millisecond)
+	if timeoutMS <= 0 {
+		return joinRunBytes
+	}
+	// RingStats sums the bytes of all n blocks but spans only the n-1 intervals
+	// between their start times: the newest block's own duration is not in it.
+	// Dividing n blocks of bytes by n-1 blocks of time reads the source as
+	// n/(n-1) times faster than it is — twice as fast on a two-block ring — so
+	// scale the bytes to the blocks the span actually covers. Without this a
+	// short ring (one just refilled after an idle-stop, a zap onto a gated
+	// channel, a source with long GOPs) spent the promised factor of two.
+	if ringBytes, spanMS, gops := st.Hub.RingStats(); ringBytes > 0 && spanMS > 0 && gops > 1 {
+		return clampRunBytes(int64(ringBytes) * int64(gops-1) * timeoutMS / (int64(gops) * 2 * spanMS))
+	}
+	if bps, ok := st.publishRate(now); ok {
+		return clampRunBytes(bps * timeoutMS / 2000)
+	}
+	return joinRunBytes
+}
+
+// clampRunBytes bounds a sized run to [minRunBytes, joinRunBytes].
+func clampRunBytes(n int64) int {
+	if n > joinRunBytes {
+		return joinRunBytes
+	}
+	if n < minRunBytes {
+		return minRunBytes
+	}
+	return int(n)
+}
 
 func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/live/")
@@ -1616,18 +1968,22 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// the ring (maxPrebufMS).
 	prebufMS := m.resolvePrebufMS(r.URL.Query().Get("prebuffer"))
 
-	// Restore a gated ring BEFORE capturing the join burst, so this viewer's own
-	// snapshot is drawn from the full buffer rather than the idle floor. attach()
-	// would do it too, but only after Subscribe had already copied.
-	st.restoreBuffer()
-
-	// Place the join FIRST, then attach: the cursor fixes where this viewer's
-	// history starts before the puller (if it was stopped) begins publishing, and
-	// the catch-up below subscribes it at the live edge with no gap between the
-	// history and the live tail.
-	head, cur := st.Hub.Join(prebufMS)
+	// Attach FIRST, then place the join. attach takes the ref, stamps lastAccess,
+	// restores a gated ring to the full buffer and starts the puller if it was
+	// stopped — all under st.mu — so the cursor below is placed in a ring the
+	// reaper can no longer touch: refs>0 blocks both the idle-stop (Hub.Flush) and
+	// the idle-buffer gate.
+	//
+	// The cursor used to be placed first, which left a window where the viewer
+	// held a cursor while the stream still looked unwatched (refs==0, lastAccess
+	// as old as the last departure). A reaper sweep landing in it flushed or gated
+	// the ring under the joining viewer, its block was pruned, and its very first
+	// Follow reported behind: a fresh zap on a fast link dropped as "fell behind
+	// the ring". Nothing is lost by joining second — whatever the restarted puller
+	// publishes in between is history this viewer then starts from.
 	st.attach()
 	defer st.detach()
+	head, cur := st.Hub.Join(prebufMS)
 
 	// Track this viewer by its connection uuid (from live.php's X-Accel URL) so
 	// fanout_sync can detect its disconnect and close the lines_live row, and so
@@ -1670,19 +2026,29 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// run and fanout_sync can close the lines_live row, instead of a ghost
 	// connection lingering on the stream the viewer already left.
 	rc := http.NewResponseController(w)
+	// written counts what has gone out through write(). Only this goroutine
+	// touches it, and the overlay window writes through the same closure, so
+	// differencing it across a window says whether anything reached the viewer.
+	var written int64
 	write := func(b []byte) error {
 		if err := rc.SetWriteDeadline(time.Now().Add(time.Duration(m.writeTimeout.Load()))); err != nil {
 			// Deadlines unsupported (shouldn't happen for a real conn) — fall back
 			// to a plain write rather than aborting the viewer.
 			n, werr := w.Write(b)
-			if cs != nil && n > 0 {
-				cs.bytes.Add(int64(n))
+			if n > 0 {
+				written += int64(n)
+				if cs != nil {
+					cs.bytes.Add(int64(n))
+				}
 			}
 			return werr
 		}
 		n, err := w.Write(b)
-		if cs != nil && n > 0 {
-			cs.bytes.Add(int64(n))
+		if n > 0 {
+			written += int64(n)
+			if cs != nil {
+				cs.bytes.Add(int64(n))
+			}
 		}
 		if err != nil {
 			return err
@@ -1747,10 +2113,13 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// Follow the ring by cursor for the WHOLE session — the join history and then
 	// the live tail, one loop (ADR 0004). Nothing is copied per viewer and nothing
 	// queues behind the history: the viewer takes the ring at its own link speed in
-	// runs of joinRunBytes (each pinned only while it is written), and one slower
-	// than the stream falls off the ring's tail (behind) and is let go. At the live
-	// edge the follower parks on wake until the next Publish, and a teardown
-	// (CloseAll) surfaces as ended so this handler returns and runs its cleanup.
+	// runs sized from the stream's rate (each pinned only while it is written), and
+	// one slower than the stream falls off the ring's tail (behind) and is let go.
+	// At the live edge the follower parks on wake until the next Publish, and a
+	// teardown (CloseAll) surfaces as ended so this handler returns and runs its
+	// cleanup.
+	runMeasured := time.Now()
+	runMax := m.runBytes(st, runMeasured)
 	if len(head) > 0 {
 		if err := write(head); err != nil {
 			reason = writeFailReason(err)
@@ -1764,18 +2133,33 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		if uuid != "" && m.signals.peek(uuid) {
 			if sig, ok := m.signals.take(uuid); ok {
 				dlog.Logf("signal", "id=%s uuid=%s applying overlay to live TS window", id, uuid)
+				before := written
 				next, alive := m.overlayTSWindow(st, cur, write, sig, codec)
 				if !alive {
 					reason = "client closed (during overlay)"
 					return
 				}
 				cur = next
-				resetIdle() // the overlay delivered a window of video, not silence
+				// Only if the window really delivered a span of video. It can
+				// deliver nothing and keep the viewer's cursor — a vc this ffmpeg
+				// build lacks, a colour drawtext rejects, an off-air stream with no
+				// video to burn the banner onto — and then the viewer has received
+				// nothing, which is precisely what the idle timer is there to
+				// notice. Resetting it anyway handed a ghost connection the whole
+				// window plus a fresh idle period for a banner nobody saw.
+				if written > before {
+					resetIdle()
+				}
 				continue
 			}
 		}
 
-		burst, next, atEnd, wake, behind, ended := st.Hub.Follow(cur, joinRunBytes)
+		// Re-measure the run size occasionally: a stream that was cold at join has
+		// a rate only once it has published something.
+		if now := time.Now(); now.Sub(runMeasured) >= runResizeEvery {
+			runMax, runMeasured = m.runBytes(st, now), now
+		}
+		burst, next, atEnd, wake, behind, ended := st.Hub.Follow(cur, runMax)
 		if behind {
 			burst.Release()
 			reason = "dropped: fell behind the ring (link slower than the stream)"
@@ -1787,8 +2171,9 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Write the whole run under one deadline (writeRun); a kick / client-close is
-		// checked once before it. A run is bounded by joinRunBytes, so a healthy
-		// viewer clears it in milliseconds, and a stalled one is dropped by the run's
+		// checked once before it. A run is bounded by runMax — what the source itself
+		// produces in half the deadline — so a viewer keeping up with the stream
+		// clears it with room to spare, and a stalled one is dropped by the run's
 		// write deadline.
 		delivered := false
 		if len(burst.Parts) > 0 {

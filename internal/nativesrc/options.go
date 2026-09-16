@@ -6,12 +6,15 @@ package nativesrc
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 )
 
 // Options are the per-source knobs the daemon already carries for a pull, so a
@@ -29,7 +32,36 @@ type Options struct {
 	// Headers are extra request headers as raw "Key: value" lines. They apply
 	// to every fetch this package makes for the source — the playlist AND each
 	// segment — because an upstream that gates on a header gates on all of it.
+	// A "Host:" line overrides the request's Host, as ffmpeg's -headers does,
+	// for fetches to the source's own host — see scopedTo.
 	Headers []string
+
+	// hostScope is the host of the URL these options were configured for, set by
+	// scopedTo as a source is opened. A configured "Host:" line is an answer to
+	// ONE origin (a vhost reached by IP), and a playlist there can list segments
+	// on a separate CDN name; sending the origin's vhost to that CDN is the 404
+	// the line exists to avoid. Empty means "unknown", where the line still
+	// applies: it is the most specific thing anyone said about the source.
+	hostScope string
+}
+
+// scopedTo pins the configured Host override to the host of the URL the source
+// was opened at. Only the first call counts: the scope belongs to the source
+// URL, not to whatever host a later fetch happens to reach.
+func (o Options) scopedTo(u *url.URL) Options {
+	if o.hostScope == "" && u != nil {
+		o.hostScope = u.Host
+	}
+	return o
+}
+
+// hostInScope reports whether req is going to the host the source was opened at,
+// which is where a configured Host override belongs.
+func (o Options) hostInScope(req *http.Request) bool {
+	if o.hostScope == "" || req.URL == nil {
+		return true
+	}
+	return strings.EqualFold(req.URL.Host, o.hostScope)
 }
 
 // Timeouts. Bounded fetches (playlists, segments) get a whole-request deadline;
@@ -61,6 +93,25 @@ var ErrHLSIsFMP4 = fmt.Errorf("%w: hls source carries fmp4 segments", ErrFormat)
 // is a format refusal (IsFormat) that the fallback can serve.
 var ErrHLSEncrypted = fmt.Errorf("%w: hls segments are encrypted", ErrFormat)
 
+// ErrHLSNotTS marks an HLS source whose segments are not MPEG-TS at all. Packed
+// audio is the one that turns up in practice — RFC 8216 lets a playlist carry
+// ID3 + ADTS directly in .aac/.ac3/.mp3 segments, which is how radio channels
+// ship — and an HTML error page served in a segment's place is the other. This
+// package copies segment bytes through unread, so either would reach viewers as
+// 188-byte slices of something that is not TS: no PAT, no PMT, no keyframe,
+// nothing playable. ffmpeg handles packed audio, so this is a format refusal
+// (IsFormat) that the fallback can serve.
+var ErrHLSNotTS = fmt.Errorf("%w: hls segments are not mpeg-ts", ErrFormat)
+
+// ErrHLSByteRange marks an HLS source whose segments are #EXT-X-BYTERANGE slices
+// of one larger resource rather than whole files. This package GETs a segment
+// URI and passes the whole response through, so such a playlist would fetch the
+// entire resource for its first entry and then skip every later one that names
+// it again — and once that resource grows past the runaway limit, fetch nothing
+// at all. ffmpeg sends a Range header per segment, so this is a format refusal
+// (IsFormat) that the fallback can serve.
+var ErrHLSByteRange = fmt.Errorf("%w: hls segments are byte ranges of one resource", ErrFormat)
+
 // transport builds the shared transport shape. dialWait separates the two
 // callers: a bounded fetch can afford to wait a little longer to connect than a
 // live body, which should fail fast so the puller can rotate to the next URL.
@@ -77,12 +128,55 @@ func (o Options) transport(dialWait time.Duration) *http.Transport {
 		MaxIdleConns:          32,
 		IdleConnTimeout:       idleConnLife,
 	}
-	if o.Proxy != "" {
-		if pu, err := url.Parse("http://" + o.Proxy); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
-		}
+	switch pu, err := o.proxyURL(); {
+	case err != nil:
+		// Fail CLOSED. The parse error used to be dropped, which left a source
+		// that an operator had put behind a proxy connecting DIRECTLY from the
+		// node's own IP — no error, no log line, and no proxy, which is the one
+		// outcome a proxy is configured to prevent. checkProxy refuses the fetch
+		// before it starts; this is the belt to that braces, for any path that
+		// builds a transport without asking first.
+		tr.Proxy = func(*http.Request) (*url.URL, error) { return nil, err }
+	case pu != nil:
+		tr.Proxy = http.ProxyURL(pu)
 	}
 	return tr
+}
+
+// proxyURL resolves the configured proxy. The panel sends a bare "host:port",
+// which needs the scheme prefixed; the remux flag and hand-written configs carry
+// "http://host:port", which must NOT be prefixed again — "http://http://host"
+// either fails to parse or aims at a host called "http".
+func (o Options) proxyURL() (*url.URL, error) {
+	raw := strings.TrimSpace(o.Proxy)
+	if raw == "" {
+		return nil, nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		// A *url.Error repeats the whole URL — credentials included — in its
+		// message, so only the reason is safe to put in a log.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return nil, fmt.Errorf("proxy %s: %v", redact.URL(raw), err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("proxy %s: no host", redact.URL(raw))
+	}
+	return u, nil
+}
+
+// checkProxy refuses a fetch whose proxy cannot be used, so a misconfigured
+// proxy is an error the operator sees rather than a direct connection nobody
+// notices. Callers that speak HTTP check it before their first request.
+func (o Options) checkProxy() error {
+	_, err := o.proxyURL()
+	return err
 }
 
 // apply stamps the source's identity onto a request.
@@ -100,9 +194,28 @@ func (o Options) apply(req *http.Request) {
 	for _, line := range o.Headers {
 		name, value, ok := strings.Cut(line, ":")
 		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
 		if !ok || name == "" {
 			continue
 		}
-		req.Header.Set(name, strings.TrimSpace(value))
+		// Host is the one header a client cannot set through the header map:
+		// net/http writes the request line's Host from req.Host and drops
+		// Header["Host"] on the floor. A vhost-routed origin reached by IP —
+		// which is why anyone configures this line — would have kept seeing the
+		// IP and answering 404. An empty value is left alone, since blanking
+		// req.Host makes the request unroutable, and a request to a host other
+		// than the source's is left alone too: that origin's playlist can list
+		// segments on a separate CDN name, and the source's vhost means nothing
+		// there but a 403.
+		if strings.EqualFold(name, "Host") {
+			if value != "" && o.hostInScope(req) {
+				req.Host = value
+			}
+			// Drop any earlier attempt at it too, so what is in the map is what
+			// actually goes out.
+			req.Header.Del("Host")
+			continue
+		}
+		req.Header.Set(name, value)
 	}
 }

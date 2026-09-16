@@ -55,14 +55,35 @@ func TestParseXY(t *testing.T) {
 	}
 }
 
+// TestEscapeDrawtext pins the shape of the two-pass escaping. A -vf value is
+// unescaped twice on its way to drawtext — by the filtergraph parser and then by
+// the option parser — and each pass eats one layer of backslashes, so a character
+// the inner pass cares about needs two. TestDrawtextFilterDrawsTheMessageVerbatim
+// is what proves these strings are the RIGHT ones; this is the cheap unit-level
+// record of them.
 func TestEscapeDrawtext(t *testing.T) {
-	got := escapeDrawtext(`a:b'c\d%e`)
-	// A single quote becomes the '\'' break-out sequence (it cannot be escaped
-	// inside the surrounding single quotes); the colon keeps its \: escape, which
-	// ffmpeg's filtergraph parser requires and consumes even inside quotes.
-	want := `a\:b'\''c\\d\%e`
-	if got != want {
-		t.Fatalf("escapeDrawtext = %q; want %q", got, want)
+	cases := map[string]string{
+		// ':' matters to the option parser only: escaped on the inner pass, and
+		// that backslash then escaped on the outer one.
+		`3:00`: `3\\:00`,
+		// '\' and '\'' matter to both passes, so they come out doubled twice.
+		`a'b`: `a\\\'b`,
+		`a\b`: `a\\\\b`,
+		// ',' ';' '[' ']' end a filter or open a link label: outer pass only.
+		`a,b;c[d]e`: `a\,b\;c\[d\]e`,
+		// '%' is drawtext's own expansion, which drawtextFilter turns off; the
+		// escaper must leave it alone or the banner draws a backslash.
+		`50% off`: `50% off`,
+		// drawtext draws one line.
+		"two\nlines": "two lines",
+		"cr\rlf":     "cr lf",
+		// Plain text is untouched.
+		`channel back at 9`: `channel back at 9`,
+	}
+	for in, want := range cases {
+		if got := escapeDrawtext(in); got != want {
+			t.Errorf("escapeDrawtext(%q) = %q; want %q", in, got, want)
+		}
 	}
 }
 
@@ -131,5 +152,49 @@ func TestSignalStoreHotPathSkipsLock(t *testing.T) {
 	}
 	if s.n.Load() != 0 || s.peek("b") {
 		t.Fatalf("drained store must count 0 and peek false (count=%d)", s.n.Load())
+	}
+}
+
+// TestSignalStoreSweepsStrandedSignals: a signal is cleared by the viewer it was
+// addressed to — and nothing says that viewer ever comes back. The admin
+// messages a uuid that has already disconnected, an HLS viewer that stopped
+// polling, or a uuid this node never serves at all. The entry used to be deleted
+// only by a peek or take for that same uuid, so it sat in the map for the life of
+// the process with n above zero, and from then on EVERY live-TS viewer on the
+// node took the single signalStore mutex for every chunk it was delivered: the
+// node-wide contention the atomic count exists to remove, turned back on by one
+// ordinary admin action. Each further stranded signal also grew the map.
+func TestSignalStoreSweepsStrandedSignals(t *testing.T) {
+	s := newSignalStore()
+	s.set("gone", pendingSignal{text: "to a viewer that already left", expires: time.Now().Add(20 * time.Millisecond)})
+	time.Sleep(40 * time.Millisecond)
+
+	// Another viewer's hot path. It must not merely miss: once the stranded
+	// signal is past its TTL the fast path has to come back, for everyone.
+	for i := 0; i < 5; i++ {
+		if s.peek("someone-else") {
+			t.Fatal("peek matched a uuid that has no signal queued")
+		}
+	}
+	if n := s.n.Load(); n != 0 {
+		t.Fatalf("count = %d after an expired signal was left stranded; every live viewer's peek now takes the global lock", n)
+	}
+	s.mu.Lock()
+	left := len(s.m)
+	s.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d expired entr(ies) still held; the map grows by one for every signal nobody picks up", left)
+	}
+
+	// Queueing a signal clears out whatever else has expired, so a node whose
+	// addressed viewers never return does not accumulate them either.
+	s.set("stale", pendingSignal{text: "old", expires: time.Now().Add(10 * time.Millisecond)})
+	time.Sleep(20 * time.Millisecond)
+	s.set("live", pendingSignal{text: "new", expires: time.Now().Add(time.Minute)})
+	if n := s.n.Load(); n != 1 {
+		t.Fatalf("count = %d after queueing one live signal alongside an expired one, want 1", n)
+	}
+	if !s.peek("live") {
+		t.Fatal("the live signal must survive the sweep")
 	}
 }

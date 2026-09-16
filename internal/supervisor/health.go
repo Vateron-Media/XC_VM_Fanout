@@ -138,6 +138,10 @@ func (v healthVerdict) failed() bool { return v.event != "" }
 // able to do) without that failure mode.
 type fpsBaseline struct {
 	peak float64
+	// zeroSince is when the current unbroken run of zero readings began, or the
+	// zero time when the last reading carried frames. A freeze is a RUN of them:
+	// see dropped.
+	zeroSince time.Time
 }
 
 func (b *fpsBaseline) observe(fps float64) {
@@ -148,11 +152,65 @@ func (b *fpsBaseline) observe(fps float64) {
 
 // dropped reports whether fps has fallen to below `threshold` of the peak.
 // A zero peak (nothing measured yet) never trips.
-func (b *fpsBaseline) dropped(fps, threshold float64) bool {
-	if b.peak <= 0 || threshold <= 0 || fps <= 0 {
+//
+// frozenFor is how long the rate must stay at zero before the picture counts as
+// frozen; now is the moment this reading was taken.
+func (b *fpsBaseline) dropped(now time.Time, fps, threshold float64, frozenFor time.Duration) bool {
+	if b.peak <= 0 || threshold <= 0 {
 		return false
 	}
+	if fps < 0 {
+		// Not a measurement at all. internal/server derives the rate by
+		// subtracting the previous sample's counters from the hub's, and those
+		// restart at zero when a Stream is torn down and recreated under a
+		// supervised encoder — so the first reading after that goes backwards.
+		// No verdict comes out of arithmetic against counters that are gone,
+		// and the run of zeros starts again from the next honest reading.
+		b.zeroSince = time.Time{}
+		return false
+	}
+	if fps <= 0 {
+		// A rate of 0 means "could not measure" only until this encoder has
+		// shown one: no video PID, or a window too short to divide by. A peak
+		// rules both out — this stream's video WAS measurable here — so 0 now
+		// means the frames stopped. That is a frozen picture, and with audio
+		// still flowing it is invisible to the stall rule.
+		//
+		// But ONE zero window does not say that. The rate is measured over the
+		// last few seconds, and a bursty source — a live HLS origin delivers a
+		// whole segment and then says nothing until the next one, ten seconds
+		// later — empties every other window as a matter of course. Condemning
+		// that restarts a healthy channel on a cadence its own upstream sets,
+		// which is why the panel skipped 0 outright. Only a run of zeros long
+		// enough to outlast the silence this stream tolerates is a freeze.
+		if b.zeroSince.IsZero() {
+			b.zeroSince = now
+		}
+		return now.Sub(b.zeroSince) >= frozenFor
+	}
+	b.zeroSince = time.Time{}
 	return fps < b.peak*threshold
+}
+
+// defaultFreezeWindow is how long a zero frame rate must last to be a freeze
+// when the stream has no stall bound to borrow one from. Sixty seconds is the
+// longest segment duration internal/nativesrc will honour from a live playlist
+// (clampTargetDuration's maximum), so it is the longest gap a healthy bursty
+// source can leave between deliveries.
+const defaultFreezeWindow = 60 * time.Second
+
+// freezeWindow is how long the frame rate must read zero before the picture is
+// called frozen.
+//
+// It is the stall bound, which the panel derives as seg_time*6 and always sends:
+// that IS this stream's statement of how long it may say nothing, and it is the
+// cadence at which the panel's own playlist-md5 check caught a stopped encoder.
+// Anything shorter judges a freeze on less evidence than the panel used.
+func (h Health) freezeWindow() time.Duration {
+	if h.StallSec > 0 {
+		return time.Duration(h.StallSec) * time.Second
+	}
+	return defaultFreezeWindow
 }
 
 // check runs every enabled health rule against a stream's vitals and returns the
@@ -184,29 +242,45 @@ func (h Health) check(now, startedAt time.Time, v Vitals, base *fpsBaseline) hea
 
 	// Audio loss. Only meaningful once audio has been seen at all: a video-only
 	// channel has no audio to lose, and restarting it forever would be the
-	// obvious way to get that wrong.
-	if h.AudioLossSec > 0 && !v.LastAudio.IsZero() && v.LastAudio.After(startedAt) {
+	// obvious way to get that wrong. A zero LastAudio is exactly that case and
+	// is left alone.
+	//
+	// Audio last seen BEFORE this encoder started is not evidence against it
+	// either — that would make every restart cascade into another — but it is
+	// not a reason to stop looking. It is measured from the start instead, the
+	// same answer the stall rule gives to "nothing since this encoder came up":
+	// a stream that declares an audio PID and carries nothing on it for the whole
+	// window is broken, whether the silence began before this start or during it.
+	// Skipping instead left the rule switched off for the entire life of any
+	// encoder that never carried audio — including the replacement an AUDIO_LOSS
+	// restart had just started — so the channel stayed silent with no further
+	// event, restart or failover.
+	if h.AudioLossSec > 0 && !v.LastAudio.IsZero() {
 		limit := time.Duration(h.AudioLossSec) * time.Second
-		if now.Sub(v.LastAudio) >= limit {
+		last := v.LastAudio
+		if last.Before(startedAt) {
+			last = startedAt
+		}
+		if now.Sub(last) >= limit {
 			return healthVerdict{
 				event:  EventAudioLoss,
-				reason: fmt.Sprintf("no audio for %s", now.Sub(v.LastAudio).Round(time.Second)),
+				reason: fmt.Sprintf("no audio for %s", now.Sub(last).Round(time.Second)),
 			}
 		}
 	}
 
 	// Frame rate, once the stream has had its grace period to settle.
 	if h.FPSThreshold > 0 && sinceStart >= time.Duration(h.FPSGraceSec)*time.Second {
-		if v.FPS > 0 {
-			if base.dropped(v.FPS, h.FPSThreshold) {
-				return healthVerdict{
-					event: EventFPSDropThreshold,
-					reason: fmt.Sprintf("fps %.1f fell below %.0f%% of the %.1f baseline",
-						v.FPS, h.FPSThreshold*100, base.peak),
-				}
+		if base.dropped(now, v.FPS, h.FPSThreshold, h.freezeWindow()) {
+			reason := fmt.Sprintf("fps %.1f fell below %.0f%% of the %.1f baseline",
+				v.FPS, h.FPSThreshold*100, base.peak)
+			if v.FPS <= 0 {
+				reason = fmt.Sprintf("no video frames for %s, against a %.1f baseline",
+					now.Sub(base.zeroSince).Round(time.Second), base.peak)
 			}
-			base.observe(v.FPS)
+			return healthVerdict{event: EventFPSDropThreshold, reason: reason}
 		}
+		base.observe(v.FPS)
 	}
 
 	return healthVerdict{}

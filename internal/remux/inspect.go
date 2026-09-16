@@ -39,6 +39,13 @@ type inspector struct {
 	reported  bool
 	warnedCA  bool
 	warnedNoT bool
+
+	// pmtAsm folds the PMT section. A section longer than the ~183 payload bytes
+	// of one packet is ordinary on a DVB-derived source (CA descriptors in
+	// program_info, then video, then several audio, teletext and subtitle
+	// streams with language descriptors), and it continues in the packets that
+	// follow the PUSI one.
+	pmtAsm tspes.SectionAssembler
 }
 
 func newInspector(input string, outputs []string, notef, warnf func(string, ...any)) *inspector {
@@ -73,10 +80,12 @@ func (i *inspector) feed(pkt []byte) {
 		if p := tspes.PMTPID(pkt); p != 0 {
 			i.pmtPID = p
 		}
-	case i.pmtPID != 0 && pid == i.pmtPID && pusi:
-		if es, ok := tspes.ParsePMTStreams(pkt); ok {
-			i.havePMT = true
-			i.report(es)
+	case i.pmtPID != 0 && pid == i.pmtPID:
+		if sec := i.pmtAsm.Feed(pkt); sec != nil {
+			if es, ok := tspes.PMTStreamsSection(sec); ok {
+				i.havePMT = true
+				i.report(es)
+			}
 		}
 	}
 

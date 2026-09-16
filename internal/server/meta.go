@@ -35,9 +35,10 @@ type StreamMeta struct {
 // metaCache holds what has been determined per stream.
 //
 // Codecs and picture size are read from a clean-join snapshot, which costs a
-// copy of the ring, so it is done once and then only retried while something is
-// still missing -- a stream whose metadata is complete is never re-parsed. The
-// bitrate is a running measurement and is refreshed on every read.
+// copy of the ring, so it is not done per call: while something is still missing
+// it is retried every metaRetry, and once everything is known it is refreshed
+// only every metaRefresh. The bitrate is a running measurement and is refreshed
+// on every read.
 type metaCache struct {
 	mu      sync.Mutex
 	entries map[string]*metaEntry
@@ -66,6 +67,19 @@ func (c *metaCache) forget(id string) {
 // back incomplete -- a stream that has not yet carried a sequence header, say.
 const metaRetry = 15 * time.Second
 
+// metaRefresh is how often a stream whose metadata IS complete is read again.
+//
+// What sits under a stream id changes without this cache hearing about it: the
+// supervisor fails over to a backup source, an operator forces another one, an
+// encoder restarts with different settings. A complete entry that was never
+// re-read therefore kept telling the panel that a 720p HEVC backup was still the
+// 1080p H.264 primary, forever -- and the panel writes that answer into
+// streams_servers, having retired the ffprobe that used to correct it. Five
+// minutes is that ffprobe's own cadence, so the value can be stale for no longer
+// than it ever was, at the cost of one ring snapshot per stream per five
+// minutes.
+const metaRefresh = 5 * time.Minute
+
 // minBitrateWindow is the shortest interval a bitrate is worth computing over.
 const minBitrateWindow = 2 * time.Second
 
@@ -89,7 +103,13 @@ func (m *Manager) StreamMetadata(id string) (StreamMeta, bool) {
 		e = &metaEntry{}
 		c.entries[id] = e
 	}
-	needParse := !e.info.Complete() && (e.lastParse.IsZero() || now.Sub(e.lastParse) >= metaRetry)
+	// Retry quickly while something is missing, then keep checking slowly: the
+	// stream under this id can be replaced by another one at any time.
+	interval := metaRetry
+	if e.info.Complete() {
+		interval = metaRefresh
+	}
+	needParse := e.lastParse.IsZero() || now.Sub(e.lastParse) >= interval
 	prevBytes, prevAt := e.bytes, e.at
 	c.mu.Unlock()
 
@@ -123,12 +143,19 @@ func (m *Manager) StreamMetadata(id string) (StreamMeta, bool) {
 			e.info.Width, e.info.Height = parsed.Width, parsed.Height
 		}
 	}
-	if !prevAt.IsZero() {
+	if !prevAt.IsZero() && published >= prevBytes {
 		if elapsed := now.Sub(prevAt); elapsed >= minBitrateWindow {
 			e.kbps = int(float64(published-prevBytes) * 8 / elapsed.Seconds() / 1000)
 			e.bytes, e.at = published, now
 		}
 	} else {
+		// First reading, or the counter went BACKWARDS: publishedBytes belongs to
+		// the Stream, and a stream torn down and re-created under the same id (a
+		// panel re-registration, a teardown then a new viewer) starts a fresh one
+		// at zero while this entry still holds the old sample. Differencing
+		// across that boundary reported a negative bitrate_kbps to the panel.
+		// Re-baseline instead and keep the last measured figure until the next
+		// window produces a real one.
 		e.bytes, e.at = published, now
 	}
 

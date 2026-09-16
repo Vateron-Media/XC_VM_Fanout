@@ -244,8 +244,105 @@ func TestPriorityBackupClimbsBack(t *testing.T) {
 	}
 }
 
+// TestPriorityBackupStillReachesTheBackupOnAFailedStart: with priority backup
+// on the list stays in priority order — but a start that keeps failing must
+// still WALK it, or the backup is never tried at all.
+//
+// This is the whole of failover for the panel's normal multi-source setup:
+// buildSupervisorSpec sends priority_backup_sec=300 whenever priority_backup is
+// set and the stream has more than one source. PHP's startStream probed every
+// source in turn inside one start, so a dead primary fell through to the backup.
+// A retry that only ever relaunches the primary leaves the channel off air until
+// stop_failures gives up, with a working backup sitting unused.
+func TestPriorityBackupStillReachesTheBackupOnAFailedStart(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(t)
+	h.setData(true)
+	h.failNextLaunches(errTest, errTest, errTest, errTest)
+
+	spec := baseSpec(dir)
+	spec.Sources = []Source{
+		{Label: "primary", Cmd: "ffmpeg -i primary"},
+		{Label: "backup", Cmd: "ffmpeg -i backup"},
+	}
+	spec.Policy.PriorityBackupSec = 300 // what the panel sends for priority_backup
+	if err := h.sup.Supervise("5", spec); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "a start on the backup", func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, c := range h.launched {
+			if c == "ffmpeg -i backup" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// And the priority order is still honoured: every pass begins at the top,
+	// so the preferred source is retried before the backup is tried again.
+	waitFor(t, "four attempts", func() bool { return h.launchCount() >= 4 })
+	h.mu.Lock()
+	got := append([]string(nil), h.launched[:4]...)
+	h.mu.Unlock()
+	want := []string{"ffmpeg -i primary", "ffmpeg -i backup", "ffmpeg -i primary", "ffmpeg -i backup"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("attempt order = %q, want %q", got, want)
+		}
+	}
+}
+
 var errTest = &testErr{}
 
 type testErr struct{}
 
 func (*testErr) Error() string { return "test failure" }
+
+// TestAForcedBackupIsHeldForTheBackupInterval: with priority backup on, an
+// operator forcing a backup means the primary is reachable but no good — bad
+// content, a wrong feed, an upstream that answers and delivers nothing. The
+// backup-check clock only started when the first check ran, so it was zero when
+// the force landed: the very next health tick probed the primary, found it
+// answering, and undid the operator's choice within seconds of a 300s interval.
+// PHP stamped that clock at every (re)start, so a forced backup held.
+func TestAForcedBackupIsHeldForTheBackupInterval(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(t)
+	h.setData(true)
+	vit := &vitalsStub{}
+	vit.set(Vitals{LastData: time.Now()})
+	h.sup.WithVitals(vit.get)
+	h.sup.healthTick = 10 * time.Millisecond
+	// The primary answers a probe perfectly well; that is the whole point.
+	h.sup.WithProber(func(context.Context, string) bool { return true })
+
+	spec := baseSpec(dir)
+	spec.Sources = []Source{
+		{Label: "primary", Cmd: "ffmpeg -i primary", ProbeCmd: "probe-primary"},
+		{Label: "backup", Cmd: "ffmpeg -i backup", ProbeCmd: "probe-backup"},
+	}
+	spec.Policy.PriorityBackupSec = 300 // what the panel sends for priority_backup
+	if err := h.sup.Supervise("5", spec); err != nil {
+		t.Fatal(err)
+	}
+	h.nextProcess(t)
+	waitFor(t, "start on the primary", func() bool { return h.sup.State("5").Source == "primary" })
+
+	if err := h.sup.ForceSource("5", 1); err != nil {
+		t.Fatalf("ForceSource: %v", err)
+	}
+	waitFor(t, "the switch to the backup", func() bool { return h.sup.State("5").Source == "backup" })
+
+	// Many health ticks later it must still be where the operator put it.
+	time.Sleep(300 * time.Millisecond)
+	if st := h.sup.State("5"); st.Source != "backup" {
+		t.Errorf("source = %q, want the forced backup: a 300s backup check cannot fire seconds after the force",
+			st.Source)
+	}
+	if got := actions(readLog(t, dirLog(dir))); contains(got, EventPrioritySwitch) {
+		t.Errorf("event trail = %v, want no %s inside the backup interval", got, EventPrioritySwitch)
+	}
+}

@@ -23,14 +23,18 @@ import (
 
 const vpid = 0x101
 
-// pmtWithPCR is the fixture PMT with its PCR_PID pointing at the video PID, so
-// segment timing runs off the PCR like a real broadcast stream.
-func pmtWithPCR() []byte {
-	p := tsfixture.PMT(0x100, vpid)
-	p[13] = byte(0xe0 | (vpid>>8)&0x1f) // section byte 8: PCR_PID
-	p[14] = byte(vpid & 0xff)
+// pmtFor is the fixture PMT announcing video on videoPID, with its PCR_PID
+// pointing at the same PID, so segment timing runs off the PCR like a real
+// broadcast stream.
+func pmtFor(videoPID int) []byte {
+	p := tsfixture.PMT(0x100, videoPID)
+	p[13] = byte(0xe0 | (videoPID>>8)&0x1f) // section byte 8: PCR_PID
+	p[14] = byte(videoPID & 0xff)
 	return p
 }
+
+// pmtWithPCR is that table for the stream these tests feed.
+func pmtWithPCR() []byte { return pmtFor(vpid) }
 
 type rig struct {
 	t   *testing.T
@@ -62,15 +66,18 @@ func (r *rig) feed(pkts ...[]byte) {
 	}
 }
 
-// gop feeds one GOP starting at t seconds: a flagged keyframe with PCR, then a
-// few fill packets.
-func (r *rig) gop(sec float64) {
+// gopOn feeds one GOP on pid starting at sec seconds: a flagged keyframe with
+// PCR, then a few fill packets.
+func (r *rig) gopOn(pid int, sec float64) {
 	ticks := int64(sec * 90000)
-	r.feed(tsfixture.KeyframePCR(vpid, ticks, ticks))
+	r.feed(tsfixture.KeyframePCR(pid, ticks, ticks))
 	for i := 0; i < 5; i++ {
-		r.feed(tsfixture.Fill(vpid))
+		r.feed(tsfixture.Fill(pid))
 	}
 }
+
+// gop feeds one GOP on the stream's video PID.
+func (r *rig) gop(sec float64) { r.gopOn(vpid, sec) }
 
 func (r *rig) playlist() string {
 	b, err := os.ReadFile(filepath.Join(r.dir, "12_.m3u8"))
@@ -314,6 +321,47 @@ func TestCutsOnTheKeyframeClockNotThePCR(t *testing.T) {
 	}
 }
 
+// TestDeliveryGapIsNotAMissingKeyframe: the no-keyframe limit must be spent on
+// stream that arrived, not on silence. A native HLS pull hands over a whole
+// upstream segment at once and then says nothing until the next one — with an
+// upstream TARGETDURATION of 10s and a poll every 5s, 13s between bursts is a
+// healthy source, and the reader's own idle bound (3×TD) agrees. Under
+// hls_time=2 the limit is 12s, so the first packet of the next burst — the PAT,
+// which is not a keyframe — reported ErrNoKeyframe, and the remuxer moved a
+// perfectly segmentable source onto ffmpeg for the rest of the spec's life.
+func TestDeliveryGapIsNotAMissingKeyframe(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 5}) // MaxNoKeyframe = 12s
+	r.feed(tsfixture.PAT(0x100), pmtWithPCR())
+	pts := 0.0
+	for burst := 0; burst < 4; burst++ {
+		for g := 0; g < 5; g++ { // one upstream segment, delivered back to back
+			r.gop(pts)
+			pts += 2
+		}
+		r.now = r.now.Add(13 * time.Second) // ...then nothing at all
+		// The next burst opens with the tables, ahead of its first keyframe.
+		if err := r.s.Feed(tsfixture.PAT(0x100)); err != nil {
+			t.Fatalf("burst %d: a delivery gap was read as a missing keyframe: %v", burst, err)
+		}
+	}
+	if n := strings.Count(r.playlist(), "#EXTINF:"); n < 3 {
+		t.Fatalf("%d segments from a bursty source, want one per GOP:\n%s", n, r.playlist())
+	}
+}
+
+// TestSlowOpenIsNotAMissingKeyframe: the limit starts at the first packet, not
+// at New. remux.Run builds the segmenter BEFORE it opens the source, so a dial,
+// a TLS handshake, a master playlist, a variant playlist and a first segment all
+// happen on the clock — over 12s of that, and the very first packet of a healthy
+// stream came back ErrNoKeyframe.
+func TestSlowOpenIsNotAMissingKeyframe(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2})
+	r.now = r.now.Add(13 * time.Second)
+	if err := r.s.Feed(tsfixture.PAT(0x100)); err != nil {
+		t.Fatalf("a slow first open was read as a missing keyframe: %v", err)
+	}
+}
+
 // pcrOnly is an adaptation-only packet on pid carrying just a PCR.
 func pcrOnly(pid int, pcr int64) []byte {
 	p := make([]byte, tspes.PacketSize)
@@ -325,4 +373,344 @@ func pcrOnly(pid int, pcr int64) []byte {
 	p[6], p[7], p[8], p[9] = byte(pcr>>25), byte(pcr>>17), byte(pcr>>9), byte(pcr>>1)
 	p[10] = byte(pcr&1) << 7
 	return p
+}
+
+// TestConfigRejectsPercentDOutsideTheFileName: the %d has to be in the segment
+// file's own name. `-hls_segment_filename /streams/%d/12.ts` passed the "exactly
+// one %d" check, and sweep then looked the %d up in the base name, found none
+// and sliced at -1: the remux process died with a panic trace on every
+// supervisor restart instead of reporting a bad configuration once.
+func TestConfigRejectsPercentDOutsideTheFileName(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Playlist: filepath.Join(dir, "12_.m3u8"), SegPattern: filepath.Join(dir, "%d", "12.ts")}
+	if _, err := New(cfg); err == nil {
+		t.Fatalf("segment pattern %q accepted: %%d outside the file name names one file per directory", cfg.SegPattern)
+	}
+}
+
+// listedSeg is one playlist entry: its file, its EXTINF and whether an
+// #EXT-X-DISCONTINUITY stands in front of it.
+type listedSeg struct {
+	name string
+	dur  float64
+	disc bool
+}
+
+func (r *rig) listed() []listedSeg {
+	r.t.Helper()
+	var out []listedSeg
+	disc := false
+	for _, l := range strings.Split(strings.TrimSpace(r.playlist()), "\n") {
+		switch {
+		case l == "#EXT-X-DISCONTINUITY":
+			disc = true
+		case strings.HasPrefix(l, "#EXTINF:"):
+			d, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimPrefix(l, "#EXTINF:"), ","), 64)
+			if err != nil {
+				r.t.Fatalf("EXTINF %q: %v", l, err)
+			}
+			out = append(out, listedSeg{dur: d, disc: disc})
+			disc = false
+		case strings.HasSuffix(l, ".ts"):
+			out[len(out)-1].name = l
+		}
+	}
+	return out
+}
+
+// segPTS lists the video PTSs a written segment carries, in file order.
+func (r *rig) segPTS(name string) []int64 {
+	r.t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.dir, name))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	var out []int64
+	for off := 0; off+tspes.PacketSize <= len(b); off += tspes.PacketSize {
+		p := b[off : off+tspes.PacketSize]
+		if int(tspes.PID(p)) != vpid || !tspes.PUSI(p) {
+			continue
+		}
+		if pts, ok := tspes.PTS(p); ok {
+			out = append(out, pts)
+		}
+	}
+	return out
+}
+
+// checkTimeline asserts what a source splice has to look like from the outside:
+// no segment holds media from both sides of the jump, the segment that starts
+// the new timeline is the one carrying #EXT-X-DISCONTINUITY, and every EXTINF
+// covers the media its own file holds.
+func (r *rig) checkTimeline() {
+	r.t.Helper()
+	list := r.listed()
+	if len(list) < 3 {
+		r.t.Fatalf("%d segments listed:\n%s", len(list), r.playlist())
+	}
+	prevFirst := int64(-1)
+	for _, sg := range list {
+		pts := r.segPTS(sg.name)
+		if len(pts) == 0 {
+			r.t.Fatalf("%s carries no video PES", sg.name)
+		}
+		for i := 1; i < len(pts); i++ {
+			if pts[i] < pts[i-1] {
+				r.t.Errorf("%s spans the jump (PTS %d then %d): the discontinuity is mid-segment, where no tag can mark it:\n%s",
+					sg.name, pts[i-1], pts[i], r.playlist())
+				break
+			}
+		}
+		if prevFirst >= 0 && pts[0] < prevFirst && !sg.disc {
+			r.t.Errorf("%s restarts the timeline (PTS %d after %d) with no #EXT-X-DISCONTINUITY in front of it:\n%s",
+				sg.name, pts[0], prevFirst, r.playlist())
+		}
+		if span := float64(pts[len(pts)-1]-pts[0]) / 90000; span > sg.dur+0.001 {
+			r.t.Errorf("%s holds %.3fs of media but is listed as #EXTINF:%.6f:\n%s", sg.name, span, sg.dur, r.playlist())
+		}
+		prevFirst = pts[0]
+	}
+}
+
+// TestSpliceCutsTheSegmentAtTheJump: an upstream splice sends the clock
+// backwards, and the cut has to happen ON that keyframe — so the jump lands on a
+// segment boundary and the EXT-X-DISCONTINUITY goes in front of the segment that
+// starts the new timeline. Rebasing the clock and carrying on left the segment
+// that was already open holding both timelines — twelve seconds of media
+// labelled six — with the tag in front of IT, where the previous segment is in
+// fact continuous, and the real jump buried inside it where no tag can mark it.
+// Players reset their timeline at the wrong place and then met a mid-segment PTS
+// jump, and the live edge drifted by the missing seconds.
+func TestSpliceCutsTheSegmentAtTheJump(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 6, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), pmtWithPCR())
+	for g := 0; g <= 5; g++ {
+		r.gop(100 + float64(g)*2)
+	}
+	for g := 0; g <= 6; g++ { // the source splices back to the start of its clock
+		r.gop(1 + float64(g)*2)
+	}
+	r.checkTimeline()
+}
+
+// TestForwardTimelineJumpIsASplice: an encoder that restarts with its clock an
+// hour AHEAD is as much a splice as one that restarts at zero, but only
+// backwards steps were treated as one. The huge elapsed sailed past the cut, so
+// finalize clamped the duration to 4×hls_time and published that: a segment
+// holding two seconds of media listed as '#EXTINF:8.000000', and
+// '#EXT-X-TARGETDURATION:8' for as long as it stayed in the window — the HLS
+// spec says TARGETDURATION must not change, and every player's reload interval
+// follows it. The segment that started the new timeline carried no
+// #EXT-X-DISCONTINUITY at all.
+func TestForwardTimelineJumpIsASplice(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), pmtWithPCR())
+	for g := 0; g <= 3; g++ {
+		r.gop(100 + float64(g)*2)
+	}
+	for g := 0; g <= 3; g++ { // the encoder restarts an hour ahead
+		r.gop(3700 + float64(g)*2)
+	}
+
+	list := r.listed()
+	if len(list) < 5 {
+		t.Fatalf("%d segments listed:\n%s", len(list), r.playlist())
+	}
+	jumped, prevLast := -1, int64(-1)
+	for i, sg := range list {
+		pts := r.segPTS(sg.name)
+		if len(pts) == 0 {
+			t.Fatalf("%s carries no video PES", sg.name)
+		}
+		if span := float64(pts[len(pts)-1]-pts[0]) / 90000; sg.dur > span+2.001 {
+			t.Errorf("%s holds %.3fs of media but is listed as #EXTINF:%.6f:\n%s", sg.name, span, sg.dur, r.playlist())
+		}
+		if prevLast >= 0 && pts[0]-prevLast > 60*90000 {
+			jumped = i
+		}
+		prevLast = pts[len(pts)-1]
+	}
+	if jumped < 0 {
+		t.Fatalf("no segment starts the jumped-to timeline:\n%s", r.playlist())
+	}
+	if !list[jumped].disc {
+		t.Errorf("%s opens an hour after the segment before it with no #EXT-X-DISCONTINUITY:\n%s", list[jumped].name, r.playlist())
+	}
+	if !strings.Contains(r.playlist(), "#EXT-X-TARGETDURATION:2\n") {
+		t.Errorf("TARGETDURATION is not the real 2s target, so every player slows its reload:\n%s", r.playlist())
+	}
+}
+
+// TestVideoPIDChangeIsFollowed: the PMT is re-read every time it arrives, not
+// once. An upstream that restarts mid-connection — an HLS source whose encoder
+// comes back, a multicast feed re-provisioned — can return with its video on a
+// different PID. The segmenter kept hunting keyframes on the old one, found
+// none, and after 3×hls_time+6s returned ErrNoKeyframe, which the remuxer turns
+// into ErrUnsupported: in auto mode a permanent ffmpeg fallback for a source
+// that is perfectly segmentable.
+func TestVideoPIDChangeIsFollowed(t *testing.T) {
+	const newPID = 0x102
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), pmtFor(vpid))
+	for g := 0; g < 5; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gopOn(vpid, float64(g)*2)
+	}
+	before := strings.Count(r.playlist(), "#EXTINF:")
+
+	// The encoder restarts and comes back with its video on another PID; the
+	// PMT, on the PID the PAT still names, says so.
+	r.feed(tsfixture.PAT(0x100), pmtFor(newPID))
+	for g := 0; g < 8; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gopOn(newPID, 1000+float64(g)*2)
+	}
+	if got := strings.Count(r.playlist(), "#EXTINF:"); got <= before {
+		t.Fatalf("%d segments listed, %d before the video moved to pid %#x: the segmenter is still looking for keyframes on %#x:\n%s",
+			got, before, newPID, vpid, r.playlist())
+	}
+}
+
+// TestDamagedPMTIsNotTrusted: a packet whose transport_error_indicator is set
+// reached the daemon with at least one uncorrectable bit error. Its bytes still
+// go into the segment verbatim — that is this segmenter's whole contract — but
+// nothing is decided from them. A PMT whose elementary_PID bits were flipped
+// used to be believed, and since the table was read only once, believed
+// permanently: no keyframe was ever seen again.
+func TestDamagedPMTIsNotTrusted(t *testing.T) {
+	bad := pmtFor(0x1fe) // the same table with its video PID corrupted...
+	bad[1] |= 0x80       // ...and flagged by the demodulator that saw the error
+
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10, Logf: t.Logf})
+	r.feed(tsfixture.PAT(0x100), bad, pmtWithPCR())
+	for g := 0; g < 3; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gop(float64(g) * 2)
+	}
+	r.feed(bad) // the damaged table comes round again, and is not corrected after
+	for g := 3; g < 8; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.gop(float64(g) * 2)
+	}
+	if got := strings.Count(r.playlist(), "#EXTINF:"); got < 6 {
+		t.Fatalf("%d segments from 8 GOPs: a PMT flagged as bit-damaged was taken for the programme's:\n%s", got, r.playlist())
+	}
+}
+
+// longPMT is a PMT whose program_info descriptor block pushes the elementary
+// stream loop past the first packet — the ordinary shape of a DVB passthrough
+// table. It returns the packets of the one section, in order.
+func longPMT(videoPID int) [][]byte {
+	body := []byte{
+		0x00, 0x01, 0xc1, 0x00, 0x00,
+		byte(0xe0 | (videoPID>>8)&0x1f), byte(videoPID), // PCR_PID
+		0xf0, 0xb4, // program_info_length = 180: pushes the ES loop past this packet
+	}
+	for i := 0; i < 180; i++ {
+		body = append(body, 0xff)
+	}
+	body = append(body, 0x1b, byte(0xe0|(videoPID>>8)&0x1f), byte(videoPID), 0xf0, 0x00) // H.264
+	body = append(body, 0x0f, 0xe1, 0x02, 0xf0, 0x00)                                    // AAC on 0x102
+	body = append(body, 0xde, 0xad, 0xbe, 0xef)                                          // CRC32
+	sec := append([]byte{0x02, byte(0xb0 | (len(body)>>8)&0x0f), byte(len(body))}, body...)
+
+	var out [][]byte
+	cc := byte(0)
+	for first := true; len(sec) > 0; first = false {
+		p := make([]byte, tspes.PacketSize)
+		for i := range p {
+			p[i] = 0xff
+		}
+		p[0], p[1], p[2], p[3] = 0x47, byte((0x100>>8)&0x1f), 0x00, 0x10|cc
+		if first {
+			p[1] |= 0x40
+		}
+		cc++
+		off := 4
+		if first {
+			p[4], off = 0x00, 5
+		}
+		sec = sec[copy(p[off:], sec):]
+		out = append(out, p)
+	}
+	return out
+}
+
+// A PMT too long for one packet is ordinary on DVB passthrough. The segmenter
+// read only the packet that STARTS the section, so the table's video entry —
+// which sits after the descriptors, in the second packet — was never seen: no
+// video PID, no keyframes, and after MaxNoKeyframe the source was declared
+// unsegmentable and moved to the ffmpeg fallback for good.
+func TestAMultiPacketPMTIsAdopted(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10})
+	pkts := longPMT(vpid)
+	if len(pkts) < 2 {
+		t.Fatalf("fixture fits in one packet (%d); the test proves nothing", len(pkts))
+	}
+	r.feed(tsfixture.PAT(0x100))
+	r.feed(pkts...)
+
+	for g := 0; g <= 3; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.feed(tsfixture.KeyframePCR(vpid, int64(g)*2*90000, int64(g)*2*90000))
+		r.feed(tsfixture.Fill(vpid))
+	}
+	if segs := r.segFiles(); len(segs) == 0 {
+		t.Error("no segments were cut: the multi-packet PMT was never adopted, so the segmenter never found the video PID")
+	}
+}
+
+// rai is a video keyframe flagged by random_access_indicator alone: no PES
+// header, so no PTS, and no PCR either — the clock lives on its own PID.
+func rai(pid int) []byte {
+	p := make([]byte, tspes.PacketSize)
+	for i := range p {
+		p[i] = 0xff
+	}
+	p[0], p[1], p[2], p[3] = 0x47, byte((pid>>8)&0x1f)|0x40, byte(pid), 0x30
+	p[4], p[5] = 1, 0x40 // adaptation_field_length, random_access_indicator
+	return p
+}
+
+// pmtSplitClock announces video on 0x101 with the PCR on its own PID, 0x200 —
+// an ordinary broadcast layout the PMT is free to use.
+func pmtSplitClock() []byte {
+	p := tsfixture.PMT(0x100, vpid)
+	p[13], p[14] = 0xe2, 0x00 // PCR_PID = 0x200
+	return p
+}
+
+// A source whose keyframes carry neither PTS nor PCR — the clock is on its own
+// PID — still splices. The keyframe-level check had nothing to compare on such
+// a stream, so a backwards splice was neither marked nor recovered from: the
+// open segment's elapsed time stayed 0, nothing was ever finalised, and the
+// playlist froze at the live edge until the new clock climbed back past the old
+// one, which is the source's whole previous uptime.
+func TestASpliceIsCaughtWhenTheClockIsOnItsOwnPID(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10})
+	r.feed(tsfixture.PAT(0x100), pmtSplitClock())
+
+	// Nine GOPs two seconds apart, at 100 s on the source clock.
+	pcr := int64(100 * 90000)
+	for g := 0; g < 9; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.feed(pcrOnly(0x200, pcr), rai(vpid), tsfixture.Fill(vpid))
+		pcr += 2 * 90000
+	}
+	before := len(r.segFiles())
+
+	// The upstream encoder restarts: the clock lands back at one second.
+	pcr = 1 * 90000
+	for g := 0; g < 9; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.feed(pcrOnly(0x200, pcr), rai(vpid), tsfixture.Fill(vpid))
+		pcr += 2 * 90000
+	}
+
+	if after := len(r.segFiles()); after <= before {
+		t.Errorf("segments went %d -> %d across the splice: the segmenter stopped cutting", before, after)
+	}
+	if pl := r.playlist(); !strings.Contains(pl, "#EXT-X-DISCONTINUITY\n") {
+		t.Errorf("the splice was not marked:\n%s", pl)
+	}
 }

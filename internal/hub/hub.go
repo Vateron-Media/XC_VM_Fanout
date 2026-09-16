@@ -121,16 +121,25 @@ func (h *Hub) signalWake() {
 // is what removed the per-chunk broadcast allocation and the redundant second copy
 // that the old push-to-N-channels fan-out made on every watched stream.
 //
-// The wake is skipped for an empty chunk (nothing was appended to wake for) and
-// after teardown (the wake channel is already closed for good — see CloseAll).
+// After teardown (CloseAll) Publish does nothing at all: the hub is out of the
+// registry, so no viewer can ever join it again and the reaper can never idle-stop
+// it, and a producer that has not yet noticed its cancellation — or one a Register
+// racing the Unregister started — would otherwise keep a whole prebuffer resident
+// and churn it for a reader that cannot exist. What the ring already held is left
+// alone: an HLS segment or Snapshot read may still be in flight over it.
+//
+// The wake is skipped for an empty chunk (nothing was appended to wake for).
 func (h *Hub) Publish(chunk []byte) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
 	h.join.Update(chunk)
-	if len(chunk) > 0 && h.armed && !h.closed {
+	if len(chunk) > 0 && h.armed {
 		h.signalWake()
 		h.armed = false
 	}
-	h.mu.Unlock()
 }
 
 // Follow returns the next run of ring bytes from cursor c — about max of them,
@@ -150,6 +159,15 @@ func (h *Hub) Publish(chunk []byte) {
 // a Publish landing between this return and the caller's select finds the channel
 // already closed: the select fires at once and the caller re-reads. No wakeup is
 // lost. Nothing is pinned when the returned Burst has no parts.
+//
+// Follow allocates the Burst, and ReadFrom the parts slice, on every call, so a
+// viewer parked at the live edge pays two small allocations for every chunk it is
+// woken for, for the whole of its session. tsjoin.ReadFromInto exists to remove
+// the second, but neither can be removed here alone: both objects have to outlive
+// the call, which means a FollowInto whose caller — the follower loop in
+// internal/server — owns one Burst and one parts slice across the session. Until
+// those loops are changed with it, ReadFromInto has no production caller by
+// design: this is deliberately deferred, not a finished fix.
 func (h *Hub) Follow(c tsjoin.Cursor, max int) (burst *Burst, next tsjoin.Cursor, atEnd bool, wake <-chan struct{}, behind, ended bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

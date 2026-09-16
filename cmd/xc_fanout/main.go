@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -90,6 +91,21 @@ func main() {
 	}
 	flag.Parse()
 
+	// A leftover positional word is never a daemon launch — refuse it instead of
+	// silently ignoring it. flag.Parse stops at the first non-flag argument, so
+	// `xc_fanout version`, `xc_fanout status`, or the panel's
+	// `xc_fanout remux -i … <playlist>` line handed to a binary from BEFORE the
+	// native remuxer, all used to fall straight through into a full daemon on the
+	// DEFAULT -sock path. On a production node that second instance took the
+	// running daemon's client socket (see listenUnix) and the whole node went
+	// dark. Exit 2, the same "bad usage" status the remux mode uses.
+	if flag.NArg() > 0 {
+		out := flag.CommandLine.Output()
+		fmt.Fprintf(out, "%s: unknown command %q — this binary takes flags only (and `remux`, see -h)\n", os.Args[0], flag.Arg(0))
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	if *showVersion {
 		fmt.Println(buildVersion())
 		return
@@ -127,11 +143,13 @@ func main() {
 	// malformed file falls back to the built-in defaults. The daemon then polls the
 	// file and applies changes live (prebuffer/HLS retune existing streams).
 	cfg := config.Defaults()
+	var startupCfg *config.Values // the boot tuning, once it is known to be real
 	if *configPath != "" {
 		if v, wrote, err := config.Load(*configPath); err != nil {
 			log.Printf("config: %v (using built-in defaults)", err)
 		} else {
 			cfg = v
+			startupCfg = &cfg
 			if wrote {
 				log.Printf("config: seeded/backfilled %s", *configPath)
 			}
@@ -164,7 +182,7 @@ func main() {
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
 
 	if *configPath != "" {
-		go pollConfig(ctx, *configPath, time.Duration(*configInterval)*time.Second, mgr)
+		go pollConfig(ctx, *configPath, time.Duration(*configInterval)*time.Second, mgr, startupCfg)
 	}
 
 	clientSrv, cleanupClient := serveUnix(*sock, mgr.ClientHandler())
@@ -209,39 +227,85 @@ func main() {
 
 	<-ctx.Done()
 
-	// Stop watching the encoders but LEAVE THEM RUNNING. They are orphaned, not
-	// killed, and the next daemon adopts them (internal/supervisor/adopt.go), so a
-	// restart or an upgrade costs the viewers nothing. Killing them here would take
-	// every channel on this node off air for the length of the restart.
-	if n := mgr.DetachSupervision(); n > 0 {
-		log.Printf("monitor: detached %d encoder(s), left running for the next daemon to adopt", n)
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = clientSrv.Shutdown(shutdownCtx)
-	if ctlSrv != nil {
-		_ = ctlSrv.Shutdown(shutdownCtx)
-	}
+	shutdownDaemon(ctlSrv, clientSrv, func() {
+		// Stop watching the encoders but LEAVE THEM RUNNING. They are orphaned, not
+		// killed, and the next daemon adopts them (internal/supervisor/adopt.go), so a
+		// restart or an upgrade costs the viewers nothing. Killing them here would take
+		// every channel on this node off air for the length of the restart.
+		if n := mgr.DetachSupervision(); n > 0 {
+			log.Printf("monitor: detached %d encoder(s), left running for the next daemon to adopt", n)
+		}
+	}, shutdownGrace)
 	cleanupClient()
 	cleanupCtl()
 }
 
+// shutdownGrace is how long each HTTP surface is given to drain on the way out.
+const shutdownGrace = 2 * time.Second
+
+// shutdownDaemon stops the two HTTP surfaces and detaches encoder supervision,
+// in the one order that cannot orphan an encoder: the CONTROL surface first,
+// then supervision, then the client surface.
+//
+// Detaching first left the control socket accepting for as long as the rest of
+// the shutdown took — the full grace period on a node with viewers, because a
+// live-TS viewer is never idle. A DELETE /monitor/<id> arriving in that window
+// found an already-emptied process table, so Release returned false and the
+// handler still answered 204. The encoder is its own process group and is not
+// tied to the daemon's context, so it kept running, with its pid file; the
+// panel took the 204 for a stop and never handed the channel to the next
+// daemon, and nothing adopted or reaped the process while it held the provider
+// connection and went on writing HLS for a "stopped" channel.
+//
+// Each surface gets its own grace: the control API drains in milliseconds (the
+// panel's requests are short), and giving it a share of the client's budget
+// would only cut the drain viewers actually benefit from.
+func shutdownDaemon(ctlSrv, clientSrv *http.Server, detach func(), grace time.Duration) {
+	shutdown := func(srv *http.Server) {
+		if srv == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), grace)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}
+	shutdown(ctlSrv)
+	detach()
+	shutdown(clientSrv)
+}
+
 // pollConfig re-reads the operator-tuning file every `every` and applies it when
-// the file changes. It is mtime-gated, so a steady file costs one stat per tick.
-// A read or parse error is logged and the current tuning kept — a bad config
-// (or a mid-write torn read) never interrupts streaming; the next tick retries.
+// the file changes. It is gated on (mtime, size), so a steady file costs one
+// stat per tick. A read or parse error is logged and the current tuning kept —
+// a bad config (or a mid-write torn read) never interrupts streaming — and the
+// gate is left where it was so the next tick really does retry.
 // If the file is deleted out from under a running daemon it is recreated,
 // preserving the running tuning (or the built-in defaults if nothing has loaded
 // yet), so the self-healing contract holds at runtime, not just at startup.
-func pollConfig(ctx context.Context, path string, every time.Duration, mgr *server.Manager) {
+// `startup` is the tuning main loaded at boot, so that contract also holds in
+// the first interval, before any tick has run.
+// configApplier is the part of the Manager the poll loop drives. It is an
+// interface so the loop's gating can be tested without a live stream registry.
+type configApplier interface {
+	ApplyConfig(config.Values)
+}
+
+func pollConfig(ctx context.Context, path string, every time.Duration, mgr configApplier, startup *config.Values) {
 	if every < time.Second {
 		every = time.Second
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()
 	var lastMod time.Time
-	var current *config.Values // last successfully applied tuning, or nil
+	var lastSize int64
+	current := startup // last applied tuning (the boot one to begin with), or nil
+	if current != nil {
+		// Seed the gate from the file the daemon booted with, so the first tick
+		// is not a pointless re-apply of what is already in force.
+		if fi, err := os.Stat(path); err == nil {
+			lastMod, lastSize = fi.ModTime(), fi.Size()
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -272,19 +336,25 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 					dlog.Logf("config", "recreated %s after deletion (defaults)", path)
 				}
 				if nfi, serr := os.Stat(path); serr == nil {
-					lastMod = nfi.ModTime() // re-arm the mtime gate on the recreated file
+					lastMod, lastSize = nfi.ModTime(), nfi.Size() // re-arm the gate on the recreated file
 				}
 				continue
 			}
-			if fi.ModTime().Equal(lastMod) {
+			if fi.ModTime().Equal(lastMod) && fi.Size() == lastSize {
 				continue
 			}
-			lastMod = fi.ModTime()
 			v, _, err := config.Load(path)
 			if err != nil {
+				// Do NOT arm the gate here. The panel writes this file
+				// non-atomically (truncate, then write) and Linux stamps mtime
+				// from the coarse clock, so a poll landing mid-write read an
+				// empty file, failed, and armed the gate with the very mtime the
+				// completed write then carried — every later tick saw "no
+				// change" and the admin's edit was lost until the next save.
 				log.Printf("config reload: %v (keeping current tuning)", err)
 				continue
 			}
+			lastMod, lastSize = fi.ModTime(), fi.Size()
 			current = &v
 			mgr.ApplyConfig(v)
 			applyMemLimit(v.MemLimitMB)
@@ -295,26 +365,88 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 }
 
 // serveUnix starts an HTTP server on a fresh unix socket and returns it with a
-// cleanup that removes the socket file.
+// cleanup that removes the socket file. A socket the daemon cannot bind is
+// fatal: without it nginx has nothing to reach.
 func serveUnix(path string, h http.Handler) (*http.Server, func()) {
+	srv, cleanup, err := listenUnix(path, h)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return srv, cleanup
+}
+
+// listenUnix binds path and serves h on it, returning the server and a cleanup
+// that removes the socket file.
+//
+// Binding a unix socket means unlinking whatever is at the path first, which is
+// how the daemon heals after its own unclean exit: a SIGKILLed instance leaves
+// the file behind and nothing else will ever remove it. Done blind, though, that
+// unlink also takes the socket of a daemon that is still RUNNING and serving
+// nginx — the whole node then reaches an instance with an empty registry, every
+// /live and /hls request 404s, and when the impostor stops it takes the path
+// with it. So probe first: if something ANSWERS on the path, another daemon owns
+// it and this one refuses rather than evicting it. Only a dead file is removed.
+func listenUnix(path string, h http.Handler) (*http.Server, func(), error) {
 	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
+	}
+	if socketAnswers(path) {
+		return nil, nil, fmt.Errorf("listen %s: another xc_fanout is already listening there; refusing to take its socket", path)
 	}
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
-		log.Fatalf("listen %s: %v", path, err)
+		return nil, nil, fmt.Errorf("listen %s: %w", path, err)
 	}
 	_ = os.Chmod(path, 0o660)
+	owned := &ownedListener{Listener: ln}
 
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: defaults.HTTPReadHeaderTimeout}
 	go func() {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(owned); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve %s: %v", path, err)
 		}
 	}()
 	log.Printf("xc_fanout listening on unix:%s", path)
-	return srv, func() { _ = os.Remove(path) }
+	// Closing the listener is what unlinks the socket — it owns the file it
+	// created — so once Shutdown has run there is nothing left to remove, and
+	// removing the path BY NAME anyway is how an exiting daemon used to delete
+	// its REPLACEMENT's socket: Shutdown gets two seconds, and a daemon still
+	// inside it when the new instance binds the same path took the new socket
+	// with it, leaving nginx with nothing to reach and a healthy daemon behind
+	// it. So clean up only while we still hold the listener, when the path can
+	// only be our own socket.
+	return srv, func() {
+		if !owned.closed.Load() {
+			_ = os.Remove(path)
+		}
+	}, nil
+}
+
+// ownedListener records that the socket file has been unlinked — which is what
+// closing a unix listener does — before it can happen, so the cleanup above can
+// never race the close and delete a path that by then belongs to someone else.
+type ownedListener struct {
+	net.Listener
+	closed atomic.Bool
+}
+
+func (l *ownedListener) Close() error {
+	l.closed.Store(true)
+	return l.Listener.Close()
+}
+
+// socketAnswers reports whether a connection can be made to path right now, i.e.
+// whether a live daemon is serving it. A socket file with no listener behind it
+// (an unclean exit) refuses the connection immediately and reads as free, which
+// is what keeps the self-heal working.
+func socketAnswers(path string) bool {
+	c, err := net.DialTimeout("unix", path, defaults.SocketProbeTimeout)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
 }
 
 // buildVersion returns the ldflags-stamped version, or—when the binary was
@@ -404,35 +536,140 @@ func applyMemLimit(explicitMB int) {
 var appliedMemLimit atomic.Int64
 
 // memoryBudget returns the memory this process should size its soft limit
-// against, a label for it, and the fraction of it to claim: the cgroup limit when
-// the daemon runs under a finite one (v2 first, then v1 — a v1-only host was
-// previously missed entirely and silently fell back to the whole machine's RAM),
-// else the physical RAM from /proc/meminfo. Returns 0 if neither can be read.
+// against, a label for it, and the fraction of it to claim: the cgroup limit the
+// daemon actually runs under when there is a finite one, else the physical RAM
+// from /proc/meminfo. Returns 0 if neither can be read.
 func memoryBudget() (int64, string, float64) {
-	host := physicalMemoryBytes()
+	return memoryBudgetFrom(cgroupRoot, procSelfCgroup, physicalMemoryBytes())
+}
 
-	// cgroup v2: a finite memory.max is the real ceiling the OOM killer enforces.
-	if b, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
-		if s := strings.TrimSpace(string(b)); s != "" && s != "max" {
-			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
-				return v, "cgroup v2 limit", defaults.MemLimitFraction
-			}
-		}
-	}
-	// cgroup v1: "unlimited" is expressed as a sentinel near the int64 ceiling
-	// rather than a keyword, so treat any limit at or above physical RAM as no
-	// limit at all instead of reading it as a budget.
-	if b, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
-		if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && v > 0 {
-			if host <= 0 || v < host {
-				return v, "cgroup v1 limit", defaults.MemLimitFraction
-			}
-		}
+// cgroupRoot and procSelfCgroup are where the cgroup facts live on a running
+// node; a test points memoryBudgetFrom at a fixture tree instead.
+const (
+	cgroupRoot     = "/sys/fs/cgroup"
+	procSelfCgroup = "/proc/self/cgroup"
+)
+
+func memoryBudgetFrom(root, procCgroup string, host int64) (int64, string, float64) {
+	if v, src := cgroupMemoryLimit(root, procCgroup, host); v > 0 {
+		return v, src, defaults.MemLimitFraction
 	}
 	if host > 0 {
 		return host, "system RAM", defaults.MemLimitHostFraction
 	}
 	return 0, "", 0
+}
+
+// cgroupMemoryLimit is the tightest finite memory ceiling in force for this
+// process, found by walking from its OWN cgroup up to the root.
+//
+// Reading only the root cgroup's files, as this used to, sees a limit only
+// inside a container namespace where the root IS the container's cgroup. On an
+// ordinary cgroup v2 host the root has no memory.max at all and a unit's
+// MemoryMax lives at /sys/fs/cgroup/system.slice/<unit>/memory.max, so a daemon
+// run under `MemoryMax=2G` on a 16 GB box was given a soft limit of 8 GB: the
+// GC never tightened, and the kernel OOM-killed the daemon at 2 GB with every
+// viewer on the node attached. A v1 parent-slice limit was missed the same way.
+func cgroupMemoryLimit(root, procCgroup string, host int64) (int64, string) {
+	v2, v1 := cgroupPaths(procCgroup)
+	best, src := int64(0), ""
+	take := func(v int64, label string) {
+		if v > 0 && (best == 0 || v < best) {
+			best, src = v, label
+		}
+	}
+	// cgroup v2: a finite memory.max is the real ceiling the OOM killer enforces.
+	for _, dir := range cgroupAncestors(v2) {
+		if v, ok := readCgroupV2Max(filepath.Join(root, dir, "memory.max")); ok {
+			take(v, "cgroup v2 limit")
+		}
+	}
+	for _, dir := range cgroupAncestors(v1) {
+		if v, ok := readCgroupV1Limit(filepath.Join(root, "memory", dir, "memory.limit_in_bytes"), host); ok {
+			take(v, "cgroup v1 limit")
+		}
+	}
+	return best, src
+}
+
+// cgroupPaths reads /proc/self/cgroup for this process's cgroup path on the
+// unified (v2) hierarchy and on v1's memory controller. Either falls back to
+// "/", which is the root-only lookup this did before and the right answer
+// inside a cgroup namespace.
+func cgroupPaths(procCgroup string) (v2, v1 string) {
+	v2, v1 = "/", "/"
+	b, err := os.ReadFile(procCgroup)
+	if err != nil {
+		return v2, v1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		// hierarchy-ID:controller-list:path — "0::/…" is the unified hierarchy.
+		f := strings.SplitN(strings.TrimSpace(line), ":", 3)
+		if len(f) != 3 || f[2] == "" {
+			continue
+		}
+		if f[1] == "" {
+			v2 = f[2]
+			continue
+		}
+		for _, c := range strings.Split(f[1], ",") {
+			if c == "memory" {
+				v1 = f[2]
+			}
+		}
+	}
+	return v2, v1
+}
+
+// cgroupAncestors lists a cgroup path and every parent up to the root, nearest
+// first. A limit set on a parent slice binds this process just as much as one
+// on its own cgroup.
+func cgroupAncestors(p string) []string {
+	if p == "" || p[0] != '/' {
+		p = "/" + p
+	}
+	p = path.Clean(p)
+	out := []string{p}
+	for p != "/" {
+		p = path.Dir(p)
+		out = append(out, p)
+	}
+	return out
+}
+
+// readCgroupV2Max reads a v2 memory.max, where no limit is the word "max".
+func readCgroupV2Max(path string) (int64, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "max" {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// readCgroupV1Limit reads a v1 memory.limit_in_bytes. "unlimited" there is a
+// sentinel near the int64 ceiling rather than a keyword, so treat any limit at
+// or above physical RAM as no limit at all instead of reading it as a budget.
+func readCgroupV1Limit(path string, host int64) (int64, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	if host > 0 && v >= host {
+		return 0, false
+	}
+	return v, true
 }
 
 // physicalMemoryBytes reads MemTotal (kB) from /proc/meminfo, or 0.

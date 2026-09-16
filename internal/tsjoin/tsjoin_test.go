@@ -41,7 +41,17 @@ func patPacket(pmtPID int) []byte {
 func TestSnapshotPicksPatPmtAndGopFromKeyframe(t *testing.T) {
 	const pmtPID = 0x100
 	pat := patPacket(pmtPID)
-	pmt := pkt(map[int]byte{1: byte(pmtPID >> 8), 2: byte(pmtPID & 0xff), 3: 0x10})
+	// A PMT section declaring no elementary stream: enough to be captured as the
+	// table a join starts with, and it leaves videoPID unset as before.
+	pmt := pkt(map[int]byte{
+		1: byte(0x40 | (pmtPID>>8)&0x1f), // PUSI: the packet starts the section
+		2: byte(pmtPID & 0xff),
+		3: 0x10, // payload only
+		4: 0x00, // pointer_field
+		5: 0x02, // table_id (PMT)
+		6: 0xb0, // section syntax + length hi
+		7: 0x0d, // section_length: the section header and CRC, no ES loop
+	})
 	key := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x30, 4: 0x07, 5: 0x40}) // AFC=3, adaptLen=7, RAI set
 	non := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x10})                    // payload only, no RAI
 

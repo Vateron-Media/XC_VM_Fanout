@@ -13,20 +13,29 @@ import (
 
 // pmtPacket is a PMT on PID 0x100 (matches patPacket(0x100)) that declares one
 // H.264 video elementary stream on PID 0x101 — so parseVideoPID locates the PES
-// the HLS clock reads. Only the bytes parseVideoPID inspects are set.
+// the HLS clock reads. It is a whole section: the ES loop is read bounded by
+// table_id and section_length, so a table missing either is not one.
 func pmtPacket() []byte {
 	return pkt(map[int]byte{
 		1:  0x41, // PUSI + PID hi → 0x100
 		2:  0x00, // PID lo
 		3:  0x10, // payload only
 		4:  0x00, // pointer_field = 0 → section at offset 5
-		15: 0x00, // program_info_length hi (p+10)
-		16: 0x00, // program_info_length lo (p+11) → 0
+		5:  0x02, // table_id (PMT)
+		6:  0xb0, // section syntax + length hi
+		7:  0x12, // section_length = 18: the header, one ES entry and the CRC
+		9:  0x01, // program_number = 1
+		10: 0xc1, // version, current_next
+		13: 0xe1, // PCR_PID hi (masked &0x1f → 0x01)
+		14: 0x01, // PCR_PID lo → 0x101
+		15: 0xf0, // program_info_length hi (masked &0x0f → 0)
+		16: 0x00, // program_info_length lo → 0
 		17: 0x1b, // ES loop @ es=17: stream_type = H.264 (video)
 		18: 0xe1, // ES PID hi (masked &0x1f → 0x01)
 		19: 0x01, // ES PID lo → video PID 0x101
 		20: 0xf0, // ES_info_length hi (masked &0x0f → 0)
 		21: 0x00, // ES_info_length lo → 0
+		// 22..25 are the CRC32, which the ES loop must not read as an entry.
 	})
 }
 

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 )
 
 func write(t *testing.T, body string) string {
@@ -101,7 +103,9 @@ func TestLoadClampsOutOfRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.PrebufferMaxSec != 120 || v.HLSWindow != 1 || v.HLSTargetSec != 1 || v.GraceSec != 1 || v.WriteTimeoutSec != 600 || v.ChunkBytes != 188 || v.MaxGOPBytes != 188 {
+	// max_gop_bytes caps one ring block, so 1 is floored to a size that can still
+	// hold a GOP rather than to a single TS packet — see TestMaxGOPClampRange.
+	if v.PrebufferMaxSec != 120 || v.HLSWindow != 1 || v.HLSTargetSec != 1 || v.GraceSec != 1 || v.WriteTimeoutSec != 600 || v.ChunkBytes != 188 || v.MaxGOPBytes != defaults.CfgMinMaxGOPBytes {
 		t.Fatalf("clamp failed: %+v", v)
 	}
 }

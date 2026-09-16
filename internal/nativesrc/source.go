@@ -39,6 +39,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 )
 
 // DefaultSourceIdleTimeout bounds how long a source read may stall with NO bytes
@@ -60,6 +62,12 @@ type idleTimeoutReader struct {
 	last atomic.Int64 // unixnano of the last byte received
 	done chan struct{}
 	once sync.Once
+	// stalled records that the watchdog, not the consumer and not the upstream,
+	// is why rc is closed. Without it the read error that follows is whatever
+	// closing happened to produce — "io: read/write on closed pipe", "use of
+	// closed network connection" — which reads in a log like a local bug rather
+	// than the frozen upstream it actually is.
+	stalled atomic.Bool
 }
 
 // WrapIdleTimeout wraps rc so a no-bytes stall longer than idle becomes a read
@@ -80,10 +88,23 @@ func WrapIdleTimeout(rc io.ReadCloser, idle time.Duration) io.ReadCloser {
 	if rc == nil || idle <= 0 {
 		return rc
 	}
+	return newIdleTimeout(rc, idle)
+}
+
+func newIdleTimeout(rc io.ReadCloser, idle time.Duration) *idleTimeoutReader {
 	r := &idleTimeoutReader{rc: rc, idle: idle, done: make(chan struct{})}
 	r.last.Store(time.Now().UnixNano())
 	go r.watch()
 	return r
+}
+
+// detach stops the watcher and hands back the source it was guarding, still
+// open, so a caller that only needed a bound for its OWN reads does not leave
+// one armed on the stream it passes on. If the watcher has already fired, the
+// source comes back closed — which is the right answer: it stalled.
+func (r *idleTimeoutReader) detach() io.ReadCloser {
+	r.once.Do(func() { close(r.done) })
+	return r.rc
 }
 
 func (r *idleTimeoutReader) watch() {
@@ -99,6 +120,9 @@ func (r *idleTimeoutReader) watch() {
 			return
 		case <-t.C:
 			if time.Since(time.Unix(0, r.last.Load())) > r.idle {
+				// Flagged BEFORE the close, so the Read it unblocks can
+				// already see why it is failing.
+				r.stalled.Store(true)
 				_ = r.rc.Close() // unblock a stuck Read: it returns an error
 				return
 			}
@@ -111,6 +135,14 @@ func (r *idleTimeoutReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		r.last.Store(time.Now().UnixNano())
 	}
+	// Name the watchdog as the cause. puller.Run logs this error verbatim and
+	// remux writes it to <id>.errors, so it is the only place an operator can
+	// learn that the upstream went quiet rather than that something local broke.
+	// io.EOF is left exactly as it is: callers compare it by identity, and a
+	// clean end of stream is not this wrapper's business to redefine.
+	if err != nil && err != io.EOF && r.stalled.Load() {
+		return n, fmt.Errorf("source idle for %s: %w", r.idle, err)
+	}
 	return n, err
 }
 
@@ -118,6 +150,13 @@ func (r *idleTimeoutReader) Close() error {
 	r.once.Do(func() { close(r.done) })
 	return r.rc.Close()
 }
+
+// playlistReadDeadline is the ABSOLUTE cap on reading one playlist body during
+// classification. The stall bound cannot catch a slow loris — a byte at a time
+// keeps resetting it — and a playlist, unlike a live body, is a bounded object
+// that has no business taking longer than one ordinary fetch. A var so tests can
+// shorten it.
+var playlistReadDeadline = pullRequestTimeout
 
 // ErrUnsupportedSource is returned by Open when the URL scheme or content-type
 // isn't something the native reader can take. The caller falls back to ffmpeg.
@@ -152,7 +191,7 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 	}
 	// Bare path → file.
 	if strings.HasPrefix(rawURL, "/") || strings.HasPrefix(rawURL, "./") || strings.HasPrefix(rawURL, "../") {
-		return os.Open(rawURL)
+		return openFile(rawURL)
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -160,8 +199,12 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "file":
-		return os.Open(u.Path)
+		return openFile(u.Path)
 	case "http", "https":
+		// A proxy that cannot be used is a refusal, not a direct connection.
+		if err := opt.checkProxy(); err != nil {
+			return nil, err
+		}
 		// HLS playlists are routed through the pull client, which returns a pipe
 		// whose reader yields concatenated MPEG-TS bytes from the live segment
 		// window. An m3u8 served under an arbitrary path extension is still
@@ -174,6 +217,47 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 		return openUDP(ctx, u)
 	}
 	return nil, fmt.Errorf("%w: scheme %q", ErrFormat, u.Scheme)
+}
+
+// openFile reads a local source, sniffed exactly as an HTTP body is.
+//
+// Handing back os.Open unchecked was the one place a source reached viewers
+// without proving what it was. The daemon routes a bare path and file:// past
+// the HTTP probe straight into Open, so a stream registered with
+// /home/xc_vm/content/movie.mp4 — or with a local <id>_.m3u8 — opened fine,
+// reported itself as running natively, and fanned out MP4 boxes (or playlist
+// text) as if they were MPEG-TS. Nothing ever refused, so the ffmpeg fallback,
+// which reads both of those correctly, was never reached.
+func openFile(name string) (io.ReadCloser, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	head := make([]byte, tsSyncProbePackets*tsPacketSize)
+	n, err := io.ReadFull(f, head)
+	head = head[:n]
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, name, err)
+	}
+	if looksLikeTS(head) {
+		return &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), f), c: f}, nil
+	}
+	_ = f.Close()
+	if n == 0 {
+		// An empty file says nothing about WHAT it is — a producer that has not
+		// written yet looks exactly like this — so it stays an ordinary failure
+		// rather than the format refusal that pins a stream to ffmpeg for good.
+		return nil, fmt.Errorf("%w: %s: empty", ErrUnsupportedSource, name)
+	}
+	if n < tsPacketSize && !namesAnotherContainer(head) {
+		// Nor does a file too short to hold one packet: the producer is a moment
+		// further on, and looksLikeTS cannot confirm what it cannot see a whole
+		// packet of. The segment body check already draws the line exactly here.
+		return nil, fmt.Errorf("%w: %s: %d bytes, short of one %d-byte packet",
+			ErrUnsupportedSource, name, n, tsPacketSize)
+	}
+	return nil, fmt.Errorf("%w: %s: not an mpegts stream", ErrFormat, name)
 }
 
 // newStreamClient opens a CONTINUOUS live source body. Unlike the pull client it
@@ -207,11 +291,22 @@ func (c *clientBoundReadCloser) Close() error {
 	return err
 }
 
+// IdleBound forwards the wrapped source's own stall bound, because embedding the
+// io.ReadCloser INTERFACE promotes only Read and Close. A provider URL that
+// carries no .m3u8 but serves a playlist — /live/user/pass/123 and friends —
+// comes back through here as a live HLS pull, and hiding its bound armed the 8s
+// default against a source that is legitimately silent for a whole segment: the
+// watcher closed the pipe between two healthy segments and the channel
+// restart-looped. Passing 0 as the default keeps this honest — a source with no
+// bound of its own reports none, and the caller's default still wins.
+func (c *clientBoundReadCloser) IdleBound() time.Duration { return IdleBound(c.ReadCloser, 0) }
+
 func openHTTP(ctx context.Context, u *url.URL, opt Options) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
+	opt = opt.scopedTo(u)
 	opt.apply(req)
 	client := newStreamClient(opt)
 	resp, err := client.Do(req)
@@ -238,19 +333,52 @@ func openHTTP(ctx context.Context, u *url.URL, opt Options) (io.ReadCloser, erro
 // one's connection unusable for the pool because it was closed undrained. The
 // caller keeps ownership of the http.Client the response came from; only the body
 // transfers.
+//
+// The reader that comes back is NOT stall-bounded: wrap it in
+// WrapIdleTimeout(rc, IdleBound(rc, def)), as Open's callers do, so one bound —
+// the caller's, widened by the source's own when it is silent between bursts —
+// governs the whole session.
 func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCloser, error) {
 	if resp.StatusCode/100 != 2 {
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: http %d", ErrUnsupportedSource, resp.StatusCode)
 	}
+	// Every fetch from here on — playlist polls and segments — is ours, so a
+	// proxy this package cannot use must stop the source here rather than send
+	// those fetches out direct from the node's own IP.
+	if err := opt.checkProxy(); err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
 	final := resp.Request.URL // honour redirects when resolving segment URIs
+	// A caller that fetched the URL itself (internal/puller) has not pinned the
+	// source's headers to a host yet. The response says which one it was.
+	opt = opt.scopedTo(final)
+
+	// Bound the reads THIS function makes — the sniff below and the playlist
+	// read. They are the two that come first and they used to be unbounded: the
+	// caller's probe client carries no Client.Timeout, ResponseHeaderTimeout
+	// covers only the headers, and ctx is the stream's whole lifetime. An
+	// upstream that flushed 200 and then went silent parked the puller here for
+	// good, so the stream never errored, never reconnected and never reached its
+	// backup URLs while still reporting itself healthy.
+	//
+	// The bound is detached again before a live body is handed on, because the
+	// body's bound belongs to the CALLER: remux carries the operator's
+	// -idle_timeout and the puller takes the source's own longer bound for a
+	// segment-at-a-time pull. Leaving this 8s default armed inside meant the
+	// inner watcher always fired first, so `-idle_timeout 30` could only ever
+	// shorten the bound and never lengthen it, and every http TS source ran two
+	// watcher goroutines and two tickers.
+	classify := newIdleTimeout(resp.Body, DefaultSourceIdleTimeout)
+	body := io.ReadCloser(classify)
 
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	switch {
 	case strings.Contains(ct, "mpegurl"):
-		return adoptHLS(ctx, final, opt, nil, resp.Body)
+		return adoptHLS(ctx, final, opt, nil, body)
 	case strings.Contains(ct, "mp2t"):
-		return WrapIdleTimeout(resp.Body, DefaultSourceIdleTimeout), nil
+		return classify.detach(), nil
 	}
 
 	// Anything else has to PROVE what it is before we hand it on. Upstream this
@@ -261,21 +389,41 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 	// serve real TS, and the odd playlist, as application/octet-stream, so the
 	// header alone is neither sufficient nor necessary.
 	head := make([]byte, tsSyncProbePackets*tsPacketSize)
-	n, err := io.ReadFull(resp.Body, head)
+	n, err := io.ReadFull(body, head)
 	head = head[:n]
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, redact(final), err)
+		_ = body.Close()
+		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, redactURL(final), err)
 	}
 	switch {
 	case looksLikeTS(head):
-		body := &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), resp.Body), c: resp.Body}
-		return WrapIdleTimeout(body, DefaultSourceIdleTimeout), nil
+		live := classify.detach()
+		return &prefixedReadCloser{r: io.MultiReader(bytes.NewReader(head), live), c: live}, nil
 	case looksLikePlaylist(head):
-		return adoptHLS(ctx, final, opt, head, resp.Body)
+		return adoptHLS(ctx, final, opt, head, body)
 	}
-	_ = resp.Body.Close()
-	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redact(final))
+	_ = body.Close()
+	if n == 0 {
+		// 200 and then not one byte is a source that is DOWN, not a source in
+		// another container: an origin blip, a backend restart, an account
+		// momentarily over its connection limit. ErrFormat is what moves a
+		// stream onto its ffmpeg fallback for the life of its spec (remux exits
+		// ExitUnsupported and the supervisor's fallback is sticky), and its own
+		// contract says that must never happen for a source that is merely down.
+		// With nothing to classify, there is nothing to refuse on.
+		return nil, fmt.Errorf("%w: %s: empty body", ErrUnsupportedSource, redactURL(final))
+	}
+	if looksLikeErrorPage(ct, head) {
+		// The other half of the same blip, and the commoner one: an origin over
+		// its connection limit, or an account that has just expired, answers the
+		// stream URL with 200 and a web page. That says the source is
+		// unavailable right now, not that it is in another container — and
+		// ffmpeg cannot play an HTML page either, so moving the stream onto its
+		// fallback for the life of the spec buys nothing and loses the native
+		// path once the account comes back.
+		return nil, fmt.Errorf("%w: %s: a web page, not a stream", ErrUnsupportedSource, redactURL(final))
+	}
+	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redactURL(final))
 }
 
 // adoptHLS finishes reading a playlist whose first bytes have already been
@@ -283,20 +431,28 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 // second time. Always closes body.
 func adoptHLS(ctx context.Context, base *url.URL, opt Options, head []byte, body io.ReadCloser) (io.ReadCloser, error) {
 	defer body.Close()
+	// Closing the body is what unblocks a read that is trickling rather than
+	// stalled; see playlistReadDeadline.
+	stop := time.AfterFunc(playlistReadDeadline, func() { _ = body.Close() })
+	defer stop.Stop()
 	rest, err := io.ReadAll(io.LimitReader(body, maxPlaylistBytes-int64(len(head))))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s: read playlist: %v", ErrUnsupportedSource, redact(base), err)
+		return nil, fmt.Errorf("%w: %s: read playlist: %v", ErrUnsupportedSource, redactURL(base), err)
 	}
 	manifest := make([]byte, 0, len(head)+len(rest))
 	manifest = append(append(manifest, head...), rest...)
 	return openHLSPullWith(ctx, base, opt, manifest)
 }
 
-func redact(u *url.URL) string {
+// redactURL keeps a source's credentials out of an error message. u.Redacted()
+// alone masks only userinfo, and an XC source carries its account in the PATH
+// (/live/<username>/<password>/1234.ts) — which every one of these errors is
+// logged with, on every retry. The shared masker knows both shapes.
+func redactURL(u *url.URL) string {
 	if u == nil {
 		return "source"
 	}
-	return u.Redacted()
+	return redact.URL(u.String())
 }
 
 // tsSyncProbePackets is how many consecutive packet boundaries must carry the
@@ -321,11 +477,45 @@ func looksLikeTS(head []byte) bool {
 	return true
 }
 
+// namesAnotherContainer reports whether the opening bytes POSITIVELY identify a
+// container this package does not serve. It only has to answer for a body too
+// short to hold one TS packet, where "does not look like TS" is no evidence at
+// all — the first bytes of a real TS file do not look like TS either. A file
+// that opens with an ISO-BMFF box, a Matroska header or a playlist is a fact a
+// retry cannot change, and ffmpeg reads all three, so those stay format
+// refusals however short they are.
+func namesAnotherContainer(head []byte) bool {
+	switch {
+	case looksLikePlaylist(head):
+		return true
+	case len(head) >= 8 && string(head[4:8]) == "ftyp": // MP4, fMP4
+		return true
+	case bytes.HasPrefix(head, []byte{0x1a, 0x45, 0xdf, 0xa3}): // Matroska, WebM
+		return true
+	}
+	return false
+}
+
 // looksLikePlaylist reports whether head opens an m3u8, tolerating a UTF-8 BOM
 // and leading whitespace. An upstream that serves playlists as text/plain or
 // octet-stream would otherwise be bounced to ffmpeg for no reason.
 func looksLikePlaylist(head []byte) bool {
 	return bytes.HasPrefix(bytes.TrimLeft(head, "\xef\xbb\xbf \t\r\n"), []byte("#EXTM3U"))
+}
+
+// looksLikeErrorPage reports whether a 200 body is a web page rather than
+// media — the shape an IPTV origin answers with when the account is over its
+// connection limit, expired, or the backend is restarting behind a portal. It is
+// a statement about this minute, not about the source's container, so it must
+// not read as a format refusal. Either signal settles it: a text/* content type,
+// or a body that opens with a tag. A real TS or playlist body never gets here —
+// both are recognised before this is asked, whatever content type they carried.
+func looksLikeErrorPage(contentType string, head []byte) bool {
+	if strings.HasPrefix(strings.TrimSpace(strings.ToLower(contentType)), "text/") {
+		return true
+	}
+	h := bytes.TrimLeft(head, "\xef\xbb\xbf \t\r\n")
+	return len(h) > 0 && h[0] == '<'
 }
 
 // prefixedReadCloser replays already-consumed bytes ahead of the live body while
@@ -351,12 +541,19 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	var conn *net.UDPConn
-	if addr.IP.IsMulticast() {
-		conn, err = net.ListenMulticastUDP("udp", nil, addr)
-	} else {
-		conn, err = net.ListenUDP("udp", addr)
+	q := u.Query()
+	// Options that decide WHICH datagrams arrive cannot be quietly ignored: a
+	// source-filtered join that falls back to any-source delivers a different
+	// stream from the one that was configured. Refuse as a format refusal, which
+	// is what hands the source to ffmpeg — where they work. Everything else in a
+	// udp:// query (fifo_size, buffer_size, overrun_nonfatal, pkt_size…) is
+	// tuning, and refusing tuning would take working multicast sources off air.
+	for _, k := range []string{"sources", "block"} {
+		if q.Get(k) != "" {
+			return nil, fmt.Errorf("%w: udp option %q is not read natively", ErrFormat, k)
+		}
 	}
+	conn, err := listenUDP(addr, strings.TrimSpace(q.Get("localaddr")))
 	if err != nil {
 		return nil, err
 	}
@@ -367,6 +564,76 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 	r := &udpReader{conn: conn, ctx: ctx, done: make(chan struct{}), rtp: strings.EqualFold(u.Scheme, "rtp")}
 	go r.watch()
 	return r, nil
+}
+
+// listenUDP binds the socket a udp:// read URL asks for, following the same
+// rules ffmpeg's udp.c does — the two backends must reach the same source the
+// same way, or `backend=auto` changes what an operator gets.
+//
+//   - multicast: join on the interface that carries localaddr, if one was named.
+//     A nil interface lets the kernel pick from the routing table, which on a
+//     node whose feed arrives on a dedicated VLAN NIC is the wrong one: the join
+//     succeeds, no datagrams arrive, and the stall bound reconnects forever.
+//   - localaddr on a unicast URL: bind it, as asked.
+//   - a unicast host that is not one of ours: the URL is naming the SENDER,
+//     which ffmpeg accepts and binds INADDR_ANY:port for. Binding the remote
+//     address failed with "cannot assign requested address" — not a format
+//     refusal, so remux exited 1 and the supervisor restart-looped a channel
+//     whose fallback would have played it. An address that IS local still binds
+//     exactly as configured, so a feed deliberately pinned to one NIC stays
+//     pinned.
+func listenUDP(addr *net.UDPAddr, localaddr string) (*net.UDPConn, error) {
+	if addr.IP.IsMulticast() {
+		var ifi *net.Interface
+		if localaddr != "" {
+			var err error
+			if ifi, err = interfaceForIP(localaddr); err != nil {
+				return nil, err
+			}
+		}
+		return net.ListenMulticastUDP("udp", ifi, addr)
+	}
+	if localaddr != "" {
+		lip := net.ParseIP(localaddr)
+		if lip == nil {
+			return nil, fmt.Errorf("%w: localaddr %q is not an ip address", ErrUnsupportedSource, localaddr)
+		}
+		return net.ListenUDP("udp", &net.UDPAddr{IP: lip, Port: addr.Port, Zone: addr.Zone})
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err == nil || addr.IP == nil || addr.IP.IsUnspecified() {
+		return conn, err
+	}
+	wild, werr := net.ListenUDP("udp", &net.UDPAddr{Port: addr.Port})
+	if werr != nil {
+		return nil, err // the original failure is the more specific one
+	}
+	return wild, nil
+}
+
+// interfaceForIP resolves a localaddr to the interface that carries it, which is
+// what a multicast join takes.
+func interfaceForIP(raw string) (*net.Interface, error) {
+	ip := net.ParseIP(raw)
+	if ip == nil {
+		return nil, fmt.Errorf("%w: localaddr %q is not an ip address", ErrUnsupportedSource, raw)
+	}
+	ifis, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	for i := range ifis {
+		addrs, err := ifis[i].Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+				return &ifis[i], nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("%w: localaddr %s is on no interface of this node", ErrUnsupportedSource, ip)
 }
 
 // udpReader adapts a datagram socket to io.Reader.

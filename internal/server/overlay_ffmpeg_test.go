@@ -85,12 +85,13 @@ func TestOverlaySegmentRealFFmpeg(t *testing.T) {
 	}
 }
 
-// TestOverlaySegmentSpecialChars proves the drawtext escaping actually parses
-// under real ffmpeg for a message carrying the characters that are special to the
-// filtergraph — an apostrophe and a colon. Before the '\'' fix the apostrophe
-// broke the filter parse, so the re-encode failed and the overlay silently served
-// the plain segment: exactly the "returned unchanged" state that would pass the
-// other tests while the feature was dead for any message with a quote in it.
+// TestOverlaySegmentSpecialChars proves the whole segment re-encode still runs
+// for a message carrying the characters that are special to the filtergraph.
+// A parse failure makes the re-encode fail, and being best-effort that shows up
+// as the plain segment served back unchanged: the feature dead, silently.
+//
+// What the viewer actually READS is a separate question this cannot answer —
+// TestDrawtextFilterDrawsTheMessageVerbatim is the test for that.
 func TestOverlaySegmentSpecialChars(t *testing.T) {
 	ffmpeg := systemFFmpeg(t)
 	font := systemFont(t)
@@ -99,7 +100,10 @@ func TestOverlaySegmentSpecialChars(t *testing.T) {
 	mgr := NewManager(1<<20, 0, 2, 6, 0)
 	mgr.SetOverlay(ffmpeg, font)
 
-	for _, msg := range []string{"it's back", "on at 3:00", "it's on at 3:00!"} {
+	for _, msg := range []string{
+		"it's back", "on at 3:00", "it's on at 3:00!",
+		"50% off", `back\slash`, "a,b;c[d]=e", "%{e:1+1}", "o'brien",
+	} {
 		out := mgr.overlaySegment(seg, pendingSignal{text: msg, fontSize: 20, color: "white", x: 10, y: 10}, "h264")
 		if len(out) == 0 || out[0] != 0x47 {
 			t.Fatalf("msg %q: overlay produced an invalid TS (%d bytes)", msg, len(out))
