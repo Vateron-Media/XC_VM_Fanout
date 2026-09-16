@@ -29,6 +29,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/nativesrc"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 )
 
 // tailBuffer keeps only the last max bytes written to it — a bounded sink for a
@@ -406,14 +407,45 @@ func httpClient(src Source) (*http.Client, error) {
 		ResponseHeaderTimeout: defaults.PullHeaderTimeout,
 		IdleConnTimeout:       defaults.PullIdleConnTimeout,
 	}
-	if src.Proxy != "" {
-		pu, err := url.Parse("http://" + src.Proxy)
-		if err != nil {
-			return nil, err
-		}
+	pu, err := proxyURL(src.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	if pu != nil {
 		tr.Proxy = http.ProxyURL(pu)
 	}
 	return &http.Client{Transport: tr}, nil // no client timeout: this is a long-lived stream
+}
+
+// proxyURL turns the configured proxy value into the address the transport and
+// the ffmpeg child both dial, or nil when no proxy is configured.
+//
+// The panel's field is free text, documented as host:port, and the daemon used
+// to prefix "http://" unconditionally. "http://10.0.0.5:3128" — the value an
+// operator naturally types — then PARSES, as the host "http:" with the path
+// "//10.0.0.5:3128": every probe died with `dial tcp: lookup http:: no such
+// host`, an error naming neither the proxy nor the stream, and ffmpeg was
+// handed `-http_proxy http://http://10.0.0.5:3128` besides. Accept the scheme
+// when it is there, add it when it is not, and keep only the address.
+func proxyURL(raw string) (*url.URL, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return nil, nil
+	}
+	if low := strings.ToLower(v); !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://") {
+		v = "http://" + v
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return nil, fmt.Errorf("proxy %q: %w", redact.URL(raw), err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("proxy %q has no host:port", redact.URL(raw))
+	}
+	// A proxy is an address to dial, never a document to fetch: anything after
+	// the host is at best noise and at worst part of the dialled name.
+	u.Path, u.RawPath, u.RawQuery, u.Fragment = "", "", "", ""
+	return u, nil
 }
 
 // probe opens the URL. On success the whole response, headers AND an unread,
@@ -573,8 +605,11 @@ func runFfmpeg(ctx context.Context, src Source, raw string, stall time.Duration,
 		if hdr := ffmpegHeaderBlock(src); hdr != "" {
 			args = append(args, "-headers", hdr)
 		}
-		if src.Proxy != "" {
-			args = append(args, "-http_proxy", "http://"+src.Proxy)
+		// The same normalised address the probe dials — see proxyURL. A value
+		// too broken to be one is dropped here rather than passed on: Run has
+		// already refused to start with it, so this can only be a direct caller.
+		if pu, err := proxyURL(src.Proxy); err == nil && pu != nil {
+			args = append(args, "-http_proxy", pu.String())
 		}
 	}
 	args = append(args,
