@@ -903,7 +903,31 @@ func (s *State) JoinStart(dst []byte, reqMS int64) ([]byte, Cursor) {
 // then subscribes to the live tail. The live tail used to queue behind the whole
 // burst instead, and a queue short enough to be cheap dropped every viewer whose
 // link could not take a 30 s burst in ~5 s. Caller (Hub) serialises access.
+//
+// It allocates the returned parts slice on every call. A follower at the live
+// edge reads once per published chunk for its whole session, so it should own
+// one slice and use ReadFromInto instead.
 func (s *State) ReadFrom(c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool, pin Pin) {
+	return s.ReadFromInto(nil, c, max)
+}
+
+// ReadFromInto is ReadFrom appending the run's slices into dst (its contents are
+// overwritten; it grows only when the run has more slices than it holds). The
+// returned parts alias dst when they fit.
+//
+// It exists for the follower loop: under ADR 0004 a viewer parked at the live
+// edge wakes and reads once per published chunk — about 80 times a second on an
+// 8 Mbit/s stream in 12 KB chunks — and building the parts slice by appending to
+// nil made that one allocation per viewer per chunk. Past a hundred or so
+// followers on a stream that is more garbage per chunk than the single broadcast
+// buffer ADR 0004 removed. A follower that keeps one slice across its session
+// pays none of it.
+//
+// dst must not be a slice whose previous run is still being written: the parts
+// are the ring's own buffers and are handed back in place. Caller (Hub)
+// serialises access.
+func (s *State) ReadFromInto(dst [][]byte, c Cursor, max int) (parts [][]byte, next Cursor, atEnd, behind bool, pin Pin) {
+	parts = dst[:0]
 	if len(s.gops) == 0 {
 		return nil, c, true, false, Pin{}
 	}
