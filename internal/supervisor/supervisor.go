@@ -881,6 +881,18 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 			if verdict.event == EventAudioLoss && !st.audioLossDue(now, sup.audioLossRetry) {
 				dlog.Logf("monitor", "id=%s %s, but the last AUDIO_LOSS restart did not help; leaving it up",
 					st.id, verdict.reason)
+				// Only the audio rule is paced. check returns the FIRST rule
+				// that fires, and on a permanently silent channel that is this
+				// one on every tick — so skipping the tick would switch off the
+				// rules behind it (the frame rate, and the baseline it is judged
+				// against) for as long as the silence lasted. A silent channel
+				// that then freezes is still a frozen channel. Judge it again
+				// with the paced rule taken out.
+				muted := health
+				muted.AudioLossSec = 0
+				if verdict := muted.check(now, startedAt, v, base); verdict.failed() {
+					return verdict
+				}
 				continue
 			}
 			return verdict

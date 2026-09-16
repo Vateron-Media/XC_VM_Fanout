@@ -5,6 +5,7 @@
 package supervisor
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -84,4 +85,88 @@ func TestAudioLossPacingRearmsWhenAudioComesBack(t *testing.T) {
 	if !st.audioLossDue(t0.Add(7*time.Minute), audioLossRetryDefault) {
 		t.Fatal("audio came back and was lost again; that must be acted on at once")
 	}
+}
+
+// TestPacedAudioLossDoesNotMuteTheOtherRules: Health.check returns the FIRST
+// rule that fires, and on a channel whose audio PID is permanently silent that
+// is AUDIO_LOSS on every single tick. Pacing the restart by skipping the tick
+// therefore skipped every rule behind it — for as long as the silence lasted,
+// not just for the retry interval — so a silent channel whose picture then froze
+// was left on air showing a still image, with no event and no restart. The
+// frame-rate baseline was not even measured, because that too lives behind the
+// audio rule.
+func TestPacedAudioLossDoesNotMuteTheOtherRules(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(t)
+	h.setData(true)
+
+	var mu sync.Mutex
+	clock := time.Now()
+	h.sup.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	h.sup.healthTick = 5 * time.Millisecond
+
+	vit := &vitalsStub{}
+	h.sup.WithVitals(vit.get)
+	silentSince := clock.Add(-time.Hour) // audio declared, nothing on it, ever
+
+	// step moves the clock on by d with the vitals that go with it. LastData is
+	// stamped first, so no tick in between sees a stale one and calls it a stall.
+	step := func(d time.Duration, fps float64) {
+		mu.Lock()
+		at := clock.Add(d)
+		mu.Unlock()
+		vit.set(Vitals{LastData: at, LastAudio: silentSince, FPS: fps})
+		mu.Lock()
+		clock = at
+		mu.Unlock()
+		time.Sleep(40 * time.Millisecond) // several health ticks at this reading
+	}
+
+	spec := baseSpec(dir)
+	spec.Health = Health{StallSec: 30, AudioLossSec: 30, FPSThreshold: 0.5}
+	if err := h.sup.Supervise("5", spec); err != nil {
+		t.Fatal(err)
+	}
+	h.nextProcess(t)
+	waitFor(t, "the first start", func() bool { return h.sup.State("5").Running })
+	vit.set(Vitals{LastData: clock, LastAudio: silentSince, FPS: 25})
+
+	// The one AUDIO_LOSS restart the pacing allows.
+	step(31*time.Second, 25)
+	h.nextProcess(t)
+	waitFor(t, "the AUDIO_LOSS restart", func() bool {
+		st := h.sup.State("5")
+		return st.Running && h.launchCount() == 2
+	})
+
+	// The replacement is silent too, so from 30s in every tick carries an
+	// AUDIO_LOSS the pacing declines to act on. The picture is fine.
+	step(25*time.Second, 25)
+	step(20*time.Second, 25)
+
+	// And then it freezes: no video frames at all, for longer than the stall
+	// bound this stream declares. Nothing else catches that — the bytes keep
+	// flowing, so the stall rule is satisfied — and it must not be hidden behind
+	// a rule that is merely being paced.
+	step(10*time.Second, 0)
+	step(35*time.Second, 0)
+
+	waitFor(t, "the frozen picture to be caught", func() bool { return h.launchCount() >= 3 })
+	if n := countAction(readLog(t, dirLog(dir)), EventFPSDropThreshold); n != 1 {
+		t.Errorf("%s logged %d times, want 1: the frozen picture must still be judged", EventFPSDropThreshold, n)
+	}
+	if n := countAction(readLog(t, dirLog(dir)), EventAudioLoss); n != 1 {
+		t.Errorf("%s logged %d times, want 1 inside the retry interval", EventAudioLoss, n)
+	}
+}
+
+// countAction counts the panel log entries carrying one action.
+func countAction(entries []logLine, action string) int {
+	n := 0
+	for _, a := range actions(entries) {
+		if a == action {
+			n++
+		}
+	}
+	return n
 }
