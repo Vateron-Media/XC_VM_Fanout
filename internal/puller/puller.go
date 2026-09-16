@@ -466,12 +466,21 @@ func httpClient(src Source) (*http.Client, error) {
 // host`, an error naming neither the proxy nor the stream, and ffmpeg was
 // handed `-http_proxy http://http://10.0.0.5:3128` besides. Accept the scheme
 // when it is there, add it when it is not, and keep only the address.
+//
+// "when it is there" is decided the way nativesrc.Options.proxyURL decides it —
+// on a "://" anywhere in the value, not on an http/https prefix. Both packages
+// read the SAME field of the same source, so a value only one of them
+// understands is a value the daemon cannot honour: "socks5://10.0.0.5:1080" was
+// prefixed here into "http://socks5://10.0.0.5:1080", which parses as the host
+// "socks5:", so every probe dialled a host literally called socks5 and the URL
+// was dropped from the candidate list before the native reader — which dials
+// that proxy correctly — was ever asked.
 func proxyURL(raw string) (*url.URL, error) {
 	v := strings.TrimSpace(raw)
 	if v == "" {
 		return nil, nil
 	}
-	if low := strings.ToLower(v); !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://") {
+	if !strings.Contains(v, "://") {
 		v = "http://" + v
 	}
 	u, err := url.Parse(v)
