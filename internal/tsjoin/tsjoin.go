@@ -143,10 +143,22 @@ type State struct {
 	segs        []hlsSeg // closed segments, oldest→newest
 	nextSeq     int      // next HLS media sequence number
 	segStartID  int64    // open segment's first GOP id, or -1 = none open
-	segStartPTS int64    // open segment's start HLS clock (90 kHz)
-	segStartT   int64    // open segment's start on the ring clock, or -1
+	segLastPTS  int64    // HLS clock of the newest keyframe in the open segment, or -1
+	segSpan     int64    // media the open segment holds so far (90 kHz), gaps excluded
 	segDisc     bool     // the open segment starts after a timeline jump
 	discDropped int      // discontinuities in segments pruned out of s.segs
+	// hlsStep is the last keyframe-to-keyframe step a cadence explains (90 kHz):
+	// this source's GOP length as observed. It is what the next step is judged
+	// against, and what the final GOP of a segment cut short by a jump is timed
+	// at. 0 until the stream has shown two keyframes.
+	hlsStep int64
+	// hlsMaxDur is the largest #EXT-X-TARGETDURATION this configuration has
+	// published (seconds). RFC 8216 requires the tag not to change for the life
+	// of the playlist, and rendering it from the window alone moved it every time
+	// a longer-than-usual segment slid out — the same client saw it change
+	// between two reloads of the same URL. Cleared when the target changes
+	// (Configure) or the stream is torn down (Reset).
+	hlsMaxDur int
 
 	// plCache is the last rendered playlist, valid until the segment list changes.
 	// Every HLS viewer polls index.m3u8 on its own schedule, so an audience of a few
@@ -174,7 +186,7 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, prunedID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, segLastPTS: -1, prunedID: -1, idleRatio: 0.5}
 	s.recompute()
 	return s
 }
@@ -242,6 +254,11 @@ func (s *State) Configure(prebufMS, hlsTargetMS int64, hlsWindow int) {
 	}
 	if hlsWindow < 0 {
 		hlsWindow = 0
+	}
+	if hlsTargetMS != s.hlsTargetMS {
+		// A new target means a new playlist: the published target duration is
+		// free to move to it, and must not stay pinned to the old segment length.
+		s.hlsMaxDur = 0
 	}
 	s.prebufMS, s.hlsTargetMS, s.hlsWindow = prebufMS, hlsTargetMS, hlsWindow
 	s.plValid = false // the window (and whether HLS runs at all) may have changed
@@ -360,7 +377,7 @@ func (s *State) Update(chunk []byte) {
 			if s.videoPID >= 0 && pid == s.videoPID {
 				if p, ok := parsePTS(pkt); ok {
 					pts = p
-					s.hlsOnKeyframe(id, pts, t)
+					s.hlsOnKeyframe(id, pts)
 				}
 			}
 			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: t, pts: pts, video: onVideo})
@@ -516,51 +533,70 @@ func (s *State) prune() {
 }
 
 // hlsOnKeyframe advances the HLS segment view when a new keyframe (a new GOP,
-// id=newID, opening at newPCR) arrives. If the currently-open segment now spans
-// at least hlsTargetMS, it is closed — ending at the previous last GOP — and this
-// keyframe opens the next one. Called before the new GOP is appended, so
-// s.gops[last] is the closing segment's final GOP. No-op unless the HLS view is
-// enabled and PCR timing is available.
-func (s *State) hlsOnKeyframe(newID, newPTS, newT int64) {
+// id=newID, carrying PES PTS newPTS) arrives. If the currently-open segment now
+// holds at least hlsTargetMS of media, it is closed — ending at the previous last
+// GOP — and this keyframe opens the next one. Called before the new GOP is
+// appended, so s.gops[last] is the closing segment's final GOP. No-op unless the
+// HLS view is enabled and a PES clock is available.
+//
+// A segment is timed KEYFRAME BY KEYFRAME, not by the span from its first
+// keyframe to the one that closes it. The two agree while the stream is
+// continuous, and differ by exactly the gap when it is not: a source reconnect,
+// an upstream HLS source skipping segments, an ffmpeg -copyts restart all step
+// the PTS forward with no media in between. Measured across the whole span, the
+// segment straddling such a gap was listed with #EXTINF (and so
+// #EXT-X-TARGETDURATION) of media PLUS gap — 16 s of #EXTINF for 6 s of video
+// after a 10 s gap — and with no #EXT-X-DISCONTINUITY, so a player buffered
+// against a duration the segment could not fill and nothing told it the timeline
+// had moved. Per step, the gap is visible as one step far outside the cadence:
+// the segment closes on the media it holds and the next one is a discontinuity.
+func (s *State) hlsOnKeyframe(newID, newPTS int64) {
 	if s.hlsTargetMS <= 0 {
 		return
 	}
-	if s.segStartID < 0 {
-		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+	if newPTS < 0 {
+		return // cannot time a segment without a clock on this end
+	}
+	if s.segStartID < 0 || s.segLastPTS < 0 {
+		s.segStartID, s.segLastPTS, s.segSpan = newID, newPTS, 0
 		return
 	}
-	if newPTS < 0 || s.segStartPTS < 0 {
-		return // cannot measure duration without a clock on both ends
+	step := newPTS - s.segLastPTS
+	if step < 0 && step+ptsWrap <= maxWrap {
+		step += ptsWrap // straddled the 33-bit wrap: a forward step after all
 	}
-	d := newPTS - s.segStartPTS
-	switch {
-	case d >= 0 && d <= maxCadence:
-		// time moved on by a plausible amount: the segment clock
-	case d < 0 && d+ptsWrap <= maxWrap:
-		d += ptsWrap // straddled the 33-bit wrap
-	default:
-		// The timeline jumped: a producer restart starts its PTS over, a
-		// failover lands on another clock, a splice skips ahead. Adding 2^33 to
-		// every backwards step read a restart as the wrap and closed a segment of
-		// ~26 hours — #EXTINF and #EXT-X-TARGETDURATION of ~95000 s, and players
-		// broken until it left the window. The open segment ends here instead (a
-		// segment must not span two timelines), timed on the ring clock, which is
-		// monotonic by construction; the next one is marked a discontinuity.
-		dur := int64(-1)
-		if newT >= 0 && s.segStartT >= 0 {
-			dur = (newT - s.segStartT) / pcrHz
-		}
+	// A step no cadence explains is a jump, not time passing: a producer restart
+	// starts its PTS over, a failover lands on another clock, a splice skips
+	// ahead. (Adding 2^33 to every backwards step read a restart as the wrap and
+	// closed a segment of ~26 hours — #EXTINF and #EXT-X-TARGETDURATION of
+	// ~95000 s, and players broken until it left the window.) Until the stream
+	// has shown a cadence any forward step is taken at face value, which is what
+	// keeps a source whose keyframes are further apart than the target — one long
+	// GOP per segment — reading as media rather than as a jump.
+	jump := step < 0 || step > maxCadence ||
+		(s.hlsStep > 0 && step > 2*s.hlsStep+s.hlsTargetMS*pcrHz)
+	if jump {
+		// The open segment ends here — a segment must not span two timelines —
+		// timed on the media it actually holds: every step up to its last
+		// keyframe, plus one cadence for that last GOP, whose own end is what the
+		// jump swallowed.
+		dur := (s.segSpan + s.hlsStep) / pcrHz
 		if dur <= 0 {
 			dur = s.hlsTargetMS
 		}
 		s.closeSegment(newID, dur)
 		s.segDisc = true
-		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+		s.segStartID, s.segLastPTS, s.segSpan = newID, newPTS, 0
 		return
 	}
-	if d >= s.hlsTargetMS*pcrHz {
-		s.closeSegment(newID, d/pcrHz)
-		s.segStartID, s.segStartPTS, s.segStartT = newID, newPTS, newT
+	if step > 0 {
+		s.hlsStep = step
+	}
+	s.segLastPTS = newPTS
+	s.segSpan += step
+	if s.segSpan >= s.hlsTargetMS*pcrHz {
+		s.closeSegment(newID, s.segSpan/pcrHz)
+		s.segStartID, s.segLastPTS, s.segSpan = newID, newPTS, 0
 	}
 }
 
@@ -629,15 +665,24 @@ func (s *State) HLSPlaylist() string {
 			discSeq++
 		}
 	}
+	// #EXT-X-TARGETDURATION must not change for the life of the playlist (RFC
+	// 8216): a player sizes its reload timer and its startup buffer from it.
+	// Taken from the window alone it moved every time a longer-than-usual segment
+	// slid out, so the same client saw it change between two reloads of the same
+	// URL. It only ever rises here, and is cleared when the target itself changes
+	// (Configure) or the stream is torn down (Reset).
 	maxDur := 0.0
 	for _, sg := range win {
 		if d := float64(sg.durMS) / 1000.0; d > maxDur {
 			maxDur = d
 		}
 	}
+	if td := int(math.Ceil(maxDur)); td > s.hlsMaxDur {
+		s.hlsMaxDur = td
+	}
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
-	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(maxDur)))
+	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", s.hlsMaxDur)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", win[0].seq)
 	if discSeq > 0 {
 		fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
@@ -960,10 +1005,11 @@ func (s *State) Reset() {
 	s.gops = nil
 	s.segs = nil
 	s.freeBufs = nil
-	s.segStartID, s.segStartPTS, s.segStartT = -1, -1, -1
+	s.segStartID, s.segLastPTS, s.segSpan = -1, -1, 0
 	// Whatever the producer sends next follows a gap: its first segment is a
 	// discontinuity to anyone who saw the ones before.
 	s.segDisc = s.nextSeq > 0
+	s.hlsStep, s.hlsMaxDur = 0, 0
 	s.plCache, s.plValid = "", false
 }
 
