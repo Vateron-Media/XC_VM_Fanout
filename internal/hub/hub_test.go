@@ -101,3 +101,41 @@ func TestCloseAllIdempotentAndPublishSafe(t *testing.T) {
 		t.Fatal("Follow on a torn-down hub must report ended")
 	}
 }
+
+// TestPublishAfterCloseAllTouchesNothing: after teardown the hub is unreachable —
+// the stream is out of the registry, so no viewer can ever join it again and the
+// reaper can never idle-stop it. A producer that has not noticed its cancellation
+// yet (or one started by a Register racing the Unregister) must therefore not go
+// on folding chunks into its ring: that keeps a whole prebuffer resident, and
+// churns it, for a reader that cannot exist. CloseAll's contract says closed
+// short-circuits Publish; this pins that it really does.
+func TestPublishAfterCloseAllTouchesNothing(t *testing.T) {
+	h := New(1<<20, 0)
+	h.CloseAll()
+
+	for i := 0; i < 64; i++ {
+		h.Publish(mkPkt(3))
+	}
+	if b, _, g := h.RingStats(); b != 0 || g != 0 {
+		t.Fatalf("Publish after CloseAll grew the ring: %d bytes in %d gop(s), want 0/0", b, g)
+	}
+	if a, v, _ := h.Counters(); a != 0 || v != 0 {
+		t.Fatalf("Publish after CloseAll advanced the counters: audio=%d video=%d, want 0/0", a, v)
+	}
+}
+
+// TestCloseAllKeepsWhatItAlreadyHeld: closing must not disturb the bytes already
+// in the ring — an HLS segment request or a Snapshot may still be in flight when
+// the teardown lands, and they read through the same join state.
+func TestCloseAllKeepsWhatItAlreadyHeld(t *testing.T) {
+	h := New(1<<20, 0)
+	h.Publish(mkPkt(5))
+	before, _, _ := h.RingStats()
+	if before == 0 {
+		t.Fatal("setup: expected the ring to hold the published packet")
+	}
+	h.CloseAll()
+	if after, _, _ := h.RingStats(); after != before {
+		t.Fatalf("CloseAll changed the ring: %d bytes, want %d", after, before)
+	}
+}
