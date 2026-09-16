@@ -244,19 +244,27 @@ func main() {
 }
 
 // pollConfig re-reads the operator-tuning file every `every` and applies it when
-// the file changes. It is mtime-gated, so a steady file costs one stat per tick.
-// A read or parse error is logged and the current tuning kept — a bad config
-// (or a mid-write torn read) never interrupts streaming; the next tick retries.
+// the file changes. It is gated on (mtime, size), so a steady file costs one
+// stat per tick. A read or parse error is logged and the current tuning kept —
+// a bad config (or a mid-write torn read) never interrupts streaming — and the
+// gate is left where it was so the next tick really does retry.
 // If the file is deleted out from under a running daemon it is recreated,
 // preserving the running tuning (or the built-in defaults if nothing has loaded
 // yet), so the self-healing contract holds at runtime, not just at startup.
-func pollConfig(ctx context.Context, path string, every time.Duration, mgr *server.Manager) {
+// configApplier is the part of the Manager the poll loop drives. It is an
+// interface so the loop's gating can be tested without a live stream registry.
+type configApplier interface {
+	ApplyConfig(config.Values)
+}
+
+func pollConfig(ctx context.Context, path string, every time.Duration, mgr configApplier) {
 	if every < time.Second {
 		every = time.Second
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()
 	var lastMod time.Time
+	var lastSize int64
 	var current *config.Values // last successfully applied tuning, or nil
 	for {
 		select {
@@ -288,19 +296,25 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr *serv
 					dlog.Logf("config", "recreated %s after deletion (defaults)", path)
 				}
 				if nfi, serr := os.Stat(path); serr == nil {
-					lastMod = nfi.ModTime() // re-arm the mtime gate on the recreated file
+					lastMod, lastSize = nfi.ModTime(), nfi.Size() // re-arm the gate on the recreated file
 				}
 				continue
 			}
-			if fi.ModTime().Equal(lastMod) {
+			if fi.ModTime().Equal(lastMod) && fi.Size() == lastSize {
 				continue
 			}
-			lastMod = fi.ModTime()
 			v, _, err := config.Load(path)
 			if err != nil {
+				// Do NOT arm the gate here. The panel writes this file
+				// non-atomically (truncate, then write) and Linux stamps mtime
+				// from the coarse clock, so a poll landing mid-write read an
+				// empty file, failed, and armed the gate with the very mtime the
+				// completed write then carried — every later tick saw "no
+				// change" and the admin's edit was lost until the next save.
 				log.Printf("config reload: %v (keeping current tuning)", err)
 				continue
 			}
+			lastMod, lastSize = fi.ModTime(), fi.Size()
 			current = &v
 			mgr.ApplyConfig(v)
 			applyMemLimit(v.MemLimitMB)
