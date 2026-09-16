@@ -9,10 +9,14 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
 )
 
 // packedAudioFromTSNames serves an HLS playlist whose segments are NAMED .ts
@@ -55,10 +59,11 @@ func packedAudioFromTSNames(t *testing.T) *httptest.Server {
 // zero bytes published while the panel showed it running.
 func TestNativeFormatRefusalMidPullFallsBackToFfmpeg(t *testing.T) {
 	srv := packedAudioFromTSNames(t)
-	bin, marker := markerFfmpeg(t)
+	bin, marker := deliveringFfmpeg(t)
 
 	var mu sync.Mutex
 	var paths []string
+	var published int
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -68,10 +73,11 @@ func TestNativeFormatRefusalMidPullFallsBackToFfmpeg(t *testing.T) {
 		Backend:   BackendAuto,
 		Label:     "t",
 		OnPath:    func(p string) { mu.Lock(); paths = append(paths, p); mu.Unlock() },
-	}, 12032, func([]byte) {})
+	}, 12032, func(b []byte) { mu.Lock(); published += len(b); mu.Unlock() })
 
 	mu.Lock()
 	got := append([]string(nil), paths...)
+	n := published
 	mu.Unlock()
 
 	if !ran(marker) {
@@ -81,6 +87,30 @@ func TestNativeFormatRefusalMidPullFallsBackToFfmpeg(t *testing.T) {
 		t.Fatalf("route settled on %v, want the last one to be %q: nothing tells the panel the source was format-refused (err=%v)",
 			got, PathFfmpegBack, err)
 	}
+	// And the point of the fallback is bytes: the native reader's wrapper is
+	// closed before ffmpeg starts, so this also pins that closing it does not
+	// take the attempt down with it.
+	if n == 0 {
+		t.Fatalf("the fallback ran but published nothing: routes=%v err=%v", got, err)
+	}
+}
+
+// deliveringFfmpeg is a stand-in ffmpeg that records that it ran AND serves a
+// TS payload, so a test can tell the fallback apart from a fallback that only
+// spawned something.
+func deliveringFfmpeg(t *testing.T) (bin, marker string) {
+	t.Helper()
+	dir := t.TempDir()
+	payload := filepath.Join(dir, "p.ts")
+	if err := os.WriteFile(payload, tsfixture.Concat(tsfixture.PAT(0x100), tsfixture.Keyframe(0x101, 0)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin, marker = filepath.Join(dir, "fakeffmpeg"), filepath.Join(dir, "ran")
+	script := "#!/bin/sh\ntouch " + marker + "\ncat " + payload + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, marker
 }
 
 // TestNativeFormatRefusalMidPullIsNotFallenBackOnWhenPinnedNative: backend=native
