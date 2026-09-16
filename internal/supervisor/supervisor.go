@@ -949,6 +949,23 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 	exited := make(chan error, 1)
 	go func() { exited <- proc.Wait() }()
 
+	// cancelled ends a start the daemon itself gave up on. Whether the encoder
+	// dies with it is the SAME question the watch loop asks on its way out: a
+	// stop kills it, a detach leaves it running for the next daemon to adopt.
+	// Killing unconditionally broke that contract for every stream inside its
+	// confirmation window — a daemon upgrade that landed on a slow start took the
+	// channel off air and left a pid file naming a dead pid, so the next daemon
+	// could not adopt it either. And a kill must be followed by the reap, or
+	// stop() returns while the encoder it condemned is still alive and the
+	// replacement comes up beside it.
+	cancelled := func() (Process, error) {
+		if st.killOnExit.Load() {
+			proc.Kill()
+			<-exited
+		}
+		return nil, ctx.Err()
+	}
+
 	deadline := st.sup.now().Add(time.Duration(spec.Policy.StartTimeoutSec) * time.Second)
 	for {
 		select {
@@ -959,8 +976,7 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 			}
 			return nil, fmt.Errorf("exited during startup: %v", werr)
 		case <-ctx.Done():
-			proc.Kill()
-			return nil, ctx.Err()
+			return cancelled()
 		default:
 		}
 
@@ -976,9 +992,7 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, error) {
 			return nil, fmt.Errorf("no data within %ds of start", spec.Policy.StartTimeoutSec)
 		}
 		if !st.sup.sleep(ctx, 200*time.Millisecond) {
-			proc.Kill()
-			<-exited
-			return nil, ctx.Err()
+			return cancelled()
 		}
 	}
 }
