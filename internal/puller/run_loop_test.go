@@ -7,10 +7,13 @@ package puller
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -127,5 +130,36 @@ func TestRunResetsBackoffBeforeTheWait(t *testing.T) {
 	if got[4] != defaults.PullBackoffInitial {
 		t.Fatalf("the reconnect after a healthy run waits %s, want %s: every new incident still opens with the stale ceiling",
 			got[4], defaults.PullBackoffInitial)
+	}
+}
+
+// TestRunLogsACleanSourceEndAsAnEnd: a source that simply ends must not be
+// written to the operator log as a fault.
+//
+// ingest.Copy returns the reader's error and never nil, so a clean end arrives
+// as io.EOF — which made the loop's "source ended cleanly" branch dead code and
+// put a bare "EOF (retry in 1s)" in the log, once per reconnect, forever. The
+// log support reads could not tell a source that ended from one that broke.
+func TestRunLogsACleanSourceEndAsAnEnd(t *testing.T) {
+	payload := tsfixture.Concat(tsfixture.PAT(0x100), tsfixture.Keyframe(0x101, 0))
+	srv := serveTS("video/mp2t", payload)
+	defer srv.Close()
+
+	// The premise the branch depends on: a clean end really is io.EOF.
+	if err := pullOnce(context.Background(), mustClient(t, Source{}),
+		Source{URLs: []string{srv.URL}}, 12032, func([]byte) {}); !errors.Is(err, io.EOF) {
+		t.Fatalf("a source that ends returns %v, want io.EOF", err)
+	}
+
+	sink := captureLog(t)
+	recordWaits(t, 1)
+	Run(context.Background(), Source{URLs: []string{srv.URL}, Label: "t"}, 12032, func([]byte) {})
+
+	out := strings.TrimSpace(sink.String())
+	if strings.Contains(out, "EOF") {
+		t.Errorf("a clean source end is logged as the error %q: indistinguishable from a failure", out)
+	}
+	if !strings.Contains(out, "source ended") {
+		t.Errorf("the log says %q, want it to name the source end", out)
 	}
 }

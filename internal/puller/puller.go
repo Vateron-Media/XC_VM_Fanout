@@ -165,12 +165,20 @@ func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
 		if ran > backoffResetAfter {
 			backoff = defaults.PullBackoffInitial
 		}
-		if err != nil && ctx.Err() == nil {
-			log.Printf("puller: id=%s %v (retry in %s)", src.Label, err, backoff)
-		} else if ctx.Err() == nil {
-			// A pullOnce that returned nil/EOF means the source ended cleanly; the
-			// daemon still reconnects (live sources are not supposed to end).
-			dlog.Logf("puller", "id=%s source ended after %s (retry in %s)", src.Label, ran.Round(time.Millisecond), backoff)
+		if ctx.Err() == nil {
+			if err != nil && !errors.Is(err, io.EOF) {
+				log.Printf("puller: id=%s %v (retry in %s)", src.Label, err, backoff)
+			} else {
+				// A source that simply ended (an upstream rotating its encoder, a
+				// playlist that ran out) is not a fault. ingest.Copy returns the
+				// reader's error and never nil, so a clean end arrives here as
+				// io.EOF — which is why the old "err == nil" branch below was
+				// unreachable and every clean end was logged as the bare error
+				// "EOF", once per reconnect, forever. The daemon still
+				// reconnects: live sources are not supposed to end, so say so in
+				// the operator log, just not as a failure.
+				log.Printf("puller: id=%s source ended after %s (retry in %s)", src.Label, ran.Round(time.Millisecond), backoff)
+			}
 		}
 		if ctx.Err() != nil {
 			dlog.Logf("puller", "id=%s stop (context cancelled)", src.Label)
