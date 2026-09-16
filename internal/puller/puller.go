@@ -582,10 +582,32 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 		// bound is the source's own when it is longer — a live HLS pull is
 		// silent for a whole segment between bursts.
 		rc = nativesrc.WrapIdleTimeout(rc, nativesrc.IdleBound(rc, nativesrc.DefaultSourceIdleTimeout))
-		defer rc.Close()
 		src.reportPath(PathNative)
 		dlog.Logf("puller", "id=%s connected native (no ffmpeg child): %s", src.Label, redact.URL(raw))
-		return ingest.Copy(rc, chunkSize, publish)
+		copyErr := ingest.Copy(rc, chunkSize, publish)
+		// Closed here rather than deferred: the fallback below outlives this
+		// block, and the wrapper is a goroutine and a ticker that stop only on
+		// Close — one left watching a dead pipe for the whole of an ffmpeg
+		// session is the leak the stdout bound was already fixed for.
+		rc.Close()
+		// The native reader refuses a source for what it IS at two different
+		// moments. AdoptHTTP/Open refuses before a byte moves, and that refusal
+		// is handled below. The HLS puller refuses AFTER the pull has started —
+		// a segment whose body turns out not to be MPEG-TS, a live playlist
+		// that changes flavour mid-life — and that one arrives here instead, as
+		// the pipe's error out of ingest.Copy. It used to be returned to Run(),
+		// which only logs and reconnects, so such a source looped connect →
+		// refuse → back off forever with nothing published, and nothing
+		// recorded that it had been format-refused at all. Give it the same
+		// fallback the refusal at open gets: the rest of this attempt runs on
+		// ffmpeg, and the next reconnect tries native again, exactly as it does
+		// for a source refused at open.
+		if ctx.Err() != nil || src.Backend == BackendNative || !nativesrc.IsFormat(copyErr) {
+			return copyErr
+		}
+		src.reportPath(PathFfmpegBack)
+		dlog.Logf("puller", "id=%s native refused the source mid-pull (%v); falling back to ffmpeg: %s", src.Label, copyErr, redact.URL(raw))
+		return runFfmpeg(ctx, src, raw, ffmpegStallBound(isHLSSource(raw, resp, copyErr)), chunkSize, publish)
 	}
 
 	if src.Backend == BackendNative {
