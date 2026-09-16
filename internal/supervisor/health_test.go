@@ -158,14 +158,44 @@ func TestFPSBaselineTracksThePeak(t *testing.T) {
 	}
 }
 
-// TestUnmeasurableFPSIsNotADrop: 0 means "could not measure" (no video PID, or
-// too short a window), not "no frames". Treating it as a drop would restart
-// every audio-only stream forever.
+// TestUnmeasurableFPSIsNotADrop: until this encoder has shown a frame rate of
+// its own, 0 means "could not measure" (no video PID, or too short a window),
+// not "no frames". Treating it as a drop would restart every audio-only stream
+// forever — and an audio-only stream never builds a baseline, which is exactly
+// what tells the two apart.
 func TestUnmeasurableFPSIsNotADrop(t *testing.T) {
 	h := Health{FPSThreshold: 0.5}
-	base := &fpsBaseline{peak: 25}
-	if got := h.check(t0.Add(time.Hour), t0, Vitals{FPS: 0}, base); got.failed() {
-		t.Fatalf("an unmeasurable frame rate was treated as a drop: %+v", got)
+	base := &fpsBaseline{} // nothing has ever been measured on this encoder
+	for _, after := range []time.Duration{time.Minute, time.Hour, 24 * time.Hour} {
+		if got := h.check(t0.Add(after), t0, Vitals{FPS: 0}, base); got.failed() {
+			t.Fatalf("after %s: an unmeasurable frame rate was treated as a drop: %+v", after, got)
+		}
+	}
+}
+
+// TestAFrozenPictureIsADrop: a video PID that stops while the audio keeps
+// flowing leaves the stall rule quiet (bytes are still arriving) and the frame
+// rate at exactly 0. Skipping 0 as "unmeasurable" meant the one total failure
+// the fps rule exists to catch was the one it never caught: a frozen picture ran
+// on untouched. A baseline measured on THIS encoder is the proof that its video
+// was measurable, which is what the panel's playlist-md5 check had instead.
+func TestAFrozenPictureIsADrop(t *testing.T) {
+	h := Health{FPSThreshold: 0.5, FPSGraceSec: 60}
+	base := &fpsBaseline{}
+
+	// It settled at 25fps: the baseline is its own.
+	if got := h.check(t0.Add(90*time.Second), t0, Vitals{FPS: 25, LastData: t0.Add(90 * time.Second)}, base); got.failed() {
+		t.Fatalf("a healthy 25fps was condemned: %+v", got)
+	}
+	got := h.check(t0.Add(2*time.Minute), t0, Vitals{FPS: 0, LastData: t0.Add(2 * time.Minute)}, base)
+	if !got.failed() || got.event != EventFPSDropThreshold {
+		t.Fatalf("verdict = %+v, want %s for a video PID that stopped", got, EventFPSDropThreshold)
+	}
+
+	// And the grace window still protects a stream that is only starting up.
+	warming := &fpsBaseline{peak: 25}
+	if g := h.check(t0.Add(30*time.Second), t0, Vitals{FPS: 0}, warming); g.failed() {
+		t.Fatalf("fired inside the grace window: %+v", g)
 	}
 }
 

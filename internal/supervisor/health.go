@@ -149,8 +149,16 @@ func (b *fpsBaseline) observe(fps float64) {
 // dropped reports whether fps has fallen to below `threshold` of the peak.
 // A zero peak (nothing measured yet) never trips.
 func (b *fpsBaseline) dropped(fps, threshold float64) bool {
-	if b.peak <= 0 || threshold <= 0 || fps <= 0 {
+	if b.peak <= 0 || threshold <= 0 {
 		return false
+	}
+	if fps <= 0 {
+		// A rate of 0 means "could not measure" only until this encoder has
+		// shown one: no video PID, or a window too short to divide by. A peak
+		// rules both out — this stream's video WAS measurable here — so 0 now
+		// means the frames stopped. That is a frozen picture, and with audio
+		// still flowing it is invisible to the stall rule.
+		return true
 	}
 	return fps < b.peak*threshold
 }
@@ -213,16 +221,15 @@ func (h Health) check(now, startedAt time.Time, v Vitals, base *fpsBaseline) hea
 
 	// Frame rate, once the stream has had its grace period to settle.
 	if h.FPSThreshold > 0 && sinceStart >= time.Duration(h.FPSGraceSec)*time.Second {
-		if v.FPS > 0 {
-			if base.dropped(v.FPS, h.FPSThreshold) {
-				return healthVerdict{
-					event: EventFPSDropThreshold,
-					reason: fmt.Sprintf("fps %.1f fell below %.0f%% of the %.1f baseline",
-						v.FPS, h.FPSThreshold*100, base.peak),
-				}
+		if base.dropped(v.FPS, h.FPSThreshold) {
+			reason := fmt.Sprintf("fps %.1f fell below %.0f%% of the %.1f baseline",
+				v.FPS, h.FPSThreshold*100, base.peak)
+			if v.FPS <= 0 {
+				reason = fmt.Sprintf("no video frames at all, against a %.1f baseline", base.peak)
 			}
-			base.observe(v.FPS)
+			return healthVerdict{event: EventFPSDropThreshold, reason: reason}
 		}
+		base.observe(v.FPS)
 	}
 
 	return healthVerdict{}
