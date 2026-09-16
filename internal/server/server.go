@@ -885,8 +885,9 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	// holding m.mu across all of them would block GetOrCreate needlessly).
 	// maxGOP/defaultChunk apply to streams created after this point (existing
 	// hubs keep the join cap they were built with); prebuffer/HLS retune live.
+	grace := time.Duration(v.GraceSec) * time.Second
 	m.mu.Lock()
-	m.grace = time.Duration(v.GraceSec) * time.Second
+	m.grace = grace
 	m.maxGOP = v.MaxGOPBytes
 	m.defaultChunk = v.ChunkBytes
 	streams := make([]*Stream, 0, len(m.streams))
@@ -899,8 +900,15 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	// fully-buffered (watched) stream to the new full prebuffer/HLS, a gated
 	// (idle) one to the new idle floor — so a config change never un-gates an
 	// unwatched stream. st.mu orders before the hub lock everywhere.
+	// The idle-stop window travels with the stream (it is read by the reaper under
+	// st.mu), and it was copied at creation and never updated: a node booted with
+	// grace_sec=3600 to keep channels warm went on holding every already-registered
+	// channel's puller for an hour after the operator lowered grace_sec, since the
+	// panel keeps streams registered indefinitely. grace_sec is one of the keys
+	// documented as applying live to existing streams, so carry it to them.
 	for _, st := range streams {
 		st.mu.Lock()
+		st.grace = grace
 		m.applyBufferLocked(st)
 		st.mu.Unlock()
 	}
@@ -916,17 +924,48 @@ func (m *Manager) applyBufferLocked(st *Stream) {
 	st.Hub.SetGated(!st.buffered)
 }
 
+// reapMinInterval / reapMaxInterval bound the sweep cadence. The floor keeps a
+// tiny grace_sec from spinning the sweep; the ceiling keeps a large one (up to
+// an hour is allowed) from parking it for half of that, which is both how the
+// idle-buffer gate ran half an hour late on a warm node and why a live grace_sec
+// change went unseen for as long.
+const (
+	reapMinInterval = time.Second
+	reapMaxInterval = 5 * time.Second
+)
+
+// reapInterval is how often the sweep runs: half the SHORTER of the two windows
+// it enforces — the idle-stop grace and the idle-buffer gate — bounded to
+// [reapMinInterval, reapMaxInterval] and re-read on every tick, so an operator
+// lowering grace_sec in the panel gets the new cadence with the next sweep. It
+// used to be m.grace/2, computed once when the reaper started: a node booted
+// with grace_sec=3600 swept every 30 minutes, so unwatched rings held their
+// memory for that long past the 30 s idle-buffer grace, and lowering grace_sec
+// later changed nothing until a restart.
+func (m *Manager) reapInterval() time.Duration {
+	m.mu.Lock()
+	iv := m.grace
+	m.mu.Unlock()
+	if g := time.Duration(m.idleBufferGraceNS.Load()); g > 0 && g < iv {
+		iv = g
+	}
+	iv /= 2
+	if iv < reapMinInterval {
+		return reapMinInterval
+	}
+	if iv > reapMaxInterval {
+		return reapMaxInterval
+	}
+	return iv
+}
+
 // StartReaper runs the idle-stop sweep until ctx is cancelled: control-managed
 // streams with no live viewers and no HLS access within the grace window get
 // their puller stopped. This is the single idle-stop path for both TS and HLS
 // audiences. Call once from main; tests that don't need reaping omit it.
 func (m *Manager) StartReaper(ctx context.Context) {
-	interval := m.grace / 2
-	if interval < time.Second {
-		interval = time.Second
-	}
 	go func() {
-		t := time.NewTicker(interval)
+		t := time.NewTimer(m.reapInterval())
 		defer t.Stop()
 		for {
 			select {
@@ -956,7 +995,7 @@ func (m *Manager) StartReaper(ctx context.Context) {
 				// garbage, but Go hands freed pages back to the OS only lazily, so
 				// RSS would sit flat for minutes. Hand that fact to the memory
 				// scavenger rather than forcing a full stop-the-world GC here: this
-				// sweep runs every grace/2 (5 s at the default grace), and calling
+				// sweep runs every few seconds (see reapInterval), and calling
 				// FreeOSMemory from it put the daemon in near-continuous full
 				// collections, re-faulting the pages it had just returned. The
 				// scavenger owns the release, and this flag lets it skip its rate
@@ -964,6 +1003,7 @@ func (m *Manager) StartReaper(ctx context.Context) {
 				if freed {
 					m.gatedSinceScavenge.Store(true)
 				}
+				t.Reset(m.reapInterval()) // re-read: grace_sec is retunable live
 			}
 		}
 	}()

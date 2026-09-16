@@ -48,8 +48,8 @@ func (l smallBufListener) Accept() (net.Conn, error) {
 // at 400 KB/s — four times the stream, a quarter of what a 1 MiB run demanded.
 func TestServeLiveKeepsViewerFasterThanTheStream(t *testing.T) {
 	const (
-		blocks    = 12       // seconds of history
-		pktsPerS  = 532      // ~100 KB per second of stream
+		blocks    = 12        // seconds of history
+		pktsPerS  = 532       // ~100 KB per second of stream
 		clientBps = 400 << 10 // the client drains four times the stream's rate
 		wantBytes = 900 << 10 // well past the 1 MiB a single-deadline run needed
 	)
