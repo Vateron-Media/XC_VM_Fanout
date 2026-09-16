@@ -32,6 +32,7 @@ type Options struct {
 	// Headers are extra request headers as raw "Key: value" lines. They apply
 	// to every fetch this package makes for the source — the playlist AND each
 	// segment — because an upstream that gates on a header gates on all of it.
+	// A "Host:" line overrides the request's Host, as ffmpeg's -headers does.
 	Headers []string
 }
 
@@ -165,9 +166,25 @@ func (o Options) apply(req *http.Request) {
 	for _, line := range o.Headers {
 		name, value, ok := strings.Cut(line, ":")
 		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
 		if !ok || name == "" {
 			continue
 		}
-		req.Header.Set(name, strings.TrimSpace(value))
+		// Host is the one header a client cannot set through the header map:
+		// net/http writes the request line's Host from req.Host and drops
+		// Header["Host"] on the floor. A vhost-routed origin reached by IP —
+		// which is why anyone configures this line — would have kept seeing the
+		// IP and answering 404. An empty value is left alone, since blanking
+		// req.Host makes the request unroutable.
+		if strings.EqualFold(name, "Host") {
+			if value != "" {
+				req.Host = value
+			}
+			// Drop any earlier attempt at it too, so what is in the map is what
+			// actually goes out.
+			req.Header.Del("Host")
+			continue
+		}
+		req.Header.Set(name, value)
 	}
 }
