@@ -154,3 +154,47 @@ func TestSignalStoreHotPathSkipsLock(t *testing.T) {
 		t.Fatalf("drained store must count 0 and peek false (count=%d)", s.n.Load())
 	}
 }
+
+// TestSignalStoreSweepsStrandedSignals: a signal is cleared by the viewer it was
+// addressed to — and nothing says that viewer ever comes back. The admin
+// messages a uuid that has already disconnected, an HLS viewer that stopped
+// polling, or a uuid this node never serves at all. The entry used to be deleted
+// only by a peek or take for that same uuid, so it sat in the map for the life of
+// the process with n above zero, and from then on EVERY live-TS viewer on the
+// node took the single signalStore mutex for every chunk it was delivered: the
+// node-wide contention the atomic count exists to remove, turned back on by one
+// ordinary admin action. Each further stranded signal also grew the map.
+func TestSignalStoreSweepsStrandedSignals(t *testing.T) {
+	s := newSignalStore()
+	s.set("gone", pendingSignal{text: "to a viewer that already left", expires: time.Now().Add(20 * time.Millisecond)})
+	time.Sleep(40 * time.Millisecond)
+
+	// Another viewer's hot path. It must not merely miss: once the stranded
+	// signal is past its TTL the fast path has to come back, for everyone.
+	for i := 0; i < 5; i++ {
+		if s.peek("someone-else") {
+			t.Fatal("peek matched a uuid that has no signal queued")
+		}
+	}
+	if n := s.n.Load(); n != 0 {
+		t.Fatalf("count = %d after an expired signal was left stranded; every live viewer's peek now takes the global lock", n)
+	}
+	s.mu.Lock()
+	left := len(s.m)
+	s.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d expired entr(ies) still held; the map grows by one for every signal nobody picks up", left)
+	}
+
+	// Queueing a signal clears out whatever else has expired, so a node whose
+	// addressed viewers never return does not accumulate them either.
+	s.set("stale", pendingSignal{text: "old", expires: time.Now().Add(10 * time.Millisecond)})
+	time.Sleep(20 * time.Millisecond)
+	s.set("live", pendingSignal{text: "new", expires: time.Now().Add(time.Minute)})
+	if n := s.n.Load(); n != 1 {
+		t.Fatalf("count = %d after queueing one live signal alongside an expired one, want 1", n)
+	}
+	if !s.peek("live") {
+		t.Fatal("the live signal must survive the sweep")
+	}
+}

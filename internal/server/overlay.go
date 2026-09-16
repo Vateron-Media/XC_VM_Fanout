@@ -63,9 +63,33 @@ func (s *signalStore) set(uuid string, sig pendingSignal) {
 	if s.m == nil {
 		s.m = make(map[string]pendingSignal)
 	}
+	// Sweep BEFORE inserting, so this signal is queued whatever its own TTL says
+	// and only somebody else's dead one is dropped.
+	s.sweepLocked(time.Now())
 	s.m[uuid] = sig
 	s.n.Store(int64(len(s.m)))
 	s.mu.Unlock()
+}
+
+// sweepLocked drops every expired entry and re-syncs the atomic count. Callers
+// hold mu.
+//
+// A signal is addressed to one viewer, and that viewer may never come back to
+// collect it: the admin messages a uuid that has already disconnected, an HLS
+// viewer that stopped polling, or a uuid another node serves. Deleting an entry
+// only when ITS OWN uuid looks again therefore left it in the map for the life
+// of the process, and while n stayed above zero every live-TS viewer on the node
+// took the mutex below on every chunk it was delivered — the whole point of the
+// atomic count, lost to one ordinary admin action. Sweeping is cheap: signals
+// are a manual action, so the map holds a handful of entries at most, and this
+// only ever runs when a signal is queued or when a lookup already missed.
+func (s *signalStore) sweepLocked(now time.Time) {
+	for u, sig := range s.m {
+		if !sig.expires.IsZero() && now.After(sig.expires) {
+			delete(s.m, u)
+		}
+	}
+	s.n.Store(int64(len(s.m)))
 }
 
 // peek reports whether a live (non-expired) signal is queued for uuid, without
@@ -76,18 +100,18 @@ func (s *signalStore) peek(uuid string) bool {
 	if uuid == "" || s.n.Load() == 0 {
 		return false
 	}
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sig, ok := s.m[uuid]
-	if !ok {
-		return false
+	if ok && (sig.expires.IsZero() || !now.After(sig.expires)) {
+		return true
 	}
-	if !sig.expires.IsZero() && time.Now().After(sig.expires) {
-		delete(s.m, uuid)
-		s.n.Store(int64(len(s.m)))
-		return false
-	}
-	return true
+	// Nothing for this viewer. We are already holding the lock the fast path is
+	// trying to avoid, so clear out anything nobody is coming back for — that,
+	// and not this uuid's own miss, is what keeps the lock hot for everyone.
+	s.sweepLocked(now)
+	return false
 }
 
 // take returns and removes a non-expired signal for uuid (one-shot, mirroring
