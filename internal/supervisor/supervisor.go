@@ -1135,6 +1135,14 @@ func (st *stream) markStarted(p Process, label string) {
 	st.proc, st.pid, st.source = p, p.Pid(), label
 	st.started, st.running, st.confirmed = st.sup.now(), true, false
 	st.starts++
+	// Landing on anything but the top source starts the priority-backup clock,
+	// exactly as MonitorCommand.php stamped $rBackupsChecked at every (re)start.
+	// Without it the clock was still zero when an operator forced a backup, so
+	// the first health tick probed the preferred source, found it answering and
+	// undid the force within seconds of a 300s interval.
+	if st.srcIdx > 0 {
+		st.backupCheckedAt = st.started
+	}
 	st.mu.Unlock()
 }
 
