@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,6 +56,147 @@ func (t *tailBuffer) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return strings.TrimSpace(string(t.buf))
+}
+
+// scrubTail masks the credentials a child process quoted back at us, so an
+// ffmpeg stderr tail can be logged without putting the provider account in the
+// operator log.
+//
+// ffmpeg echoes the whole input URL on any failure to open it — n7.1.5 against
+// a 403 writes "Error opening input file
+// http://host:8080/live/<user>/<pass>/1234.ts." — and an XC source carries the
+// account in its path, so a source pinned to (or falling back to) ffmpeg
+// against a refusing provider wrote the password to the log on every
+// reconnect. The daemon composes none of this text: mask what it can
+// recognise, and leave the rest, because the reason and the host are why the
+// line is logged at all.
+//
+// Two passes, because a 4 KiB tail can be cut mid-line: the source's own URLs
+// (and their paths and queries on their own, which is all that survives a cut
+// ahead of the scheme), then every absolute URL still in the text, which covers
+// what the daemon never saw — a redirect target, a segment URI, the proxy.
+func scrubTail(src Source, raw, tail string) string {
+	if tail == "" {
+		return ""
+	}
+	if reps := credentialReplacements(src, raw); len(reps) > 0 {
+		tail = strings.NewReplacer(reps...).Replace(tail)
+	}
+	return maskURLsIn(tail)
+}
+
+// minTailSecretLen is the shortest path segment worth replacing on its own in
+// a child's output. Below it the replacement does more harm to the line than
+// the segment could do to the account.
+const minTailSecretLen = 4
+
+// credentialReplacements pairs each literal the source is configured with
+// against its redacted form, longest first so a path never masks part of the
+// URL that contains it.
+func credentialReplacements(src Source, raw string) []string {
+	type pair struct{ from, to string }
+	var pairs []pair
+	add := func(from, to string) {
+		if from == "" || from == to {
+			return
+		}
+		pairs = append(pairs, pair{from, to})
+	}
+	for _, v := range append(append([]string{}, src.URLs...), raw) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		red := redact.URL(v)
+		add(v, red)
+		u, uerr := url.Parse(v)
+		ru, rerr := url.Parse(red)
+		if uerr != nil || rerr != nil || u.Host == "" {
+			continue
+		}
+		add(u.EscapedPath(), ru.EscapedPath())
+		add(u.RawQuery, ru.RawQuery)
+		// And each masked segment on its own, for a cut that landed inside the
+		// path as well as ahead of the scheme. Only segments long enough to be
+		// a credential rather than a word: replacing a two-character string
+		// everywhere would mangle the message the line is logged for, and a
+		// secret that short is not one worth protecting a log line over.
+		from, to := strings.Split(u.EscapedPath(), "/"), strings.Split(ru.EscapedPath(), "/")
+		for i := range from {
+			if i < len(to) && from[i] != to[i] && len(from[i]) >= minTailSecretLen {
+				add(from[i], to[i])
+			}
+		}
+	}
+	// The proxy is the other configured value carrying a password, and it is
+	// quoted back by a child that failed to reach it.
+	add(strings.TrimSpace(src.Proxy), proxyForLog(src.Proxy))
+
+	sort.SliceStable(pairs, func(i, j int) bool { return len(pairs[i].from) > len(pairs[j].from) })
+	out := make([]string, 0, 2*len(pairs))
+	for _, p := range pairs {
+		out = append(out, p.from, p.to)
+	}
+	return out
+}
+
+// maskURLsIn replaces every absolute URL in s with its redacted form.
+func maskURLsIn(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		j := strings.Index(s[i:], "://")
+		if j < 0 {
+			b.WriteString(s[i:])
+			break
+		}
+		j += i
+		start := j
+		for start > i && isSchemeByte(s[start-1]) {
+			start--
+		}
+		if start == j {
+			// "://" with nothing in front of it is not a URL we can parse.
+			b.WriteString(s[i : j+3])
+			i = j + 3
+			continue
+		}
+		end := j + 3
+		for end < len(s) && !isURLEnd(s[end]) {
+			end++
+		}
+		cand, trail := s[start:end], ""
+		// Trailing punctuation belongs to the sentence, not to the URL —
+		// ffmpeg's own line ends "…/1234.ts.".
+		for cand != "" && strings.IndexByte(".,;:!?)]}", cand[len(cand)-1]) >= 0 {
+			trail = cand[len(cand)-1:] + trail
+			cand = cand[:len(cand)-1]
+		}
+		b.WriteString(s[i:start])
+		b.WriteString(redact.URL(cand))
+		b.WriteString(trail)
+		i = end
+	}
+	return b.String()
+}
+
+// isSchemeByte reports whether c may appear in a URL scheme.
+func isSchemeByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '+' || c == '-' || c == '.':
+		return true
+	}
+	return false
+}
+
+// isURLEnd reports whether c ends a URL in free text.
+func isURLEnd(c byte) bool {
+	switch c {
+	case ' ', '\t', '\r', '\n', '"', '\'', '`', '<', '>', '|', '(':
+		return true
+	}
+	return false
 }
 
 // Source describes where and how to pull a live stream.
@@ -808,7 +950,7 @@ func runFfmpeg(ctx context.Context, src Source, raw string, stall time.Duration,
 	// cancellation is handled just above, so there is no other way to get here;
 	// a real ffmpeg failure is a non-zero *ExitError and is still caught below.
 	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
-		if tail := stderr.String(); tail != "" {
+		if tail := scrubTail(src, raw, stderr.String()); tail != "" {
 			dlog.Logf("puller", "id=%s ffmpeg exited (%v): %s", src.Label, waitErr, tail)
 		} else {
 			dlog.Logf("puller", "id=%s ffmpeg exited: %v", src.Label, waitErr)

@@ -8,8 +8,11 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 )
@@ -66,5 +69,48 @@ func TestSourceCredentialsAreNotLogged(t *testing.T) {
 	// are why it is logged at all.
 	if !strings.Contains(out, "id=1234") || !strings.Contains(out, "127.0.0.1") {
 		t.Errorf("the redacted log no longer says which stream and host failed:\n%s", out)
+	}
+}
+
+// TestFfmpegStderrTailIsNotLoggedVerbatim: the child's stderr is untrusted
+// text, and ffmpeg quotes the whole input URL on any failure to open it —
+// "Error opening input file http://host/live/<user>/<pass>/1234.ts." — so an XC
+// source pinned to (or falling back to) ffmpeg against a provider answering 403
+// wrote the account password into the daemon log on every reconnect, through
+// the one line that carries it. That is the same log support reads and ships
+// off the box, and the same failure the URL redaction was done for.
+func TestFfmpegStderrTailIsNotLoggedVerbatim(t *testing.T) {
+	raw := "http://127.0.0.1:18081/live/joe/" + thePassword + "/1234.ts"
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fakeffmpeg")
+	// Exactly what ffmpeg n7.1.5 writes for a 403, measured against a local
+	// refusing server.
+	script := "#!/bin/sh\n" +
+		"echo 'Error opening input: Server returned 403 Forbidden (access denied)' >&2\n" +
+		"echo 'Error opening input file " + raw + ".' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dlog.Enable(true)
+	t.Cleanup(func() { dlog.Enable(false) })
+	sink := captureLog(t)
+
+	if err := runFfmpeg(context.Background(), Source{FfmpegBin: bin, Label: "1234"},
+		raw, 8*time.Second, 12032, func([]byte) {}); err == nil {
+		t.Fatal("a stand-in ffmpeg that exits 1 must surface an error")
+	}
+
+	out := sink.String()
+	if strings.Contains(out, thePassword) {
+		t.Errorf("ffmpeg's stderr tail put the account password in the log:\n%s", out)
+	}
+	// And the line still has to be worth logging: the reason and the host are
+	// why it is written at all.
+	for _, want := range []string{"403 Forbidden", "127.0.0.1:18081", "id=1234"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the scrubbed tail no longer says %q:\n%s", want, out)
+		}
 	}
 }
