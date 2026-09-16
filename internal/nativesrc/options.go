@@ -61,6 +61,16 @@ var ErrHLSIsFMP4 = fmt.Errorf("%w: hls source carries fmp4 segments", ErrFormat)
 // is a format refusal (IsFormat) that the fallback can serve.
 var ErrHLSEncrypted = fmt.Errorf("%w: hls segments are encrypted", ErrFormat)
 
+// ErrHLSNotTS marks an HLS source whose segments are not MPEG-TS at all. Packed
+// audio is the one that turns up in practice — RFC 8216 lets a playlist carry
+// ID3 + ADTS directly in .aac/.ac3/.mp3 segments, which is how radio channels
+// ship — and an HTML error page served in a segment's place is the other. This
+// package copies segment bytes through unread, so either would reach viewers as
+// 188-byte slices of something that is not TS: no PAT, no PMT, no keyframe,
+// nothing playable. ffmpeg handles packed audio, so this is a format refusal
+// (IsFormat) that the fallback can serve.
+var ErrHLSNotTS = fmt.Errorf("%w: hls segments are not mpeg-ts", ErrFormat)
+
 // transport builds the shared transport shape. dialWait separates the two
 // callers: a bounded fetch can afford to wait a little longer to connect than a
 // live body, which should fail fast so the puller can rotate to the next URL.

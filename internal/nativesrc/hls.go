@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -254,6 +255,14 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 				continue
 			}
 			if err := p.streamSegment(seg.URI); err != nil {
+				// What the upstream IS cannot be retried away, so a segment that
+				// is not MPEG-TS ends the pull immediately — the same move a
+				// playlist that changes flavour mid-life makes, and the one that
+				// hands the stream to ffmpeg instead of stalling it silently.
+				if IsFormat(err) {
+					p.pw.CloseWithError(fmt.Errorf("hls pull: %w", err))
+					return
+				}
 				segFails++
 				if segFails >= maxHLSConsecutiveFails {
 					p.pw.CloseWithError(fmt.Errorf("hls pull: %d consecutive segment failures: %w", segFails, err))
@@ -333,6 +342,16 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 	}
 }
 
+// nonTSSegmentExt are segment suffixes that are definitively NOT MPEG-TS. The
+// audio ones are RFC 8216 packed audio (ID3 + ADTS/MP3 straight in the segment,
+// no TS wrapper), which is how radio channels ship; the caption ones are WebVTT.
+// Refusing on the name catches these before a single byte goes out, which is
+// what gets the source onto its ffmpeg fallback — ffmpeg reads packed audio.
+var nonTSSegmentExt = map[string]bool{
+	".aac": true, ".ac3": true, ".ec3": true, ".mp3": true,
+	".vtt": true, ".webvtt": true,
+}
+
 // servable reports why a media playlist cannot be passed through, or nil.
 func servable(pl *hlsPlaylist) error {
 	switch {
@@ -342,6 +361,33 @@ func servable(pl *hlsPlaylist) error {
 		return ErrHLSIsFMP4
 	case pl.Encrypted:
 		return ErrHLSEncrypted
+	}
+	for _, seg := range pl.Segments {
+		if ext := strings.ToLower(path.Ext(seg.URI.Path)); nonTSSegmentExt[ext] {
+			return fmt.Errorf("%w (%s segments)", ErrHLSNotTS, ext)
+		}
+	}
+	return nil
+}
+
+// checkSegmentIsTS is the guard the filename cannot give: a provider serving
+// packed audio, or an error page, from a .ts URL. Segment bytes are passed
+// through unread, so the body is the last place to notice before they reach
+// viewers as 188-byte chunks of something that is not TS.
+func checkSegmentIsTS(b []byte, u *url.URL) error {
+	if len(b) < tsPacketSize {
+		// Too short to be even one packet: a truncated or empty fetch. That says
+		// nothing about WHAT the upstream is, so it stays an ordinary transport
+		// failure — retried, then failed over once the threshold trips — rather
+		// than a format refusal, which would move the source to ffmpeg for good.
+		return fmt.Errorf("segment %s: %d bytes, short of one %d-byte packet", u.Redacted(), len(b), tsPacketSize)
+	}
+	head := b
+	if len(head) > tsSyncProbePackets*tsPacketSize {
+		head = head[:tsSyncProbePackets*tsPacketSize]
+	}
+	if !looksLikeTS(head) {
+		return fmt.Errorf("%w: segment %s", ErrHLSNotTS, u.Redacted())
 	}
 	return nil
 }
@@ -401,6 +447,9 @@ func (p *hlsPuller) streamSegment(u *url.URL) error {
 	}
 	if n >= maxHLSSegmentBytes {
 		return fmt.Errorf("segment %s: exceeds %d-byte cap (runaway upstream)", u.Redacted(), maxHLSSegmentBytes)
+	}
+	if err := checkSegmentIsTS(p.segBuf.Bytes(), u); err != nil {
+		return err
 	}
 	_, err = p.pw.Write(p.segBuf.Bytes())
 	return err
