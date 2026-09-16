@@ -261,6 +261,23 @@ func nativeOnlyScheme(raw string) bool {
 	return false
 }
 
+// isHTTPScheme reports whether raw is an http/https URL, i.e. whether ffmpeg
+// will open it with the HTTP protocol and so accept that protocol's options.
+// Anything else — udp, rtp, file, a bare path, a URL that will not even parse —
+// answers false, because the cost of being wrong that way is one missing header
+// and the cost of being wrong the other way is a child that refuses to start.
+func isHTTPScheme(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		return true
+	}
+	return false
+}
+
 // applyHeaders stamps raw "Key: value" lines onto a request. A line without a
 // colon, or with an empty name, is skipped rather than guessed at: a malformed
 // entry in a panel's per-stream settings must not become a malformed request.
@@ -430,25 +447,37 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 		// which we capture from stderr and log — the mpegts byte stream is on
 		// stdout, a separate pipe, so this never pollutes it.
 		"-copyts", "-vsync", "0", "-nostats", "-nostdin", "-hide_banner",
-		"-loglevel", "error", "-y", "-user_agent", src.ua(),
+		"-loglevel", "error", "-y",
 		// Cold-start bounds (ADR 0003, Phase C1a): cap input analysis so the first
 		// mpegts bytes appear quickly on a cold on-demand join, instead of ffmpeg
 		// spending its default 5s/5MB probing the source. 1s/1MB still identifies
-		// the PAT/PMT + codecs a live TS/HLS source presents. HTTP reconnect (as
-		// the panel's own ffmpeg uses) rides out a transient fetch hiccup during
-		// warm-up without dropping the pull. Input options — must precede -i.
+		// the PAT/PMT + codecs a live TS/HLS source presents. These are
+		// AVFormatContext options, so they are valid for every input. Input
+		// options — must precede -i.
 		"-probesize", defaults.PullFfmpegProbeSize, "-analyzeduration", defaults.PullFfmpegAnalyzeDuration,
-		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
 	}
-	// ffmpeg takes ONE -headers value, so the cookie and any extra headers have
-	// to be folded into a single CRLF-separated block. Passing -headers twice
-	// silently keeps only the last, which would drop whichever the panel cared
-	// about more.
-	if hdr := ffmpegHeaderBlock(src); hdr != "" {
-		args = append(args, "-headers", hdr)
-	}
-	if src.Proxy != "" {
-		args = append(args, "-http_proxy", "http://"+src.Proxy)
+	// Everything below is declared by the http/https PROTOCOL, not by ffmpeg
+	// itself, and ffmpeg treats an input option no protocol consumed as fatal:
+	// `-user_agent ... -i udp://…` prints "Option user_agent not found." and
+	// exits 8 with nothing on stdout. Passing them unconditionally made the
+	// ffmpeg backend dead for every udp://, rtp:// and file:// source — the
+	// documented kill-switch and the auto fallback both died in under 100ms and
+	// were retried forever. Gate them on the scheme actually being HTTP.
+	if isHTTPScheme(raw) {
+		args = append(args, "-user_agent", src.ua(),
+			// HTTP reconnect (as the panel's own ffmpeg uses) rides out a
+			// transient fetch hiccup during warm-up without dropping the pull.
+			"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+		// ffmpeg takes ONE -headers value, so the cookie and any extra headers
+		// have to be folded into a single CRLF-separated block. Passing -headers
+		// twice silently keeps only the last, which would drop whichever the
+		// panel cared about more.
+		if hdr := ffmpegHeaderBlock(src); hdr != "" {
+			args = append(args, "-headers", hdr)
+		}
+		if src.Proxy != "" {
+			args = append(args, "-http_proxy", "http://"+src.Proxy)
+		}
 	}
 	args = append(args,
 		"-i", raw, "-map", "0", "-c", "copy",
