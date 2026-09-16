@@ -197,13 +197,38 @@ func nextBackoff(cur, ranFor time.Duration) time.Duration {
 const ffmpegWaitDelay = 5 * time.Second
 
 // ffmpegStallBound is how long the ffmpeg path may deliver nothing before it is
-// treated as stalled: the native path's bound, and room for a segment-at-a-time
-// HLS source, which ffmpeg also reads in bursts.
-func ffmpegStallBound(raw string) time.Duration {
-	if strings.Contains(strings.ToLower(raw), ".m3u8") {
+// treated as stalled: the native path's bound for a continuous source, and room
+// for a segment-at-a-time HLS source, which ffmpeg also reads in bursts. It is
+// the ffmpeg-path twin of nativesrc.hlsIdleBound.
+func ffmpegStallBound(hls bool) time.Duration {
+	if hls {
 		return 3 * nativesrc.DefaultSourceIdleTimeout
 	}
 	return nativesrc.DefaultSourceIdleTimeout
+}
+
+// isHLSSource answers the only question the stall bound depends on: will ffmpeg
+// read this source a segment at a time, and so be legitimately silent between
+// bursts? Three independent signals, any one of which settles it:
+//
+//   - a ".m3u8" in the configured URL;
+//   - the content-type we were actually served, for the very common playlist
+//     under an arbitrary path extension (nativesrc.AdoptHTTP classifies by
+//     content-type and by sniffing, never by extension);
+//   - the native reader's own refusal, which names an HLS source when it
+//     declines one for being encrypted or fMP4 — and those refusals are
+//     precisely why the ffmpeg fallback gets HLS sources at all.
+//
+// Guessing from the URL text alone gave an extensionless HLS source the 8s
+// continuous bound and killed it between two healthy segments.
+func isHLSSource(raw string, resp *http.Response, refusal error) bool {
+	if strings.Contains(strings.ToLower(raw), ".m3u8") {
+		return true
+	}
+	if resp != nil && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "mpegurl") {
+		return true
+	}
+	return errors.Is(refusal, nativesrc.ErrHLSIsFMP4) || errors.Is(refusal, nativesrc.ErrHLSEncrypted)
 }
 
 // pullOnce tries each URL once: mp2t is streamed directly, anything else goes
@@ -377,10 +402,13 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 	}
 
 	if src.Backend == BackendFfmpeg {
+		// Classify BEFORE the body goes: resp's content-type is the only thing
+		// that can tell an extensionless playlist from a continuous source.
+		stall := ffmpegStallBound(isHLSSource(raw, resp, nil))
 		closeBody(resp)
 		src.reportPath(PathFfmpegPin)
 		dlog.Logf("puller", "id=%s connected via ffmpeg remux (backend=ffmpeg): %s", src.Label, raw)
-		return runFfmpeg(ctx, src, raw, chunkSize, publish)
+		return runFfmpeg(ctx, src, raw, stall, chunkSize, publish)
 	}
 
 	// AdoptHTTP closes the body itself on every refusal, so the ffmpeg fallback
@@ -413,7 +441,10 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 	}
 	src.reportPath(PathFfmpegBack)
 	dlog.Logf("puller", "id=%s native declined (%v); falling back to ffmpeg: %s", src.Label, err, raw)
-	return runFfmpeg(ctx, src, raw, chunkSize, publish)
+	// The refusal itself is a classification: ErrHLSEncrypted and ErrHLSIsFMP4
+	// say "this IS an HLS source, just not one I will serve", which is the case
+	// the ffmpeg fallback exists for and the case that needs the wider bound.
+	return runFfmpeg(ctx, src, raw, ffmpegStallBound(isHLSSource(raw, resp, err)), chunkSize, publish)
 }
 
 // closeBody discards a response the chosen path will not read.
@@ -443,8 +474,10 @@ func ffmpegHeaderBlock(src Source) string {
 }
 
 // runFfmpeg remuxes a non-mp2t source to MPEG-TS on stdout and feeds it in.
-// Mirrors the ffmpeg invocation in ProxyCommand.php.
-func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publish func([]byte)) error {
+// Mirrors the ffmpeg invocation in ProxyCommand.php. stall is how long the child
+// may deliver nothing before it is treated as stalled; the caller picks it,
+// because only the caller knows whether this source arrives in bursts.
+func runFfmpeg(ctx context.Context, src Source, raw string, stall time.Duration, chunkSize int, publish func([]byte)) error {
 	bin := src.FfmpegBin
 	if bin == "" {
 		bin = "ffmpeg"
@@ -540,7 +573,7 @@ func runFfmpeg(ctx context.Context, src Source, raw string, chunkSize int, publi
 	// can see — and ingest.Copy then blocked forever: no retry, no failover,
 	// while viewers who reconnected kept the stream referenced. Close the pipe
 	// after the stall bound, then end the process before waiting on it.
-	copyErr := ingest.Copy(nativesrc.WrapIdleTimeout(stdout, ffmpegStallBound(raw)), chunkSize, publish)
+	copyErr := ingest.Copy(nativesrc.WrapIdleTimeout(stdout, stall), chunkSize, publish)
 	ccancel()
 	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
