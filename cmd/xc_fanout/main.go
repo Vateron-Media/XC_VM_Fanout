@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -481,35 +482,140 @@ func applyMemLimit(explicitMB int) {
 var appliedMemLimit atomic.Int64
 
 // memoryBudget returns the memory this process should size its soft limit
-// against, a label for it, and the fraction of it to claim: the cgroup limit when
-// the daemon runs under a finite one (v2 first, then v1 — a v1-only host was
-// previously missed entirely and silently fell back to the whole machine's RAM),
-// else the physical RAM from /proc/meminfo. Returns 0 if neither can be read.
+// against, a label for it, and the fraction of it to claim: the cgroup limit the
+// daemon actually runs under when there is a finite one, else the physical RAM
+// from /proc/meminfo. Returns 0 if neither can be read.
 func memoryBudget() (int64, string, float64) {
-	host := physicalMemoryBytes()
+	return memoryBudgetFrom(cgroupRoot, procSelfCgroup, physicalMemoryBytes())
+}
 
-	// cgroup v2: a finite memory.max is the real ceiling the OOM killer enforces.
-	if b, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
-		if s := strings.TrimSpace(string(b)); s != "" && s != "max" {
-			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
-				return v, "cgroup v2 limit", defaults.MemLimitFraction
-			}
-		}
-	}
-	// cgroup v1: "unlimited" is expressed as a sentinel near the int64 ceiling
-	// rather than a keyword, so treat any limit at or above physical RAM as no
-	// limit at all instead of reading it as a budget.
-	if b, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
-		if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && v > 0 {
-			if host <= 0 || v < host {
-				return v, "cgroup v1 limit", defaults.MemLimitFraction
-			}
-		}
+// cgroupRoot and procSelfCgroup are where the cgroup facts live on a running
+// node; a test points memoryBudgetFrom at a fixture tree instead.
+const (
+	cgroupRoot     = "/sys/fs/cgroup"
+	procSelfCgroup = "/proc/self/cgroup"
+)
+
+func memoryBudgetFrom(root, procCgroup string, host int64) (int64, string, float64) {
+	if v, src := cgroupMemoryLimit(root, procCgroup, host); v > 0 {
+		return v, src, defaults.MemLimitFraction
 	}
 	if host > 0 {
 		return host, "system RAM", defaults.MemLimitHostFraction
 	}
 	return 0, "", 0
+}
+
+// cgroupMemoryLimit is the tightest finite memory ceiling in force for this
+// process, found by walking from its OWN cgroup up to the root.
+//
+// Reading only the root cgroup's files, as this used to, sees a limit only
+// inside a container namespace where the root IS the container's cgroup. On an
+// ordinary cgroup v2 host the root has no memory.max at all and a unit's
+// MemoryMax lives at /sys/fs/cgroup/system.slice/<unit>/memory.max, so a daemon
+// run under `MemoryMax=2G` on a 16 GB box was given a soft limit of 8 GB: the
+// GC never tightened, and the kernel OOM-killed the daemon at 2 GB with every
+// viewer on the node attached. A v1 parent-slice limit was missed the same way.
+func cgroupMemoryLimit(root, procCgroup string, host int64) (int64, string) {
+	v2, v1 := cgroupPaths(procCgroup)
+	best, src := int64(0), ""
+	take := func(v int64, label string) {
+		if v > 0 && (best == 0 || v < best) {
+			best, src = v, label
+		}
+	}
+	// cgroup v2: a finite memory.max is the real ceiling the OOM killer enforces.
+	for _, dir := range cgroupAncestors(v2) {
+		if v, ok := readCgroupV2Max(filepath.Join(root, dir, "memory.max")); ok {
+			take(v, "cgroup v2 limit")
+		}
+	}
+	for _, dir := range cgroupAncestors(v1) {
+		if v, ok := readCgroupV1Limit(filepath.Join(root, "memory", dir, "memory.limit_in_bytes"), host); ok {
+			take(v, "cgroup v1 limit")
+		}
+	}
+	return best, src
+}
+
+// cgroupPaths reads /proc/self/cgroup for this process's cgroup path on the
+// unified (v2) hierarchy and on v1's memory controller. Either falls back to
+// "/", which is the root-only lookup this did before and the right answer
+// inside a cgroup namespace.
+func cgroupPaths(procCgroup string) (v2, v1 string) {
+	v2, v1 = "/", "/"
+	b, err := os.ReadFile(procCgroup)
+	if err != nil {
+		return v2, v1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		// hierarchy-ID:controller-list:path — "0::/…" is the unified hierarchy.
+		f := strings.SplitN(strings.TrimSpace(line), ":", 3)
+		if len(f) != 3 || f[2] == "" {
+			continue
+		}
+		if f[1] == "" {
+			v2 = f[2]
+			continue
+		}
+		for _, c := range strings.Split(f[1], ",") {
+			if c == "memory" {
+				v1 = f[2]
+			}
+		}
+	}
+	return v2, v1
+}
+
+// cgroupAncestors lists a cgroup path and every parent up to the root, nearest
+// first. A limit set on a parent slice binds this process just as much as one
+// on its own cgroup.
+func cgroupAncestors(p string) []string {
+	if p == "" || p[0] != '/' {
+		p = "/" + p
+	}
+	p = path.Clean(p)
+	out := []string{p}
+	for p != "/" {
+		p = path.Dir(p)
+		out = append(out, p)
+	}
+	return out
+}
+
+// readCgroupV2Max reads a v2 memory.max, where no limit is the word "max".
+func readCgroupV2Max(path string) (int64, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "max" {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// readCgroupV1Limit reads a v1 memory.limit_in_bytes. "unlimited" there is a
+// sentinel near the int64 ceiling rather than a keyword, so treat any limit at
+// or above physical RAM as no limit at all instead of reading it as a budget.
+func readCgroupV1Limit(path string, host int64) (int64, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	if host > 0 && v >= host {
+		return 0, false
+	}
+	return v, true
 }
 
 // physicalMemoryBytes reads MemTotal (kB) from /proc/meminfo, or 0.
