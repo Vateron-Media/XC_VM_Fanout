@@ -214,6 +214,16 @@ func (c *clientBoundReadCloser) Close() error {
 	return err
 }
 
+// IdleBound forwards the wrapped source's own stall bound, because embedding the
+// io.ReadCloser INTERFACE promotes only Read and Close. A provider URL that
+// carries no .m3u8 but serves a playlist — /live/user/pass/123 and friends —
+// comes back through here as a live HLS pull, and hiding its bound armed the 8s
+// default against a source that is legitimately silent for a whole segment: the
+// watcher closed the pipe between two healthy segments and the channel
+// restart-looped. Passing 0 as the default keeps this honest — a source with no
+// bound of its own reports none, and the caller's default still wins.
+func (c *clientBoundReadCloser) IdleBound() time.Duration { return IdleBound(c.ReadCloser, 0) }
+
 func openHTTP(ctx context.Context, u *url.URL, opt Options) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
