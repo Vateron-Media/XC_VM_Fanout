@@ -230,6 +230,15 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 		"-vf", filter,
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
 		"-acodec", "copy", "-scodec", "copy",
+		// Stay on the source's clock. Without these ffmpeg rebases the output to
+		// start at zero plus its mux delay, so a segment whose first PTS was 19.4 s
+		// came back at 1.4 s. The playlist is cut from the ring and shared by every
+		// viewer, so it cannot carry an #EXT-X-DISCONTINUITY for one viewer's
+		// overlaid sequence — which RFC 8216 requires for a timestamp change — and a
+		// player that places segments by PTS misplaces or stalls on the very segment
+		// carrying the message. -copyts alone still shifts by the mux delay, hence
+		// the two zeroes.
+		"-copyts", "-muxdelay", "0", "-muxpreload", "0",
 		"-mpegts_flags", "+initial_discontinuity",
 		"-f", "mpegts", "pipe:1",
 	)
@@ -289,6 +298,11 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 		"-vf", filter, // see overlaySegment: -filter_complex cannot bind under ffmpeg 7
 		"-map", "0", "-vcodec", codec, "-preset", "ultrafast",
 		"-acodec", "copy", "-scodec", "copy",
+		// Stay on the stream's own clock (see overlaySegment). It matters twice
+		// over here: the raw fan-out resumes on that clock the instant the window
+		// ends, so a rebase made the viewer's timeline jump down to ~1.4 s and
+		// straight back up again, with only the first packet flagged.
+		"-copyts", "-muxdelay", "0", "-muxpreload", "0",
 		"-mpegts_flags", "+initial_discontinuity",
 		"-f", "mpegts", "pipe:1",
 	)
