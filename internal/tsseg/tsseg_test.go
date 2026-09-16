@@ -596,3 +596,66 @@ func TestDamagedPMTIsNotTrusted(t *testing.T) {
 		t.Fatalf("%d segments from 8 GOPs: a PMT flagged as bit-damaged was taken for the programme's:\n%s", got, r.playlist())
 	}
 }
+
+// longPMT is a PMT whose program_info descriptor block pushes the elementary
+// stream loop past the first packet — the ordinary shape of a DVB passthrough
+// table. It returns the packets of the one section, in order.
+func longPMT(videoPID int) [][]byte {
+	body := []byte{
+		0x00, 0x01, 0xc1, 0x00, 0x00,
+		byte(0xe0 | (videoPID>>8)&0x1f), byte(videoPID), // PCR_PID
+		0xf0, 0xb4, // program_info_length = 180: pushes the ES loop past this packet
+	}
+	for i := 0; i < 180; i++ {
+		body = append(body, 0xff)
+	}
+	body = append(body, 0x1b, byte(0xe0|(videoPID>>8)&0x1f), byte(videoPID), 0xf0, 0x00) // H.264
+	body = append(body, 0x0f, 0xe1, 0x02, 0xf0, 0x00)                                    // AAC on 0x102
+	body = append(body, 0xde, 0xad, 0xbe, 0xef)                                          // CRC32
+	sec := append([]byte{0x02, byte(0xb0 | (len(body)>>8)&0x0f), byte(len(body))}, body...)
+
+	var out [][]byte
+	cc := byte(0)
+	for first := true; len(sec) > 0; first = false {
+		p := make([]byte, tspes.PacketSize)
+		for i := range p {
+			p[i] = 0xff
+		}
+		p[0], p[1], p[2], p[3] = 0x47, byte((0x100>>8)&0x1f), 0x00, 0x10|cc
+		if first {
+			p[1] |= 0x40
+		}
+		cc++
+		off := 4
+		if first {
+			p[4], off = 0x00, 5
+		}
+		sec = sec[copy(p[off:], sec):]
+		out = append(out, p)
+	}
+	return out
+}
+
+// A PMT too long for one packet is ordinary on DVB passthrough. The segmenter
+// read only the packet that STARTS the section, so the table's video entry —
+// which sits after the descriptors, in the second packet — was never seen: no
+// video PID, no keyframes, and after MaxNoKeyframe the source was declared
+// unsegmentable and moved to the ffmpeg fallback for good.
+func TestAMultiPacketPMTIsAdopted(t *testing.T) {
+	r := newRig(t, Config{TargetSec: 2, ListSize: 10})
+	pkts := longPMT(vpid)
+	if len(pkts) < 2 {
+		t.Fatalf("fixture fits in one packet (%d); the test proves nothing", len(pkts))
+	}
+	r.feed(tsfixture.PAT(0x100))
+	r.feed(pkts...)
+
+	for g := 0; g <= 3; g++ {
+		r.now = r.now.Add(2 * time.Second)
+		r.feed(tsfixture.KeyframePCR(vpid, int64(g)*2*90000, int64(g)*2*90000))
+		r.feed(tsfixture.Fill(vpid))
+	}
+	if segs := r.segFiles(); len(segs) == 0 {
+		t.Error("no segments were cut: the multi-packet PMT was never adopted, so the segmenter never found the video PID")
+	}
+}

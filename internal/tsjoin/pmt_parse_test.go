@@ -66,12 +66,14 @@ func TestPMTParsingStopsAtTheSectionsEnd(t *testing.T) {
 		{"an ordinary CRC", [4]byte{0xb6, 0x1f, 0x2c, 0x08}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := radioPMT(0x100, 0x101, tc.crc)
-			if v, ty := parseVideoPID(p); v >= 0 {
-				t.Errorf("an audio-only PMT yielded videoPID=%#x type=%#x, want none", v, ty)
+			// Read it the way Update does: fold the section, then decide.
+			s := New(1<<20, 0)
+			s.Update(tsfixture.Concat(tsfixture.PAT(0x100), radioPMT(0x100, 0x101, tc.crc)))
+			if s.videoPID >= 0 {
+				t.Errorf("an audio-only PMT yielded videoPID=%#x type=%#x, want none", s.videoPID, s.videoType)
 			}
-			if a := parseAudioPID(p); a != 0x101 {
-				t.Errorf("audioPID = %#x, want 0x101", a)
+			if s.audioPID != 0x101 {
+				t.Errorf("audioPID = %#x, want 0x101", s.audioPID)
 			}
 		})
 	}

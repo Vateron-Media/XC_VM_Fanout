@@ -76,11 +76,12 @@ type hlsSeg struct {
 // State accumulates join information from a packet-aligned byte stream.
 // It is not safe for concurrent use; the caller (Hub) serialises access.
 type State struct {
-	lastPAT  []byte // one 188-byte PAT packet, or nil
-	lastPMT  []byte // one 188-byte PMT packet, or nil
-	pmtPID   int    // PID carrying the PMT, or -1 if unknown
-	videoPID int    // PID carrying the video ES (for HLS segment PTS), or -1
-	audioPID int    // PID carrying the audio ES, or -1 when the source has none
+	lastPAT  []byte                 // one 188-byte PAT packet, or nil
+	lastPMT  []byte                 // one 188-byte PMT packet, or nil
+	pmtPID   int                    // PID carrying the PMT, or -1 if unknown
+	pmtAsm   tspes.SectionAssembler // folds a PMT section that spans several packets
+	videoPID int                    // PID carrying the video ES (for HLS segment PTS), or -1
+	audioPID int                    // PID carrying the audio ES, or -1 when the source has none
 	// videoType is the PMT stream_type of videoPID. It decides whether a PES
 	// start on that PID can be recognised as a keyframe from its own bytes when
 	// the source sets no random_access_indicator (see tspes.StartsKeyframe).
@@ -345,31 +346,41 @@ func (s *State) Update(chunk []byte) {
 		// whatever they happened to spell — and left lastPMT holding a packet that
 		// is not a table, which is then the packet every join burst and every HLS
 		// segment starts with. Multi-packet PMTs are ordinary on DVB passthrough.
-		case s.pmtPID >= 0 && pid == s.pmtPID && pusi:
-			s.lastPMT = cloneInto(s.lastPMT, pkt)
-			if v, t := parseVideoPID(pkt); v >= 0 {
-				s.videoPID, s.videoType = v, t
+		case s.pmtPID >= 0 && pid == s.pmtPID:
+			if pusi {
+				s.lastPMT = cloneInto(s.lastPMT, pkt)
 			}
-			if m, ok := tspes.ParsePMT(pkt); ok && int(m.PCRPID) != s.pcrPID {
-				s.pcrPID, s.pcrOnPID = int(m.PCRPID), false
-			}
-			// The audio declaration MIRRORS the table: a PMT that lists no audio
-			// ES means this source has none now. Kept sticky, "the stream has
-			// audio" outlived the source it was true for — the daemon reports it
-			// to the supervisor, whose audio-loss rule restarts a channel
-			// carrying video and no audio, so a failover to a genuinely
-			// video-only backup was restarted every audio_loss_sec for ever,
-			// each restart landing back on the same silent source. Only a table
-			// that parsed WITH entries is allowed to withdraw it: a truncated or
-			// corrupt one says nothing about the stream, and reading it as "the
-			// audio is gone" would switch the rule off for a channel that has it.
-			if es, ok := tspes.ParsePMTStreams(pkt); ok {
-				s.audioPID = -1
-				for _, e := range es {
-					if isAudioStreamType(e.Type) {
-						s.audioPID = int(e.PID)
-						break
+			// Decide only from a COMPLETE table. A PMT too long for one packet
+			// continues in packets carrying no PUSI, and reading either half as a
+			// section of its own gets the stream wrong in both directions: the
+			// continuation's bytes parse as pointer_field and ES entries, and the
+			// opening packet parses as a table that simply lists fewer streams
+			// than it has. The declarations below are mirrors of the table, so a
+			// half-read one withdraws streams the source is still sending.
+			if sec := s.pmtAsm.Feed(pkt); sec != nil {
+				if es, ok := tspes.PMTStreamsSection(sec); ok {
+					// The stream carries what its PMT says it carries, no more and
+					// no longer. Left sticky, "this stream has audio" outlived the
+					// source it was true for: the supervisor's audio-loss rule
+					// restarts a channel that carries video and no audio, so a
+					// failover to a genuinely video-only backup was restarted
+					// every audio_loss_sec for ever, each restart landing back on
+					// the same silent source. The same applies to video, where a
+					// stale PID means keyframes are looked for on a stream that is
+					// no longer there.
+					video, audio, vtype := -1, -1, byte(0)
+					for _, e := range es {
+						if video < 0 && isVideoStreamType(e.Type) {
+							video, vtype = int(e.PID), e.Type
+						}
+						if audio < 0 && isAudioStreamType(e.Type) {
+							audio = int(e.PID)
+						}
 					}
+					s.videoPID, s.videoType, s.audioPID = video, vtype, audio
+				}
+				if m, ok := tspes.ParsePMTSection(sec); ok && int(m.PCRPID) != s.pcrPID {
+					s.pcrPID, s.pcrOnPID = int(m.PCRPID), false
 				}
 			}
 		}
@@ -1222,19 +1233,6 @@ func (s *State) Counters() (audioPkts, videoFrames int64, hasAudio bool) {
 	return s.audioPkts, s.videoFrames, s.audioPID >= 0
 }
 
-// parseAudioPID reads the first audio elementary-stream PID out of a PMT packet,
-// or -1. Mirrors parseVideoPID; the two differ only in the stream types they
-// accept.
-func parseAudioPID(pkt []byte) int {
-	es, _ := tspes.ParsePMTStreams(pkt)
-	for _, e := range es {
-		if isAudioStreamType(e.Type) {
-			return int(e.PID)
-		}
-	}
-	return -1
-}
-
 // isAudioStreamType covers the audio codecs an IPTV source realistically
 // carries: MPEG-1/2 audio, AAC (ADTS and LATM), AC-3 and E-AC-3 — including the
 // 0x06 private-stream form the latter two are usually signalled as in DVB.
@@ -1244,30 +1242,6 @@ func isAudioStreamType(t byte) bool {
 		return true
 	}
 	return false
-}
-
-// parseVideoPID reads the first video elementary-stream PID out of a PMT packet,
-// with its stream_type, or -1. Used to locate the PES that carries the HLS
-// segment clock (PTS), and to know how to read a keyframe off that PES.
-//
-// The ES loop is tspes's, which reads the table_id and walks bounded by
-// section_length. The loop here ran to the end of the 188-byte PACKET instead,
-// so on a table whose entries do not fill it — an audio-only PMT, one AAC stream
-// — it stepped straight onto the section's CRC32 and read that as another entry.
-// About six CRC values in 256 begin with a video stream_type, and a table's CRC
-// is fixed, so an affected channel stayed affected across restarts: it then had a
-// video PID nothing ever arrived on, `rap && (onVideo || videoPID < 0)` was never
-// true, and the stream was cut into blocks only by the maxGOP cap — minutes at
-// radio bitrates, which a listener joins at the start of and never catches up
-// from.
-func parseVideoPID(pkt []byte) (int, byte) {
-	es, _ := tspes.ParsePMTStreams(pkt)
-	for _, e := range es {
-		if isVideoStreamType(e.Type) {
-			return int(e.PID), e.Type
-		}
-	}
-	return -1, 0
 }
 
 func isVideoStreamType(t byte) bool {

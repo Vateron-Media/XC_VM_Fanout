@@ -104,3 +104,73 @@ func TestAudioPacketsStopCountingOnceThePMTWithdrawsThePID(t *testing.T) {
 		t.Errorf("audio packets counted on a withdrawn PID: %d -> %d", before, after)
 	}
 }
+
+// longAVPMT is an A/V PMT whose program_info descriptor block pushes the
+// elementary-stream loop past the first packet: the shape of a DVB
+// passthrough table. Returns the packets of the one section, in order.
+func longAVPMT(pmtPID, videoPID, audioPID, descLen int) [][]byte {
+	body := []byte{
+		0x00, 0x01, 0xc1, 0x00, 0x00,
+		byte(0xe0 | (videoPID>>8)&0x1f), byte(videoPID),
+		byte(0xf0 | (descLen>>8)&0x0f), byte(descLen),
+	}
+	for i := 0; i < descLen; i++ {
+		body = append(body, 0xff)
+	}
+	body = append(body, 0x1b, byte(0xe0|(videoPID>>8)&0x1f), byte(videoPID), 0xf0, 0x00)
+	body = append(body, 0x0f, byte(0xe0|(audioPID>>8)&0x1f), byte(audioPID), 0xf0, 0x00)
+	body = append(body, 0xde, 0xad, 0xbe, 0xef)
+	sec := append([]byte{0x02, byte(0xb0 | (len(body)>>8)&0x0f), byte(len(body))}, body...)
+
+	var out [][]byte
+	for cc, first := byte(0), true; len(sec) > 0; first = false {
+		p := make([]byte, PacketSize)
+		for i := range p {
+			p[i] = 0xff
+		}
+		p[0], p[1], p[2], p[3] = 0x47, byte((pmtPID>>8)&0x1f), byte(pmtPID), 0x10|cc
+		if first {
+			p[1] |= 0x40
+		}
+		cc++
+		off := 4
+		if first {
+			p[4], off = 0x00, 5
+		}
+		sec = sec[copy(p[off:], sec):]
+		out = append(out, p)
+	}
+	return out
+}
+
+// A PMT too long for one packet must be folded before anything is decided from
+// it. Read packet by packet, the opening packet parses as a table that simply
+// lists fewer streams than it has — so the audio mirror above withdrew audio
+// the source was still sending, and (worse) the video PID with it.
+func TestAMultiPacketPMTIsReadWhole(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		descLen int
+	}{
+		{"audio entry in the continuation packet", 162},
+		{"video entry in the continuation packet too", 180},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkts := longAVPMT(0x100, 0x101, 0x102, tc.descLen)
+			if len(pkts) < 2 {
+				t.Fatalf("fixture fits in one packet (%d); the test proves nothing", len(pkts))
+			}
+			s := New(1<<20, 40000)
+			s.Update(tsfixture.PAT(0x100))
+			for _, p := range pkts {
+				s.Update(p)
+			}
+			if _, _, hasAudio := s.Counters(); !hasAudio {
+				t.Error("the audio entry was in the continuation packet and the stream was reported as having no audio")
+			}
+			if s.videoPID != 0x101 {
+				t.Errorf("videoPID = %#x, want 0x101 from the folded table", s.videoPID)
+			}
+		})
+	}
+}

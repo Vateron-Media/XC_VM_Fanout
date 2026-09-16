@@ -168,6 +168,10 @@ type Stats struct {
 	MediaSec float64 // stream time covered, from the video clock
 }
 
+// maxPMTPackets bounds what a PMT PID may buffer before the segmenter gives up
+// on the section: the PSI maximum is 1024 bytes, which is six payloads.
+const maxPMTPackets = 8
+
 // Segmenter is fed one packet at a time. Not safe for concurrent use.
 type Segmenter struct {
 	cfg Config
@@ -176,6 +180,11 @@ type Segmenter struct {
 	videoType                byte
 	havePMT                  bool
 	pat, pmt, sdt            []byte // latest raw tables, re-emitted per segment
+	// pmtAsm folds a PMT section that spans several packets; pmtPkts holds
+	// those packets verbatim until it does, so s.pmt re-emits the whole table
+	// at a segment head and not just the packet that opened it.
+	pmtAsm  tspes.SectionAssembler
+	pmtPkts []byte
 
 	// open segment
 	f        *os.File
@@ -253,10 +262,30 @@ func (s *Segmenter) Feed(pkt []byte) error {
 		}
 	case pid == 0x0011 && pusi && !tei: // SDT — carried for players that show the service name
 		s.sdt = append(s.sdt[:0], pkt...)
-	case s.pmtPID != 0 && pid == s.pmtPID && pusi && !tei:
-		s.pmt = append(s.pmt[:0], pkt...)
-		if m, ok := tspes.ParsePMT(pkt); ok {
-			s.adoptPMT(m)
+	case s.pmtPID != 0 && pid == s.pmtPID && !tei:
+		// A PMT too long for one packet — a table with many streams, or with
+		// descriptors, which is ordinary on DVB passthrough — continues in the
+		// packets that follow, and those carry no PUSI. Reading only the packet
+		// that STARTS the section meant a table whose video entry sits after the
+		// descriptors was seen as a PMT that names no video: the segmenter never
+		// found the video PID, never saw a keyframe, and after MaxNoKeyframe
+		// declared the source unsegmentable, which moves the channel to the
+		// ffmpeg fallback for good. Fold the section first, decide from the whole
+		// of it, and re-emit exactly the packets it came in.
+		if pusi {
+			s.pmtPkts = append(s.pmtPkts[:0], pkt...)
+		} else if len(s.pmtPkts) > 0 {
+			s.pmtPkts = append(s.pmtPkts, pkt...)
+		}
+		if len(s.pmtPkts) > maxPMTPackets*tspes.PacketSize {
+			s.pmtPkts = s.pmtPkts[:0] // a PID that never completes a section
+		}
+		if sec := s.pmtAsm.Feed(pkt); sec != nil {
+			s.pmt = append(s.pmt[:0], s.pmtPkts...)
+			s.pmtPkts = s.pmtPkts[:0]
+			if m, ok := tspes.ParsePMTSection(sec); ok {
+				s.adoptPMT(m)
+			}
 		}
 	}
 
