@@ -223,8 +223,20 @@ type hlsPuller struct {
 	base   *url.URL
 	client *http.Client
 	opt    Options
-	seen   map[string]bool
 	pw     *io.PipeWriter
+
+	// How the pull knows what it has already sent. The media sequence is the
+	// primary key when the playlist carries one, as it is for ffmpeg: it is the
+	// identity of a segment's PLACE in the stream, which the URI is not. An
+	// upstream that re-signs every segment URL per response (seg.ts?token=…)
+	// made the whole window look new on every poll and replayed it into the
+	// ring; an encoder restarting inside one window length reuses its names, and
+	// every one of them looked already-sent. seen is the fallback for a playlist
+	// with no usable sequence.
+	seen  map[string]bool
+	seq   int64 // next media sequence to stream
+	bySeq bool  // de-dup follows the media sequence rather than the URI
+	first int64 // MEDIA-SEQUENCE of the playlist the state was last synced to
 
 	// segBuf stages one segment body at a time. run() is the only goroutine that
 	// touches it and pw.Write blocks until the consumer has drained what it was
@@ -244,17 +256,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 	defer p.client.CloseIdleConnections()
 
 	pl := initial
-	// A live playlist is joined near its edge, as ffmpeg's HLS demuxer does
-	// (live_start_index -3), not from its oldest entry. Streaming the whole
-	// window first put up to a minute of old content into the pipeline in a few
-	// seconds at download speed — and every reconnect, starting from an empty
-	// seen map, sent segments already published all over again. A VOD playlist
-	// (ENDLIST) still plays from its start.
-	if !pl.Endlist && len(pl.Segments) > hlsLiveStartSegments {
-		for _, seg := range pl.Segments[:len(pl.Segments)-hlsLiveStartSegments] {
-			p.seen[seg.URI.String()] = true
-		}
-	}
+	p.join(pl)
 	// Segment failures and manifest failures are counted SEPARATELY. A shared
 	// counter that any success reset meant a source serving a perfectly valid
 	// playlist of dead segments could never trip it whenever the live window held
@@ -263,12 +265,11 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 	for {
 		// First pass: enqueue any new segments from the current pl.
 		stalled := false
-		for _, seg := range pl.Segments {
+		for i, seg := range pl.Segments {
 			if p.ctx.Err() != nil {
 				return
 			}
-			uri := seg.URI.String()
-			if p.seen[uri] {
+			if p.streamed(pl, i) {
 				continue
 			}
 			if err := p.streamSegment(seg.URI); err != nil {
@@ -296,7 +297,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			// Mark seen only after a successful stream so a transient fetch
 			// failure is retried on the next manifest poll instead of being
 			// permanently skipped by retainSeenInWindow.
-			p.seen[uri] = true
+			p.markStreamed(pl, i)
 			segFails = 0
 		}
 		if pl.Endlist && !stalled {
@@ -342,12 +343,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			p.pw.CloseWithError(fmt.Errorf("hls pull: playlist changed: %w", err))
 			return
 		}
-		// Bound the de-dup map to the live window: a live HLS window only
-		// slides forward, so a URI that has rolled out of the manifest can
-		// never reappear. Forgetting evicted URIs keeps `seen` from growing
-		// for the life of the run while preserving de-dup of still-listed
-		// segments (a slow leak otherwise).
-		p.seen = retainSeenInWindow(p.seen, next)
+		p.resync(pl, next)
 		pl = next
 	}
 }
@@ -400,6 +396,106 @@ func checkSegmentIsTS(b []byte, u *url.URL) error {
 		return fmt.Errorf("%w: segment %s", ErrHLSNotTS, u.Redacted())
 	}
 	return nil
+}
+
+// join positions the de-dup state on a playlist the pull is starting to read —
+// at open, and again whenever the upstream turns out to be a different stream
+// from the one that was being followed.
+//
+// A live playlist is joined near its edge, as ffmpeg's HLS demuxer does
+// (live_start_index -3), not from its oldest entry. Streaming the whole window
+// first put up to a minute of old content into the pipeline in a few seconds at
+// download speed — and every reconnect did it again. A VOD playlist (ENDLIST)
+// still plays from its start.
+func (p *hlsPuller) join(pl *hlsPlaylist) {
+	p.bySeq = pl.HasMediaSeq
+	p.first = pl.MediaSequence
+	p.seen = map[string]bool{}
+	edge := 0
+	if !pl.Endlist && len(pl.Segments) > hlsLiveStartSegments {
+		edge = len(pl.Segments) - hlsLiveStartSegments
+	}
+	if p.bySeq {
+		p.seq = pl.MediaSequence + int64(edge)
+		return
+	}
+	for _, seg := range pl.Segments[:edge] {
+		p.seen[seg.URI.String()] = true
+	}
+}
+
+// streamed reports whether the i'th segment of pl has already gone out.
+func (p *hlsPuller) streamed(pl *hlsPlaylist, i int) bool {
+	if p.bySeq {
+		return pl.MediaSequence+int64(i) < p.seq
+	}
+	return p.seen[pl.Segments[i].URI.String()]
+}
+
+// markStreamed records that it has. Called only after a successful stream, so a
+// transient fetch failure is retried on the next poll rather than skipped.
+func (p *hlsPuller) markStreamed(pl *hlsPlaylist, i int) {
+	if p.bySeq {
+		p.seq = pl.MediaSequence + int64(i) + 1
+		return
+	}
+	p.seen[pl.Segments[i].URI.String()] = true
+}
+
+// resync moves the de-dup state from the playlist just finished onto the one
+// just fetched.
+func (p *hlsPuller) resync(pl, next *hlsPlaylist) {
+	if !p.bySeq {
+		// Bound the de-dup map to the live window: a live window only slides
+		// forward, so a URI that has rolled out of the manifest can never
+		// reappear. Forgetting evicted URIs keeps `seen` from growing for the
+		// life of the run while still de-duping what is still listed.
+		p.seen = retainSeenInWindow(p.seen, next)
+		return
+	}
+	switch {
+	case !next.HasMediaSeq:
+		// The tag we were following vanished; nothing left to follow.
+		p.uriFallback(pl, next)
+	case next.MediaSequence < p.first:
+		// The sequence went BACKWARDS: this is a new stream on the same URL, an
+		// encoder that restarted. Its segments are new content however familiar
+		// their names are, so rejoin as if opening the playlist fresh.
+		p.join(next)
+	case next.MediaSequence == p.first && rolledUnderAFrozenSequence(pl, next):
+		p.uriFallback(pl, next)
+	default:
+		p.first = next.MediaSequence
+	}
+}
+
+// uriFallback abandons media-sequence de-dup for the rest of the run, carrying
+// over what has already been streamed so the switch itself replays nothing.
+func (p *hlsPuller) uriFallback(pl, next *hlsPlaylist) {
+	p.seen = map[string]bool{}
+	for i := range pl.Segments {
+		if pl.MediaSequence+int64(i) < p.seq {
+			p.seen[pl.Segments[i].URI.String()] = true
+		}
+	}
+	p.bySeq = false
+	p.seen = retainSeenInWindow(p.seen, next)
+}
+
+// rolledUnderAFrozenSequence reports whether next's window has moved on while
+// #EXT-X-MEDIA-SEQUENCE stood still — an encoder that writes a constant
+// sequence, which some do. Trusting the number there would freeze the channel
+// at the first window, so the URI is the only thing left to follow.
+//
+// The test is the first entry's PATH, with its query dropped: a rolled window
+// names a different segment, while an upstream that merely re-signs its URLs
+// per response names the same one under a new token. Comparing whole URIs would
+// mistake the re-signed window for a rolled one and put the replay back.
+func rolledUnderAFrozenSequence(pl, next *hlsPlaylist) bool {
+	if len(pl.Segments) == 0 || len(next.Segments) == 0 {
+		return false
+	}
+	return pl.Segments[0].URI.Path != next.Segments[0].URI.Path
 }
 
 // retainSeenInWindow rebuilds the segment de-dup set to only the URIs still
@@ -500,8 +596,17 @@ type hlsPlaylist struct {
 	HasFMP4        bool
 	Encrypted      bool // an #EXT-X-KEY with a METHOD other than NONE
 	Endlist        bool
-	TargetDuration int      // seconds
-	MapURI         *url.URL // EXT-X-MAP target (fMP4 init)
+	TargetDuration int // seconds
+	// MediaSequence is #EXT-X-MEDIA-SEQUENCE: the sequence number of the first
+	// segment listed, each later one counting up from it. It is what identifies
+	// a segment's place in the stream — the URI does not, because upstreams
+	// re-sign URLs per response and encoders reuse names after a restart.
+	// HasMediaSeq says the playlist actually carried a usable one, since a
+	// missing tag means 0 and a de-dup keyed on a number that never moves would
+	// freeze the channel.
+	MediaSequence int64
+	HasMediaSeq   bool
+	MapURI        *url.URL // EXT-X-MAP target (fMP4 init)
 	Segments       []hlsSegment
 	Variants       []hlsVariant
 	// DemuxedAudio holds the GROUP-IDs of #EXT-X-MEDIA TYPE=AUDIO renditions
@@ -545,6 +650,14 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 			continue
 		case strings.HasPrefix(line, "#EXT-X-TARGETDURATION:"):
 			pl.TargetDuration = clampTargetDuration(atoiSafe(line[len("#EXT-X-TARGETDURATION:"):]))
+		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
+			// Only a value that can be counted on: negative is nonsense, and one
+			// close to the int64 ceiling would wrap when the segment index is
+			// added to it and make every segment look already-sent.
+			if n, err := strconv.ParseInt(strings.TrimSpace(line[len("#EXT-X-MEDIA-SEQUENCE:"):]), 10, 64); err == nil && n >= 0 && n < 1<<62 {
+				pl.MediaSequence = n
+				pl.HasMediaSeq = true
+			}
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.Endlist = true
 		case strings.HasPrefix(line, "#EXT-X-KEY:"):
