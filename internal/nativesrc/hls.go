@@ -80,6 +80,11 @@ func OpenHLSPull(ctx context.Context, rawURL string, opt Options) (io.ReadCloser
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse: %v", ErrUnsupportedSource, err)
 	}
+	// A proxy that cannot be used is a refusal: the manifest polls and every
+	// segment fetch would otherwise go direct from the node's own IP.
+	if err := opt.checkProxy(); err != nil {
+		return nil, err
+	}
 	client := newPullClient(opt)
 	// One synchronous fetch up front to (a) classify the playlist and
 	// (b) surface obvious 4xx/5xx errors to the caller cleanly instead

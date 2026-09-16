@@ -182,6 +182,10 @@ func Open(ctx context.Context, rawURL string, opt Options) (io.ReadCloser, error
 	case "file":
 		return openFile(u.Path)
 	case "http", "https":
+		// A proxy that cannot be used is a refusal, not a direct connection.
+		if err := opt.checkProxy(); err != nil {
+			return nil, err
+		}
 		// HLS playlists are routed through the pull client, which returns a pipe
 		// whose reader yields concatenated MPEG-TS bytes from the live segment
 		// window. An m3u8 served under an arbitrary path extension is still
@@ -312,6 +316,13 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: http %d", ErrUnsupportedSource, resp.StatusCode)
 	}
+	// Every fetch from here on — playlist polls and segments — is ours, so a
+	// proxy this package cannot use must stop the source here rather than send
+	// those fetches out direct from the node's own IP.
+	if err := opt.checkProxy(); err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
 	final := resp.Request.URL // honour redirects when resolving segment URIs
 
 	// Bound the reads THIS function makes — the sniff below and the playlist
@@ -352,7 +363,7 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 	head = head[:n]
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		_ = body.Close()
-		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, redact(final), err)
+		return nil, fmt.Errorf("%w: %s: read: %v", ErrUnsupportedSource, redactURL(final), err)
 	}
 	switch {
 	case looksLikeTS(head):
@@ -370,9 +381,9 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 		// ExitUnsupported and the supervisor's fallback is sticky), and its own
 		// contract says that must never happen for a source that is merely down.
 		// With nothing to classify, there is nothing to refuse on.
-		return nil, fmt.Errorf("%w: %s: empty body", ErrUnsupportedSource, redact(final))
+		return nil, fmt.Errorf("%w: %s: empty body", ErrUnsupportedSource, redactURL(final))
 	}
-	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redact(final))
+	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redactURL(final))
 }
 
 // adoptHLS finishes reading a playlist whose first bytes have already been
@@ -386,14 +397,16 @@ func adoptHLS(ctx context.Context, base *url.URL, opt Options, head []byte, body
 	defer stop.Stop()
 	rest, err := io.ReadAll(io.LimitReader(body, maxPlaylistBytes-int64(len(head))))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s: read playlist: %v", ErrUnsupportedSource, redact(base), err)
+		return nil, fmt.Errorf("%w: %s: read playlist: %v", ErrUnsupportedSource, redactURL(base), err)
 	}
 	manifest := make([]byte, 0, len(head)+len(rest))
 	manifest = append(append(manifest, head...), rest...)
 	return openHLSPullWith(ctx, base, opt, manifest)
 }
 
-func redact(u *url.URL) string {
+// redactURL keeps a source's userinfo out of an error message. It is named for
+// the shared masker in internal/redact, which options.go imports as `redact`.
+func redactURL(u *url.URL) string {
 	if u == nil {
 		return "source"
 	}

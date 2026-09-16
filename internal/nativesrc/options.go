@@ -6,12 +6,15 @@ package nativesrc
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 )
 
 // Options are the per-source knobs the daemon already carries for a pull, so a
@@ -87,12 +90,55 @@ func (o Options) transport(dialWait time.Duration) *http.Transport {
 		MaxIdleConns:          32,
 		IdleConnTimeout:       idleConnLife,
 	}
-	if o.Proxy != "" {
-		if pu, err := url.Parse("http://" + o.Proxy); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
-		}
+	switch pu, err := o.proxyURL(); {
+	case err != nil:
+		// Fail CLOSED. The parse error used to be dropped, which left a source
+		// that an operator had put behind a proxy connecting DIRECTLY from the
+		// node's own IP — no error, no log line, and no proxy, which is the one
+		// outcome a proxy is configured to prevent. checkProxy refuses the fetch
+		// before it starts; this is the belt to that braces, for any path that
+		// builds a transport without asking first.
+		tr.Proxy = func(*http.Request) (*url.URL, error) { return nil, err }
+	case pu != nil:
+		tr.Proxy = http.ProxyURL(pu)
 	}
 	return tr
+}
+
+// proxyURL resolves the configured proxy. The panel sends a bare "host:port",
+// which needs the scheme prefixed; the remux flag and hand-written configs carry
+// "http://host:port", which must NOT be prefixed again — "http://http://host"
+// either fails to parse or aims at a host called "http".
+func (o Options) proxyURL() (*url.URL, error) {
+	raw := strings.TrimSpace(o.Proxy)
+	if raw == "" {
+		return nil, nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		// A *url.Error repeats the whole URL — credentials included — in its
+		// message, so only the reason is safe to put in a log.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return nil, fmt.Errorf("proxy %s: %v", redact.URL(raw), err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("proxy %s: no host", redact.URL(raw))
+	}
+	return u, nil
+}
+
+// checkProxy refuses a fetch whose proxy cannot be used, so a misconfigured
+// proxy is an error the operator sees rather than a direct connection nobody
+// notices. Callers that speak HTTP check it before their first request.
+func (o Options) checkProxy() error {
+	_, err := o.proxyURL()
+	return err
 }
 
 // apply stamps the source's identity onto a request.
