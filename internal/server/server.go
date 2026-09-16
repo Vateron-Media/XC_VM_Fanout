@@ -38,6 +38,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hub"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/supervisor"
 )
 
@@ -452,13 +453,23 @@ func (s *Stream) setConfig(src puller.Source, chunk int) bool {
 	if s.removed {
 		return false
 	}
+	first := s.cfg == nil
 	changed := s.cfg != nil && !sameSource(*s.cfg, src)
 	c := src
 	s.cfg = &c
 	if chunk > 0 {
 		s.chunk = chunk
 	}
-	dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, src.URLs, src.Proxy, s.refs)
+	// Log the source only when it is actually new or edited, and never with the
+	// account in it. The panel re-registers a stream on EVERY viewer request (HLS
+	// playlist polls included), so this line used to write the provider's user and
+	// password — as userinfo or as the /live/<user>/<pass>/ path an XC panel hands
+	// out — plus the proxy's, into the journal hundreds of times a minute, in logs
+	// support reads and ships off the box. redact keeps the host, the stream id
+	// and the query shape, which is all the line was ever read for.
+	if first || changed {
+		dlog.Logf("ctl", "id=%s registered pull config: urls=%v proxy=%q (refs=%d)", s.id, redact.URLs(src.URLs), redact.URL(src.Proxy), s.refs)
+	}
 	// A running puller holds the Source it started with, so an edit made in the
 	// panel (a new URL, a changed user agent) only reaches it through a restart —
 	// and whether the audience happens to be holding a ref is beside the point.
