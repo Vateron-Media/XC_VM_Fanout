@@ -131,7 +131,7 @@ func (s Source) ua() string {
 // Run pulls src into publish until ctx is cancelled, reconnecting with capped
 // exponential backoff whenever the source ends or errors.
 func Run(ctx context.Context, src Source, chunkSize int, publish func([]byte)) {
-	dlog.Logf("puller", "id=%s start; urls=%v proxy=%q", src.Label, src.URLs, src.Proxy)
+	dlog.Logf("puller", "id=%s start; urls=%v proxy=%q", src.Label, redact.URLs(src.URLs), proxyForLog(src.Proxy))
 
 	// One client — and so one connection pool — for the whole puller, not one per
 	// probe. A fresh http.Transport per attempt meant no connection was ever
@@ -278,7 +278,7 @@ func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize in
 		// native reader's support for them (and ffmpeg's) was unreachable through
 		// the daemon no matter what the operator configured.
 		if nativeOnlyScheme(raw) {
-			dlog.Logf("puller", "id=%s non-http source, skipping probe: %s", src.Label, raw)
+			dlog.Logf("puller", "id=%s non-http source, skipping probe: %s", src.Label, redact.URL(raw))
 			// A native-only URL is a CANDIDATE like any other. This branch used
 			// to return the attempt's error, so a stream whose first URL was
 			// udp://, rtp:// or a path never reached its configured backups:
@@ -300,17 +300,17 @@ func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize in
 			if err == nil || delivered || ctx.Err() != nil {
 				return err
 			}
-			dlog.Logf("puller", "id=%s source delivered nothing: %s: %v", src.Label, raw, err)
+			dlog.Logf("puller", "id=%s source delivered nothing: %s: %v", src.Label, redact.URL(raw), err)
 			lastErr = err
 			continue
 		}
 		resp, err := probe(ctx, client, src, raw)
 		if err != nil {
-			dlog.Logf("puller", "id=%s probe failed: %s: %v", src.Label, raw, err)
+			dlog.Logf("puller", "id=%s probe failed: %s: %v", src.Label, redact.URL(raw), err)
 			lastErr = err
 			continue
 		}
-		dlog.Logf("puller", "id=%s probe %s: HTTP %d content-type=%q", src.Label, raw, resp.StatusCode, resp.Header.Get("Content-Type"))
+		dlog.Logf("puller", "id=%s probe %s: HTTP %d content-type=%q", src.Label, redact.URL(raw), resp.StatusCode, resp.Header.Get("Content-Type"))
 		if isMP2T(resp) {
 			src.reportPath(PathDirectMP2T)
 			// Bound a stall: without this a source that goes half-open (stops
@@ -319,7 +319,7 @@ func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize in
 			// dead while the panel still saw a running stream with a live puller.
 			body := nativesrc.WrapIdleTimeout(resp.Body, nativesrc.DefaultSourceIdleTimeout)
 			defer body.Close()
-			dlog.Logf("puller", "id=%s connected direct mpegts: %s", src.Label, raw)
+			dlog.Logf("puller", "id=%s connected direct mpegts: %s", src.Label, redact.URL(raw))
 			return ingest.Copy(body, chunkSize, publish)
 		}
 		// Hand the OPEN response to convert rather than closing it and fetching
@@ -455,7 +455,7 @@ func proxyURL(raw string) (*url.URL, error) {
 func probe(ctx context.Context, c *http.Client, src Source, raw string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return nil, err
+		return nil, redactRequestError(err)
 	}
 	req.Header.Set("User-Agent", src.ua())
 	if src.Cookie != "" {
@@ -464,13 +464,39 @@ func probe(ctx context.Context, c *http.Client, src Source, raw string) (*http.R
 	applyHeaders(req, src.Headers)
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, redactRequestError(err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("%s: HTTP %d", raw, resp.StatusCode)
+		return nil, fmt.Errorf("%s: HTTP %d", redact.URL(raw), resp.StatusCode)
 	}
 	return resp, nil
+}
+
+// redactRequestError masks the credentials net/http itself put in an error:
+// every failure out of Client.Do is a *url.Error carrying the request URL
+// verbatim ("Get \"http://host/live/user/pass/1.ts\": dial tcp …"), and that
+// error is what Run prints on every reconnect.
+func redactRequestError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL = redact.URL(ue.URL)
+	}
+	return err
+}
+
+// proxyForLog is the configured proxy as a log line may carry it. A proxy value
+// holds a password as often as a source URL does, and the shared redactor can
+// only see userinfo in something shaped like a URL — "user:pass@host:3128" on
+// its own has no scheme for it to find the authority behind.
+func proxyForLog(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	if u, err := proxyURL(raw); err == nil && u != nil {
+		return redact.URL(u.String())
+	}
+	return redact.URL(raw)
 }
 
 // convert turns a non-mp2t source into MPEG-TS and feeds it in, natively when
@@ -497,7 +523,7 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 		stall := ffmpegStallBound(isHLSSource(raw, resp, nil))
 		closeBody(resp)
 		src.reportPath(PathFfmpegPin)
-		dlog.Logf("puller", "id=%s connected via ffmpeg remux (backend=ffmpeg): %s", src.Label, raw)
+		dlog.Logf("puller", "id=%s connected via ffmpeg remux (backend=ffmpeg): %s", src.Label, redact.URL(raw))
 		return runFfmpeg(ctx, src, raw, stall, chunkSize, publish)
 	}
 
@@ -519,7 +545,7 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 		rc = nativesrc.WrapIdleTimeout(rc, nativesrc.IdleBound(rc, nativesrc.DefaultSourceIdleTimeout))
 		defer rc.Close()
 		src.reportPath(PathNative)
-		dlog.Logf("puller", "id=%s connected native (no ffmpeg child): %s", src.Label, raw)
+		dlog.Logf("puller", "id=%s connected native (no ffmpeg child): %s", src.Label, redact.URL(raw))
 		return ingest.Copy(rc, chunkSize, publish)
 	}
 
@@ -530,7 +556,7 @@ func convert(ctx context.Context, src Source, raw string, resp *http.Response, c
 		return fmt.Errorf("native source declined (backend=native, no fallback): %w", err)
 	}
 	src.reportPath(PathFfmpegBack)
-	dlog.Logf("puller", "id=%s native declined (%v); falling back to ffmpeg: %s", src.Label, err, raw)
+	dlog.Logf("puller", "id=%s native declined (%v); falling back to ffmpeg: %s", src.Label, err, redact.URL(raw))
 	// The refusal itself is a classification: ErrHLSEncrypted and ErrHLSIsFMP4
 	// say "this IS an HLS source, just not one I will serve", which is the case
 	// the ffmpeg fallback exists for and the case that needs the wider bound.
