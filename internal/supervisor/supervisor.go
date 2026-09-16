@@ -569,6 +569,16 @@ func (st *stream) run(ctx context.Context) {
 
 		proc, err := st.startOnce(ctx, src)
 		if err != nil {
+			// WE ended the start — a DELETE, a re-PUT after a source change, or a
+			// shutdown — so there is no failure here to report or to act on.
+			// Charging it walked the source list, counted towards stop_failures
+			// (with on_demand_failure_exit, gave up on the spot) and wrote a
+			// STREAM_START_FAIL into the panel's stream log, which its cron copies
+			// into the database: every stop of a stream that was still starting
+			// left the operator a failed start that never happened.
+			if ctx.Err() != nil {
+				return
+			}
 			// The command could not serve this source at all, and the panel gave
 			// it a fallback: that is a choice of pipeline, not a failed start, so
 			// it neither counts towards stop_failures nor waits out the fail sleep.
