@@ -107,10 +107,14 @@ func (c *Config) normalise() error {
 	if c.Playlist == "" || c.SegPattern == "" {
 		return errors.New("tsseg: playlist and segment pattern are required")
 	}
-	// A pattern with no numeric verb would send every segment to one file,
-	// which looks like it works while destroying the recording.
-	if strings.Count(c.SegPattern, "%d") != 1 || strings.Count(c.SegPattern, "%") != 1 {
-		return fmt.Errorf("tsseg: segment pattern %q must contain exactly one %%d", c.SegPattern)
+	// A pattern with no numeric verb would send every segment to one file, which
+	// looks like it works while destroying the recording. The verb has to be in
+	// the file's own name: a %d in the directory part counts once here but names
+	// one directory per segment, and every reader of these files — the sweep
+	// below, the playlist, the panel's archive worker — looks for the number in
+	// the base name.
+	if strings.Count(c.SegPattern, "%") != 1 || strings.Count(filepath.Base(c.SegPattern), "%d") != 1 {
+		return fmt.Errorf("tsseg: segment pattern %q must contain exactly one %%d, in its file name", c.SegPattern)
 	}
 	if c.TargetSec <= 0 {
 		c.TargetSec = 10
@@ -510,6 +514,9 @@ func (s *Segmenter) sweep() {
 	_ = os.Remove(s.cfg.Playlist)
 	dir, base := filepath.Split(s.cfg.SegPattern)
 	i := strings.Index(base, "%d")
+	if i < 0 { // normalise rejects such a pattern; never index at -1 if it ever slips
+		return
+	}
 	prefix, suffix := base[:i], base[i+2:]
 	entries, err := os.ReadDir(filepath.Clean(dir))
 	if err != nil {

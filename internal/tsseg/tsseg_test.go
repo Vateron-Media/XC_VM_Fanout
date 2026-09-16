@@ -367,3 +367,16 @@ func pcrOnly(pid int, pcr int64) []byte {
 	p[10] = byte(pcr&1) << 7
 	return p
 }
+
+// TestConfigRejectsPercentDOutsideTheFileName: the %d has to be in the segment
+// file's own name. `-hls_segment_filename /streams/%d/12.ts` passed the "exactly
+// one %d" check, and sweep then looked the %d up in the base name, found none
+// and sliced at -1: the remux process died with a panic trace on every
+// supervisor restart instead of reporting a bad configuration once.
+func TestConfigRejectsPercentDOutsideTheFileName(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Playlist: filepath.Join(dir, "12_.m3u8"), SegPattern: filepath.Join(dir, "%d", "12.ts")}
+	if _, err := New(cfg); err == nil {
+		t.Fatalf("segment pattern %q accepted: %%d outside the file name names one file per directory", cfg.SegPattern)
+	}
+}
