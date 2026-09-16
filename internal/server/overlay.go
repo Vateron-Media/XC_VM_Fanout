@@ -490,11 +490,16 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 	}()
 
 	ok := true
-	var delivered int64
+	// produced is what ffmpeg wrote out; delivered is what reached the viewer.
+	// They part company on exactly one path — the viewer's first write failing —
+	// and that is the difference between "the encoder is broken" and "the viewer
+	// went away", which is the whole of what the log below is for.
+	var produced, delivered int64
 	buf := make([]byte, 32*1024)
 	for {
 		n, rerr := stdout.Read(buf)
 		if n > 0 {
+			produced += int64(n)
 			if werr := write(buf[:n]); werr != nil {
 				ok = false
 				// Kill ffmpeg before joining the feed. Nobody drains its stdout
@@ -524,13 +529,22 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 		dlog.Logf("signal", "overlay TS window: ffmpeg exited (%v): %s", err, strings.TrimSpace(errBuf.String()))
 	}
 	if delivered == 0 {
-		// ffmpeg never produced a byte: a codec this build lacks, a colour
-		// drawtext rejects, a filter that would not parse. It had still READ
-		// (probed) whatever the feed pushed at it, so endCur points past bytes
-		// the viewer was never shown — resuming there cut seconds out of its
-		// stream for a banner it never saw. Nothing was delivered, so the window
-		// never happened: carry on raw from exactly where the viewer was.
-		dlog.Logf("signal", "overlay TS window: ffmpeg produced no output, resuming raw from the viewer's own cursor")
+		// Nothing reached the viewer, so the window never happened: carry on raw
+		// from exactly where the viewer was. ffmpeg may still have READ (probed)
+		// whatever the feed pushed at it, so endCur points past bytes nobody was
+		// shown — resuming there cut seconds out of the stream for a banner that
+		// was never seen.
+		//
+		// Why it delivered nothing is a different question, and only ffmpeg
+		// producing nothing — a codec this build lacks, a colour drawtext
+		// rejects, a filter that would not parse — is ffmpeg's fault. Blaming it
+		// for a zero DELIVERED count sent an operator debugging a signal that
+		// never appeared to look at an encoder that had worked perfectly, when
+		// the viewer had simply gone (ok is false there, and its disconnect is
+		// already narrated by serveLive).
+		if produced == 0 {
+			dlog.Logf("signal", "overlay TS window: ffmpeg produced no output, resuming raw from the viewer's own cursor")
+		}
 		return cur, ok
 	}
 	return endCur, ok
