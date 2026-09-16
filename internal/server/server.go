@@ -1652,11 +1652,52 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// joinRunBytes is how much join history a viewer is written per pinned run
-// while it catches up to the live edge: big enough to keep lock round-trips
-// rare, small enough that a slow viewer never holds a pin — which suspends GOP
-// recycling for the whole stream — for more than a moment.
+// joinRunBytes is the CEILING on how much join history a viewer is written per
+// pinned run while it catches up to the live edge: big enough to keep lock
+// round-trips rare, small enough that a slow viewer never holds a pin — which
+// suspends GOP recycling for the whole stream — for more than a moment. What a
+// live viewer actually gets per run is sized from the stream's own rate; see
+// runBytes.
 const joinRunBytes = 1 << 20
+
+// minRunBytes floors a sized run at 64 packets, so a very low-bitrate stream
+// (or a very short write timeout) still moves the ring in useful steps instead
+// of a packet at a time, which would put the hub lock on the per-packet path.
+const minRunBytes = 64 * 188
+
+// runResizeEvery is how often a live session re-measures the stream's rate. The
+// bitrate barely moves, and a stream that was cold when the viewer joined has no
+// rate to measure yet — re-measuring is what lets that session settle onto a real
+// run size instead of keeping the cold-start ceiling for hours.
+const runResizeEvery = 5 * time.Second
+
+// runBytes sizes ONE Follow run for st. writeRun deadlines the whole run, so the
+// run — not the stream — is what sets the throughput a viewer must sustain to
+// survive: a fixed 1 MiB run demanded ~533 kbit/s at the default 15 s timeout
+// whatever the channel's bitrate, so a 500 kbit/s channel joined with a deep
+// prebuffer dropped viewers whose link was several times faster than its source,
+// on every reconnect. Size the run in stream time instead — the bytes the source
+// itself produces in half a write deadline, measured off the ring (what it holds
+// over the stream time it spans) — so the bar a viewer must clear is "keep up
+// with the stream, with a factor of two to spare".
+//
+// Clamped to [minRunBytes, joinRunBytes]. A ring with no clock yet (a cold start,
+// where there is no backlog to drain anyway) keeps the ceiling.
+func (m *Manager) runBytes(st *Stream) int {
+	ringBytes, spanMS, _ := st.Hub.RingStats()
+	timeoutMS := int64(time.Duration(m.writeTimeout.Load()) / time.Millisecond)
+	if ringBytes <= 0 || spanMS <= 0 || timeoutMS <= 0 {
+		return joinRunBytes
+	}
+	n := int64(ringBytes) * timeoutMS / (2 * spanMS)
+	if n > joinRunBytes {
+		return joinRunBytes
+	}
+	if n < minRunBytes {
+		return minRunBytes
+	}
+	return int(n)
+}
 
 func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/live/")
@@ -1810,10 +1851,12 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 	// Follow the ring by cursor for the WHOLE session — the join history and then
 	// the live tail, one loop (ADR 0004). Nothing is copied per viewer and nothing
 	// queues behind the history: the viewer takes the ring at its own link speed in
-	// runs of joinRunBytes (each pinned only while it is written), and one slower
-	// than the stream falls off the ring's tail (behind) and is let go. At the live
-	// edge the follower parks on wake until the next Publish, and a teardown
-	// (CloseAll) surfaces as ended so this handler returns and runs its cleanup.
+	// runs sized from the stream's rate (each pinned only while it is written), and
+	// one slower than the stream falls off the ring's tail (behind) and is let go.
+	// At the live edge the follower parks on wake until the next Publish, and a
+	// teardown (CloseAll) surfaces as ended so this handler returns and runs its
+	// cleanup.
+	runMax, runMeasured := m.runBytes(st), time.Now()
 	if len(head) > 0 {
 		if err := write(head); err != nil {
 			reason = writeFailReason(err)
@@ -1838,7 +1881,12 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		burst, next, atEnd, wake, behind, ended := st.Hub.Follow(cur, joinRunBytes)
+		// Re-measure the run size occasionally: a stream that was cold at join has
+		// a rate only once it has published something.
+		if time.Since(runMeasured) >= runResizeEvery {
+			runMax, runMeasured = m.runBytes(st), time.Now()
+		}
+		burst, next, atEnd, wake, behind, ended := st.Hub.Follow(cur, runMax)
 		if behind {
 			burst.Release()
 			reason = "dropped: fell behind the ring (link slower than the stream)"
@@ -1850,8 +1898,9 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Write the whole run under one deadline (writeRun); a kick / client-close is
-		// checked once before it. A run is bounded by joinRunBytes, so a healthy
-		// viewer clears it in milliseconds, and a stalled one is dropped by the run's
+		// checked once before it. A run is bounded by runMax — what the source itself
+		// produces in half the deadline — so a viewer keeping up with the stream
+		// clears it with room to spare, and a stalled one is dropped by the run's
 		// write deadline.
 		delivered := false
 		if len(burst.Parts) > 0 {
