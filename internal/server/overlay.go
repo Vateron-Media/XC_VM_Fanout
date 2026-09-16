@@ -33,6 +33,11 @@ var overlayTSDuration = defaults.OverlayTSDuration
 // It reproduces the legacy admin "send message" feature: a text banner burned into the
 // video (ffmpeg drawtext) shown once to a single viewer, then cleared.
 type pendingSignal struct {
+	// uuid is the viewer this signal is addressed to — the map key, carried in
+	// the value as well so a consumer that was handed the signal alone still
+	// knows whose it is. overlayTSWindow needs it to watch that viewer's kill
+	// channel for the length of the banner window.
+	uuid     string
 	text     string
 	fontSize int
 	color    string
@@ -66,6 +71,7 @@ func (s *signalStore) set(uuid string, sig pendingSignal) {
 	// Sweep BEFORE inserting, so this signal is queued whatever its own TTL says
 	// and only somebody else's dead one is dropped.
 	s.sweepLocked(time.Now())
+	sig.uuid = uuid
 	s.m[uuid] = sig
 	s.n.Store(int64(len(s.m)))
 	s.mu.Unlock()
@@ -279,6 +285,25 @@ func (m *Manager) overlaySegment(seg []byte, sig pendingSignal, codec string) []
 	return out.Bytes()
 }
 
+// killChan returns the channel the panel's kick closes for one live-TS viewer
+// uuid on this stream (see Stream.dropConn), or nil when that uuid is not
+// connected here — which a nil-safe select reads as "never ready", exactly what
+// a caller with no viewer to watch wants. It lives here because the banner
+// window is its only caller: nothing else needs to watch a kick it did not
+// itself hand out.
+func (s *Stream) killChan(uuid string) <-chan struct{} {
+	if uuid == "" {
+		return nil
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	cs := s.conns[uuid]
+	if cs == nil {
+		return nil
+	}
+	return cs.kill
+}
+
 // laterCursor returns whichever of two cursors on the same ring is further on.
 // Block ids are monotonic and a cursor only ever moves forward inside a block, so
 // comparing them lexicographically is the ring's own ordering.
@@ -344,6 +369,34 @@ func (m *Manager) overlayTSWindow(st *Stream, cur tsjoin.Cursor, write func([]by
 	if err := cmd.Start(); err != nil {
 		dlog.Logf("signal", "overlay TS window: ffmpeg start failed (%v), continuing raw", err)
 		return cur, true // couldn't start ffmpeg → continue raw
+	}
+
+	// Watch the panel's kick for the length of the window. DELETE
+	// /connections/<uuid> only closes this channel — dropConn does not touch the
+	// socket — so every write to a kicked viewer keeps succeeding, and serveLive
+	// looks at the channel once per loop iteration, of which this whole window is
+	// one. An admin kill, a connection-limit eviction or a line banned mid-banner
+	// therefore went on being served for the rest of overlayTSDuration (five
+	// seconds in production) after the panel had already ended the session.
+	//
+	// Cancelling the window's context is the same lever the failed-write path
+	// pulls: ffmpeg dies, its pipes close, the stdout loop and the feed unwind at
+	// once. The session is handed back ALIVE on purpose — serveLive's own killC
+	// select then returns on the very next iteration with "dropped by panel",
+	// which is what the operator did; alive=false would log it as a client that
+	// closed. The goroutine is joined before returning, so it can never outlive
+	// the window or call cancel on a later one.
+	if kill := st.killChan(sig.uuid); kill != nil {
+		watchStop, watchDone := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			select {
+			case <-kill:
+				cancel()
+			case <-watchStop:
+			}
+		}()
+		defer func() { close(watchStop); <-watchDone }()
 	}
 
 	stopFeed := make(chan struct{})
