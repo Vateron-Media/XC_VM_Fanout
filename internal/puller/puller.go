@@ -379,6 +379,16 @@ func applyHeaders(req *http.Request, lines []string) {
 		if !ok || name == "" {
 			continue
 		}
+		// Host is the one header net/http will not take from the header map: it
+		// sends URL.Host and Request.Host is the only override. ffmpeg's
+		// -headers block DOES honour a Host line, so leaving this out made the
+		// probe and the native reader ask a different vhost than the ffmpeg
+		// fallback — and the probe could 404 a URL out of the candidate list
+		// before ffmpeg was ever given it.
+		if strings.EqualFold(name, "Host") {
+			req.Host = strings.TrimSpace(value)
+			continue
+		}
 		req.Header.Set(name, strings.TrimSpace(value))
 	}
 }
