@@ -138,6 +138,10 @@ func (v healthVerdict) failed() bool { return v.event != "" }
 // able to do) without that failure mode.
 type fpsBaseline struct {
 	peak float64
+	// zeroSince is when the current unbroken run of zero readings began, or the
+	// zero time when the last reading carried frames. A freeze is a RUN of them:
+	// see dropped.
+	zeroSince time.Time
 }
 
 func (b *fpsBaseline) observe(fps float64) {
@@ -148,7 +152,10 @@ func (b *fpsBaseline) observe(fps float64) {
 
 // dropped reports whether fps has fallen to below `threshold` of the peak.
 // A zero peak (nothing measured yet) never trips.
-func (b *fpsBaseline) dropped(fps, threshold float64) bool {
+//
+// frozenFor is how long the rate must stay at zero before the picture counts as
+// frozen; now is the moment this reading was taken.
+func (b *fpsBaseline) dropped(now time.Time, fps, threshold float64, frozenFor time.Duration) bool {
 	if b.peak <= 0 || threshold <= 0 {
 		return false
 	}
@@ -158,9 +165,42 @@ func (b *fpsBaseline) dropped(fps, threshold float64) bool {
 		// rules both out — this stream's video WAS measurable here — so 0 now
 		// means the frames stopped. That is a frozen picture, and with audio
 		// still flowing it is invisible to the stall rule.
-		return true
+		//
+		// But ONE zero window does not say that. The rate is measured over the
+		// last few seconds, and a bursty source — a live HLS origin delivers a
+		// whole segment and then says nothing until the next one, ten seconds
+		// later — empties every other window as a matter of course. Condemning
+		// that restarts a healthy channel on a cadence its own upstream sets,
+		// which is why the panel skipped 0 outright. Only a run of zeros long
+		// enough to outlast the silence this stream tolerates is a freeze.
+		if b.zeroSince.IsZero() {
+			b.zeroSince = now
+		}
+		return now.Sub(b.zeroSince) >= frozenFor
 	}
+	b.zeroSince = time.Time{}
 	return fps < b.peak*threshold
+}
+
+// defaultFreezeWindow is how long a zero frame rate must last to be a freeze
+// when the stream has no stall bound to borrow one from. Sixty seconds is the
+// longest segment duration internal/nativesrc will honour from a live playlist
+// (clampTargetDuration's maximum), so it is the longest gap a healthy bursty
+// source can leave between deliveries.
+const defaultFreezeWindow = 60 * time.Second
+
+// freezeWindow is how long the frame rate must read zero before the picture is
+// called frozen.
+//
+// It is the stall bound, which the panel derives as seg_time*6 and always sends:
+// that IS this stream's statement of how long it may say nothing, and it is the
+// cadence at which the panel's own playlist-md5 check caught a stopped encoder.
+// Anything shorter judges a freeze on less evidence than the panel used.
+func (h Health) freezeWindow() time.Duration {
+	if h.StallSec > 0 {
+		return time.Duration(h.StallSec) * time.Second
+	}
+	return defaultFreezeWindow
 }
 
 // check runs every enabled health rule against a stream's vitals and returns the
@@ -221,11 +261,12 @@ func (h Health) check(now, startedAt time.Time, v Vitals, base *fpsBaseline) hea
 
 	// Frame rate, once the stream has had its grace period to settle.
 	if h.FPSThreshold > 0 && sinceStart >= time.Duration(h.FPSGraceSec)*time.Second {
-		if base.dropped(v.FPS, h.FPSThreshold) {
+		if base.dropped(now, v.FPS, h.FPSThreshold, h.freezeWindow()) {
 			reason := fmt.Sprintf("fps %.1f fell below %.0f%% of the %.1f baseline",
 				v.FPS, h.FPSThreshold*100, base.peak)
 			if v.FPS <= 0 {
-				reason = fmt.Sprintf("no video frames at all, against a %.1f baseline", base.peak)
+				reason = fmt.Sprintf("no video frames for %s, against a %.1f baseline",
+					now.Sub(base.zeroSince).Round(time.Second), base.peak)
 			}
 			return healthVerdict{event: EventFPSDropThreshold, reason: reason}
 		}

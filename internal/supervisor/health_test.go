@@ -179,6 +179,9 @@ func TestUnmeasurableFPSIsNotADrop(t *testing.T) {
 // the fps rule exists to catch was the one it never caught: a frozen picture ran
 // on untouched. A baseline measured on THIS encoder is the proof that its video
 // was measurable, which is what the panel's playlist-md5 check had instead.
+//
+// It takes a SUSTAINED run of zeros, not one window: see
+// TestOneEmptyFPSWindowIsNotAFreeze.
 func TestAFrozenPictureIsADrop(t *testing.T) {
 	h := Health{FPSThreshold: 0.5, FPSGraceSec: 60}
 	base := &fpsBaseline{}
@@ -187,7 +190,18 @@ func TestAFrozenPictureIsADrop(t *testing.T) {
 	if got := h.check(t0.Add(90*time.Second), t0, Vitals{FPS: 25, LastData: t0.Add(90 * time.Second)}, base); got.failed() {
 		t.Fatalf("a healthy 25fps was condemned: %+v", got)
 	}
-	got := h.check(t0.Add(2*time.Minute), t0, Vitals{FPS: 0, LastData: t0.Add(2 * time.Minute)}, base)
+	// The frames stop. One empty window proves nothing — a bursty source has
+	// those — so the run of zeros has to cover the freeze window, which is 60s
+	// here, this stream having declared no stall bound of its own.
+	frozenAt := t0.Add(2 * time.Minute)
+	for _, after := range []time.Duration{0, 30 * time.Second, 59 * time.Second} {
+		at := frozenAt.Add(after)
+		if got := h.check(at, t0, Vitals{FPS: 0, LastData: at}, base); got.failed() {
+			t.Fatalf("%s into the silence: condemned before the freeze window was up: %+v", after, got)
+		}
+	}
+	at := frozenAt.Add(61 * time.Second)
+	got := h.check(at, t0, Vitals{FPS: 0, LastData: at}, base)
 	if !got.failed() || got.event != EventFPSDropThreshold {
 		t.Fatalf("verdict = %+v, want %s for a video PID that stopped", got, EventFPSDropThreshold)
 	}
@@ -196,6 +210,52 @@ func TestAFrozenPictureIsADrop(t *testing.T) {
 	warming := &fpsBaseline{peak: 25}
 	if g := h.check(t0.Add(30*time.Second), t0, Vitals{FPS: 0}, warming); g.failed() {
 		t.Fatalf("fired inside the grace window: %+v", g)
+	}
+}
+
+// TestOneEmptyFPSWindowIsNotAFreeze: the frame rate this rule judges is an
+// INSTANTANEOUS one — internal/server divides the video-frame counter's growth
+// by the time since the previous sample, and the supervisor samples every 5s —
+// so a source that arrives in bursts reads exactly 0 between them. This repo's
+// own HLS puller says as much ("a live HLS source arrives a whole segment at a
+// time and says nothing in between", ten seconds being common), and the panel's
+// ffmpeg is not paced with -re either, so its output to the ingest socket has
+// the same cadence. Condemning a single empty window restarts a healthy channel,
+// and then restarts its replacement, for ever — the panel guarded against
+// exactly this with `if (0 < $rFps)`.
+func TestOneEmptyFPSWindowIsNotAFreeze(t *testing.T) {
+	// seg_time 10 → the panel sends stall_sec = seg_time*6 = 60.
+	h := Health{StallSec: 60, FPSThreshold: 0.5, FPSGraceSec: 10}
+	base := &fpsBaseline{}
+
+	// Ten minutes of a 10s-segment source sampled every 5s: a window carrying a
+	// whole segment, then a window carrying nothing.
+	for i := 0; i < 120; i++ {
+		at := t0.Add(time.Duration(i+4) * 5 * time.Second)
+		fps := 0.0
+		if i%2 == 0 {
+			fps = 50 // 250 frames of a 10s segment, over a 5s window
+		}
+		if got := h.check(at, t0, Vitals{FPS: fps, LastData: at}, base); got.failed() {
+			t.Fatalf("tick %d (fps %.0f, %s in): a bursty but healthy source was condemned: %+v",
+				i, fps, at.Sub(t0), got)
+		}
+	}
+
+	// The rule is still armed: once the frames really stop, a run of zeros that
+	// outlasts the stream's own tolerated silence is a freeze.
+	at := t0.Add(20 * time.Minute)
+	if got := h.check(at, t0, Vitals{FPS: 50, LastData: at}, base); got.failed() {
+		t.Fatalf("a segment arrived and it was condemned anyway: %+v", got)
+	}
+	at = at.Add(5 * time.Second)
+	if got := h.check(at, t0, Vitals{FPS: 0, LastData: at}, base); got.failed() {
+		t.Fatalf("the first zero after the last segment condemned it: %+v", got)
+	}
+	at = at.Add(61 * time.Second)
+	got := h.check(at, t0, Vitals{FPS: 0, LastData: at}, base)
+	if !got.failed() || got.event != EventFPSDropThreshold {
+		t.Fatalf("verdict = %+v, want %s once the zeros outlast the stall bound", got, EventFPSDropThreshold)
 	}
 }
 
