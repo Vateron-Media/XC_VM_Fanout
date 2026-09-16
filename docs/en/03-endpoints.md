@@ -119,6 +119,7 @@ Registers a source that the daemon will pull **itself**. The body is JSON:
   "ua":     "Mozilla/5.0",
   "proxy":  "host:port",
   "cookie": "...",
+  "headers": ["Referer: http://portal/", "X-Token: ..."],
   "ffmpeg": "/usr/bin/ffmpeg",
   "chunk":  12032,
   "key":    "<hex 16 bytes, optional>",
@@ -133,6 +134,7 @@ Registers a source that the daemon will pull **itself**. The body is JSON:
 | `ua` | no | User-Agent for the request to the source. |
 | `proxy` | no | HTTP proxy `host:port`. |
 | `cookie` | no | Value of the `Cookie` header. |
+| `headers` | no | Extra request headers as raw `"Key: value"` lines, for an upstream that needs more than a User-Agent and a Cookie (a Referer gate, a vhost `Host:`, a provider token). They travel down every path: the probe, the native reader and the ffmpeg child. A source fetched with different headers is a different source, so changing them restarts the pull. |
 | `ffmpeg` | no | Path to ffmpeg (for remuxing non-mp2t sources). |
 | `backend` | no | Pins how **this** stream's non-mp2t source is converted, overriding `source_backend`: `auto`, `ffmpeg` or `native`. Omitted (the usual case) takes the node-wide setting — so send it only for a channel that needs pinning. An unknown value is ignored rather than honoured, so a typo can never take a channel off air. See [The source backend](06-configuration.md#the-source-backend). |
 | `chunk` | no | Ingest read size (aligned down to 188). |

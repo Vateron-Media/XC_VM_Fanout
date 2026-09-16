@@ -392,14 +392,14 @@ func checkSegmentIsTS(b []byte, u *url.URL) error {
 		// nothing about WHAT the upstream is, so it stays an ordinary transport
 		// failure — retried, then failed over once the threshold trips — rather
 		// than a format refusal, which would move the source to ffmpeg for good.
-		return fmt.Errorf("segment %s: %d bytes, short of one %d-byte packet", u.Redacted(), len(b), tsPacketSize)
+		return fmt.Errorf("segment %s: %d bytes, short of one %d-byte packet", redactURL(u), len(b), tsPacketSize)
 	}
 	head := b
 	if len(head) > tsSyncProbePackets*tsPacketSize {
 		head = head[:tsSyncProbePackets*tsPacketSize]
 	}
 	if !looksLikeTS(head) {
-		return fmt.Errorf("%w: segment %s", ErrHLSNotTS, u.Redacted())
+		return fmt.Errorf("%w: segment %s", ErrHLSNotTS, redactURL(u))
 	}
 	return nil
 }
@@ -532,7 +532,7 @@ func (p *hlsPuller) streamSegment(u *url.URL) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("segment %s: http %d", u.Redacted(), resp.StatusCode)
+		return fmt.Errorf("segment %s: http %d", redactURL(u), resp.StatusCode)
 	}
 	// Buffer the segment fully before writing to the pipe, so a mid-body
 	// read failure never emits a partial prefix into the live stream (which
@@ -558,7 +558,7 @@ func (p *hlsPuller) streamSegment(u *url.URL) error {
 		return err
 	}
 	if n >= maxHLSSegmentBytes {
-		return fmt.Errorf("segment %s: exceeds %d-byte cap (runaway upstream)", u.Redacted(), maxHLSSegmentBytes)
+		return fmt.Errorf("segment %s: exceeds %d-byte cap (runaway upstream)", redactURL(u), maxHLSSegmentBytes)
 	}
 	if err := checkSegmentIsTS(p.segBuf.Bytes(), u); err != nil {
 		return err
@@ -582,7 +582,7 @@ func hlsFetch(ctx context.Context, u *url.URL, opt Options, c *http.Client) ([]b
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, nil, fmt.Errorf("playlist %s: http %d", u.Redacted(), resp.StatusCode)
+		return nil, nil, fmt.Errorf("playlist %s: http %d", redactURL(u), resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistBytes))
 	if err != nil {

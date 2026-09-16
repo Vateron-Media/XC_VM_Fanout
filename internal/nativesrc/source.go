@@ -39,6 +39,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
 )
 
 // DefaultSourceIdleTimeout bounds how long a source read may stall with NO bytes
@@ -421,13 +423,15 @@ func adoptHLS(ctx context.Context, base *url.URL, opt Options, head []byte, body
 	return openHLSPullWith(ctx, base, opt, manifest)
 }
 
-// redactURL keeps a source's userinfo out of an error message. It is named for
-// the shared masker in internal/redact, which options.go imports as `redact`.
+// redactURL keeps a source's credentials out of an error message. u.Redacted()
+// alone masks only userinfo, and an XC source carries its account in the PATH
+// (/live/<username>/<password>/1234.ts) — which every one of these errors is
+// logged with, on every retry. The shared masker knows both shapes.
 func redactURL(u *url.URL) string {
 	if u == nil {
 		return "source"
 	}
-	return u.Redacted()
+	return redact.URL(u.String())
 }
 
 // tsSyncProbePackets is how many consecutive packet boundaries must carry the

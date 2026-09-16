@@ -1648,6 +1648,16 @@ type streamConfig struct {
 	Chunk  int      `json:"chunk"`
 	Key    string   `json:"key"` // hex AES-128 key for encrypted HLS (optional)
 	IV     string   `json:"iv"`  // hex AES-128-CBC IV
+	// Headers are extra request headers as raw "Key: value" lines, for an
+	// upstream that needs more than a User-Agent and a Cookie to answer (a
+	// Referer gate, a vhost Host, a provider's own token header). puller.Source
+	// has carried them down every path — probe, native reader and ffmpeg child —
+	// since it was written, but nothing could ever set them: this field is the
+	// missing wire. Omitted by a panel that has none, like every other optional
+	// key here. sameSource compares them, so changing them restarts the pull —
+	// which is right: a source fetched with different headers is a different
+	// source.
+	Headers []string `json:"headers"`
 	// Backend pins how THIS stream's non-mp2t source is converted, overriding
 	// source_backend from the config file: "auto", "ffmpeg" or "native". Empty
 	// (the usual case) takes the node-wide setting, so the panel only has to
@@ -1703,6 +1713,7 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 			UserAgent: c.UA,
 			Proxy:     c.Proxy,
 			Cookie:    c.Cookie,
+			Headers:   c.Headers,
 			FfmpegBin: c.Ffmpeg,
 			Backend:   normalizeBackend(c.Backend),
 		}, c.Chunk)
