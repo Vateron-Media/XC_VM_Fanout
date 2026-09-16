@@ -197,6 +197,18 @@ func hlsIdleBound(pl *hlsPlaylist) time.Duration {
 	return d
 }
 
+// hlsPollWait is how long to wait before re-fetching the manifest. The spec says
+// a client should poll at most every target duration; half of it keeps latency
+// down without hammering the upstream, and the 1s floor covers a playlist that
+// advertises no target duration at all.
+func hlsPollWait(pl *hlsPlaylist) time.Duration {
+	wait := pl.TargetDuration / 2
+	if wait < 1 {
+		wait = 1
+	}
+	return time.Duration(wait) * time.Second
+}
+
 // hlsLiveStartSegments is how many of a live playlist's newest segments a pull
 // starts with — ffmpeg's default live_start_index of -3.
 const hlsLiveStartSegments = 3
@@ -285,15 +297,8 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 		if pl.Endlist && !stalled {
 			return // VOD: source-side ended.
 		}
-		// Sleep before re-fetching the manifest. HLS spec says clients
-		// should poll at most every target_duration; / 2 is reasonable
-		// for live and gives us low latency without hammering the
-		// upstream.
-		wait := pl.TargetDuration / 2
-		if wait < 1 {
-			wait = 1
-		}
-		t := time.NewTimer(time.Duration(wait) * time.Second)
+		// Sleep before re-fetching the manifest.
+		t := time.NewTimer(hlsPollWait(pl))
 		select {
 		case <-p.ctx.Done():
 			t.Stop()
@@ -534,7 +539,7 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 		case line == "#EXTM3U":
 			continue
 		case strings.HasPrefix(line, "#EXT-X-TARGETDURATION:"):
-			pl.TargetDuration = atoiSafe(line[len("#EXT-X-TARGETDURATION:"):])
+			pl.TargetDuration = clampTargetDuration(atoiSafe(line[len("#EXT-X-TARGETDURATION:"):]))
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.Endlist = true
 		case strings.HasPrefix(line, "#EXT-X-KEY:"):
@@ -680,4 +685,30 @@ func resolveURI(base *url.URL, raw string) (*url.URL, error) {
 func atoiSafe(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))
 	return n
+}
+
+// Bounds on a playlist's advertised #EXT-X-TARGETDURATION. Both the poll cadence
+// and the stall bound are derived from it, so an unbounded value is an unbounded
+// timer: `#EXT-X-TARGETDURATION:9223372036854775807` overflowed
+// time.Duration to a NEGATIVE poll wait, so the timer fired at once and the
+// puller re-fetched the manifest in a tight loop against the provider; an
+// upstream writing milliseconds (6000) put the polls 50 minutes apart under a
+// five-hour stall bound, so the channel played its first segments and then sat
+// frozen for hours with the watchdog asleep. 60s is well past any real live
+// target duration (10s is typical, 6s common), and anything outside the range is
+// a broken value rather than a cadence, so it falls back to the usual one.
+const (
+	maxTargetDuration     = 60
+	defaultTargetDuration = 10
+)
+
+// clampTargetDuration keeps a parsed target duration inside those bounds. A
+// playlist with NO target duration tag keeps 0 — that is the absence of a value,
+// not a broken one, and it already has its own floor (a 1s poll, the default
+// stall bound).
+func clampTargetDuration(v int) int {
+	if v < 1 || v > maxTargetDuration {
+		return defaultTargetDuration
+	}
+	return v
 }
