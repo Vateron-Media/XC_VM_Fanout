@@ -76,7 +76,33 @@ func (m *Manager) sample(id string) (supervisor.Vitals, bool) {
 	s.mu.Lock()
 	prev := s.samples[id]
 	cur := &vitalsSample{at: now, audioPkts: audio, videoFrames: video}
-	if prev != nil {
+	switch {
+	case prev != nil && (video < prev.videoFrames || audio < prev.audioPkts):
+		// A counter that went BACKWARDS is not a collapse, it is a different
+		// stream. These counters live on the hub's join state and are only ever
+		// incremented (never reset, not even by State.Reset), so the only way
+		// they fall is that the Stream behind this id was torn down and
+		// re-created — a panel re-registration, a teardown then the next viewer.
+		// Nothing drops this sample on that path (forget is only called by
+		// PUT/DELETE /monitor), and differencing across the boundary handed the
+		// supervisor a large negative frame rate. health.go reads any fps <= 0 as
+		// "the frames stopped" once the encoder has shown a peak, so a working
+		// encoder was restarted for a teardown that had nothing to do with it.
+		//
+		// Re-baseline here, exactly as metaCache does for publishedBytes: start
+		// the window again on the new counters and keep the last rate measured,
+		// which is still this encoder's real one — the encoder outlives the
+		// Stream, and a restarted one gets a fresh fpsBaseline anyway.
+		cur.fps = prev.fps
+		if hasAudio && audio > 0 {
+			// Same reading as a first sample: audio is present NOW. Leaving
+			// prev.lastAudio would freeze it (the new counter can never be
+			// "greater than" the old one) and the audio-loss rule would fire on a
+			// healthy channel; a zero lastAudio, when nothing has arrived yet, is
+			// what that rule already reads as "nothing to lose".
+			cur.lastAudio = now
+		}
+	case prev != nil:
 		cur.lastAudio, cur.fps = prev.lastAudio, prev.fps
 
 		if audio > prev.audioPkts {
@@ -91,7 +117,7 @@ func (m *Manager) sample(id string) (supervisor.Vitals, bool) {
 			cur.at = prev.at
 			cur.audioPkts, cur.videoFrames = prev.audioPkts, prev.videoFrames
 		}
-	} else if hasAudio && audio > 0 {
+	case hasAudio && audio > 0:
 		// First sample of a stream that already carries audio: treat it as
 		// present now rather than as missing since the epoch.
 		cur.lastAudio = now
