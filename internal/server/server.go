@@ -74,6 +74,13 @@ type Stream struct {
 	cancel      context.CancelFunc
 	refs        int  // live TS viewers currently connected
 	buffered    bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
+	// removed is set by Unregister once this Stream has left the registry, and is
+	// never cleared: a Stream is single-use. Register and RegisterIngest look a
+	// stream up and configure it in two steps, so a teardown landing in between
+	// left them holding a pointer the registry no longer contained — and a puller
+	// or ingest listener started on it was unreachable by the reaper, by DELETE
+	// and by /connections, i.e. leaked for the life of the daemon.
+	removed bool
 
 	ingestLn   net.Listener // non-nil = push-fed: the producer (ffmpeg tee) connects here
 	ingestSock string       // path of the ingest listener socket (for cleanup)
@@ -322,6 +329,9 @@ func (s *Stream) connRates() map[string]int {
 // (the stream's ffmpeg `-f tee … unix:<sockPath>` output) connects; the daemon
 // accepts and reads. Idempotent. Caller holds s.mu.
 func (s *Stream) startIngestLocked(sockPath string, chunk int) error {
+	if s.removed {
+		return errStreamRemoved // nothing could reach what this listener would feed
+	}
 	if s.ingestLn != nil {
 		return nil // already listening
 	}
@@ -432,11 +442,16 @@ func (s *Stream) Publish(chunk []byte) {
 	s.Hub.Publish(chunk)
 }
 
-// setConfig registers/updates the pull config; if viewers are already waiting it
-// starts the puller immediately.
-func (s *Stream) setConfig(src puller.Source, chunk int) {
+// setConfig registers/updates the pull config; if viewers are already waiting,
+// or a puller is already running on a source that just changed, it (re)starts the
+// puller. It reports false — applying nothing — when the stream has already left
+// the registry, so the caller can retry on a fresh one.
+func (s *Stream) setConfig(src puller.Source, chunk int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.removed {
+		return false
+	}
 	changed := s.cfg != nil && !sameSource(*s.cfg, src)
 	c := src
 	s.cfg = &c
@@ -464,6 +479,7 @@ func (s *Stream) setConfig(src puller.Source, chunk int) {
 	case s.refs > 0:
 		s.startLocked() // viewers are already waiting on a stream that was not pulling
 	}
+	return true
 }
 
 // sameSource reports whether two registrations describe the same pull — every
@@ -475,7 +491,7 @@ func sameSource(a, b puller.Source) bool {
 }
 
 func (s *Stream) startLocked() {
-	if s.running || s.cfg == nil {
+	if s.removed || s.running || s.cfg == nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1140,13 +1156,35 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 // that was registered before it. What is recorded here is whether the panel
 // pinned a backend for this one stream, which is the only thing registration
 // can know that the start cannot.
+//
+// The lookup and the config are two steps, so a DELETE for the same id can tear
+// the stream down in between — the panel re-registers on every request, so the
+// two really do overlap. setConfig refuses the stream it took out of the
+// registry; registering again picks up the fresh one GetOrCreate then makes.
 func (m *Manager) Register(id string, src puller.Source, chunk int) {
-	st := m.GetOrCreate(id)
-	st.mu.Lock()
-	st.pinnedBackend = src.Backend
-	st.mu.Unlock()
-	st.setConfig(src, chunk)
+	for attempt := 0; attempt < registerAttempts; attempt++ {
+		st := m.GetOrCreate(id)
+		st.mu.Lock()
+		st.pinnedBackend = src.Backend
+		st.mu.Unlock()
+		if st.setConfig(src, chunk) {
+			return
+		}
+	}
+	dlog.Logf("ctl", "id=%s registration lost to concurrent teardowns %d times: not registered", id, registerAttempts)
 }
+
+// registerAttempts bounds the Register/RegisterIngest retry when a teardown takes
+// the stream out of the registry between the lookup and the start. A single
+// racing DELETE needs one retry; the bound is what keeps a storm of them from
+// spinning here instead of answering the request.
+const registerAttempts = 4
+
+// errStreamRemoved reports that a Stream has left the registry, so nothing may be
+// started on it: whatever it started — a puller holding a provider connection, an
+// ingest listener feeding a closed hub — would be unreachable for the life of the
+// daemon.
+var errStreamRemoved = errors.New("stream was unregistered")
 
 // backend returns the node-wide source backend.
 func (m *Manager) backend() string {
@@ -1200,16 +1238,26 @@ func (m *Manager) RegisterIngest(id string, chunk int) (string, error) {
 		return "", errors.New("ingest dir not set")
 	}
 	sock := filepath.Join(m.ingestDir, id+".sock")
-	st := m.GetOrCreate(id)
-	st.mu.Lock()
-	err := st.startIngestLocked(sock, chunk)
-	st.mu.Unlock()
-	if err != nil {
-		dlog.Logf("ingest", "id=%s listen failed on %s: %v", id, sock, err)
-		return "", err
+	// Same two-step window as Register: a DELETE between the lookup and the
+	// listen used to re-open <id>.sock on a Stream the registry had just dropped,
+	// so the producer connected to an orphan and its accept goroutine leaked.
+	for attempt := 0; attempt < registerAttempts; attempt++ {
+		st := m.GetOrCreate(id)
+		st.mu.Lock()
+		err := st.startIngestLocked(sock, chunk)
+		st.mu.Unlock()
+		if errors.Is(err, errStreamRemoved) {
+			continue // torn down under us; the next GetOrCreate makes a fresh one
+		}
+		if err != nil {
+			dlog.Logf("ingest", "id=%s listen failed on %s: %v", id, sock, err)
+			return "", err
+		}
+		dlog.Logf("ingest", "id=%s listening on %s", id, sock)
+		return sock, nil
 	}
-	dlog.Logf("ingest", "id=%s listening on %s", id, sock)
-	return sock, nil
+	dlog.Logf("ingest", "id=%s listen lost to concurrent teardowns %d times: not listening", id, registerAttempts)
+	return "", errStreamRemoved
 }
 
 // Unregister stops and removes a control-managed stream (pull or ingest).
@@ -1221,9 +1269,24 @@ func (m *Manager) RegisterIngest(id string, chunk int) (string, error) {
 // never publish again, pinning the Stream, its hub and its whole ring. Waking the
 // followers (CloseAll) lets each serveLive return and run its deferred cleanup, so
 // the viewer reconnects (and re-authorises) instead of freezing on an orphan.
+//
+// The stream leaves the registry FIRST, in one step under m.mu, and is only then
+// torn down. Deleting it last left two holes. A Register that had already looked
+// the id up went on to configure and start the doomed Stream, so a puller kept an
+// upstream connection open on something the reaper, DELETE and /connections can
+// no longer see; the `removed` flag is what closes that, and the delete-first
+// order is what makes it reliable — by the time the flag is set the entry is
+// already gone, so the racing Register's retry cannot find the corpse again. And
+// a second teardown of the same id could delete an entry that a PUT had created
+// after it started, dropping a live registration nobody had torn down.
 func (m *Manager) Unregister(id string) {
-	if st := m.Get(id); st != nil {
+	m.mu.Lock()
+	st := m.streams[id]
+	delete(m.streams, id)
+	m.mu.Unlock()
+	if st != nil {
 		st.mu.Lock()
+		st.removed = true
 		st.cfg = nil
 		st.stopLocked()
 		st.stopIngestLocked()
@@ -1235,9 +1298,6 @@ func (m *Manager) Unregister(id string) {
 		}
 		st.dropSegCache()
 	}
-	m.mu.Lock()
-	delete(m.streams, id)
-	m.mu.Unlock()
 	dlog.Logf("ctl", "id=%s unregistered and removed", id)
 }
 
