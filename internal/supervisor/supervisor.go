@@ -897,6 +897,21 @@ func (st *stream) markFallback(v bool) {
 	st.mu.Unlock()
 }
 
+// rememberFallback leaves the same sticky note switchToFallback does — source
+// idx is served by its FallbackCmd from now on — for a conclusion reached
+// another way. A survivor found running a source's FallbackCmd is proof that the
+// previous daemon had already run that source's own Cmd and been told, with
+// ExitUnsupported, that it cannot serve it; that does not become untrue because
+// this daemon did not witness it.
+func (st *stream) rememberFallback(idx int) {
+	st.mu.Lock()
+	if st.fallback == nil {
+		st.fallback = make(map[int]bool)
+	}
+	st.fallback[idx] = true
+	st.mu.Unlock()
+}
+
 // recordTick stores what the watchdog just measured, for DebugLines.
 func (st *stream) recordTick(now time.Time, v Vitals, peak float64) {
 	st.mu.Lock()
@@ -1019,6 +1034,12 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, bool, err
 		if idx, fb, ok := matchRunningSource(cmdline, spec.Sources); ok {
 			st.switchTo(idx)
 			st.markFallback(fb)
+			if fb {
+				// Not just "this process is a fallback": the source itself is
+				// one from here on, or the next restart relaunches the command
+				// the previous daemon had already proved cannot serve it.
+				st.rememberFallback(idx)
+			}
 			if s, ok := st.sourceAt(idx); ok {
 				src = s
 			}
