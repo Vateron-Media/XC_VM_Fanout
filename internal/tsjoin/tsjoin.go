@@ -432,6 +432,15 @@ func (s *State) Update(chunk []byte) {
 			if len(s.gops) > 0 {
 				s.noKeyframeCuts++
 			}
+			// A cadence is only a cadence while the source still produces the
+			// blocks it was measured between. This block was cut by the byte cap,
+			// not by a random-access point, and such a block can span minutes;
+			// capping its step at the keyframe cadence the source USED to have
+			// froze the ring clock against real elapsed time, so the ring stopped
+			// ageing and grew until the byte backstop caught it. Forgetting the
+			// cadence here puts this source back in the case ringClock already
+			// documents: no cadence known, so a forward step is taken in full.
+			s.clockStep = 0
 			id := s.nextGOPID
 			s.nextGOPID++
 			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: s.ringClock(), pts: -1})
