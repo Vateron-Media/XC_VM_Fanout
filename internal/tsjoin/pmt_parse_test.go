@@ -23,11 +23,11 @@ func radioPMT(pmtPID, audioPID int, crc [4]byte) []byte {
 	p[3] = 0x10 // payload only
 	p[4] = 0x00 // pointer_field
 	sec := p[5:]
-	sec[0] = 0x02               // table_id (PMT)
-	sec[1], sec[2] = 0xb0, 0x12 // section_length = 18: sec[3]..the CRC
-	sec[3], sec[4] = 0x00, 0x01 // program_number
-	sec[5] = 0xc1               // version, current_next
-	sec[6], sec[7] = 0x00, 0x00 // section_number, last_section_number
+	sec[0] = 0x02                                                  // table_id (PMT)
+	sec[1], sec[2] = 0xb0, 0x12                                    // section_length = 18: sec[3]..the CRC
+	sec[3], sec[4] = 0x00, 0x01                                    // program_number
+	sec[5] = 0xc1                                                  // version, current_next
+	sec[6], sec[7] = 0x00, 0x00                                    // section_number, last_section_number
 	sec[8], sec[9] = byte(0xe0|(audioPID>>8)&0x1f), byte(audioPID) // PCR_PID
 	sec[10], sec[11] = 0xf0, 0x00                                  // program_info_length = 0
 	sec[12] = 0x0f                                                 // stream_type: AAC

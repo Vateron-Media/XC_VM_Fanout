@@ -53,7 +53,7 @@ func TestSnapshotPicksPatPmtAndGopFromKeyframe(t *testing.T) {
 		7: 0x0d, // section_length: the section header and CRC, no ES loop
 	})
 	key := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x30, 4: 0x07, 5: 0x40}) // AFC=3, adaptLen=7, RAI set
-	non := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x10})                    // payload only, no RAI
+	non := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x10})                   // payload only, no RAI
 
 	s := New(10*1024*1024, 0)
 	// Pre-keyframe PAT/PMT land in the GOP but must be wiped by the keyframe reset.
@@ -110,7 +110,7 @@ func keyPCR(pcr90 int64) []byte {
 }
 
 func TestSnapshotPrebufferRewindsByPCR(t *testing.T) {
-	const tick = 90000        // 1s in 90 kHz PCR ticks
+	const tick = 90000             // 1s in 90 kHz PCR ticks
 	s := New(10*1024*1024, 10_000) // retain 10s of history
 	filler := pkt(map[int]byte{1: 0x01, 2: 0x01, 3: 0x10})
 

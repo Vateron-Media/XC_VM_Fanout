@@ -94,11 +94,11 @@ func annexB(nals ...[]byte) []byte {
 // parser that ignores cropping reports the wrong number to the panel.
 func TestH264PictureSize(t *testing.T) {
 	cases := []struct {
-		name          string
-		wMBs, hMBs    uint
-		frameOnly     bool
-		cropR, cropB  uint
-		wantW, wantH  int
+		name         string
+		wMBs, hMBs   uint
+		frameOnly    bool
+		cropR, cropB uint
+		wantW, wantH int
 	}{
 		{"720x576 SD, no cropping", 45, 36, true, 0, 0, 720, 576},
 		{"1280x720", 80, 45, true, 0, 0, 1280, 720},

@@ -278,10 +278,10 @@ func New(launch Launcher, hasData func(id string, since time.Time) bool) *Superv
 		hasData = func(string, time.Time) bool { return true }
 	}
 	return &Supervisor{
-		procs:      make(map[string]*stream),
-		idLocks:    make(map[string]*sync.Mutex),
-		launch:     launch,
-		hasData:    hasData,
+		procs:          make(map[string]*stream),
+		idLocks:        make(map[string]*sync.Mutex),
+		launch:         launch,
+		hasData:        hasData,
 		now:            time.Now,
 		sleep:          sleepCtx,
 		healthTick:     5 * time.Second,
