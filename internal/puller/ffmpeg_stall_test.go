@@ -20,16 +20,21 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
 )
 
-// encryptedHLS serves an AES-128 HLS playlist — the canonical thing the native
-// reader refuses and hands to ffmpeg — classified by content-type rather than
-// by a ".m3u8" extension. nativesrc.AdoptHTTP exists exactly because upstreams
-// serve playlists under arbitrary paths.
-func encryptedHLS(t *testing.T) *httptest.Server {
+// refusedHLS serves an HLS playlist the native reader will not take — SAMPLE-AES,
+// which encrypts inside the elementary streams and so needs a demuxer nativesrc
+// does not have — so the pull falls back to ffmpeg. Classified by content-type
+// rather than by a ".m3u8" extension, because nativesrc.AdoptHTTP exists exactly
+// because upstreams serve playlists under arbitrary paths.
+//
+// It used to be AES-128. That is no longer refused: nativesrc fetches the key the
+// playlist names and decrypts the segments itself, which is the point of the
+// feature — so a fixture built on it would silently stop testing the fallback.
+func refusedHLS(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n" +
-			"#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n" +
+			"#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"key.bin\"\n" +
 			"#EXTINF:10.0,\ns0.ts\n#EXTINF:10.0,\ns1.ts\n"))
 	}))
 	t.Cleanup(srv.Close)
@@ -69,7 +74,7 @@ func TestFfmpegHLSStallBoundWithoutM3U8Extension(t *testing.T) {
 	// Long enough to trip the 8s bound (whose watchdog ticks every 8s/3), short
 	// enough to sit well inside the HLS bound.
 	const gap = 12 * time.Second
-	srv := encryptedHLS(t)
+	srv := refusedHLS(t)
 	bin, payload := burstyFfmpeg(t, gap)
 
 	var mu sync.Mutex

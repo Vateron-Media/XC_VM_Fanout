@@ -8,6 +8,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,9 +18,11 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
 )
 
 // newPullClient builds the client for manifest and segment fetches. Unlike the
@@ -186,6 +191,7 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		client: client,
 		opt:    opt,
 		seen:   map[string]bool{},
+		keys:   map[string][]byte{},
 		pw:     pw,
 	}).run(pl)
 	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl), cancel: cancel}, nil
@@ -267,6 +273,14 @@ type hlsPuller struct {
 	stallKey   string
 	stallTries int
 
+	// keys caches the AES-128 keys the playlist names, by URI. A live upstream
+	// names the same key on every segment of a window and often for the whole
+	// channel, so fetching it per segment would double the requests for nothing;
+	// a re-key simply appears under a new URI. Guarded because the fetch happens
+	// on the puller goroutine but the map outlives any single pass.
+	keys   map[string][]byte
+	keysMu sync.Mutex
+
 	// segBuf stages one segment body at a time. run() is the only goroutine that
 	// touches it and pw.Write blocks until the consumer has drained what it was
 	// handed, so the buffer is free again by the next iteration. Allocating it per
@@ -304,7 +318,7 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			if p.streamed(pl, i) {
 				continue
 			}
-			if err := p.streamSegment(seg.URI); err != nil {
+			if err := p.streamSegment(seg, pl.MediaSequence+int64(i)); err != nil {
 				// A segment body that is not MPEG-TS says the upstream is
 				// something this package cannot pass through — but ONE of them
 				// does not. An origin over its connection limit answers a
@@ -426,7 +440,11 @@ func servable(pl *hlsPlaylist) error {
 		// Distinct sentinel so the caller can tell "this upstream is fMP4" apart
 		// from a generic refusal — it is worth seeing in a log.
 		return ErrHLSIsFMP4
-	case pl.Encrypted:
+	case pl.Encrypted && !pl.everyKeyIsAES128():
+		// AES-128 this package decrypts (it fetches the key the playlist names);
+		// SAMPLE-AES and friends encrypt inside the elementary streams, which
+		// needs a demuxer this package does not have. A key line with no URI is
+		// unusable for the same practical purpose.
 		return ErrHLSEncrypted
 	case pl.HasByteRange:
 		// Segments are ranges of one resource. streamSegment sends no Range
@@ -643,7 +661,8 @@ func retainSeenInWindow(seen map[string]bool, pl *hlsPlaylist) map[string]bool {
 	return next
 }
 
-func (p *hlsPuller) streamSegment(u *url.URL) error {
+func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
+	u := seg.URI
 	req, err := http.NewRequestWithContext(p.ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return err
@@ -683,11 +702,58 @@ func (p *hlsPuller) streamSegment(u *url.URL) error {
 	if n >= maxHLSSegmentBytes {
 		return fmt.Errorf("segment %s: exceeds %d-byte cap (runaway upstream)", redactURL(u), maxHLSSegmentBytes)
 	}
-	if err := checkSegmentIsTS(p.segBuf.Bytes(), u); err != nil {
+	body := p.segBuf.Bytes()
+	if seg.Key != nil {
+		// Decrypt in place, before anything looks at the bytes: ciphertext never
+		// looks like MPEG-TS, so the sync-byte check below would refuse every
+		// segment of a perfectly good encrypted upstream. The plaintext goes to
+		// the ring exactly as a clear source's would — whether the daemon then
+		// RE-encrypts what it serves is the panel's own encrypt_hls setting,
+		// decided per stream in internal/server, and has nothing to do with this.
+		key, kerr := p.keyFor(seg.Key)
+		if kerr != nil {
+			return kerr
+		}
+		plain, derr := hlscrypt.DecryptCBC(body, key, seg.Key.iv(seq))
+		if derr != nil {
+			return fmt.Errorf("segment %s: %w", redactURL(u), derr)
+		}
+		body = plain
+	}
+	if err := checkSegmentIsTS(body, u); err != nil {
 		return err
 	}
-	_, err = p.pw.Write(p.segBuf.Bytes())
+	_, err = p.pw.Write(body)
 	return err
+}
+
+// keyFor returns the AES-128 key bytes for k, fetching them once per URI.
+//
+// The key is fetched with the source's own client, headers and proxy: an
+// upstream that gates its segments on a Referer or a token gates the key the
+// same way, and a key fetched from the node's own IP when the segments go
+// through a proxy would be the one request that gives the node away.
+func (p *hlsPuller) keyFor(k *hlsKey) ([]byte, error) {
+	id := k.URI.String()
+	p.keysMu.Lock()
+	cached, ok := p.keys[id]
+	p.keysMu.Unlock()
+	if ok {
+		return cached, nil
+	}
+	body, _, err := hlsFetch(p.ctx, k.URI, p.opt, p.client)
+	if err != nil {
+		return nil, fmt.Errorf("key %s: %w", redactURL(k.URI), err)
+	}
+	if len(body) != aes.BlockSize {
+		// An origin that answers a key URI with an error page is the common way
+		// to get here, so say what arrived rather than just "bad key".
+		return nil, fmt.Errorf("key %s: %d bytes, want %d", redactURL(k.URI), len(body), aes.BlockSize)
+	}
+	p.keysMu.Lock()
+	p.keys[id] = body
+	p.keysMu.Unlock()
+	return body, nil
 }
 
 // hlsFetch GETs a playlist URL and returns the body plus the URL that
@@ -740,8 +806,8 @@ type hlsPlaylist struct {
 	// so it cannot serve one of those.
 	HasByteRange bool
 	MapURI       *url.URL // EXT-X-MAP target (fMP4 init)
-	Segments       []hlsSegment
-	Variants       []hlsVariant
+	Segments     []hlsSegment
+	Variants     []hlsVariant
 	// DemuxedAudio holds the GROUP-IDs of #EXT-X-MEDIA TYPE=AUDIO renditions
 	// that carry their OWN URI. Per RFC 8216 such a rendition lives outside the
 	// variant, so a variant referencing one has video-only segments.
@@ -762,9 +828,56 @@ func (pl *hlsPlaylist) audioIsElsewhere(group string) bool {
 	return pl.DemuxedAudio[group] && !pl.MuxedAudio[group]
 }
 
+// everyKeyIsAES128 reports whether every segment this playlist lists is either
+// in the clear or AES-128 encrypted with a key we know where to fetch. One
+// segment we cannot read is a hole in the channel, so the whole playlist is
+// refused and ffmpeg takes it.
+func (pl *hlsPlaylist) everyKeyIsAES128() bool {
+	for _, seg := range pl.Segments {
+		if seg.Key != nil && !seg.Key.aes128() {
+			return false
+		}
+	}
+	return true
+}
+
 type hlsSegment struct {
 	URI      *url.URL
 	Duration float64
+	// Key is the #EXT-X-KEY in force for this segment, or nil when it is in the
+	// clear. An upstream may re-key mid-window, and METHOD=NONE switches back
+	// off, so the key belongs to the segment rather than to the playlist.
+	Key *hlsKey
+}
+
+// hlsKey is one #EXT-X-KEY line: how the segments that follow it are encrypted,
+// where to fetch the key, and the IV to use if the line names one.
+//
+// AES-128 is the whole of what this package decrypts — the panel's own scheme,
+// and what an ordinary IPTV upstream serves. SAMPLE-AES encrypts inside the
+// elementary streams rather than the segment, so it needs a demuxer this
+// package does not have, and it stays a refusal that routes to ffmpeg.
+type hlsKey struct {
+	Method string   // as written, upper-cased: AES-128, SAMPLE-AES, …
+	URI    *url.URL // resolved against the playlist
+	IV     []byte   // 16 bytes from IV=0x…, or nil to derive it from the sequence
+}
+
+// aes128 reports whether this key is the one flavour we can read.
+func (k *hlsKey) aes128() bool { return k != nil && k.Method == "AES-128" }
+
+// iv returns the initialisation vector for the segment at media sequence seq.
+// An explicit IV= on the key wins; otherwise RFC 8216 §5.2 says the sequence
+// number, big-endian, in the low 8 bytes of the block — which is what every
+// encoder that omits IV expects, and getting it wrong yields plausible-looking
+// garbage rather than an error.
+func (k *hlsKey) iv(seq int64) []byte {
+	if len(k.IV) == aes.BlockSize {
+		return k.IV
+	}
+	var iv [aes.BlockSize]byte
+	binary.BigEndian.PutUint64(iv[8:], uint64(seq))
+	return iv[:]
 }
 
 type hlsVariant struct {
@@ -785,6 +898,7 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 	var pendingDur float64
 	var pendingBW int
 	var pendingAudio string
+	var curKey *hlsKey // the #EXT-X-KEY in force, carried down the segment list
 	expectVariantURI := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -813,11 +927,36 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 		case strings.HasPrefix(line, "#EXT-X-KEY:"):
 			// METHOD=NONE switches encryption back off for what follows; any
 			// other method (AES-128, SAMPLE-AES…) means ciphertext segments.
+			// The key applies to every segment until the next #EXT-X-KEY, so it
+			// is carried forward rather than recorded once for the playlist.
+			key := &hlsKey{}
 			for _, kv := range splitAttrs(strings.TrimPrefix(line, "#EXT-X-KEY:")) {
-				if m, ok := strings.CutPrefix(kv, "METHOD="); ok && !strings.EqualFold(strings.Trim(m, `"`), "NONE") {
-					pl.Encrypted = true
+				switch {
+				case strings.HasPrefix(kv, "METHOD="):
+					key.Method = strings.ToUpper(strings.Trim(strings.TrimPrefix(kv, "METHOD="), `"`))
+				case strings.HasPrefix(kv, "URI="):
+					if u, err := resolveURI(base, strings.Trim(strings.TrimPrefix(kv, "URI="), `"`)); err == nil {
+						key.URI = u
+					}
+				case strings.HasPrefix(kv, "IV="):
+					raw := strings.Trim(strings.TrimPrefix(kv, "IV="), `"`)
+					raw = strings.TrimPrefix(strings.TrimPrefix(raw, "0x"), "0X")
+					if b, err := hex.DecodeString(raw); err == nil && len(b) == aes.BlockSize {
+						key.IV = b
+					}
 				}
 			}
+			if key.Method == "" || key.Method == "NONE" {
+				curKey = nil
+				break
+			}
+			pl.Encrypted = true
+			// A key we cannot fetch is a key we cannot use: servable() refuses
+			// the playlist rather than letting the pull discover it per segment.
+			if key.URI == nil {
+				key.Method = "" // unusable; servable reports it as unreadable
+			}
+			curKey = key
 		case strings.HasPrefix(line, "#EXT-X-MAP:"):
 			pl.HasFMP4 = true
 			for _, kv := range splitAttrs(strings.TrimPrefix(line, "#EXT-X-MAP:")) {
@@ -886,7 +1025,7 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 			if strings.HasSuffix(low, ".m4s") || strings.HasSuffix(low, ".mp4") {
 				pl.HasFMP4 = true
 			}
-			pl.Segments = append(pl.Segments, hlsSegment{URI: u, Duration: pendingDur})
+			pl.Segments = append(pl.Segments, hlsSegment{URI: u, Duration: pendingDur, Key: curKey})
 			pendingDur = 0
 		}
 	}

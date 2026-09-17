@@ -20,7 +20,10 @@ import (
 // ffmpeg fallback, and it must also still read as the generic refusal.
 func TestFormatRefusalsAreFormat(t *testing.T) {
 	fmp4 := newHLSServer(t, "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\ns0.m4s\n", nil)
-	enc := newHLSServer(t, "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\"\n#EXTINF:2.0,\ns0.ts\n", nil)
+	// SAMPLE-AES encrypts inside the elementary streams, so it needs a demuxer
+	// this package does not have and stays a format refusal. AES-128 is no longer
+	// one: the key is fetched and the segments decrypted (see hls_aes_test.go).
+	enc := newHLSServer(t, "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"k.bin\"\n#EXTINF:2.0,\ns0.ts\n", nil)
 	// A body that positively identifies as ANOTHER container is the case
 	// ErrFormat is for: retrying cannot make an MP4 into MPEG-TS, and ffmpeg
 	// remuxes it. (A text/html "max connections" page is NOT this case — it is a
@@ -36,7 +39,7 @@ func TestFormatRefusalsAreFormat(t *testing.T) {
 		{"rtmp scheme", "rtmp://host/app/stream"},
 		{"srt scheme", "srt://host:9000"},
 		{"fmp4 hls", fmp4.URL + "/index.m3u8"},
-		{"encrypted hls", enc.URL + "/index.m3u8"},
+		{"sample-aes hls", enc.URL + "/index.m3u8"},
 		{"not a stream", mp4.URL + "/live"},
 	} {
 		_, err := Open(context.Background(), c.url, Options{})
@@ -92,8 +95,9 @@ func TestKeyMethodNoneIsClear(t *testing.T) {
 }
 
 // TestPlaylistTurningEncryptedEndsThePull: a live playlist that switches on
-// encryption mid-life ends the pull with the format refusal rather than
-// streaming ciphertext to viewers.
+// encryption this package cannot read mid-life ends the pull with the format
+// refusal rather than streaming ciphertext to viewers. (AES-128 is the case it
+// CAN read: TestAnAES128SwitchMidPullKeepsStreaming covers that one.)
 func TestPlaylistTurningEncryptedEndsThePull(t *testing.T) {
 	calls := 0
 	var srv *httptest.Server
@@ -106,7 +110,7 @@ func TestPlaylistTurningEncryptedEndsThePull(t *testing.T) {
 				_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\ns0.ts\n")
 				return
 			}
-			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:1.0,\ns1.ts\n")
+			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"k\"\n#EXTINF:1.0,\ns1.ts\n")
 		default:
 			_, _ = w.Write(tsSegment(0))
 		}
