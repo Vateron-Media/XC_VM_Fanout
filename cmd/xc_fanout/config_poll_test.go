@@ -75,7 +75,7 @@ func TestPollConfigRetriesAfterAFailedLoad(t *testing.T) {
 	app := &recordingApplier{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pollConfig(ctx, path, time.Second, app, nil)
+	go pollConfig(ctx, path, time.Second, app, nil, false)
 
 	time.Sleep(1500 * time.Millisecond) // let the first tick fail on the malformed file
 	if n := app.count(); n != 0 {
@@ -134,7 +134,7 @@ func TestPollConfigKeepsBootTuningWhenTheFileIsDeletedEarly(t *testing.T) {
 	app := &recordingApplier{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pollConfig(ctx, path, time.Second, app, &boot)
+	go pollConfig(ctx, path, time.Second, app, &boot, false)
 
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {

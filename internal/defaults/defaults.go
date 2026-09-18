@@ -186,6 +186,10 @@ const (
 	// node's encoders is an operator decision, not a default — and because the
 	// panel must be configured to hand them over for it to do anything at all.
 	CfgSupervise = false
+	// CfgDebugCats is the default debug selection written into a fresh config:
+	// empty, i.e. off. The panel turns it on live through the fanout_debug
+	// setting (FanoutConfig::desired → debug_cats). See dlog.EnableCats.
+	CfgDebugCats = ""
 	// CfgMemLimitMB is an explicit ceiling (MiB) for the Go soft memory limit,
 	// 0 = derive it from the cgroup/host budget (see MemLimitFraction). The daemon
 	// usually shares a panel box with nginx, MySQL, PHP-FPM and the streams' own

@@ -119,8 +119,13 @@ func main() {
 	// it always was, and a category list narrows it. That matters on a node with
 	// hundreds of channels, where the full narration is too much to read and the
 	// interesting subsystem is buried in it.
+	// debugPinned records that the CLI or environment asked for debug. When set,
+	// the panel's debug_cats config key is ignored, so a developer running with
+	// -debug is never quietly turned off by whatever the node's config says.
+	debugPinned := false
 	if cats := debugSpec(*debug, *debugCats, os.Getenv("XC_FANOUT_DEBUG")); cats != "" {
 		dlog.EnableCats(cats)
+		debugPinned = true
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 		if on := dlog.Cats(); len(on) > 0 {
 			dlog.Logf("boot", "debug mode on (categories: %s); version=%s pid=%d", strings.Join(on, ","), buildVersion(), os.Getpid())
@@ -156,6 +161,11 @@ func main() {
 		}
 	}
 
+	// Debug narration can be set by the panel through config.json (debug_cats),
+	// so a fresh boot on a node the operator has left in debug comes up narrating
+	// — no flag, no restart. Skipped when the CLI already pinned it.
+	applyDebugCats(cfg.DebugCats, debugPinned)
+
 	// Bound the runtime's memory footprint: a soft heap limit from the operator's
 	// budget (or the cgroup/host one), plus the periodic idle-heap scavenge below
 	// so freed pages actually return to the OS. Both are O(1) in stream count.
@@ -182,7 +192,7 @@ func main() {
 	mgr.StartDebugStats(ctx, time.Duration(*statsEvery)*time.Second) // periodic per-stream snapshot (debug only)
 
 	if *configPath != "" {
-		go pollConfig(ctx, *configPath, time.Duration(*configInterval)*time.Second, mgr, startupCfg)
+		go pollConfig(ctx, *configPath, time.Duration(*configInterval)*time.Second, mgr, startupCfg, debugPinned)
 	}
 
 	clientSrv, cleanupClient := serveUnix(*sock, mgr.ClientHandler())
@@ -290,7 +300,7 @@ type configApplier interface {
 	ApplyConfig(config.Values)
 }
 
-func pollConfig(ctx context.Context, path string, every time.Duration, mgr configApplier, startup *config.Values) {
+func pollConfig(ctx context.Context, path string, every time.Duration, mgr configApplier, startup *config.Values, debugPinned bool) {
 	if every < time.Second {
 		every = time.Second
 	}
@@ -333,6 +343,7 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr confi
 					}
 					current = &v
 					mgr.ApplyConfig(v)
+					applyDebugCats(v.DebugCats, debugPinned)
 					dlog.Logf("config", "recreated %s after deletion (defaults)", path)
 				}
 				if nfi, serr := os.Stat(path); serr == nil {
@@ -358,6 +369,7 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr confi
 			current = &v
 			mgr.ApplyConfig(v)
 			applyMemLimit(v.MemLimitMB)
+			applyDebugCats(v.DebugCats, debugPinned)
 			dlog.Logf("config", "applied %s: supervise=%v prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds backend=%s",
 				path, v.Supervise, v.PrebufferMaxSec, v.HLSTargetSec, v.HLSWindow, v.GraceSec, v.WriteTimeoutSec, v.ViewerIdleTimeoutSec, v.SourceBackend)
 		}
@@ -690,6 +702,35 @@ func physicalMemoryBytes() int64 {
 		}
 	}
 	return 0
+}
+
+// applyDebugCats sets the debug narration from the config file's debug_cats,
+// unless the daemon was started with -debug/-debug-cats/XC_FANOUT_DEBUG, which
+// pins the selection. It logs only a real transition — off→on, on→off, or a
+// changed category set — so a steady config does not narrate on every poll, and
+// it switches the standard logger to microsecond timestamps while debug is on so
+// event timing (a slow probe, reconnect backoff, a stalled viewer) is legible.
+func applyDebugCats(spec string, pinned bool) {
+	if pinned {
+		return
+	}
+	wasOn, before := dlog.On(), strings.Join(dlog.Cats(), ",")
+	dlog.EnableCats(spec)
+	nowOn, after := dlog.On(), strings.Join(dlog.Cats(), ",")
+	if wasOn == nowOn && before == after {
+		return // no change since last time
+	}
+	switch {
+	case nowOn && len(dlog.Cats()) > 0:
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		log.Printf("debug: enabled from config (categories: %s)", strings.Join(dlog.Cats(), ","))
+	case nowOn:
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		log.Printf("debug: enabled from config (all categories)")
+	default:
+		log.Printf("debug: disabled from config")
+		log.SetFlags(log.LstdFlags)
+	}
 }
 
 // isTruthy reports whether an env var value means "on" (1/true/yes/on).

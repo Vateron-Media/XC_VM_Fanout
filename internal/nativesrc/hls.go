@@ -176,6 +176,7 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		}
 	}
 	if err := servable(pl); err != nil {
+		dlog.Logf("hls", "refusing %s to ffmpeg: %v", redactURL(base), err)
 		return refuse(err)
 	}
 	var initSeg *fmp4.Init
@@ -193,7 +194,9 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 			return refuse(fmt.Errorf("%w: init segment: %v", ErrHLSIsFMP4, perr))
 		}
 		initSeg = parsed
+		dlog.Logf("hls", "fmp4 source: init parsed, %s", describeInit(parsed))
 	}
+	dlog.Logf("hls", "native hls pull of %s: %s, %d segments in window", redactURL(base), describePlaylist(pl, initSeg), len(pl.Segments))
 	pr, pw := io.Pipe()
 	// The puller dies with its READER, not with the stream. It used to run on the
 	// caller's ctx — the stream's whole lifetime — while Close() only shut the
@@ -216,6 +219,45 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		pw:     pw,
 	}).run(pl)
 	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl), cancel: cancel}, nil
+}
+
+// describePlaylist names, for the debug log, how this playlist's segments will
+// be read: the one line an operator needs to see WHY a channel went native and
+// how — passthrough, decrypt, range-fetch, packed-audio mux or fMP4 remux.
+func describePlaylist(pl *hlsPlaylist, in *fmp4.Init) string {
+	var how []string
+	switch {
+	case in != nil:
+		how = append(how, "fmp4→ts remux")
+	case pl.packedAudio():
+		how = append(how, "packed-aac→ts mux")
+	default:
+		how = append(how, "mpeg-ts passthrough")
+	}
+	if pl.Encrypted {
+		how = append(how, "aes-128 decrypt")
+	}
+	if pl.HasByteRange {
+		how = append(how, "byte-range fetch")
+	}
+	return strings.Join(how, ", ")
+}
+
+// describeInit names an fMP4 init segment's tracks for the debug log.
+func describeInit(in *fmp4.Init) string {
+	parts := make([]string, 0, len(in.Tracks))
+	for _, t := range in.Tracks {
+		switch t.Kind {
+		case fmp4.KindVideo:
+			parts = append(parts, fmt.Sprintf("video(h264, %d Hz)", t.TimeScale))
+		case fmp4.KindAudio:
+			parts = append(parts, fmt.Sprintf("audio(aac, %d Hz)", t.TimeScale))
+		}
+	}
+	if len(parts) == 0 {
+		return "no usable tracks"
+	}
+	return strings.Join(parts, " + ")
 }
 
 // muxFor returns the muxer this playlist's segments need, or nil for one whose
@@ -980,6 +1022,7 @@ func (p *hlsPuller) keyFor(k *hlsKey) ([]byte, error) {
 	p.keysMu.Lock()
 	p.keys[id] = body
 	p.keysMu.Unlock()
+	dlog.Logf("hls", "aes-128 key fetched from %s", redactURL(k.URI))
 	return body, nil
 }
 

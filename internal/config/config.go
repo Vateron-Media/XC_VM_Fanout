@@ -69,6 +69,16 @@ type Values struct {
 	// nothing on its own — a stream is only supervised once the panel hands it
 	// over — so this is the node-level half of a two-sided opt-in.
 	Supervise bool `json:"supervise"`
+	// DebugCats turns on the daemon's debug narration live, from the panel: a
+	// comma-separated category list ("puller,hls,monitor"), "all" for every one,
+	// or "" (the default) for off. It is applied on every config poll, so an
+	// operator can flip debug on for a misbehaving node and off again without a
+	// restart — a restart would drop every viewer, which is exactly what you do
+	// not want while diagnosing one. A daemon started with -debug/-debug-cats or
+	// XC_FANOUT_DEBUG ignores this key, so a developer's override is not undone
+	// by the panel. Categories: boot, config, stream, puller, hls, viewer,
+	// ingest, ctl, signal, monitor, stats, buffer, reaper, mem.
+	DebugCats string `json:"debug_cats"`
 }
 
 // Defaults is the built-in fallback (see defaults.Cfg*): what the daemon writes
@@ -91,6 +101,7 @@ func Defaults() Values {
 		MemLimitMB:           defaults.CfgMemLimitMB,
 		SourceBackend:        defaults.CfgSourceBackend,
 		Supervise:            defaults.CfgSupervise,
+		DebugCats:            defaults.CfgDebugCats,
 	}
 }
 
