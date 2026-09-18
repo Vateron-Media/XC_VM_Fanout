@@ -446,11 +446,11 @@ func servable(pl *hlsPlaylist) error {
 		// needs a demuxer this package does not have. A key line with no URI is
 		// unusable for the same practical purpose.
 		return ErrHLSEncrypted
-	case pl.HasByteRange:
-		// Segments are ranges of one resource. streamSegment sends no Range
-		// header and de-dups on the URI, so serving this would fetch the whole
-		// resource once and drop every later entry — and fetch nothing at all
-		// once it outgrows the runaway limit. Refuse rather than half-serve.
+	case pl.HasByteRange && !pl.everyRangeIsUsable():
+		// A #EXT-X-BYTERANGE this package cannot turn into a Range request —
+		// a malformed length, or a first slice with no offset and nothing
+		// before it — would be fetched as the whole resource and served as if
+		// it were the segment. Refuse rather than half-serve.
 		return ErrHLSByteRange
 	}
 	for _, seg := range pl.Segments {
@@ -505,7 +505,7 @@ func (p *hlsPuller) join(pl *hlsPlaylist) {
 		return
 	}
 	for _, seg := range pl.Segments[:edge] {
-		p.seen[seg.URI.String()] = true
+		p.seen[segIdent(seg)] = true
 	}
 }
 
@@ -514,7 +514,7 @@ func (p *hlsPuller) streamed(pl *hlsPlaylist, i int) bool {
 	if p.bySeq {
 		return pl.MediaSequence+int64(i) < p.seq
 	}
-	return p.seen[pl.Segments[i].URI.String()]
+	return p.seen[segIdent(pl.Segments[i])]
 }
 
 // segKey identifies the segment at index i the way the de-dup does: by its place
@@ -525,7 +525,18 @@ func (p *hlsPuller) segKey(pl *hlsPlaylist, i int) string {
 	if p.bySeq {
 		return strconv.FormatInt(pl.MediaSequence+int64(i), 10)
 	}
-	return pl.Segments[i].URI.String()
+	return segIdent(pl.Segments[i])
+}
+
+// segIdent is a segment's identity for de-dup and stall tracking when the
+// playlist carries no media sequence: its URI, plus its byte range when it has
+// one — a byte-range playlist gives every slice of a file the same URI, so the
+// URI alone would mark the whole file streamed after its first slice.
+func segIdent(seg hlsSegment) string {
+	if seg.Range == nil {
+		return seg.URI.String()
+	}
+	return seg.URI.String() + "#" + strconv.FormatInt(seg.Range.Offset, 10) + "-" + strconv.FormatInt(seg.Range.Length, 10)
 }
 
 // stalledOn counts this pass's failure at i against the segment it is stuck on
@@ -562,7 +573,7 @@ func (p *hlsPuller) markStreamed(pl *hlsPlaylist, i int) {
 		p.seq = pl.MediaSequence + int64(i) + 1
 		return
 	}
-	p.seen[pl.Segments[i].URI.String()] = true
+	p.seen[segIdent(pl.Segments[i])] = true
 }
 
 // resync moves the de-dup state from the playlist just finished onto the one
@@ -610,7 +621,7 @@ func (p *hlsPuller) uriFallback(pl, next *hlsPlaylist) {
 	p.seen = map[string]bool{}
 	for i := range pl.Segments {
 		if pl.MediaSequence+int64(i) < p.seq {
-			p.seen[pl.Segments[i].URI.String()] = true
+			p.seen[segIdent(pl.Segments[i])] = true
 		}
 	}
 	p.bySeq = false
@@ -653,7 +664,7 @@ func rolledUnderAFrozenSequence(pl, next *hlsPlaylist) bool {
 func retainSeenInWindow(seen map[string]bool, pl *hlsPlaylist) map[string]bool {
 	next := make(map[string]bool, len(pl.Segments))
 	for _, seg := range pl.Segments {
-		k := seg.URI.String()
+		k := segIdent(seg)
 		if seen[k] {
 			next[k] = true
 		}
@@ -668,6 +679,9 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 		return err
 	}
 	p.opt.apply(req)
+	if seg.Range != nil {
+		req.Header.Set("Range", seg.Range.header())
+	}
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return err
@@ -676,6 +690,11 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("segment %s: http %d", redactURL(u), resp.StatusCode)
 	}
+	// An origin free to ignore Range answers 200 with the WHOLE resource. Then
+	// the slice has to be cut here, and the read has to be bounded by where the
+	// slice ends rather than by the segment cap: the resource behind a
+	// byte-range playlist is the whole file, which is what the cap is for.
+	full := seg.Range != nil && resp.StatusCode != http.StatusPartialContent
 	// Buffer the segment fully before writing to the pipe, so a mid-body
 	// read failure never emits a partial prefix into the live stream (which
 	// the retry — now that we only mark a segment `seen` after success —
@@ -695,7 +714,15 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 	if cl := resp.ContentLength; cl > 0 && cl <= maxHLSSegmentBytes {
 		p.segBuf.Grow(int(cl))
 	}
-	n, err := io.Copy(&p.segBuf, io.LimitReader(resp.Body, maxHLSSegmentBytes))
+	limit := int64(maxHLSSegmentBytes)
+	if full {
+		// Read only as far as the slice: everything past it belongs to later
+		// segments, and on a large file that is most of the download.
+		if end := seg.Range.Offset + seg.Range.Length; end < limit {
+			limit = end
+		}
+	}
+	n, err := io.Copy(&p.segBuf, io.LimitReader(resp.Body, limit))
 	if err != nil {
 		return err
 	}
@@ -703,6 +730,14 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 		return fmt.Errorf("segment %s: exceeds %d-byte cap (runaway upstream)", redactURL(u), maxHLSSegmentBytes)
 	}
 	body := p.segBuf.Bytes()
+	if full {
+		o, l := seg.Range.Offset, seg.Range.Length
+		if int64(len(body)) < o+l {
+			return fmt.Errorf("segment %s: %d bytes, short of the %d..%d range the playlist asked for",
+				redactURL(u), len(body), o, o+l)
+		}
+		body = body[o : o+l]
+	}
 	if seg.Key != nil {
 		// Decrypt in place, before anything looks at the bytes: ciphertext never
 		// looks like MPEG-TS, so the sync-byte check below would refuse every
@@ -828,6 +863,41 @@ func (pl *hlsPlaylist) audioIsElsewhere(group string) bool {
 	return pl.DemuxedAudio[group] && !pl.MuxedAudio[group]
 }
 
+// parseByteRange reads "<n>[@<o>]". A missing or unreadable offset comes back
+// as -1, which the parse loop resolves against the previous slice of the same
+// URI; a length that does not read leaves the range nil, which servable then
+// refuses rather than guessing.
+func parseByteRange(v string) *hlsRange {
+	v = strings.TrimSpace(v)
+	lenPart, offPart, hasOff := strings.Cut(v, "@")
+	n, err := strconv.ParseInt(strings.TrimSpace(lenPart), 10, 64)
+	if err != nil || n <= 0 || n > maxHLSSegmentBytes {
+		return nil
+	}
+	r := &hlsRange{Length: n, Offset: -1}
+	if hasOff {
+		o, oerr := strconv.ParseInt(strings.TrimSpace(offPart), 10, 64)
+		if oerr != nil || o < 0 {
+			return nil
+		}
+		r.Offset = o
+	}
+	return r
+}
+
+// everyRangeIsUsable reports whether every segment of a byte-range playlist
+// resolved to a fetchable slice. A tag this package could not read leaves the
+// segment without a range while the playlist is marked as using them, which
+// would fetch the whole resource in place of one slice of it.
+func (pl *hlsPlaylist) everyRangeIsUsable() bool {
+	for _, seg := range pl.Segments {
+		if seg.Range == nil || seg.Range.Offset < 0 || seg.Range.Length <= 0 {
+			return false
+		}
+	}
+	return len(pl.Segments) > 0
+}
+
 // everyKeyIsAES128 reports whether every segment this playlist lists is either
 // in the clear or AES-128 encrypted with a key we know where to fetch. One
 // segment we cannot read is a hole in the channel, so the whole playlist is
@@ -844,6 +914,11 @@ func (pl *hlsPlaylist) everyKeyIsAES128() bool {
 type hlsSegment struct {
 	URI      *url.URL
 	Duration float64
+	// Range is the #EXT-X-BYTERANGE slice of URI this segment is, or nil when
+	// the segment is the whole resource. Several segments of a byte-range
+	// playlist share one URI and differ only here, which is why every identity
+	// this puller keeps — de-dup, stall tracking — has to include it.
+	Range *hlsRange
 	// Key is the #EXT-X-KEY in force for this segment, or nil when it is in the
 	// clear. An upstream may re-key mid-window, and METHOD=NONE switches back
 	// off, so the key belongs to the segment rather than to the playlist.
@@ -880,6 +955,19 @@ func (k *hlsKey) iv(seq int64) []byte {
 	return iv[:]
 }
 
+// hlsRange is one #EXT-X-BYTERANGE: n bytes at offset o. A tag written without
+// an offset (#EXT-X-BYTERANGE:<n>) means "the byte after the previous segment of
+// the same URI", which is how a packager writes a series of slices of one file.
+type hlsRange struct {
+	Offset int64
+	Length int64
+}
+
+// header renders the range as an HTTP Range request value.
+func (r *hlsRange) header() string {
+	return fmt.Sprintf("bytes=%d-%d", r.Offset, r.Offset+r.Length-1)
+}
+
 type hlsVariant struct {
 	URI       *url.URL
 	Bandwidth int
@@ -898,7 +986,9 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 	var pendingDur float64
 	var pendingBW int
 	var pendingAudio string
-	var curKey *hlsKey // the #EXT-X-KEY in force, carried down the segment list
+	var curKey *hlsKey               // the #EXT-X-KEY in force, carried down the segment list
+	var pendingRange *hlsRange       // the #EXT-X-BYTERANGE waiting for its URI line
+	nextOffset := map[string]int64{} // per URI: where an offset-less range continues
 	expectVariantURI := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -920,8 +1010,10 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 			}
 		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
 			// The segment that follows is a slice of its URI, not the whole of
-			// it. Noticed, never honoured — see servable.
+			// it: <n>[@<o>], and a missing offset continues from the previous
+			// slice of the same URI.
 			pl.HasByteRange = true
+			pendingRange = parseByteRange(strings.TrimPrefix(line, "#EXT-X-BYTERANGE:"))
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.Endlist = true
 		case strings.HasPrefix(line, "#EXT-X-KEY:"):
@@ -1025,7 +1117,22 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 			if strings.HasSuffix(low, ".m4s") || strings.HasSuffix(low, ".mp4") {
 				pl.HasFMP4 = true
 			}
-			pl.Segments = append(pl.Segments, hlsSegment{URI: u, Duration: pendingDur, Key: curKey})
+			if pendingRange != nil && pendingRange.Offset < 0 {
+				// An offset-less range continues the previous slice of the SAME
+				// URI. With no previous slice there is nothing to continue from —
+				// RFC 8216 leaves it undefined — and assuming 0 would quietly
+				// fetch the start of the file in place of a live slice, which is
+				// old content on the wire rather than an error. Leave it
+				// unresolved; servable refuses the playlist.
+				if prev, seen := nextOffset[u.String()]; seen {
+					pendingRange.Offset = prev
+				}
+			}
+			if pendingRange != nil {
+				nextOffset[u.String()] = pendingRange.Offset + pendingRange.Length
+			}
+			pl.Segments = append(pl.Segments, hlsSegment{URI: u, Duration: pendingDur, Key: curKey, Range: pendingRange})
+			pendingRange = nil
 			pendingDur = 0
 		}
 	}

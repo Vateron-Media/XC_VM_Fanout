@@ -5,7 +5,6 @@
 package nativesrc
 
 import (
-	"context"
 	"errors"
 	"testing"
 )
@@ -15,15 +14,14 @@ const byteRangePlaylist = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUEN
 	"#EXTINF:2.0,\n#EXT-X-BYTERANGE:1316000@0\nstream.ts\n" +
 	"#EXTINF:2.0,\n#EXT-X-BYTERANGE:1316000@1316000\nstream.ts\n"
 
-// TestByteRangePlaylistIsRefused: #EXT-X-BYTERANGE fell into the "tag we don't
-// model" branch, so a playlist carrying one was accepted and then served wrong
-// in every direction. No Range header is ever sent, so the first entry fetches
-// the WHOLE resource and the rest are skipped as duplicates of it; once that
-// resource passes 64 MiB every fetch fails as a runaway upstream, and the pipe
-// closes with a non-format error, so the pull retries natively forever and never
-// reaches the fallback. Refusing says what is actually wrong and hands the
-// source to ffmpeg, which reads byte ranges.
-func TestByteRangePlaylistIsRefused(t *testing.T) {
+// TestByteRangePlaylistIsServed: #EXT-X-BYTERANGE used to be refused outright,
+// because the puller fetched a segment URI whole and de-duped on that URI — so
+// the first entry would have fetched the WHOLE resource and the rest been
+// skipped as duplicates of it. Each slice is now fetched with a Range request
+// and identified by its offset, so the playlist is served rather than handed to
+// ffmpeg. The tag is honoured wherever it sits before the URI line: this
+// fixture writes it AFTER #EXTINF, which is equally legal.
+func TestByteRangePlaylistIsServed(t *testing.T) {
 	pl, err := parseHLSPlaylist([]byte(byteRangePlaylist), nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -31,31 +29,38 @@ func TestByteRangePlaylistIsRefused(t *testing.T) {
 	if !pl.HasByteRange {
 		t.Fatal("#EXT-X-BYTERANGE was not noticed at all")
 	}
+	if err := servable(pl); err != nil {
+		t.Fatalf("servable = %v, want the playlist accepted now that ranges are fetched", err)
+	}
+	if len(pl.Segments) != 2 {
+		t.Fatalf("parsed %d segments, want 2", len(pl.Segments))
+	}
+	for i, want := range []hlsRange{{Offset: 0, Length: 1316000}, {Offset: 1316000, Length: 1316000}} {
+		got := pl.Segments[i].Range
+		if got == nil || *got != want {
+			t.Errorf("segment %d range = %+v, want %+v", i, got, want)
+		}
+	}
+	if pl.Segments[0].Range.header() != "bytes=0-1315999" {
+		t.Errorf("Range header = %q", pl.Segments[0].Range.header())
+	}
+}
+
+// A byte-range playlist whose slices cannot be turned into Range requests is
+// still refused as a format problem, so such a source still reaches ffmpeg.
+func TestUnfetchableByteRangeIsStillRefused(t *testing.T) {
+	// A first slice with no offset has nothing to continue from.
+	pl, err := parseHLSPlaylist([]byte(
+		"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\n#EXT-X-BYTERANGE:1316000\nstream.ts\n"), nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	serr := servable(pl)
 	if !errors.Is(serr, ErrHLSByteRange) {
 		t.Fatalf("servable = %v, want the byte-range refusal", serr)
 	}
 	if !IsFormat(serr) {
 		t.Fatalf("servable = %v, want a format refusal so the source moves to ffmpeg", serr)
-	}
-}
-
-// TestByteRangeSourceIsRefusedOnOpen: end to end, through the pull, and without
-// a single segment byte going out.
-func TestByteRangeSourceIsRefusedOnOpen(t *testing.T) {
-	srv := newHLSServer(t, byteRangePlaylist, nil)
-	rc, err := Open(context.Background(), srv.URL+"/index.m3u8", Options{})
-	if err == nil {
-		rc.Close()
-		t.Fatal("a byte-range playlist was accepted")
-	}
-	if !errors.Is(err, ErrHLSByteRange) {
-		t.Fatalf("err = %v, want the byte-range refusal", err)
-	}
-	for _, r := range srv.seen() {
-		if r.URL.Path == "/stream.ts" {
-			t.Fatal("a byte-range segment was fetched: the whole resource would go out as one segment")
-		}
 	}
 }
 
