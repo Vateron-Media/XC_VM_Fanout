@@ -1,0 +1,70 @@
+name: ci
+
+# Every push and pull request: build, vet, check formatting and run the tests,
+# including under the race detector. release.yml runs the same suite via
+# release.sh, but only when a version tag is pushed — so until this existed, a
+# tag published binaries from code nothing had ever compiled, and a formatting
+# slip or a broken test was found by the release rather than by the commit.
+#
+# Go 1.21 matches release.yml and the `go` directive in go.mod: a build that
+# passes here on a newer toolchain and fails there would defeat the point.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      # GOWORK=off everywhere, for the same reason release.sh sets it: a go.work
+      # in a parent directory (a developer's larger workspace) otherwise drags in
+      # sibling modules that are not part of this repo.
+      - name: gofmt
+        run: |
+          unformatted=$(GOWORK=off gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"; echo "$unformatted"
+            exit 1
+          fi
+
+      - name: build
+        run: GOWORK=off go build ./...
+
+      - name: vet
+        run: GOWORK=off go vet ./...
+
+      - name: test
+        run: GOWORK=off go test -count=1 ./...
+
+      # The race detector is where the concurrency this daemon is built on gets
+      # checked: one ring, one producer, and a reader per viewer. -p 1 keeps the
+      # packages from competing for CPU, which is what makes the process and
+      # timing tests (internal/puller especially) flaky on a two-core runner.
+      - name: test -race
+        run: GOWORK=off go test -count=1 -race -p 1 ./...
+
+      # The release builds four static binaries; a cross-compile break (a 32-bit
+      # overflow, say) is invisible to everything above.
+      - name: cross-build the release targets
+        run: |
+          set -e
+          for t in amd64 arm64 armv7 386; do
+            case $t in
+              amd64) GOARCH=amd64; GOARM= ;;
+              arm64) GOARCH=arm64; GOARM= ;;
+              armv7) GOARCH=arm; GOARM=7 ;;
+              386)   GOARCH=386; GOARM= ;;
+            esac
+            echo ">>> linux-$t"
+            CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH GOARM=$GOARM GOWORK=off \
+              go build -trimpath -o /tmp/xc_fanout-linux-$t ./cmd/xc_fanout
+          done
