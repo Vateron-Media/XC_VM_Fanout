@@ -182,7 +182,25 @@ func (o Options) checkProxy() error {
 // apply stamps the source's identity onto a request.
 func (o Options) apply(req *http.Request) {
 	if o.UserAgent != "" && req.Header.Get("User-Agent") == "" {
+		// Not a credential: it says which player the source is being read as,
+		// which a CDN may legitimately gate on, so it travels wherever the
+		// playlist points.
 		req.Header.Set("User-Agent", o.UserAgent)
+	}
+	// Everything below is a credential — the provider's session, its tokens,
+	// whatever a Referer gate wants — and belongs to the origin the source was
+	// opened at and to nowhere else. The PLAYLIST decides what is fetched next,
+	// and an upstream is free to name any host for a segment, a key or a
+	// variant: sending these to it would hand the provider account to a third
+	// party on the upstream's say-so. Browsers scope cookies for this reason;
+	// this is the same rule, applied to everything configured.
+	//
+	// Nothing is refused here. Cross-host segments are ordinary — a playlist on
+	// the origin, segments on its CDN — so the fetch goes ahead, without the
+	// secrets. An unscoped Options (nothing has said what the source host is)
+	// still applies them: they remain the most specific thing anyone said.
+	if !o.hostInScope(req) {
+		return
 	}
 	if o.Cookie != "" && req.Header.Get("Cookie") == "" {
 		req.Header.Set("Cookie", o.Cookie)
@@ -208,7 +226,7 @@ func (o Options) apply(req *http.Request) {
 		// segments on a separate CDN name, and the source's vhost means nothing
 		// there but a 403.
 		if strings.EqualFold(name, "Host") {
-			if value != "" && o.hostInScope(req) {
+			if value != "" {
 				req.Host = value
 			}
 			// Drop any earlier attempt at it too, so what is in the map is what
