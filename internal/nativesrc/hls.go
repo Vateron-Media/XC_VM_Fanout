@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/fmp4"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsmux"
 )
@@ -176,6 +177,22 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 	if err := servable(pl); err != nil {
 		return refuse(err)
 	}
+	var initSeg *fmp4.Init
+	if pl.HasFMP4 {
+		// One fetch, before any segment: everything a media segment needs to be
+		// read is in here — the timescales, and the parameter sets the segments
+		// do not repeat — and a source whose init segment cannot be read is one
+		// to refuse now rather than to discover halfway through.
+		body, _, ferr := hlsFetch(ctx, pl.MapURI, opt, client)
+		if ferr != nil {
+			return refuse(fmt.Errorf("%w: init segment: %v", ErrHLSIsFMP4, ferr))
+		}
+		parsed, perr := fmp4.ParseInit(body)
+		if perr != nil {
+			return refuse(fmt.Errorf("%w: init segment: %v", ErrHLSIsFMP4, perr))
+		}
+		initSeg = parsed
+	}
 	pr, pw := io.Pipe()
 	// The puller dies with its READER, not with the stream. It used to run on the
 	// caller's ctx — the stream's whole lifetime — while Close() only shut the
@@ -193,16 +210,24 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		opt:    opt,
 		seen:   map[string]bool{},
 		keys:   map[string][]byte{},
-		mux:    muxFor(pl),
+		init:   initSeg,
+		mux:    muxFor(pl, initSeg),
 		pw:     pw,
 	}).run(pl)
 	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl), cancel: cancel}, nil
 }
 
-// muxFor returns the muxer a packed-audio playlist needs, or nil for one whose
-// segments are already MPEG-TS.
-func muxFor(pl *hlsPlaylist) *tsmux.Muxer {
-	if pl.packedAudio() {
+// muxFor returns the muxer this playlist's segments need, or nil for one whose
+// segments are already MPEG-TS: an audio-only muxer for packed audio, and a
+// full programme for fMP4, whose segments carry video too.
+func muxFor(pl *hlsPlaylist, in *fmp4.Init) *tsmux.Muxer {
+	switch {
+	case in != nil:
+		if in.Video() == nil {
+			return tsmux.New()
+		}
+		return tsmux.NewAV()
+	case pl.packedAudio():
 		return tsmux.New()
 	}
 	return nil
@@ -284,10 +309,20 @@ type hlsPuller struct {
 	stallKey   string
 	stallTries int
 
+	// nalBuf and adtsBuf stage one sample at a time on the fMP4 path, reused
+	// across samples so a segment of a few hundred frames does not allocate one
+	// buffer per frame.
+	nalBuf  []byte
+	adtsBuf []byte
+
 	// muxBuf stages the muxed form of one segment, reused across segments for
 	// the same reason segBuf is: a radio channel publishes one every few
 	// seconds for the life of the node.
 	muxBuf []byte
+
+	// init is the parsed #EXT-X-MAP for an fMP4 source: the tracks its media
+	// segments are read against. nil for a plain TS or packed-audio playlist.
+	init *fmp4.Init
 
 	// mux wraps packed-audio segments in MPEG-TS, and is nil for an ordinary
 	// .ts playlist. It holds the stream's clock and continuity counters, so
@@ -477,9 +512,12 @@ func (pl *hlsPlaylist) packedAudio() bool {
 // servable reports why a media playlist cannot be passed through, or nil.
 func servable(pl *hlsPlaylist) error {
 	switch {
-	case pl.HasFMP4:
-		// Distinct sentinel so the caller can tell "this upstream is fMP4" apart
-		// from a generic refusal — it is worth seeing in a log.
+	case pl.HasFMP4 && pl.MapURI == nil:
+		// fMP4 segments are read by internal/fmp4 — but only against the init
+		// segment #EXT-X-MAP names, which holds the timescales and the
+		// parameter sets the media segments do not repeat. Without it there is
+		// nothing to read them with. Distinct sentinel so the caller can tell
+		// "this upstream is fMP4" apart from a generic refusal.
 		return ErrHLSIsFMP4
 	case pl.Encrypted && !pl.everyKeyIsAES128():
 		// AES-128 this package decrypts (it fetches the key the playlist names);
@@ -796,6 +834,21 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 		}
 		body = plain
 	}
+	if p.init != nil {
+		// fMP4: read the fragment against the init segment and rebuild it as
+		// MPEG-TS. Same rule as packed audio for what a bad body means — a
+		// format refusal only until the stream is running, an ordinary failed
+		// segment after that.
+		muxed, merr := p.remuxFragment(body)
+		if merr != nil {
+			if p.mux.Started() {
+				return fmt.Errorf("segment %s: %w", redactURL(u), merr)
+			}
+			return fmt.Errorf("%w: segment %s: %v", ErrHLSIsFMP4, redactURL(u), merr)
+		}
+		_, err = p.pw.Write(muxed)
+		return err
+	}
 	if p.mux != nil {
 		// Packed audio: frame it as MPEG-TS rather than checking whether it
 		// already is. A body that is not ADTS after all — an origin answering a
@@ -818,6 +871,42 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 	}
 	_, err = p.pw.Write(body)
 	return err
+}
+
+// remuxFragment turns one fMP4 media segment into MPEG-TS.
+//
+// Every segment opens with the tables, so a viewer joining mid-stream has the
+// programme within one segment. The samples go out in the order the fragment
+// lists them, video before audio, which is the order they were written in.
+func (p *hlsPuller) remuxFragment(body []byte) ([]byte, error) {
+	frag, err := fmp4.ParseFragment(body, p.init)
+	if err != nil {
+		return nil, err
+	}
+	out := p.mux.Tables(p.muxBuf[:0])
+	if v := p.init.Video(); v != nil {
+		for _, s := range frag.Video {
+			annexB, aerr := fmp4.AnnexB(p.nalBuf[:0], s, v)
+			if aerr != nil {
+				return nil, aerr
+			}
+			p.nalBuf = annexB
+			out = p.mux.WriteVideo(out, annexB,
+				fmp4.Scale(s.PTS, v.TimeScale), fmp4.Scale(s.DTS, v.TimeScale), s.Sync)
+		}
+	}
+	if a := p.init.Audio(); a != nil {
+		for _, s := range frag.Audio {
+			adts, aerr := fmp4.ADTS(p.adtsBuf[:0], s.Data, a)
+			if aerr != nil {
+				return nil, aerr
+			}
+			p.adtsBuf = adts
+			out = p.mux.WriteAudio(out, adts, fmp4.Scale(s.PTS, a.TimeScale))
+		}
+	}
+	p.muxBuf = out
+	return out, nil
 }
 
 // keyFor returns the AES-128 key bytes for k, fetching them once per URI.
