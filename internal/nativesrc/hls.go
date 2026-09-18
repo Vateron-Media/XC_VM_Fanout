@@ -23,6 +23,7 @@ import (
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsmux"
 )
 
 // newPullClient builds the client for manifest and segment fetches. Unlike the
@@ -192,9 +193,19 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		opt:    opt,
 		seen:   map[string]bool{},
 		keys:   map[string][]byte{},
+		mux:    muxFor(pl),
 		pw:     pw,
 	}).run(pl)
 	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl), cancel: cancel}, nil
+}
+
+// muxFor returns the muxer a packed-audio playlist needs, or nil for one whose
+// segments are already MPEG-TS.
+func muxFor(pl *hlsPlaylist) *tsmux.Muxer {
+	if pl.packedAudio() {
+		return tsmux.New()
+	}
+	return nil
 }
 
 // hlsReader is the byte stream of a live HLS pull, which knows how long it may
@@ -272,6 +283,16 @@ type hlsPuller struct {
 	// stalling on the same segment rather than on a new one each poll.
 	stallKey   string
 	stallTries int
+
+	// muxBuf stages the muxed form of one segment, reused across segments for
+	// the same reason segBuf is: a radio channel publishes one every few
+	// seconds for the life of the node.
+	muxBuf []byte
+
+	// mux wraps packed-audio segments in MPEG-TS, and is nil for an ordinary
+	// .ts playlist. It holds the stream's clock and continuity counters, so
+	// there is one per pull and it lives as long as the pull does.
+	mux *tsmux.Muxer
 
 	// keys caches the AES-128 keys the playlist names, by URI. A live upstream
 	// names the same key on every segment of a window and often for the whole
@@ -423,14 +444,34 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 	}
 }
 
-// nonTSSegmentExt are segment suffixes that are definitively NOT MPEG-TS. The
-// audio ones are RFC 8216 packed audio (ID3 + ADTS/MP3 straight in the segment,
-// no TS wrapper), which is how radio channels ship; the caption ones are WebVTT.
-// Refusing on the name catches these before a single byte goes out, which is
-// what gets the source onto its ffmpeg fallback — ffmpeg reads packed audio.
+// nonTSSegmentExt are segment suffixes that are definitively NOT MPEG-TS and
+// that this package cannot turn into it: AC-3 and its enhanced form, MP3, and
+// WebVTT captions. Refusing on the name catches them before a single byte goes
+// out, which is what gets the source onto its ffmpeg fallback.
+//
+// .aac is NOT here: RFC 8216 packed AAC (an ID3 tag then bare ADTS frames, no
+// transport layer) is wrapped in MPEG-TS by internal/tsmux instead, since AAC
+// is already the elementary stream and framing it costs no process.
 var nonTSSegmentExt = map[string]bool{
-	".aac": true, ".ac3": true, ".ec3": true, ".mp3": true,
+	".ac3": true, ".ec3": true, ".mp3": true,
 	".vtt": true, ".webvtt": true,
+}
+
+// packedAudioExt are the suffixes this package muxes rather than passes through.
+var packedAudioExt = map[string]bool{".aac": true, ".adts": true}
+
+// packedAudio reports whether every segment of the playlist is packed AAC, in
+// which case the pull wraps each one in MPEG-TS. A playlist mixing packed audio
+// with .ts segments is not something a real packager writes, and muxing half a
+// window would put two framings on one wire, so it is left to servable to
+// refuse through nonTSSegmentExt.
+func (pl *hlsPlaylist) packedAudio() bool {
+	for _, seg := range pl.Segments {
+		if !packedAudioExt[strings.ToLower(path.Ext(seg.URI.Path))] {
+			return false
+		}
+	}
+	return len(pl.Segments) > 0
 }
 
 // servable reports why a media playlist cannot be passed through, or nil.
@@ -754,6 +795,23 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 			return fmt.Errorf("segment %s: %w", redactURL(u), derr)
 		}
 		body = plain
+	}
+	if p.mux != nil {
+		// Packed audio: frame it as MPEG-TS rather than checking whether it
+		// already is. A body that is not ADTS after all — an origin answering a
+		// .aac URL with an error page — fails here, and is a format refusal only
+		// if it happens before any segment has been muxed: once the stream is
+		// running, one bad body is a failed segment like any other.
+		muxed, merr := p.mux.Segment(p.muxBuf[:0], body)
+		if merr != nil {
+			if p.mux.Started() {
+				return fmt.Errorf("segment %s: %w", redactURL(u), merr)
+			}
+			return fmt.Errorf("%w: segment %s: %v", ErrHLSNotTS, redactURL(u), merr)
+		}
+		p.muxBuf = muxed
+		_, err = p.pw.Write(muxed)
+		return err
 	}
 	if err := checkSegmentIsTS(body, u); err != nil {
 		return err

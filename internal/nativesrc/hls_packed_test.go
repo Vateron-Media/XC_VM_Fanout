@@ -29,15 +29,18 @@ func packedAudio() []byte {
 	return b.Bytes()
 }
 
-// TestPackedAudioPlaylistIsRefused: a radio channel whose playlist lists .aac
-// segments is packed audio, not MPEG-TS. servable() checked only for fMP4 and
-// encryption, so the source was accepted and each ADTS body was copied into the
-// pipe; ingest.Copy then sliced it into 188-byte chunks and published it as TS.
-// The ring never saw a PAT, a PMT or a keyframe, so viewers got nothing — and
-// because the source was never refused, the ffmpeg fallback that handles packed
-// audio perfectly well was never tried.
+// TestPackedAudioPlaylistIsRefused: a playlist of packed-audio segments is not
+// MPEG-TS. servable() checked only for fMP4 and encryption, so the source was
+// accepted and each body copied into the pipe; ingest.Copy then sliced it into
+// 188-byte chunks and published it as TS. The ring never saw a PAT, a PMT or a
+// keyframe, so viewers got nothing.
+//
+// .aac is no longer in this list: packed AAC is now framed as MPEG-TS by
+// internal/tsmux (see TestPackedAACIsMuxedIntoMPEGTS). The formats left here
+// are the ones that still need a decoder or a different framing, and they must
+// still reach ffmpeg.
 func TestPackedAudioPlaylistIsRefused(t *testing.T) {
-	for _, ext := range []string{".aac", ".ac3", ".mp3"} {
+	for _, ext := range []string{".ac3", ".mp3"} {
 		t.Run(ext, func(t *testing.T) {
 			pl := "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg1" + ext + "\n"
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
