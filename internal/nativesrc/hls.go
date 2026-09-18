@@ -858,7 +858,11 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 	body := p.segBuf.Bytes()
 	if full {
 		o, l := seg.Range.Offset, seg.Range.Length
-		if int64(len(body)) < o+l {
+		// Written so no arithmetic can overflow before the bound is checked: o
+		// and l are each non-negative and within maxHLSSegmentBytes by the time
+		// they get here (parseByteRange), but the guard stands on its own so a
+		// future caller cannot reintroduce the wrap.
+		if o < 0 || l < 0 || o > int64(len(body)) || l > int64(len(body))-o {
 			return fmt.Errorf("segment %s: %d bytes, short of the %d..%d range the playlist asked for",
 				redactURL(u), len(body), o, o+l)
 		}
@@ -964,11 +968,18 @@ func (p *hlsPuller) remuxFragment(body []byte) ([]byte, error) {
 	// audio traf) is kept rather than shuffled between segments.
 	sort.SliceStable(p.samples, func(i, j int) bool { return p.samples[i].dts < p.samples[j].dts })
 
+	// A segment is all-or-nothing on the muxer: a sample that converts wrong
+	// partway through must not leave the continuity counters or the clock
+	// advanced, or the next segment skips on the wire and a first segment's
+	// failure stops reading as a format refusal. Snapshot, and roll back if any
+	// sample fails.
+	saved := p.mux.Save()
 	out := p.mux.Tables(p.muxBuf[:0])
 	for _, s := range p.samples {
 		if s.video {
 			annexB, aerr := fmp4.AnnexBFromAVCC(p.nalBuf[:0], s.data, v, s.sync)
 			if aerr != nil {
+				p.mux.Restore(saved)
 				return nil, aerr
 			}
 			p.nalBuf = annexB
@@ -976,6 +987,7 @@ func (p *hlsPuller) remuxFragment(body []byte) ([]byte, error) {
 		} else {
 			adts, aerr := fmp4.ADTS(p.adtsBuf[:0], s.data, a)
 			if aerr != nil {
+				p.mux.Restore(saved)
 				return nil, aerr
 			}
 			p.adtsBuf = adts
@@ -1112,7 +1124,11 @@ func parseByteRange(v string) *hlsRange {
 	r := &hlsRange{Length: n, Offset: -1}
 	if hasOff {
 		o, oerr := strconv.ParseInt(strings.TrimSpace(offPart), 10, 64)
-		if oerr != nil || o < 0 {
+		// Reject an offset so large that offset+length would overflow int64: a
+		// hostile playlist near the ceiling otherwise wrapped the end negative,
+		// which defeated every downstream bound and panicked the slice. A real
+		// resource is nowhere near this, so the honest cases are unaffected.
+		if oerr != nil || o < 0 || o > (1<<63-1)-n {
 			return nil
 		}
 		r.Offset = o

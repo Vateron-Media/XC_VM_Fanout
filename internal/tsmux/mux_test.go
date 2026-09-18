@@ -243,3 +243,47 @@ func TestID3SizeIsAddedToTheHeaderLength(t *testing.T) {
 		}
 	}
 }
+
+// Save/Restore make a segment transactional on the muxer: a caller that cannot
+// finish a segment rolls the counters and clock back, so the next segment does
+// not skip continuity and a first failed segment still reads as not-started.
+func TestSaveRestoreRollsBackTheMuxer(t *testing.T) {
+	m := NewAV()
+	if m.Started() {
+		t.Fatal("a fresh muxer should not be started")
+	}
+	saved := m.Save()
+
+	// Write a keyframe and some audio — the counters and clock advance and the
+	// muxer is now started.
+	var dst []byte
+	dst = m.Tables(dst)
+	dst = m.WriteVideo(dst, []byte{0, 0, 0, 1, 0x65, 1}, 9000, 9000, true)
+	dst = m.WriteAudio(dst, []byte{0xFF, 0xF1, 0x40, 0x80, 0x00, 0x1F, 0xFC, 1}, 9000)
+	if !m.Started() {
+		t.Fatal("the muxer did not register the writes")
+	}
+	after := m.Save()
+	if after == saved {
+		t.Fatal("Save captured no change after writing a segment")
+	}
+
+	m.Restore(saved)
+	if m.Started() {
+		t.Error("Restore did not clear started")
+	}
+	if m.Save() != saved {
+		t.Error("Restore did not return the muxer to the saved state")
+	}
+
+	// And a segment written after a rollback opens exactly as the rolled-back one
+	// would have — same continuity, same clock.
+	var a, b []byte
+	m.Restore(saved)
+	a = m.WriteVideo(m.Tables(a), []byte{0, 0, 0, 1, 0x65, 2}, 9000, 9000, true)
+	m.Restore(saved)
+	b = m.WriteVideo(m.Tables(b), []byte{0, 0, 0, 1, 0x65, 2}, 9000, 9000, true)
+	if string(a) != string(b) {
+		t.Error("two segments from the same saved state differ: rollback is not clean")
+	}
+}

@@ -52,6 +52,32 @@ type Muxer struct {
 // New returns a muxer for an audio-only programme, whose clock starts at zero.
 func New() *Muxer { return &Muxer{} }
 
+// State is a muxer's per-stream position — its continuity counters and clock —
+// captured so a caller can roll back a segment it could not finish. It is
+// opaque; only Save and Restore touch it.
+type State struct {
+	pts, nextTable                 int64
+	ccPAT, ccPMT, ccAudio, ccVideo byte
+	started                        bool
+}
+
+// Save captures the muxer's position before a segment, and Restore puts it back
+// if the segment cannot be completed. Without it, a conversion that fails
+// partway through a segment would leave the continuity counters advanced — so
+// the NEXT segment's counters skip on the wire and a demuxer logs errors — and
+// would flip started, so a first segment that fails is reported as a plain
+// error (retry) instead of an unreadable-format refusal (fall back to ffmpeg).
+func (m *Muxer) Save() State {
+	return State{m.pts, m.nextTable, m.ccPAT, m.ccPMT, m.ccAudio, m.ccVideo, m.started}
+}
+
+// Restore rolls the muxer back to a saved position.
+func (m *Muxer) Restore(s State) {
+	m.pts, m.nextTable = s.pts, s.nextTable
+	m.ccPAT, m.ccPMT, m.ccAudio, m.ccVideo = s.ccPAT, s.ccPMT, s.ccAudio, s.ccVideo
+	m.started = s.started
+}
+
 // NewAV returns a muxer for a programme with both video and audio — what a
 // fragmented-MP4 source carries. Timestamps come from the caller here rather
 // than from the bitstream: fMP4 keeps them in tables, and they are the one

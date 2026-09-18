@@ -271,12 +271,12 @@ func findDescriptor(b []byte) []byte {
 		}
 		switch tag {
 		case 0x03: // ES_Descriptor: ES_ID(2) flags(1), then children
-			if off+3 > len(b) {
+			if size < 3 || off+3 > len(b) {
 				return nil
 			}
 			return findDescriptor(b[off+3 : off+size])
 		case 0x04: // DecoderConfigDescriptor: 13 fixed bytes, then children
-			if off+13 > len(b) {
+			if size < 13 || off+13 > len(b) {
 				return nil
 			}
 			return findDescriptor(b[off+13 : off+size])

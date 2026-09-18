@@ -6,6 +6,12 @@ package fmp4
 
 import "fmt"
 
+// maxSamplesPerFragment bounds how many samples one trun may declare, so a
+// hostile sample_count cannot drive an unbounded allocation. A million is far
+// above any real segment — a 10 s window at 60 fps is ~600 video samples — and
+// keeps the per-fragment Sample slice to tens of MB in the worst case.
+const maxSamplesPerFragment = 1 << 20
+
 // Sample is one access unit: a frame of video or audio, with the timing the
 // fragment's tables give it.
 //
@@ -180,6 +186,16 @@ func parseTrun(trun, mdat []byte, mdatOff *int, baseDataOffset, dts int64, def t
 		return dts, fmt.Errorf("%w: short trun", ErrFormat)
 	}
 	count := int(be32(rest))
+	// A sample_count is a 4-byte wire field independent of the body size, so a
+	// hostile trun can claim billions of samples and make the loop below append
+	// that many Sample structs — gigabytes — from an empty mdat, since a
+	// zero-size sample consumes nothing. Every real sample is at least one byte
+	// and comes out of the mdat, so a count past the mdat length is a lie; and
+	// maxSamplesPerFragment caps even a large mdat well above any real segment
+	// (a 10 s segment at 60 fps is ~600 frames) so the allocation stays bounded.
+	if count < 0 || count > len(mdat) || count > maxSamplesPerFragment {
+		return dts, fmt.Errorf("%w: trun claims %d samples, mdat holds %d bytes", ErrFormat, count, len(mdat))
+	}
 	off := 4
 	// data_offset is relative to the moof, but this package cuts samples out of
 	// the mdat PAYLOAD sequentially instead: an offset into the whole segment
