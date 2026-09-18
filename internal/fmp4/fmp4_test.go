@@ -91,6 +91,11 @@ func initSegment() []byte {
 // mediaSegment builds a moof+mdat carrying the given video and audio samples.
 // Video samples are AVCC: a 4-byte length then the NAL.
 func mediaSegment(baseDTS int64, video [][]byte, videoDur uint32, audio [][]byte, audioDur uint32) []byte {
+	return mediaSegmentCTS(baseDTS, video, videoDur, audio, audioDur, 0)
+}
+
+// mediaSegmentCTS is mediaSegment with a composition offset on every picture.
+func mediaSegmentCTS(baseDTS int64, video [][]byte, videoDur uint32, audio [][]byte, audioDur uint32, videoCTS int32) []byte {
 	var mdat []byte
 
 	trunFor := func(samples [][]byte, dur uint32, sync func(int) bool, cts int32) []byte {
@@ -119,7 +124,7 @@ func mediaSegment(baseDTS int64, video [][]byte, videoDur uint32, audio [][]byte
 		tfhd := mkBox("tfhd", []byte{0, 0, 0, 0}, u32(1))
 		tfdt := mkBox("tfdt", []byte{1, 0, 0, 0}, u64(uint64(baseDTS)))
 		trafs = append(trafs, mkBox("traf", tfhd, tfdt,
-			trunFor(video, videoDur, func(i int) bool { return i == 0 }, 0)))
+			trunFor(video, videoDur, func(i int) bool { return i == 0 }, videoCTS)))
 	}
 	if len(audio) > 0 {
 		tfhd := mkBox("tfhd", []byte{0, 0, 0, 0}, u32(2))
@@ -301,4 +306,21 @@ func TestAFragmentWithoutATFDTIsRefused(t *testing.T) {
 	if _, err := ParseFragment(seg, in); !errors.Is(err, ErrFormat) {
 		t.Errorf("err = %v, want a format refusal", err)
 	}
+}
+
+// reorderableSegment builds a segment of three pictures and two audio frames.
+// With reorder set, the pictures carry a composition offset, which is fMP4's
+// way of saying a frame is shown later than it is decoded.
+func reorderableSegment(baseDTS int64, reorder bool) []byte {
+	video := [][]byte{
+		avcc([]byte{0x65, 1, 2, 3}), // IDR
+		avcc([]byte{0x41, 4, 5}),
+		avcc([]byte{0x41, 6}),
+	}
+	audio := [][]byte{{0xDE, 0xAD}, {0xBE, 0xEF}}
+	var cts int32
+	if reorder {
+		cts = 3000
+	}
+	return mediaSegmentCTS(baseDTS, video, 3000, audio, 1024, cts)
 }
