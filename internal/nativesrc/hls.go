@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -314,6 +315,10 @@ type hlsPuller struct {
 	// buffer per frame.
 	nalBuf  []byte
 	adtsBuf []byte
+
+	// samples stages one fMP4 fragment's samples, both tracks merged and sorted
+	// into decode order, reused across segments.
+	samples []muxSample
 
 	// muxBuf stages the muxed form of one segment, reused across segments for
 	// the same reason segBuf is: a radio channel publishes one every few
@@ -876,37 +881,77 @@ func (p *hlsPuller) streamSegment(seg hlsSegment, seq int64) error {
 // remuxFragment turns one fMP4 media segment into MPEG-TS.
 //
 // Every segment opens with the tables, so a viewer joining mid-stream has the
-// programme within one segment. The samples go out in the order the fragment
-// lists them, video before audio, which is the order they were written in.
+// programme within one segment. The samples are emitted INTERLEAVED, in decode
+// order across both tracks: fMP4 stores a whole track's samples together, but
+// a TS carries the PCR on the video and a player times audio against it, so
+// emitting all the video and then all the audio would leave every audio sample
+// a whole segment behind the clock — up to ~2 s at a typical segment length —
+// and a strict player drops it as late. Merging by DTS keeps the wire clock
+// moving with the content, the way a real muxer writes it.
 func (p *hlsPuller) remuxFragment(body []byte) ([]byte, error) {
 	frag, err := fmp4.ParseFragment(body, p.init)
 	if err != nil {
 		return nil, err
 	}
+	v, a := p.init.Video(), p.init.Audio()
+
+	// One merged, decode-ordered list. Each entry carries the sample's time on
+	// the common 90 kHz clock, which is both the sort key and what the muxer is
+	// handed — computed once here so Scale runs per sample, not per comparison.
+	p.samples = p.samples[:0]
+	if v != nil {
+		for i := range frag.Video {
+			s := &frag.Video[i]
+			p.samples = append(p.samples, muxSample{
+				video: true, sync: s.Sync,
+				dts: fmp4.Scale(s.DTS, v.TimeScale), pts: fmp4.Scale(s.PTS, v.TimeScale),
+				data: s.Data,
+			})
+		}
+	}
+	if a != nil {
+		for i := range frag.Audio {
+			s := &frag.Audio[i]
+			t := fmp4.Scale(s.PTS, a.TimeScale)
+			p.samples = append(p.samples, muxSample{
+				video: false, sync: true, dts: t, pts: t, data: s.Data,
+			})
+		}
+	}
+	// Stable so that, at an equal timestamp, the input order (video traf before
+	// audio traf) is kept rather than shuffled between segments.
+	sort.SliceStable(p.samples, func(i, j int) bool { return p.samples[i].dts < p.samples[j].dts })
+
 	out := p.mux.Tables(p.muxBuf[:0])
-	if v := p.init.Video(); v != nil {
-		for _, s := range frag.Video {
-			annexB, aerr := fmp4.AnnexB(p.nalBuf[:0], s, v)
+	for _, s := range p.samples {
+		if s.video {
+			annexB, aerr := fmp4.AnnexBFromAVCC(p.nalBuf[:0], s.data, v, s.sync)
 			if aerr != nil {
 				return nil, aerr
 			}
 			p.nalBuf = annexB
-			out = p.mux.WriteVideo(out, annexB,
-				fmp4.Scale(s.PTS, v.TimeScale), fmp4.Scale(s.DTS, v.TimeScale), s.Sync)
-		}
-	}
-	if a := p.init.Audio(); a != nil {
-		for _, s := range frag.Audio {
-			adts, aerr := fmp4.ADTS(p.adtsBuf[:0], s.Data, a)
+			out = p.mux.WriteVideo(out, annexB, s.pts, s.dts, s.sync)
+		} else {
+			adts, aerr := fmp4.ADTS(p.adtsBuf[:0], s.data, a)
 			if aerr != nil {
 				return nil, aerr
 			}
 			p.adtsBuf = adts
-			out = p.mux.WriteAudio(out, adts, fmp4.Scale(s.PTS, a.TimeScale))
+			out = p.mux.WriteAudio(out, adts, s.pts)
 		}
 	}
 	p.muxBuf = out
 	return out, nil
+}
+
+// muxSample is one sample staged for interleaved emission: its data (a slice
+// into the segment body), its decode and presentation times on the 90 kHz
+// clock, and what it is.
+type muxSample struct {
+	data     []byte
+	dts, pts int64
+	video    bool
+	sync     bool
 }
 
 // keyFor returns the AES-128 key bytes for k, fetching them once per URI.

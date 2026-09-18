@@ -200,3 +200,96 @@ func TestAnUnreadableInitSegmentIsRefused(t *testing.T) {
 		t.Errorf("err = %v, want a format refusal", err)
 	}
 }
+
+// The remux must interleave the two tracks in decode order, not emit all the
+// video and then all the audio: the PCR rides the video, and a player times
+// audio against it, so a whole segment of lag gets the audio dropped as late.
+// This builds a 2-second segment and checks that no audio PTS trails the most
+// recent video PCR by more than a small margin.
+func TestFMP4OutputIsInterleaved(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch name := strings.TrimPrefix(r.URL.Path, "/"); {
+		case name == "init.mp4":
+			_, _ = w.Write(fmp4Init())
+		case strings.HasSuffix(name, ".m4s"):
+			_, _ = w.Write(fmp4LongSegment())
+		default:
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n" +
+				"#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\ns0.m4s\n"))
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	rc, err := Open(ctx, srv.URL+"/cmaf.m3u8", Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+
+	buf := make([]byte, 300*188)
+	n, _ := io.ReadFull(rc, buf)
+	got := buf[:n]
+
+	var lastPCR int64 = -1
+	var worstLag int64
+	for off := 0; off+188 <= len(got); off += 188 {
+		pkt := got[off : off+188]
+		switch tspes.PID(pkt) {
+		case 0x0100:
+			if v, ok := tspes.PCR(pkt); ok {
+				lastPCR = v
+			}
+		case 0x0101:
+			if pts, ok := tspes.PTS(pkt); ok && lastPCR >= 0 {
+				if lag := lastPCR - pts; lag > worstLag {
+					worstLag = lag
+				}
+			}
+		}
+	}
+	// One video frame is 3600 ticks (40 ms); allow a couple of frames of slack.
+	if worstLag > 3*3600 {
+		t.Errorf("an audio PTS trailed the PCR by %d ms: the output is not interleaved", worstLag/90)
+	}
+}
+
+// fmp4LongSegment is a ~2-second muxed segment: 50 video frames at 40 ms and
+// 94 audio frames at ~21 ms, enough to show whether the tracks are interleaved.
+func fmp4LongSegment() []byte {
+	var mdat []byte
+	nal := func(b []byte) []byte { return append(b32(uint32(len(b))), b...) }
+	var video, audio [][]byte
+	for i := 0; i < 50; i++ {
+		video = append(video, nal([]byte{0x41, byte(i)}))
+	}
+	video[0] = nal([]byte{0x65, 0})
+	for i := 0; i < 94; i++ {
+		audio = append(audio, []byte{byte(i), byte(i >> 8)})
+	}
+	trun := func(samples [][]byte, dur uint32, keyFirst bool) []byte {
+		const fl = 0x000001 | 0x000100 | 0x000200 | 0x000400
+		body := []byte{1, byte(fl >> 16), byte(fl >> 8), byte(fl & 0xFF)}
+		body = append(body, b32(uint32(len(samples)))...)
+		body = append(body, b32(0)...)
+		for i, s := range samples {
+			var sf uint32
+			if keyFirst && i > 0 {
+				sf = 0x00010000
+			}
+			body = append(body, b32(dur)...)
+			body = append(body, b32(uint32(len(s)))...)
+			body = append(body, b32(sf)...)
+			mdat = append(mdat, s...)
+		}
+		return mp4Box("trun", body)
+	}
+	vTraf := mp4Box("traf", mp4Box("tfhd", []byte{0, 0, 0, 0}, b32(1)),
+		mp4Box("tfdt", []byte{1, 0, 0, 0}, b64(0)), trun(video, 3600, true))
+	aTraf := mp4Box("traf", mp4Box("tfhd", []byte{0, 0, 0, 0}, b32(2)),
+		mp4Box("tfdt", []byte{1, 0, 0, 0}, b64(0)), trun(audio, 1024, false))
+	moof := mp4Box("moof", mp4Box("mfhd", []byte{0, 0, 0, 0}, b32(1)), vTraf, aTraf)
+	return append(moof, mp4Box("mdat", mdat)...)
+}
