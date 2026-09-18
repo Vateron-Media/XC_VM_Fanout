@@ -17,7 +17,11 @@
 //   - http(s) serving MPEG-TS  → streamed through unchanged
 //   - http(s) serving m3u8     → segments pulled and concatenated (live or VOD)
 //   - udp:// and rtp://        → read straight off the socket
-//   - fMP4/CMAF HLS            → ErrHLSIsFMP4 (caller falls back to ffmpeg)
+//   - AES-128 HLS              → key fetched, segments decrypted (internal/hlscrypt)
+//   - EXT-X-BYTERANGE HLS      → each slice fetched with a Range request
+//   - packed AAC HLS           → framed as MPEG-TS (internal/tsmux)
+//   - fMP4/CMAF HLS            → remuxed against its init segment (internal/fmp4)
+//   - SAMPLE-AES, AC-3, MP3, WebVTT, a demuxed audio rendition → ErrFormat
 //   - anything else            → ErrUnsupported
 //
 // Refusing loudly is the whole contract: the caller runs ffmpeg for whatever

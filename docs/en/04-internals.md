@@ -80,13 +80,21 @@ stream**; natively it is a goroutine and a pipe. It also removes the process spa
 | `http(s)` serving `m3u8` with **TS** segments | **native** |
 | `udp://`, `rtp://` | native |
 | `file://` or a bare path serving MPEG-TS | native |
-| HLS with **fMP4/CMAF** segments | ffmpeg |
-| HLS with **packed-audio** segments (`.aac`, `.ac3`, `.mp3`) | ffmpeg |
+| HLS encrypted with **AES-128** | **native** — the key the playlist names is fetched and the segments decrypted |
+| HLS using **`EXT-X-BYTERANGE`** | **native** — each slice is fetched with a `Range` request |
+| HLS with **packed AAC** segments (`.aac`) | **native** — framed as MPEG-TS in process |
+| HLS with **fMP4/CMAF** segments | **native** — read against the `EXT-X-MAP` init segment and remuxed |
+| HLS with **AC-3 / E-AC-3 / MP3** segments | ffmpeg |
 | HLS whose audio is a **separate rendition** (`EXT-X-MEDIA`) | ffmpeg |
-| HLS using **`EXT-X-BYTERANGE`** | ffmpeg |
+| HLS encrypted with **SAMPLE-AES** | ffmpeg |
 | RTMP / SRT / RTSP | ffmpeg |
-| AES-128 encrypted HLS **source** | ffmpeg |
 | anything it cannot positively identify | ffmpeg |
+
+The four that moved from ffmpeg to native each cost a **process per channel**
+before: AES-128 and byte ranges needed only fetching differently, packed AAC
+only framing ([`internal/tsmux`](../../internal/tsmux)), and fMP4 a real remux
+of its samples ([`internal/fmp4`](../../internal/fmp4)). What is left on the
+ffmpeg side needs a decoder or a demuxer, which is what ffmpeg is there for.
 
 Refusing loudly is the whole contract. Every refusal returns `ErrUnsupported` **before a single
 byte is published**, so the caller runs ffmpeg and an unsupported source degrades to exactly the
