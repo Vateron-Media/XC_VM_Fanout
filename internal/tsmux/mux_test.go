@@ -287,3 +287,48 @@ func TestSaveRestoreRollsBackTheMuxer(t *testing.T) {
 		t.Error("two segments from the same saved state differ: rollback is not clean")
 	}
 }
+
+func TestCRC32MPEGCheckValue(t *testing.T) {
+	// The published CRC-32/MPEG-2 check value for ASCII "123456789". A wrong CRC
+	// is a section a strict set-top box drops, so this is pinned against the
+	// standard rather than against our own output.
+	if got := crc32MPEG([]byte("123456789")); got != 0x0376E6E7 {
+		t.Fatalf("crc32MPEG = %#08x, want 0x0376E6E7", got)
+	}
+}
+
+// The packed-audio clock must not drift: 1024*90000/rate does not divide evenly
+// at most sample rates, and truncating each frame lost ~0.4% — minutes of
+// radio drift over an hour. Over many frames the emitted PTS must stay within a
+// tick of the exact time.
+func TestPackedAudioClockDoesNotDrift(t *testing.T) {
+	const rate = 44100 // the awkward one: 1024*90000/44100 = 2089.79…
+	m := New()
+	// 4000 frames ≈ 93 s of audio.
+	seg := make([]byte, 0)
+	for i := 0; i < 4000; i++ {
+		seg = append(seg, adtsFrameRate(200, rate)...)
+	}
+	if _, err := m.Segment(nil, seg); err != nil {
+		t.Fatalf("Segment: %v", err)
+	}
+	exact := int64(4000) * 1024 * 90000 / rate
+	if diff := m.pts - exact; diff < -1 || diff > 1 {
+		t.Errorf("after 4000 frames the clock is %d, exact is %d (drift %d ticks = %d ms)",
+			m.pts, exact, diff, diff/90)
+	}
+}
+
+// adtsFrameRate is adtsFrame at a chosen sample rate.
+func adtsFrameRate(n, rate int) []byte {
+	idx := map[int]byte{96000: 0, 88200: 1, 64000: 2, 48000: 3, 44100: 4, 32000: 5, 24000: 6, 22050: 7, 16000: 8, 12000: 9, 11025: 10, 8000: 11}[rate]
+	total := 7 + n
+	h := make([]byte, total)
+	h[0], h[1] = 0xFF, 0xF1
+	h[2] = 0x40 | (idx << 2)
+	h[3] = byte(0x80 | (total>>11)&0x03)
+	h[4] = byte(total >> 3)
+	h[5] = byte((total&0x07)<<5) | 0x1F
+	h[6] = 0xFC
+	return h
+}

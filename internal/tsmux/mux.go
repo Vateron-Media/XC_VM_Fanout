@@ -41,6 +41,7 @@ type Muxer struct {
 	ccAudio   byte
 	ccVideo   byte
 	nextTable int64 // pts at which the tables are due again
+	ptsRem    int64 // fractional 90 kHz remainder carried between packed-audio frames
 	started   bool
 
 	// hasVideo says the programme carries video, which changes the PMT and
@@ -56,7 +57,7 @@ func New() *Muxer { return &Muxer{} }
 // captured so a caller can roll back a segment it could not finish. It is
 // opaque; only Save and Restore touch it.
 type State struct {
-	pts, nextTable                 int64
+	pts, nextTable, ptsRem         int64
 	ccPAT, ccPMT, ccAudio, ccVideo byte
 	started                        bool
 }
@@ -68,12 +69,12 @@ type State struct {
 // would flip started, so a first segment that fails is reported as a plain
 // error (retry) instead of an unreadable-format refusal (fall back to ffmpeg).
 func (m *Muxer) Save() State {
-	return State{m.pts, m.nextTable, m.ccPAT, m.ccPMT, m.ccAudio, m.ccVideo, m.started}
+	return State{m.pts, m.nextTable, m.ptsRem, m.ccPAT, m.ccPMT, m.ccAudio, m.ccVideo, m.started}
 }
 
 // Restore rolls the muxer back to a saved position.
 func (m *Muxer) Restore(s State) {
-	m.pts, m.nextTable = s.pts, s.nextTable
+	m.pts, m.nextTable, m.ptsRem = s.pts, s.nextTable, s.ptsRem
 	m.ccPAT, m.ccPMT, m.ccAudio, m.ccVideo = s.ccPAT, s.ccPMT, s.ccAudio, s.ccVideo
 	m.started = s.started
 }
@@ -138,7 +139,20 @@ func (m *Muxer) Segment(dst, body []byte) ([]byte, error) {
 		// what tsjoin cuts a block on, and every audio frame is a valid entry
 		// point anyway.
 		dst = m.writePES(dst, f, i == 0)
-		m.pts += f.duration90k()
+		// Advance the clock by the frame's EXACT duration, carrying the
+		// remainder: 1024*90000/rate rarely divides evenly (2089.79… at
+		// 44.1 kHz), and dropping the fraction every frame drifts the wire clock
+		// ~0.4% slow — minutes of a radio channel over an hour.
+		if f.sampleRate > 0 {
+			step := int64(aacSamplesPerFrame) * 90000
+			r := int64(f.sampleRate)
+			m.pts += step / r
+			m.ptsRem += step % r
+			if m.ptsRem >= r {
+				m.pts += m.ptsRem / r
+				m.ptsRem %= r
+			}
+		}
 	}
 	m.started = true
 	return dst, nil
@@ -214,21 +228,41 @@ func pmtSection(hasVideo bool) []byte {
 }
 
 // section prefixes a table body with its table_id and section_length and
-// appends a CRC field.
+// appends a real CRC-32.
 //
-// The CRC is written as zero rather than computed. Nothing in this daemon
-// verifies it — internal/tspes reads section_length and stops, as every parser
-// here does — and a real demuxer downstream of the daemon reads the tables the
-// SOURCE sent for a normal stream. For this one synthetic case a correct CRC
-// would be better manners; it is noted here so the next reader knows it is a
-// deliberate omission rather than an oversight.
+// On the packed-audio and fMP4 paths these synthetic tables are the ONLY PSI on
+// the wire — there is no source PAT/PMT behind them — and a strict hardware
+// demuxer (a set-top box, a TV) validates the section CRC and drops a section
+// that fails it, so a zero CRC there is no programme at all. The daemon's own
+// parsers read section_length and never check the CRC, so this costs them
+// nothing; it is purely for the players downstream.
 func section(tableID byte, body []byte) []byte {
 	const crcLen = 4
 	secLen := len(body) + crcLen
 	out := make([]byte, 0, 3+secLen)
 	out = append(out, tableID, byte(0xB0|secLen>>8), byte(secLen))
 	out = append(out, body...)
-	return append(out, 0x00, 0x00, 0x00, 0x00)
+	crc := crc32MPEG(out)
+	return append(out, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
+}
+
+// crc32MPEG is the CRC-32/MPEG-2 the MPEG-2 systems layer uses for PSI sections:
+// polynomial 0x04C11DB7, initial value all-ones, no input or output reflection,
+// no final xor. Computed directly rather than through a table — a PAT/PMT is a
+// few dozen bytes and this runs once per segment, not per packet.
+func crc32MPEG(b []byte) uint32 {
+	crc := uint32(0xFFFFFFFF)
+	for _, x := range b {
+		crc ^= uint32(x) << 24
+		for i := 0; i < 8; i++ {
+			if crc&0x80000000 != 0 {
+				crc = crc<<1 ^ 0x04C11DB7
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
 }
 
 // writePES packages one audio frame as a PES packet and cuts it into TS
