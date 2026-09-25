@@ -2,9 +2,7 @@ package clusteragent
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,14 +37,15 @@ func TestInteropWithPanel(t *testing.T) {
 	port := freePort(t)
 	env := append(os.Environ(), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+filepath.Join(dir, "main.sqlite"), fmt.Sprintf("XCVM_INTEROP_PORT=%d", port))
 
-	// The install flow's part: node keys on the LB, epoch 1 minted by MAIN.
+	// The install flow, as LbInstallFlow::provisionCluster runs it over SSH:
+	// keygen on the node, epoch 1 minted by MAIN, probe, install.
 	uuid := "3b0c1d2e-4f5a-4b6c-8d7e-9f0a1b2c3d4e"
-	seed := make([]byte, 32)
-	copy(seed, "interop-node-seed-0123456789abcd")
-	signPub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
-	_, boxPub, _ := cc.NewX25519()
-	ephSk, ephPub, _ := cc.NewX25519()
-	cmd := exec.Command(php, filepath.Join(harness, "enrol.php"), uuid, hex.EncodeToString(signPub), hex.EncodeToString(boxPub), hex.EncodeToString(ephPub))
+	statePath := filepath.Join(dir, "state.json")
+	keys, err := Keygen(statePath, uuid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(php, filepath.Join(harness, "enrol.php"), uuid, keys.SignPub, keys.BoxPub, keys.EphPub)
 	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
@@ -58,7 +57,8 @@ func TestInteropWithPanel(t *testing.T) {
 		Cluster      struct {
 			ServerID int64 `json:"server_id"`
 			Policy   struct {
-				MainURLs []string `json:"main_urls"`
+				PolicyVer int      `json:"policy_ver"`
+				MainURLs  []string `json:"main_urls"`
 			} `json:"policy"`
 		} `json:"cluster"`
 	}
@@ -68,14 +68,6 @@ func TestInteropWithPanel(t *testing.T) {
 	sealed, _ := base64.StdEncoding.DecodeString(first.TokenSealed)
 	panelPub, _ := base64.StdEncoding.DecodeString(first.PanelSignPub)
 
-	st := NewState(filepath.Join(dir, "state.json"))
-	st.NodeUUID, st.ServerID, st.NodeSignSeed, st.PanelSignPub = uuid, first.Cluster.ServerID, seed, panelPub
-	st.MainURLs, st.InstanceID = first.Cluster.Policy.MainURLs, "interop-instance"
-	st.Epochs = []Epoch{{Epoch: 1, EphSk: ephSk, TokenSealed: sealed}}
-	if err := st.Save(); err != nil {
-		t.Fatal(err)
-	}
-
 	srv := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(harness, "router.php"))
 	srv.Env = env
 	if err := srv.Start(); err != nil {
@@ -84,7 +76,20 @@ func TestInteropWithPanel(t *testing.T) {
 	defer srv.Process.Kill()
 	waitPort(t, port)
 
-	loaded, err := LoadState(st.path)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := Probe(ctx, panelPub, first.Cluster.Policy.MainURLs); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if _, err := Probe(ctx, make([]byte, 32), first.Cluster.Policy.MainURLs); err == nil {
+		t.Fatal("probe accepted a health document under the wrong panel key")
+	}
+	if err := Install(statePath, InstallData{ServerID: first.Cluster.ServerID, PanelSignPub: panelPub, MainURLs: first.Cluster.Policy.MainURLs, PolicyVer: first.Cluster.Policy.PolicyVer, Epoch: 1, TokenSealed: sealed}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	st := &State{MainURLs: first.Cluster.Policy.MainURLs}
+
+	loaded, err := LoadState(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,9 +97,6 @@ func TestInteropWithPanel(t *testing.T) {
 	if _, ok := c.Current(); !ok {
 		t.Fatal("epoch 1 did not open with the agent's key")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	if _, err := c.Health(ctx, st.MainURLs[0]); err != nil {
 		t.Fatalf("health: %v", err)
 	}

@@ -14,14 +14,22 @@
 //	xc_agent [-state path] [-interval 2s]   run the control loop
 //	xc_agent health [-state path]           fetch and verify MAIN's signed health
 //	xc_agent version
+//
+// Install flow (run by the panel over SSH, see internal/clusteragent/install.go):
+//
+//	xc_agent keygen  -state path -uuid <uuid>          keys stay here; prints the public halves (JSON)
+//	xc_agent probe   -panel-pub <hex> -url <u> [...]   MAIN's health must verify before any token exists
+//	xc_agent install -state path < install.json        checks and saves epoch 1
 package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -43,15 +51,49 @@ func main() {
 	fs := flag.NewFlagSet("xc_agent "+cmd, flag.ExitOnError)
 	statePath := fs.String("state", "/home/xc_vm/config/cluster/agent.json", "node state file (written by the panel's install flow)")
 	interval := fs.Duration("interval", 2*time.Second, "heartbeat interval (1s–3s)")
+	uuid := fs.String("uuid", "", "keygen: the node uuid MAIN assigned")
+	panelPub := fs.String("panel-pub", "", "probe: the panel signing key (hex), as received over SSH")
+	var urls multiFlag
+	fs.Var(&urls, "url", "probe: a MAIN cluster URL (repeatable)")
 	fs.Parse(args)
 
 	switch cmd {
 	case "version":
 		fmt.Println(version)
 		return
+	case "keygen":
+		res, err := clusteragent.Keygen(*statePath, *uuid)
+		if err != nil {
+			log.Fatalf("xc_agent keygen: %v", err)
+		}
+		json.NewEncoder(os.Stdout).Encode(res)
+		return
+	case "probe":
+		pub, err := hex.DecodeString(*panelPub)
+		if err != nil {
+			log.Fatalf("xc_agent probe: panel key: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		u, err := clusteragent.Probe(ctx, pub, urls)
+		if err != nil {
+			log.Fatalf("xc_agent probe: %v", err)
+		}
+		fmt.Println("OK " + u)
+		return
+	case "install":
+		var d clusteragent.InstallData
+		if err := json.NewDecoder(io.LimitReader(os.Stdin, 1<<20)).Decode(&d); err != nil {
+			log.Fatalf("xc_agent install: %v", err)
+		}
+		if err := clusteragent.Install(*statePath, d); err != nil {
+			log.Fatalf("xc_agent install: %v", err)
+		}
+		fmt.Println("OK")
+		return
 	case "run", "health":
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, version)\n", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, keygen, probe, install, version)\n", cmd)
 		os.Exit(2)
 	}
 
@@ -113,3 +155,8 @@ func telemetry() map[string]any {
 	}
 	return out
 }
+
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
