@@ -30,6 +30,9 @@ type Agent struct {
 	// SpoolDir is where the node's PHP spools events for MAIN (events.go);
 	// "" leaves the event lanes off.
 	SpoolDir string
+	// SocketPath is the local socket the node's PHP calls MAIN through
+	// (socket.go); "" leaves it off.
+	SocketPath string
 
 	flowsSeen string
 	flows     atomic.Int64 // the flow bits from MAIN's latest reply
@@ -261,6 +264,15 @@ func (a *Agent) Run(ctx context.Context) error {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
 		go a.RunCommands(cctx, a.Exec)
+	}
+	if a.SocketPath != "" {
+		sctx, stopSocket := context.WithCancel(ctx)
+		defer stopSocket()
+		go func() {
+			if err := a.ServeSocket(sctx, a.SocketPath); err != nil {
+				a.logf("cluster: local socket: %v", err)
+			}
+		}()
 	}
 	if a.SpoolDir != "" {
 		ectx, stopEvents := context.WithCancel(ctx)
