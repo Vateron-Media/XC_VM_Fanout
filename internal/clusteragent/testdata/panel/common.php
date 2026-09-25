@@ -41,3 +41,8 @@ $rSettings = ['cluster_api_enabled' => 1, 'lb_token_rotation_min' => (int) (gete
 SettingsManager::set($rSettings);
 $rMain = ['server_ip' => '127.0.0.1', 'http_broadcast_port' => (int) getenv('XCVM_INTEROP_PORT')];
 $rCrypto = new \XcVm\Tests\Support\FakeClusterCrypto();
+if (class_exists(\XcVm\Domain\Cluster\ConnectionDigest::class)) {
+	// Every heartbeat's digest is checked, and snapshots are staged next to the DB.
+	\XcVm\Domain\Cluster\ConnectionDigest::useState(dirname($rDbFile) . '/digest/', 0);
+	\XcVm\Domain\Cluster\ConnectionSnapshot::useDir(dirname($rDbFile) . '/snap/');
+}
