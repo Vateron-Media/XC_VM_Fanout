@@ -17,6 +17,7 @@ import (
 // through the agent, which holds the node's token:
 //
 //	POST /v1/main/{op}   body: the op's JSON payload; reply: MAIN's opened reply
+//	/v1/conn/...         the connection registry (registry.go)
 //
 // Only the ops in SocketOps pass. The socket is xc_vm's alone (0660, in the
 // agent's state directory); everything that is only a report goes through
@@ -54,6 +55,14 @@ func (a *Agent) ServeSocket(ctx context.Context, path string) error {
 
 func (a *Agent) socketHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/conn/") {
+			if a.Registry == nil {
+				http.Error(w, "no registry", http.StatusServiceUnavailable)
+				return
+			}
+			a.Registry.connHandler(w, r)
+			return
+		}
 		op, ok := strings.CutPrefix(r.URL.Path, "/v1/main/")
 		if r.Method != http.MethodPost || !ok || !SocketOps[op] {
 			http.Error(w, "not allowed", http.StatusForbidden)

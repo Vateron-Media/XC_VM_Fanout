@@ -36,6 +36,9 @@ type Agent struct {
 	// FanoutCtl is xc_fanout's control socket, whose GET /events the agent
 	// follows while STREAMS is on (fanout.go); "" leaves it off.
 	FanoutCtl string
+	// Registry holds the node's viewers while CONNECTIONS is on (registry.go);
+	// Run makes it when SpoolDir is set.
+	Registry *Registry
 
 	flowsSeen string
 	flows     atomic.Int64 // the flow bits from MAIN's latest reply
@@ -273,6 +276,27 @@ func (a *Agent) Run(ctx context.Context) error {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
 		go a.RunCommands(cctx, a.localExec(a.Exec))
+	}
+	if a.Registry == nil && a.SpoolDir != "" {
+		spool := a.SpoolDir
+		a.Registry = NewRegistry(filepath.Join(filepath.Dir(spool), "registry.snap"), func(ev []map[string]any) error { return spoolP0(spool, ev) }, a.logf)
+	}
+	if a.Registry != nil {
+		go func() {
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					a.Registry.Save()
+					return
+				case <-t.C:
+					if err := a.Registry.Save(); err != nil {
+						a.logf("cluster: saving the connection registry: %v", err)
+					}
+				}
+			}
+		}()
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)
