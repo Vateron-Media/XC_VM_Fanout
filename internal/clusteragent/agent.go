@@ -33,7 +33,10 @@ type Reply struct {
 	Flows   int    `json:"flows"`
 	Gen     int    `json:"gen"`
 	Pending int    `json:"pending"`
-	Policy  *struct {
+	// PolicyVer, in heartbeat replies, is MAIN's current transport policy;
+	// a newer one than the node holds makes it say hello again to fetch it.
+	PolicyVer int `json:"policy_ver"`
+	Policy    *struct {
 		PolicyVer int      `json:"policy_ver"`
 		Transport string   `json:"transport"`
 		MainURLs  []string `json:"main_urls"`
@@ -266,6 +269,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			continue
 		}
 		a.publish(&r)
+		if r.PolicyVer > a.Client.State.PolicyVer {
+			if _, err := a.Start(ctx); err != nil {
+				a.logf("cluster: fetching policy %d: %v", r.PolicyVer, err)
+			}
+		}
 		if r.State == "quarantined" {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
