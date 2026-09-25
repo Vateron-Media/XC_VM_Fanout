@@ -4,12 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"time"
@@ -117,11 +114,9 @@ func fanoutPoll(ctx context.Context, hc *http.Client, boot string, seq uint64) (
 	return &out, nil
 }
 
-// spoolMonitor writes the transitions as one P0 spool file, as PHP's
-// EventSpool does (written aside, renamed in, named by CLOCK_MONOTONIC).
+// spoolMonitor writes the transitions as one P0 spool file.
 func (a *Agent) spoolMonitor(out *fanoutReply) error {
-	var body []byte
-	now := time.Now().UnixMilli()
+	var events []map[string]any
 	for _, e := range out.Events {
 		id, err := strconv.Atoi(e.Stream)
 		if e.Type != "monitor" || err != nil || id <= 0 {
@@ -135,25 +130,12 @@ func (a *Agent) spoolMonitor(out *fanoutReply) error {
 			state["source"] = redact.URL(src)
 		}
 		delete(state, "last_error") // free text from ffmpeg; may quote a URL
-		line, err := json.Marshal(map[string]any{"type": "stream.monitor", "t": now, "d": map[string]any{"stream_id": id, "state": state}})
-		if err != nil {
-			return err
-		}
-		body = append(append(body, line...), '\n')
+		events = append(events, map[string]any{"type": "stream.monitor", "d": map[string]any{"stream_id": id, "state": state}})
 	}
-	if len(body) == 0 {
+	if len(events) == 0 {
 		return nil
 	}
-	dir := filepath.Join(a.SpoolDir, "p0")
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return err
-	}
-	name := fmt.Sprintf("%019d-agent-%04x.ndjson", monotonicNs(), rand.Intn(0x10000))
-	tmp := filepath.Join(dir, "."+name+".tmp")
-	if err := os.WriteFile(tmp, body, 0o640); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(dir, name))
+	return spoolP0(a.SpoolDir, events)
 }
 
 func (a *Agent) setFanoutLive(on bool) {
@@ -166,10 +148,20 @@ var dropUUID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // localExec runs the commands the agent can serve itself, within its own
 // process: `conn.drop {uuid}` against the fanout's control socket (a daemon
-// viewer, well under the plan's 1 s). Anything else, or a fanout it cannot
+// viewer, well under the plan's 1 s), and `conn.close {uuid, remove}` on the
+// connection registry (a close MAIN decided). Anything else, or a fanout it cannot
 // reach, goes to next (the node's PHP, cluster:exec).
 func (a *Agent) localExec(next Executor) Executor {
 	return func(ctx context.Context, cmd *Command, w WireCommand) (bool, []byte) {
+		if cmd.Type == "conn.close" && a.Registry != nil {
+			uuid, _ := cmd.Args["uuid"].(string)
+			if !connUUID.MatchString(uuid) {
+				return false, []byte("refused: bad uuid")
+			}
+			remove, _ := cmd.Args["remove"].(bool)
+			a.Registry.Close(uuid, remove)
+			return true, []byte(`{"result":true}`)
+		}
 		if cmd.Type != "conn.drop" || a.FanoutCtl == "" {
 			return next(ctx, cmd, w)
 		}
