@@ -74,3 +74,9 @@ func hkdf(ikm, salt, info []byte, n int) []byte {
 
 // SHA256 is the body hash the MAC and the node request signature cover.
 func SHA256(b []byte) []byte { return sum256(b) }
+
+// HKDF is HKDF-SHA256 for outputs up to 32 bytes (the enrolment-code keys).
+func HKDF(ikm, salt, info []byte, n int) []byte { return hkdf(ikm, salt, info, n) }
+
+// U32 is the canonical big-endian 32-bit encoding.
+func U32(v uint32) []byte { return u32(v) }

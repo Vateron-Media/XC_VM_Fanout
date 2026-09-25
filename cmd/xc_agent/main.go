@@ -20,6 +20,11 @@
 //	xc_agent keygen  -state path -uuid <uuid>          keys stay here; prints the public halves (JSON)
 //	xc_agent probe   -panel-pub <hex> -url <u> [...]   MAIN's health must verify before any token exists
 //	xc_agent install -state path < install.json        checks and saves epoch 1
+//
+// Break-glass enrolment, when MAIN cannot reach the node over SSH:
+//
+//	xc_agent enrol [-state path] [-force] <code>   code from `console.php cluster:enrol-code`;
+//	                                               prints the SAS the admin approves on MAIN
 package main
 
 import (
@@ -33,6 +38,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -53,6 +59,7 @@ func main() {
 	interval := fs.Duration("interval", 2*time.Second, "heartbeat interval (1s–3s)")
 	uuid := fs.String("uuid", "", "keygen: the node uuid MAIN assigned")
 	panelPub := fs.String("panel-pub", "", "probe: the panel signing key (hex), as received over SSH")
+	force := fs.Bool("force", false, "enrol: replace an identity that already holds tokens")
 	var urls multiFlag
 	fs.Var(&urls, "url", "probe: a MAIN cluster URL (repeatable)")
 	fs.Parse(args)
@@ -91,9 +98,28 @@ func main() {
 		}
 		fmt.Println("OK")
 		return
+	case "enrol":
+		// Break-glass enrolment with a code from `console.php cluster:enrol-code`.
+		if fs.NArg() != 1 {
+			log.Fatalf("usage: xc_agent enrol [-state path] [-force] <code>")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		err := clusteragent.EnrolByCode(ctx, *statePath, fs.Arg(0), "xc_agent/"+version, *force, func(sas string) {
+			fmt.Printf("Request sent. On MAIN, approve it with this SAS:\n\n  %s\n\n(console.php cluster:enrol-approve <serverID> %s). Waiting for the decision...\n", sas, sas)
+		})
+		if err != nil {
+			log.Fatalf("xc_agent enrol: %v", err)
+		}
+		// A node MAIN had stopped may run again: the supervisor starts it.
+		if exe, err := os.Executable(); err == nil {
+			os.Remove(filepath.Join(filepath.Dir(exe), "stopped"))
+		}
+		fmt.Println("OK")
+		return
 	case "run", "health":
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, keygen, probe, install, version)\n", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, keygen, probe, install, enrol, version)\n", cmd)
 		os.Exit(2)
 	}
 
