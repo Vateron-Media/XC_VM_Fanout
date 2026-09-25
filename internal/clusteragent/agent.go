@@ -33,11 +33,15 @@ type Agent struct {
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
+	// FanoutCtl is xc_fanout's control socket, whose GET /events the agent
+	// follows while STREAMS is on (fanout.go); "" leaves it off.
+	FanoutCtl string
 
 	flowsSeen string
 	flows     atomic.Int64 // the flow bits from MAIN's latest reply
 	// MAIN's event cursors from the latest hello, plus one (0: not known yet).
 	cursorP0, cursorP1 atomic.Int64
+	fanoutLive         atomic.Bool // the fanout's /events feed is being followed
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -153,7 +157,12 @@ func (a *Agent) publish(r *Reply) {
 	if a.FlowsFile == "" {
 		return
 	}
-	b, _ := json.Marshal(map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State})
+	doc := map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State}
+	if a.fanoutLive.Load() {
+		// PHP's reconcile leaves the supervised streams' state to these events.
+		doc["features"] = []string{"fanout_events"}
+	}
+	b, _ := json.Marshal(doc)
 	if string(b) == a.flowsSeen {
 		// Unchanged: touch it, so the PHP side knows the agent is alive and
 		// keeps spooling events (EventSpool::STALE_AFTER).
@@ -273,6 +282,11 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.logf("cluster: local socket: %v", err)
 			}
 		}()
+	}
+	if a.FanoutCtl != "" && a.SpoolDir != "" {
+		fctx, stopFanout := context.WithCancel(ctx)
+		defer stopFanout()
+		go a.RunFanoutEvents(fctx)
 	}
 	if a.SpoolDir != "" {
 		ectx, stopEvents := context.WithCancel(ctx)

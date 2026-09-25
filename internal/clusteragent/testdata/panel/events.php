@@ -24,11 +24,11 @@ switch ($argv[1]) {
 		echo 'OK';
 		break;
 	case 'state':
-		$rDb->query('SELECT `pid`, `current_source` FROM `streams_servers` WHERE `server_stream_id` = 70');
+		$rDb->query('SELECT `pid`, `current_source`, `stream_status` FROM `streams_servers` WHERE `server_stream_id` = 70');
 		$rRow = $rDb->get_row();
 		$rDb->query('SELECT `action`, `source`, `server_id` FROM `streams_logs`');
 		$rLogs = $rDb->get_rows();
 		$rNode = \XcVm\Domain\Cluster\NodeRegistry::byServer(7);
-		echo json_encode(['pid' => (int) $rRow['pid'], 'source' => $rRow['current_source'], 'logs' => $rLogs, 'p0' => (int) $rNode['useq_p0'], 'p1' => (int) $rNode['useq_p1']]);
+		echo json_encode(['pid' => (int) $rRow['pid'], 'status' => (int) $rRow['stream_status'], 'source' => $rRow['current_source'], 'logs' => $rLogs, 'p0' => (int) $rNode['useq_p0'], 'p1' => (int) $rNode['useq_p1']]);
 		break;
 }
