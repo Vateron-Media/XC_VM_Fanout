@@ -12,7 +12,7 @@ require $rPanel . '/tests/bootstrap.php';
 $rNew = !file_exists($rDbFile);
 $rDb = new TestDb(new PDO('sqlite:' . $rDbFile));
 if ($rNew) {
-	foreach (['029_create_cluster_nodes', '031_create_cluster_enrolment', '032_create_cluster_audit'] as $rName) {
+	foreach (['029_create_cluster_nodes', '030_create_cluster_commands', '031_create_cluster_enrolment', '032_create_cluster_audit'] as $rName) {
 		$rSql = (string) file_get_contents($rPanel . '/src/migrations/database/up/' . $rName . '.sql');
 		$rSql = (string) preg_replace('/^--.*$/m', '', $rSql);
 		$rSql = (string) preg_replace('/`id` (bigint\(20\) unsigned|int\(11\)) NOT NULL AUTO_INCREMENT/', '`id` INTEGER PRIMARY KEY AUTOINCREMENT', $rSql);

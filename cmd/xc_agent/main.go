@@ -62,6 +62,8 @@ func main() {
 	uuid := fs.String("uuid", "", "keygen: the node uuid MAIN assigned")
 	panelPub := fs.String("panel-pub", "", "probe: the panel signing key (hex), as received over SSH")
 	force := fs.Bool("force", false, "enrol: replace an identity that already holds tokens")
+	phpBin := fs.String("php", "/home/xc_vm/bin/php/bin/php", "run: the PHP that runs MAIN's commands")
+	console := fs.String("console", "/home/xc_vm/console.php", "run: the panel console (cluster:exec)")
 	var urls multiFlag
 	fs.Var(&urls, "url", "probe: a MAIN cluster URL (repeatable)")
 	fs.Parse(args)
@@ -154,7 +156,8 @@ func main() {
 	stopSampler := make(chan struct{})
 	defer close(stopSampler)
 	go sampler.Run(stopSampler)
-	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json")}
+	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
+		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute)}
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
 	switch {

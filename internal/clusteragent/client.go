@@ -57,6 +57,9 @@ type Client struct {
 	HTTP  *http.Client
 	Agent string
 
+	// LongHTTP carries the commands long-poll, which MAIN holds open.
+	LongHTTP *http.Client
+
 	mu       sync.Mutex
 	sessions map[uint64]session
 	offsetMs atomic.Int64 // MAIN time − local time, from authenticated replies
@@ -69,6 +72,7 @@ func NewClient(st *State, agent string) *Client {
 	c := &Client{
 		State:    st,
 		HTTP:     &http.Client{Timeout: 10 * time.Second},
+		LongHTTP: &http.Client{Timeout: 45 * time.Second},
 		Agent:    agent,
 		sessions: map[uint64]session{},
 		now:      time.Now,
@@ -169,7 +173,11 @@ func (c *Client) call(ctx context.Context, s session, op string, payload, out an
 
 	var lastErr error = ErrTransport
 	for _, base := range c.State.MainURLs {
-		st, rh, rb, err := c.post(ctx, strings.TrimRight(base, "/")+"/"+op, h, body)
+		hc := c.HTTP
+		if op == "commands" && c.LongHTTP != nil {
+			hc = c.LongHTTP
+		}
+		st, rh, rb, err := c.postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
 		if err != nil {
 			lastErr = err
 			continue
@@ -186,12 +194,16 @@ func (c *Client) call(ctx context.Context, s session, op string, payload, out an
 }
 
 func (c *Client) post(ctx context.Context, url string, h http.Header, body []byte) (int, http.Header, []byte, error) {
+	return c.postWith(ctx, c.HTTP, url, h, body)
+}
+
+func (c *Client) postWith(ctx context.Context, hc *http.Client, url string, h http.Header, body []byte) (int, http.Header, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	req.Header = h.Clone()
-	res, err := c.HTTP.Do(req)
+	res, err := hc.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}
