@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -153,5 +154,24 @@ func TestAgentChecksEveryCommand(t *testing.T) {
 	st.CmdSeq = 1
 	if _, err := c.verifyCommand(wire(f.panel, "cmd", nil)); err == nil {
 		t.Error("a seq at the high-water was accepted (replay)")
+	}
+}
+
+func TestRootReadyFollowsRootsPin(t *testing.T) {
+	_, st := newFake(t)
+	old := RootPinDir
+	RootPinDir = t.TempDir()
+	defer func() { RootPinDir = old }()
+	if RootReady(st) {
+		t.Fatal("ready without a pin")
+	}
+	os.WriteFile(filepath.Join(RootPinDir, "main_sign.pub"), []byte(hex.EncodeToString(st.PanelSignPub)+"\n"), 0o644)
+	os.WriteFile(filepath.Join(RootPinDir, "node"), []byte(st.NodeUUID+"\n"), 0o644)
+	if !RootReady(st) {
+		t.Fatal("not ready with a matching pin")
+	}
+	os.WriteFile(filepath.Join(RootPinDir, "main_sign.pub"), []byte(strings.Repeat("00", 32)), 0o644)
+	if RootReady(st) {
+		t.Fatal("ready with another key pinned")
 	}
 }
