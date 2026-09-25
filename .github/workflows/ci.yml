@@ -67,4 +67,6 @@ jobs:
             echo ">>> linux-$t"
             CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH GOARM=$GOARM GOWORK=off \
               go build -trimpath -o /tmp/xc_fanout-linux-$t ./cmd/xc_fanout
+            CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH GOARM=$GOARM GOWORK=off \
+              go build -trimpath -o /tmp/xc_agent-linux-$t ./cmd/xc_agent
           done

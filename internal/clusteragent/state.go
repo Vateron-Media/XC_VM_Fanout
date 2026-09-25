@@ -33,6 +33,7 @@ type State struct {
 	NodeUUID     string   `json:"node_uuid"`
 	ServerID     int64    `json:"server_id"`
 	NodeSignSeed []byte   `json:"node_sign_seed"`
+	NodeBoxSk    []byte   `json:"node_box_sk"`
 	PanelSignPub []byte   `json:"panel_sign_pub"`
 	MainURLs     []string `json:"main_urls"`
 	PolicyVer    int      `json:"policy_ver"`
@@ -48,8 +49,19 @@ type State struct {
 	mu   sync.Mutex
 }
 
-// LoadState reads the state file.
+// LoadState reads a complete state file: one the install flow has finished.
 func LoadState(path string) (*State, error) {
+	s, err := loadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.NodeSignSeed) != ed25519.SeedSize || len(s.PanelSignPub) != ed25519.PublicKeySize || s.NodeUUID == "" {
+		return nil, errors.New("clusteragent: state is incomplete (enrolment not finished)")
+	}
+	return s, nil
+}
+
+func loadRaw(path string) (*State, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -57,9 +69,6 @@ func LoadState(path string) (*State, error) {
 	var s State
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("clusteragent: state %s: %w", path, err)
-	}
-	if len(s.NodeSignSeed) != ed25519.SeedSize || len(s.PanelSignPub) != ed25519.PublicKeySize || s.NodeUUID == "" {
-		return nil, errors.New("clusteragent: state is incomplete")
 	}
 	s.path = path
 	return &s, nil

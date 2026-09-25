@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -143,5 +145,51 @@ func TestStateKeepsTwoEpochsAndRoundTrips(t *testing.T) {
 	back, err := LoadState(st.path)
 	if err != nil || back.NodeUUID != st.NodeUUID || len(back.Epochs) != 2 {
 		t.Fatalf("round trip: %v %+v", err, back)
+	}
+}
+
+func TestSASMatchesThePanel(t *testing.T) {
+	// EnrolmentService::sas() on the panel gives this for the same inputs.
+	got := SAS("0f8fad5b-d9cb-469f-a165-70867728950e", bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32))
+	if got != "FZPT-OIPM-JQFA-HIKW-RI3Q-73ZK" {
+		t.Fatalf("SAS %s", got)
+	}
+}
+
+func TestKeygenIsIdempotentUntilInstalled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cluster", "agent.json")
+	uuid := "0f8fad5b-d9cb-469f-a165-70867728950e"
+	a, err := Keygen(path, uuid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Keygen(path, uuid)
+	if err != nil || *a != *b {
+		t.Fatalf("a retried keygen changed the keys: %v", err)
+	}
+	c, err := Keygen(path, "11111111-1111-4111-a111-111111111111")
+	if err != nil || c.SignPub == a.SignPub {
+		t.Fatalf("a new uuid kept the old identity: %v", err)
+	}
+	if _, err := Keygen(path, "not-a-uuid"); err == nil {
+		t.Fatal("bad uuid accepted")
+	}
+	if _, err := LoadState(path); err == nil {
+		t.Fatal("a state without a panel key loaded as complete")
+	}
+	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("state mode %v", fi.Mode().Perm())
+	}
+}
+
+func TestInstallRefusesAForeignToken(t *testing.T) {
+	_, st := newFake(t) // a token sealed to another key, for another node's keys
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if _, err := Keygen(path, st.NodeUUID); err != nil {
+		t.Fatal(err)
+	}
+	err := Install(path, InstallData{ServerID: 3, PanelSignPub: st.PanelSignPub, MainURLs: []string{"http://x/cluster/v1/"}, Epoch: 1, TokenSealed: st.Epochs[0].TokenSealed})
+	if err == nil {
+		t.Fatal("installed a token sealed to another key")
 	}
 }
