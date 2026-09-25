@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "comment": "Panel-owned canonical request/response serialisation (src/Core/Cluster/Crypto/Canonical.php). The Go xc_agent must produce these bytes.",
+  "request": {
+    "proto": 1,
+    "agent": "xc_agent/0.1.0",
+    "method": "post",
+    "path": "/cluster/v1/heartbeat",
+    "query": "b=2&a=x+y&a=%41",
+    "canonical_query": "a=A&a=x%20y&b=2",
+    "content_type": " Application/Octet-Stream ",
+    "content_encoding": "",
+    "node": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "epoch": 3,
+    "ts_ms": 1800000000123,
+    "nonce": "000102030405060708090a0b0c0d0e0f",
+    "context": "7863766d2d7265712d7631000000010000000e78635f6167656e742f302e312e3000000004504f5354000000152f636c75737465722f76312f6865617274626561740000000f613d4126613d782532307926623d32000000186170706c69636174696f6e2f6f637465742d73747265616d000000000000002430663866616435622d643963622d343639662d613136352d3730383637373238393530650000000000000003000001a3185c507b000102030405060708090a0b0c0d0e0f",
+    "mac_key": "ab1d1088a90fc03809e32fa15f6a97ab17a84064e95812dc1dba8d25e7f3dc80",
+    "body": "body",
+    "mac": "48af12d4425caac49d28daeb5dc79f68701d076287d698e15e76f3606026a953"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/octet-stream",
+    "ts_ms": 1800000000456,
+    "nonce": "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "context": "7863766d2d7265732d76315e84973965c310a5a03a9d236a189b97af1b78a085e3bcb0e939b6baee398c2e000000c8000000186170706c69636174696f6e2f6f637465742d73747265616d000001a3185c51c8f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "mac_key": "081514752ef88084ad5a3d2675ccc42aee365294b3b7af9e439993af73550e50",
+    "body": "reply",
+    "mac": "141284762e28e0aeb371c7d235209a4881c23fb83a7e7f9e68867031c36030d1"
+  }
+}

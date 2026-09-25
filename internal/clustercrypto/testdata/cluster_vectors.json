@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "seal_v1": {
+    "recipient_sk": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+    "recipient_pub": "d89e3bad79437dbed9f843418304f460ff05c7fe81fe4a9577a804cb9367ff66",
+    "eph_sk": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+    "nonce": "505152535455565758595a5b",
+    "purpose": "token",
+    "context": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "plaintext": "hello cluster",
+    "sealed": "78733134e42d4af5ef94a07a3a84201b889d4cd1a743cb27b11b6a10438a8feb8e5847505152535455565758595a5ba5d2240cdc1283aa73ba7f46da3882a6d634c98b1582074178cdf8fad0"
+  },
+  "box_v1": {
+    "key": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+    "nonce": "505152535455565758595a5b",
+    "context": "POST /cluster/v1/heartbeat",
+    "plaintext": "{\"ok\":true}",
+    "boxed": "786231505152535455565758595a5b8061bd3c673bc219207f4aff943e3eadab3f87bfb61a75b8953860"
+  },
+  "binding": {
+    "jti": "4f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
+    "activation_key_sha256": "21c9ab91437b85175edf4dc3493ea3df8bf881482d08907c36b7adfa69330f91",
+    "b": "70109a16d19c517a5b66c776fdcb0cbb",
+    "kid": "70109a16",
+    "prk": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "ck": "23afde1e5807c4fa5e7fac8c27129e90ab31397e21c288c6da67ff2c0d366f24"
+  },
+  "token": {
+    "prk": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "b": "70109a16d19c517a5b66c776fdcb0cbb",
+    "node_uuid": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "server_id": 12,
+    "gen": 2,
+    "node_sign_pub": "dde3bccec7f3a66a1115f45d720f4dc135c3ae7c4e22dca38fdb1efd6a495ff8",
+    "epoch": 3,
+    "now": 1800000000,
+    "rotation_min": 60,
+    "nbf": 1799999880,
+    "exp": 1800004500,
+    "ext_eph_sk": "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "agent_eph_sk": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+    "agent_eph_pub": "6b3ee67463583cbe3dc08fe9d0765c2666ff5210dd527c9d8705e44927c80d55",
+    "z": "8cc93817cbfad891eb156700ddb571a729c1b48d3a965af25f36dd35f63ccc00",
+    "token_msg": "7863766d2d6e6f64652d746f6b656e010000002430663866616435622d643963622d343639662d613136352d373038363737323839353065000000000000000c0000000000000002b9bef121776426480c44779d5a3de6320d7aa639973b419f576a74ac2a4356ea0000000000000003000000006b49d188000000006b49e3942a4616b19d53bbb7ddd5ba32f91cf8f7ca30d3dac2c02cbfb9cab9a2b17f9459",
+    "t": "a3f61b48b83a8d46c8a134be5df6e3f33dd605cb05837ed65ccadc2956da5016",
+    "k_mac_up": "ab1d1088a90fc03809e32fa15f6a97ab17a84064e95812dc1dba8d25e7f3dc80",
+    "k_mac_down": "081514752ef88084ad5a3d2675ccc42aee365294b3b7af9e439993af73550e50",
+    "k_enc_up": "959c1e0c3a2eb5d9058625af42461e7205dc5a5c27b63988466b4b3af544585f",
+    "k_enc_down": "c101d9d9bf0419e583999b695ca2a6e07cf2d2396ff32c869604fc4e3516e6b8",
+    "panel_sign_pub": "4fd099ccd47d7893dfe9ec24414ecb0d9b5420232aad30d91c465be33cbe65c4",
+    "doc": "{\"v\":1,\"typ\":\"xcvm-token\",\"node_uuid\":\"0f8fad5b-d9cb-469f-a165-70867728950e\",\"server_id\":12,\"gen\":2,\"epoch\":3,\"iat\":1800000000,\"nbf\":1799999880,\"exp\":1800004500,\"kid\":\"70109a16\",\"rotation_min\":60,\"grace_min\":15,\"refresh_at\":1800001800,\"token\":\"a3f61b48b83a8d46c8a134be5df6e3f33dd605cb05837ed65ccadc2956da5016\"}",
+    "doc_sig": "5d4e9973faa2c423da70f1cc365770cf9e2fc47bc6867a661e06e8eeefd1e7629d10a60222e7204a0da6feb32a304730a8703f8d44883af06249bb6a29c1200f",
+    "seal_eph_sk": "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f",
+    "seal_nonce": "505152535455565758595a5b",
+    "token_sealed": "7873313e73ce162827a32ff92378fcf4f36464d8cf0a8113638690a775f2b699abd66e505152535455565758595a5b464a22f935fb078b9bc2d905ea32c1f0df7e684dd0c4187ec762841349e9e1f6cb7163e8d690c8a6064a1186886a80f9535899fa92d1075551a1677124e7fd6ec146bd8ccc9fea1ac4d73a8dcec809648e8807a3318be11fea90fffe84a8ad6d7e53c39fbbf0ecce9393c363680e1b28b23a4a1b3eaf33bf20b6f928a4d7f89a86aa5252018704577b8ea647eb44dee85fe78e8fc3c9fc3aaba5d335bef3711b728bfb50871cbd3f4a915486f565fa4c1852a34bc869ca340bd4c82dfdc8b364c7e4ca02d9ebe60c309b7a0385696b526eb6cedc7dccd07b3a121bf117a63bac8d4ba1a00c940e735b99f64dbef6058b4016bf7a3c4e775f5d9e5c932f6c48c1be57e06d2a48156f9c2866ad9a045af33fddec4af38b3cbb8d78e230a1774281b9b6f5bc1122bca47136a1fc28c74fb62e9da72872c3521fb49e4a6ff66318dee9c7f683c286944d6e5cab2c300c71969b267f66df8339dca22ea17be10a893a9b0794116701143c696b2312fcc7f67c3b93101414e5bab0b141f4ade690ab52de720a45e07657023b93"
+  },
+  "sign": {
+    "seed": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "public": "4fd099ccd47d7893dfe9ec24414ecb0d9b5420232aad30d91c465be33cbe65c4",
+    "cases": [
+      {
+        "tag": "cmd",
+        "payload": "{\"type\":\"conn.drop\",\"exp\":1800000300,\"args\":{\"uuid\":\"abc\"}}",
+        "class": "R",
+        "sig": "2d2f717554f386fc70e72578e51b6b0e8420fcb8d28f8775c2ace702ba610bdef02026969cd4ce4934177b2900fd9037225cd5c01a05b2525d3292137678130f"
+      },
+      {
+        "tag": "den",
+        "payload": "{\"reason\":\"NODE_REVOKED\"}",
+        "class": "R",
+        "sig": "f49bed695cb2fdb8885509e1451e487d2338d98a81d606c5ac5217befee18d7fee6043b5a758592fe1f910830f2f5c56a3c467e112e1ebd882270160fd371405"
+      },
+      {
+        "tag": "rep",
+        "payload": "section",
+        "class": "G",
+        "sig": "b1d6f064e574d52e9c4953875c8b6d524cbf0f633a64ad3c2735a31d2e52ed22109f29838dfc32732afccc1ecf7d1d4969bfebf8ef6bfb117d088fa194702203"
+      }
+    ]
+  }
+}
