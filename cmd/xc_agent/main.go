@@ -3,9 +3,11 @@
 // See LICENSE and LICENSE-ADDITIONAL-TERMS.md
 
 // Command xc_agent is an LB node's end of the XC_VM cluster API (MAIN ↔ LB
-// plan, Phase 2). It holds the node's identity and token epochs, finishes
-// enrolment, says hello, heartbeats and rotates its token. In this phase MAIN
-// only records what it hears (shadow mode); nothing depends on it yet.
+// plan). It holds the node's identity and token epochs, finishes enrolment,
+// says hello, heartbeats and rotates its token. Every heartbeat carries the
+// host sampled each second (Phase 3); with the node's TELEMETRY flow on, MAIN
+// takes the server's stats from it. The mode and flows MAIN sends are written
+// to flows.json beside the state for the node's PHP.
 //
 // The node's state file (default /home/xc_vm/config/cluster/agent.json, 0600)
 // is written by the panel's install flow over SSH: node uuid, server id, the
@@ -148,7 +150,11 @@ func main() {
 	}
 
 	*interval = max(time.Second, min(3*time.Second, *interval))
-	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: telemetry}
+	sampler := clusteragent.NewSampler(*statePath)
+	stopSampler := make(chan struct{})
+	defer close(stopSampler)
+	go sampler.Run(stopSampler)
+	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json")}
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
 	switch {
@@ -158,29 +164,11 @@ func main() {
 		// Exit 3: the supervisor must not restart a node MAIN has stopped
 		// (revoked, unknown, enrolment not completed; expiry re-keys instead).
 		log.Printf("xc_agent: %v", err)
+		a.Unpublish()
 		os.Exit(3)
 	default:
 		log.Fatalf("xc_agent: %v", err)
 	}
-}
-
-// telemetry is the shadow-mode heartbeat payload: load and memory, as the
-// legacy watchdog reports them, so MAIN can compare the two.
-func telemetry() map[string]any {
-	out := map[string]any{}
-	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
-		if f := strings.Fields(string(b)); len(f) >= 3 {
-			out["load"] = f[:3]
-		}
-	}
-	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
-		for _, line := range strings.Split(string(b), "\n") {
-			if f := strings.Fields(line); len(f) >= 2 && (f[0] == "MemTotal:" || f[0] == "MemAvailable:") {
-				out[strings.TrimSuffix(strings.ToLower(f[0]), ":")+"_kb"] = f[1]
-			}
-		}
-	}
-	return out
 }
 
 type multiFlag []string
