@@ -2,6 +2,7 @@ package clusteragent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	mrand "math/rand"
@@ -18,6 +19,11 @@ type Agent struct {
 	Interval  time.Duration
 	Telemetry func() map[string]any
 	Logf      func(format string, args ...any)
+	// FlowsFile receives the node's mode and flow bits from MAIN's replies,
+	// for the LB's PHP (Core\Cluster\NodeFlows); "" writes nothing.
+	FlowsFile string
+
+	flowsSeen string
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -27,7 +33,10 @@ type Reply struct {
 	Flows   int    `json:"flows"`
 	Gen     int    `json:"gen"`
 	Pending int    `json:"pending"`
-	Policy  *struct {
+	// PolicyVer, in heartbeat replies, is MAIN's current transport policy;
+	// a newer one than the node holds makes it say hello again to fetch it.
+	PolicyVer int `json:"policy_ver"`
+	Policy    *struct {
 		PolicyVer int      `json:"policy_ver"`
 		Transport string   `json:"transport"`
 		MainURLs  []string `json:"main_urls"`
@@ -115,7 +124,39 @@ func (a *Agent) recover(ctx context.Context) error {
 	}
 }
 
+// publish writes the mode and flows MAIN just sent, when they changed. The
+// file is replaced atomically; PHP reads it at request or loop start.
+func (a *Agent) publish(r *Reply) {
+	if a.FlowsFile == "" || r == nil || r.State == "" {
+		return
+	}
+	b, _ := json.Marshal(map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State})
+	if string(b) == a.flowsSeen {
+		return
+	}
+	tmp := a.FlowsFile + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o640); err != nil {
+		a.logf("cluster: writing flows: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, a.FlowsFile); err != nil {
+		a.logf("cluster: writing flows: %v", err)
+		return
+	}
+	a.flowsSeen = string(b)
+	a.logf("cluster: mode %d, flows %d (%s)", r.Mode, r.Flows, r.State)
+}
+
+// Unpublish removes the flows file, so the LB's PHP falls back to the legacy
+// paths: called when MAIN stops the node.
+func (a *Agent) Unpublish() {
+	if a.FlowsFile != "" {
+		os.Remove(a.FlowsFile)
+	}
+}
+
 func (a *Agent) apply(r *Reply) {
+	a.publish(r)
 	if r == nil || r.Policy == nil || r.Policy.PolicyVer < a.Client.State.PolicyVer || len(r.Policy.MainURLs) == 0 {
 		return
 	}
@@ -226,6 +267,12 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 			a.logf("cluster: heartbeat: %v", err)
 			continue
+		}
+		a.publish(&r)
+		if r.PolicyVer > a.Client.State.PolicyVer {
+			if _, err := a.Start(ctx); err != nil {
+				a.logf("cluster: fetching policy %d: %v", r.PolicyVer, err)
+			}
 		}
 		if r.State == "quarantined" {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
