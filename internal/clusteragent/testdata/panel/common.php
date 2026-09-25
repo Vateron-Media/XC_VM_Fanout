@@ -26,6 +26,9 @@ if ($rNew) {
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `root_ready` tinyint(1) NOT NULL DEFAULT 0');
 	$rDb->exec('CREATE TABLE `servers` (`id` INTEGER PRIMARY KEY, `status` int NOT NULL DEFAULT 0)');
 	$rDb->exec('INSERT INTO `servers` (`id`, `status`) VALUES (7, 0)');
+	$rDb->exec('CREATE TABLE `streams_servers` (`server_stream_id` INTEGER PRIMARY KEY, `stream_id` int, `server_id` int, `pid` int, `current_source` text)');
+	$rDb->exec('INSERT INTO `streams_servers` (`server_stream_id`, `stream_id`, `server_id`, `pid`) VALUES (70, 100, 7, 0)');
+	$rDb->exec('CREATE TABLE `streams_logs` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `stream_id` int, `server_id` int, `action` text, `source` text, `date` int)');
 }
 DatabaseFactory::set($rDb);
 $rSettings = ['cluster_api_enabled' => 1, 'lb_token_rotation_min' => (int) (getenv('XCVM_INTEROP_ROTATION') ?: 60), 'lb_new_node_mode' => 'legacy'];
