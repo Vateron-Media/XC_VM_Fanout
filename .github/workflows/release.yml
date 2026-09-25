@@ -47,4 +47,5 @@ jobs:
           body_path: CHANGELOG_RELEASE.md
           files: |
             dist/xc_fanout-linux-*
+            dist/xc_agent-linux-*
             dist/SHA256SUMS

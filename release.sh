@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build the xc_fanout daemon for every target arch into ./dist as flat,
+# Build the xc_fanout daemon and the xc_agent cluster agent for every target arch into ./dist as flat,
 # release-ready assets (+ SHA256SUMS). Binaries are NOT committed to the repo —
 # they are attached to a GitHub Release (see .github/workflows/release.yml, or
 # upload dist/* manually with `gh release create <tag> dist/*`).
@@ -41,12 +41,18 @@ for T in "${TARGETS[@]}"; do
   echo ">>> build linux-$T"
   CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" \
     go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$BIN" ./cmd/xc_fanout
+  # The LB cluster agent (MAIN ↔ LB API), same release and version.
+  AGENT="$OUT/xc_agent-linux-$T"
+  CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" \
+    go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$AGENT" ./cmd/xc_agent
   # abort if not fully static
-  if command -v file >/dev/null && file "$BIN" | grep -qv "statically linked"; then
-    echo "ERROR: $BIN is not statically linked"; exit 1
-  fi
+  for B in "$BIN" "$AGENT"; do
+    if command -v file >/dev/null && file "$B" | grep -qv "statically linked"; then
+      echo "ERROR: $B is not statically linked"; exit 1
+    fi
+  done
 done
 
-( cd "$OUT" && sha256sum xc_fanout-linux-* > SHA256SUMS )
+( cd "$OUT" && sha256sum xc_fanout-linux-* xc_agent-linux-* > SHA256SUMS )
 echo ">>> done — $OUT (tag as $VERSION and attach these as release assets)"
 ls -la "$OUT"
