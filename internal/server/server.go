@@ -906,6 +906,7 @@ type Manager struct {
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
 	signals   *signalStore // pending per-uuid "send message" overlays
+	events    *eventLog    // monitor transitions for GET /events (events.go)
 
 	// sup supervises per-stream encoder processes when the node has taken that
 	// over from the panel watchdog (docs/adr/0002-monitor-in-daemon.md). nil
@@ -965,6 +966,7 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 		grace:        grace,
 		defaultChunk: defaultChunk,
 		signals:      newSignalStore(),
+		events:       newEventLog(),
 	}
 	m.maxPrebufMS.Store(maxPrebufMS)
 	m.defaultPrebufMS.Store(int64(defaults.CfgDefaultPrebufferSec) * 1000) // fallback only; panel is authoritative
@@ -1545,6 +1547,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/monitor/", m.serveMonitor)
 	mux.HandleFunc("/monitors", m.serveMonitors)
 	mux.HandleFunc("/monitors/state", m.serveMonitorStates)
+	mux.HandleFunc("/events", m.serveEvents)
 	mux.HandleFunc("/memory", m.serveMemory)
 	return mux
 }

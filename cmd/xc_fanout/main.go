@@ -185,6 +185,7 @@ func main() {
 	// hand-over only while config.json says `supervise: true` — a live setting,
 	// so the panel can turn it on without a daemon restart dropping every viewer.
 	mgr.EnableSupervision()
+	mgr.StartEvents(ctx)                                                                     // monitor transitions for the node's agent (GET /events)
 	mgr.StartReaper(ctx)                                                                     // idle-stop sweep for control-managed streams (TS + HLS)
 	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS
 	dlog.Logf("boot", "config: supervise=%v sock=%s ctl=%s ingestdir=%s prebuffer-max=%ds hls=%.1fs/%dseg grace=%ds write-timeout=%ds viewer-idle=%ds chunk=%dB maxgop=%dB insecure=%v backend=%s overlay=%v",

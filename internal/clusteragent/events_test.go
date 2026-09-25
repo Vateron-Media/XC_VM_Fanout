@@ -311,3 +311,44 @@ func TestInteropEvents(t *testing.T) {
 		}
 	}
 }
+
+func TestP0CompactsPastItsSizeToTheLatestStatePerKey(t *testing.T) {
+	_, a := newEventsMain(t)
+	ls := laneFor(a, "p0")
+	dir := filepath.Join(a.SpoolDir, "p0")
+	os.MkdirAll(dir, 0o750)
+	write := func(seq int, lines ...string) {
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("%019d-1-0000.ndjson", seq)), []byte(strings.Join(lines, "\n")+"\n"), 0o640)
+	}
+	write(1, `{"type":"stream.state","t":1,"d":{"stream_id":5,"server_id":7,"fields":{"pid":1,"stream_status":2}}}`,
+		`{"type":"recording.state","t":1,"d":{"id":3,"status":1}}`)
+	write(2, `{"type":"stream.state","t":2,"d":{"stream_id":5,"server_id":7,"fields":{"pid":2}}}`,
+		`{"type":"future.thing","t":2,"d":{"x":1}}`,
+		`{"type":"recording.state","t":2,"d":{"id":3,"status":2}}`)
+	ls.lane.Compact = 1 << 30
+	if n, _ := ls.compact(); n != 0 {
+		t.Fatal("compacted below its size")
+	}
+	ls.lane.Compact = 10
+	n, err := ls.compact()
+	if err != nil || n != 2 {
+		t.Fatalf("folded %d, %v", n, err)
+	}
+	files, _ := ls.spooled()
+	if len(files) != 1 || files[0].Name() != fmt.Sprintf("%019d-1-0000.ndjson", 1) {
+		t.Fatalf("files %v", files)
+	}
+	evs, _, _ := readSpoolFile(filepath.Join(dir, files[0].Name()))
+	var got []string
+	for _, e := range evs {
+		got = append(got, string(e))
+	}
+	want := []string{
+		`{"d":{"fields":{"pid":2,"stream_status":2},"server_id":7,"stream_id":5},"t":2,"type":"stream.state"}`,
+		`{"d":{"x":1},"t":2,"type":"future.thing"}`,
+		`{"d":{"id":3,"status":2},"t":2,"type":"recording.state"}`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("compacted:\n%s", strings.Join(got, "\n"))
+	}
+}

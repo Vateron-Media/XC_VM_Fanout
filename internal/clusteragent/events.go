@@ -35,11 +35,14 @@ type Lane struct {
 	// Cap is the most bytes the lane's spool may hold before its oldest files
 	// are dropped (reported to MAIN as a `skip`); 0 never drops.
 	Cap int64
+	// Compact is the size past which the lane's spool is collapsed to the
+	// latest state per key instead (P0, which is never dropped); 0 never.
+	Compact int64
 }
 
 // Lanes are P0 (stream state, within ~250 ms) and P1 (logs, batched).
 var Lanes = []Lane{
-	{Name: "p0", Interval: 200 * time.Millisecond},
+	{Name: "p0", Interval: 200 * time.Millisecond, Compact: 128 << 20},
 	{Name: "p1", Interval: 5 * time.Second, Cap: 64 << 20},
 }
 
@@ -117,6 +120,13 @@ func (a *Agent) shipOnce(ctx context.Context, ls *laneSpool, next int64) (int64,
 	case fl == nil:
 		if ls.lane.Cap > 0 {
 			ls.enforceCap()
+		}
+		if ls.lane.Compact > 0 {
+			if n, err := ls.compact(); err != nil {
+				a.logf("cluster: events %s: compacting: %v", ls.lane.Name, err)
+			} else if n > 0 {
+				a.logf("cluster: events %s: backlog past %d MB collapsed (%d events folded)", ls.lane.Name, ls.lane.Compact>>20, n)
+			}
 		}
 		files, events, err := ls.collect()
 		if err != nil || len(events) == 0 {
@@ -354,4 +364,116 @@ func (ls *laneSpool) finish(fl *inflight) {
 		os.Remove(filepath.Join(ls.dir, filepath.Base(f)))
 	}
 	os.Remove(ls.state)
+}
+
+// compact collapses a backlog past the lane's Compact size to the latest
+// state per key (the plan's p0_reset): P0 events describe state, so only the
+// last word on each stream row, worker, recording or movie matters, merged
+// where an event carries part of it. Events of other types are kept as they
+// are. The result replaces the oldest file, so it still goes first; the rest
+// are removed after. A crash between the two only repeats state, which MAIN
+// applies idempotently. Returns how many events were folded away.
+func (ls *laneSpool) compact() (int, error) {
+	entries, err := ls.spooled()
+	if err != nil || len(entries) < 2 {
+		return 0, err
+	}
+	var total int64
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	if total <= ls.lane.Compact {
+		return 0, nil
+	}
+	type slot struct {
+		last int
+		ev   map[string]any
+	}
+	slots := map[string]*slot{}
+	var order []string
+	n := 0
+	for _, e := range entries {
+		evs, _, err := readSpoolFile(filepath.Join(ls.dir, e.Name()))
+		if err != nil {
+			return 0, err
+		}
+		for _, raw := range evs {
+			var ev map[string]any
+			if json.Unmarshal(raw, &ev) != nil {
+				continue
+			}
+			key, merge := compactKey(ev, n)
+			n++
+			if s, ok := slots[key]; ok {
+				if merge != "" {
+					ev = mergeInto(s.ev, ev, merge)
+				}
+				s.ev, s.last = ev, n
+			} else {
+				slots[key] = &slot{last: n, ev: ev}
+				order = append(order, key)
+			}
+		}
+	}
+	sort.SliceStable(order, func(i, j int) bool { return slots[order[i]].last < slots[order[j]].last })
+	var body []byte
+	for _, k := range order {
+		line, _ := json.Marshal(slots[k].ev)
+		body = append(append(body, line...), '\n')
+	}
+	first := filepath.Join(ls.dir, entries[0].Name())
+	tmp := filepath.Join(ls.dir, "."+entries[0].Name()+".compact.tmp")
+	if err := os.WriteFile(tmp, body, 0o640); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(tmp, first); err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	for _, e := range entries[1:] {
+		os.Remove(filepath.Join(ls.dir, e.Name()))
+	}
+	return n - len(order), nil
+}
+
+// compactKey is what an event describes, and which part of it merges ("" to
+// replace): the latest event for a key carries the state.
+func compactKey(ev map[string]any, i int) (string, string) {
+	d, _ := ev["d"].(map[string]any)
+	id := func(k string) string { return fmt.Sprint(d[k]) }
+	switch ev["type"] {
+	case "stream.state":
+		if _, ok := d["ssid"]; ok {
+			return "state:r" + id("ssid"), "fields"
+		}
+		return "state:s" + id("stream_id") + ":" + id("server_id"), "fields"
+	case "stream.monitor":
+		return "monitor:" + id("stream_id"), ""
+	case "stream.worker":
+		return "worker:" + id("stream_id") + ":" + id("worker"), ""
+	case "recording.state":
+		return "recording:" + id("id"), ""
+	case "vod.analysis":
+		return "vod:" + id("stream_id"), "props"
+	}
+	return fmt.Sprintf("keep:%d", i), ""
+}
+
+// mergeInto lays the newer event's part over the older one's.
+func mergeInto(older, newer map[string]any, part string) map[string]any {
+	od, _ := older["d"].(map[string]any)
+	nd, _ := newer["d"].(map[string]any)
+	op, _ := od[part].(map[string]any)
+	np, _ := nd[part].(map[string]any)
+	merged := map[string]any{}
+	for k, v := range op {
+		merged[k] = v
+	}
+	for k, v := range np {
+		merged[k] = v
+	}
+	nd[part] = merged
+	return newer
 }
