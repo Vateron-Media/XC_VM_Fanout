@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -76,7 +77,13 @@ func (l *eventLog) observe(states map[string]monitorStateView) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	changed := false
-	for id, v := range states {
+	ids := make([]string, 0, len(states))
+	for id := range states {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // one order for transitions seen in the same tick
+	for _, id := range ids {
+		v := states[id]
 		fp := fingerprint(v)
 		l.latest[id] = v
 		if l.last[id] == fp {
