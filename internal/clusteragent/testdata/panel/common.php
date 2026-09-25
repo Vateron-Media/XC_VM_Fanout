@@ -12,16 +12,17 @@ require $rPanel . '/tests/bootstrap.php';
 $rNew = !file_exists($rDbFile);
 $rDb = new TestDb(new PDO('sqlite:' . $rDbFile));
 if ($rNew) {
-	foreach (['029_create_cluster_nodes', '032_create_cluster_audit'] as $rName) {
+	foreach (['029_create_cluster_nodes', '031_create_cluster_enrolment', '032_create_cluster_audit'] as $rName) {
 		$rSql = (string) file_get_contents($rPanel . '/src/migrations/database/up/' . $rName . '.sql');
 		$rSql = (string) preg_replace('/^--.*$/m', '', $rSql);
-		$rSql = (string) preg_replace('/`id` bigint\(20\) unsigned NOT NULL AUTO_INCREMENT/', '`id` INTEGER PRIMARY KEY AUTOINCREMENT', $rSql);
+		$rSql = (string) preg_replace('/`id` (bigint\(20\) unsigned|int\(11\)) NOT NULL AUTO_INCREMENT/', '`id` INTEGER PRIMARY KEY AUTOINCREMENT', $rSql);
 		$rSql = (string) preg_replace('/,\s*PRIMARY KEY \(`id`\)/', '', $rSql);
 		$rSql = (string) preg_replace('/,\s*(UNIQUE )?KEY `\w+` \([^)]*\)/', '', $rSql);
 		$rSql = (string) preg_replace('/ unsigned| COLLATE \w+/', '', $rSql);
 		$rDb->exec((string) preg_replace('/\) ENGINE=[^;]*;/', ');', $rSql));
 	}
 	$rDb->exec('ALTER TABLE `cluster_node_epochs` ADD COLUMN `agent_eph_pub` binary(32) DEFAULT NULL');
+	$rDb->exec('ALTER TABLE `cluster_enrol_requests` ADD COLUMN `agent_eph_pub` binary(32) DEFAULT NULL');
 	$rDb->exec('CREATE TABLE `servers` (`id` INTEGER PRIMARY KEY, `status` int NOT NULL DEFAULT 0)');
 	$rDb->exec('INSERT INTO `servers` (`id`, `status`) VALUES (7, 0)');
 }
