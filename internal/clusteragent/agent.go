@@ -2,11 +2,13 @@ package clusteragent
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
 	mrand "math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -259,7 +261,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.logf("cluster: token refresh: %v", err)
 			}
 		}
-		payload := map[string]any{}
+		payload := map[string]any{"root_ready": RootReady(a.Client.State)}
 		if a.Telemetry != nil {
 			payload["telemetry"] = a.Telemetry()
 		}
@@ -299,6 +301,21 @@ func jitter(d time.Duration) time.Duration {
 		return d
 	}
 	return d - d/10 + time.Duration(mrand.Int63n(int64(d/5)+1))
+}
+
+// RootPinDir is where root pins the panel key for root commands.
+var RootPinDir = "/etc/xc_vm/cluster"
+
+// RootReady reports whether root's pin of the panel key matches the one this
+// agent holds, so MAIN may send this node root commands (cluster:root checks
+// them against that pin).
+func RootReady(st *State) bool {
+	pub, err1 := os.ReadFile(filepath.Join(RootPinDir, "main_sign.pub"))
+	node, err2 := os.ReadFile(filepath.Join(RootPinDir, "node"))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return err1 == nil && err2 == nil && strings.TrimSpace(string(pub)) == hex.EncodeToString(st.PanelSignPub) &&
+		strings.TrimSpace(string(node)) == st.NodeUUID
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
