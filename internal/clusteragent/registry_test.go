@@ -278,4 +278,43 @@ func TestInteropConnections(t *testing.T) {
 	if fmt.Sprint(a.Registry.Get("v1")["hls_end"]) != "1" {
 		t.Fatalf("the registry did not follow MAIN's close: %v", a.Registry.Get("v1"))
 	}
+
+	// A drift (a row MAIN holds that the node never had): two heartbeats in a
+	// row disagree, MAIN asks for the snapshot, and applying it removes the row.
+	runPHP("conn.php", "ghost", "g1")
+	var want bool
+	for i := 0; i < 3 && !want; i++ {
+		r, err := a.Heartbeat(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = r.WantConnSnapshot
+	}
+	if !want {
+		t.Fatal("MAIN never asked for the snapshot")
+	}
+	if err := a.SendSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var mainDigest ConnDigest
+	json.Unmarshal([]byte(runPHP("conn.php", "digest")), &mainDigest)
+	if mainDigest != a.Registry.Digest() || mainDigest.Count != 0 {
+		t.Fatalf("after the snapshot: MAIN %+v, agent %+v", mainDigest, a.Registry.Digest())
+	}
+	if r, _ := a.Heartbeat(ctx); r.WantConnSnapshot {
+		t.Fatal("asked again after the digests agreed")
+	}
+
+	// cluster:seed-connections: MAIN's rows for the node, loaded with no event.
+	runPHP("conn.php", "ghost", "g2")
+	if got := runPHP("conn.php", "seed", a.SocketPath); got != "2" {
+		t.Fatalf("seeded %s", got)
+	}
+	json.Unmarshal([]byte(runPHP("conn.php", "digest")), &mainDigest)
+	if a.Registry.Get("g2") == nil || mainDigest != a.Registry.Digest() || mainDigest.Count != 1 {
+		t.Fatalf("after the seed: MAIN %+v, agent %+v, g2 %v", mainDigest, a.Registry.Digest(), a.Registry.Get("g2"))
+	}
+	if secret, ok := a.Registry.Get("g2")["password"]; ok {
+		t.Fatalf("the seed carried a line column: %v", secret)
+	}
 }

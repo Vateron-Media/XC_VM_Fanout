@@ -1,6 +1,8 @@
 package clusteragent
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,11 +41,18 @@ import (
 //	POST   /v1/conn/oldest         {user_id} → the line's oldest open connection, or 404
 //	POST   /v1/conn/{uuid}/touch   {hls_last_read} → the record, or 404
 //	POST   /v1/conn/{uuid}/close   {remove}: a close already made in MAIN's store; no event
+//	POST   /v1/conn/seed           {records, reset}: load records with no event (cluster:seed-connections)
 //	DELETE /v1/conn/{uuid}
+//
+// Every heartbeat carries the registry's Digest. When MAIN's store for the
+// node drifts from it, MAIN asks for the whole registry (conn_snapshot).
 
 // TouchEvery is the most often a change of hls_last_read alone reaches MAIN.
 // MAIN's reaper closes an HLS viewer after 30 s without one.
 var TouchEvery = 10 * time.Second
+
+// FlowConnections is the CONNECTIONS flow bit: the registry holds the node's viewers.
+const FlowConnections = 64
 
 var connUUID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
@@ -185,6 +195,115 @@ func (r *Registry) Close(uuid string, remove bool) {
 	r.dirty = true
 }
 
+// ConnDigest is a node's open connections in one short value; MAIN computes
+// the same from its store (Domain\Cluster\ConnectionDigest).
+type ConnDigest struct {
+	Count int    `json:"count"`
+	Users int    `json:"users"`
+	Xor64 string `json:"xor64"`
+}
+
+// Digest summarises the open connections (hls_end not set): their number,
+// their distinct owners, and the XOR of the first 8 bytes of
+// SHA-256(uuid "\n" owner).
+func (r *Registry) Digest() ConnDigest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return digestOf(r.conns)
+}
+
+func digestOf(conns map[string]map[string]any) ConnDigest {
+	users := map[string]bool{}
+	var x uint64
+	n := 0
+	for uuid, c := range conns {
+		if num(c["hls_end"]) != 0 {
+			continue
+		}
+		o := owner(c)
+		n++
+		users[o] = true
+		h := sha256.Sum256([]byte(uuid + "\n" + o))
+		x ^= binary.BigEndian.Uint64(h[:8])
+	}
+	return ConnDigest{Count: n, Users: len(users), Xor64: fmt.Sprintf("%016x", x)}
+}
+
+// owner is a connection's owner as PHP's ConnectionDigest::owner() writes it.
+func owner(c map[string]any) string {
+	if id := intOf(c["user_id"]); id != 0 {
+		return "u:" + strconv.FormatInt(id, 10)
+	}
+	ident := ""
+	if v, ok := c["hmac_identifier"]; ok && v != nil {
+		ident = fmt.Sprint(v)
+	}
+	return "h:" + strconv.FormatInt(intOf(c["hmac_id"]), 10) + ":" + ident
+}
+
+// intOf reads a JSON number or numeric string as PHP's intval() would.
+func intOf(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	case string:
+		i, _ := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+		return i
+	case bool:
+		if n {
+			return 1
+		}
+	}
+	return 0
+}
+
+// Records returns a copy of every record, in uuid order.
+func (r *Registry) Records() []map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	keys := make([]string, 0, len(r.conns))
+	for k := range r.conns {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]map[string]any, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, clone(r.conns[k]))
+	}
+	return out
+}
+
+// Seed loads records as they are, with no event: MAIN's store already holds
+// them (cluster:seed-connections, before the CONNECTIONS switch). reset
+// empties the registry first. Records without a valid uuid are skipped.
+func (r *Registry) Seed(records []map[string]any, reset bool) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if reset {
+		r.conns = map[string]map[string]any{}
+		r.sentAt = map[string]time.Time{}
+	}
+	n := 0
+	for _, c := range records {
+		uuid, _ := c["uuid"].(string)
+		if c == nil || !connUUID.MatchString(uuid) {
+			continue
+		}
+		r.conns[uuid] = c
+		r.sentAt[uuid] = r.now()
+		n++
+	}
+	r.dirty = true
+	return n
+}
+
 // Save writes the snapshot when something changed (written aside, renamed in).
 func (r *Registry) Save() error {
 	r.mu.Lock()
@@ -304,6 +423,17 @@ func (r *Registry) connHandler(w http.ResponseWriter, req *http.Request) {
 		reply(r.Find(match), nil)
 	case req.Method == http.MethodPost && path == "oldest":
 		reply(r.Oldest(body["user_id"]), nil)
+	case req.Method == http.MethodPost && path == "seed":
+		raw, _ := body["records"].([]any)
+		records := make([]map[string]any, 0, len(raw))
+		for _, v := range raw {
+			if c, ok := v.(map[string]any); ok {
+				records = append(records, c)
+			}
+		}
+		reset, _ := body["reset"].(bool)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"seeded": r.Seed(records, reset)})
 	case req.Method == http.MethodPost && strings.HasSuffix(path, "/close") && connUUID.MatchString(strings.TrimSuffix(path, "/close")):
 		// A close the node's PHP made in MAIN's store itself (its reaper, its
 		// own kick): the registry follows, with no event.

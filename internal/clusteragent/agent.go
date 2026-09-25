@@ -45,6 +45,7 @@ type Agent struct {
 	// MAIN's event cursors from the latest hello, plus one (0: not known yet).
 	cursorP0, cursorP1 atomic.Int64
 	fanoutLive         atomic.Bool // the fanout's /events feed is being followed
+	snapshotting       atomic.Bool // a conn_snapshot is being sent
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -57,6 +58,9 @@ type Reply struct {
 	// PolicyVer, in heartbeat replies, is MAIN's current transport policy;
 	// a newer one than the node holds makes it say hello again to fetch it.
 	PolicyVer int `json:"policy_ver"`
+	// WantConnSnapshot, in heartbeat replies: MAIN's store for this node
+	// drifted from the digest the heartbeat carried; send the registry.
+	WantConnSnapshot bool `json:"want_conn_snapshot"`
 	// Cursors, in hello replies, are the last event numbers MAIN applied per lane.
 	Cursors *struct {
 		P0 int64 `json:"p0"`
@@ -336,12 +340,8 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.logf("cluster: token refresh: %v", err)
 			}
 		}
-		payload := map[string]any{"root_ready": RootReady(a.Client.State)}
-		if a.Telemetry != nil {
-			payload["telemetry"] = a.Telemetry()
-		}
-		var r Reply
-		if err := a.Client.Call(ctx, "heartbeat", payload, &r, false); err != nil {
+		r, err := a.Heartbeat(ctx)
+		if err != nil {
 			if fatal(err) {
 				return errors.Join(ErrStop, err)
 			}
@@ -358,7 +358,13 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logf("cluster: heartbeat: %v", err)
 			continue
 		}
-		a.publish(&r)
+		if r.WantConnSnapshot {
+			go func() {
+				if err := a.SendSnapshot(ctx); err != nil {
+					a.logf("cluster: connection snapshot: %v", err)
+				}
+			}()
+		}
 		if r.PolicyVer > a.Client.State.PolicyVer {
 			if _, err := a.Start(ctx); err != nil {
 				a.logf("cluster: fetching policy %d: %v", r.PolicyVer, err)
@@ -368,6 +374,24 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
 	}
+}
+
+// Heartbeat sends one heartbeat and publishes the reply's mode and flows. A
+// node whose CONNECTIONS flow is on adds its registry's digest.
+func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
+	payload := map[string]any{"root_ready": RootReady(a.Client.State)}
+	if a.Telemetry != nil {
+		payload["telemetry"] = a.Telemetry()
+	}
+	if a.Registry != nil && a.flows.Load()&FlowConnections != 0 {
+		payload["conn_digest"] = a.Registry.Digest()
+	}
+	var r Reply
+	if err := a.Client.Call(ctx, "heartbeat", payload, &r, false); err != nil {
+		return nil, err
+	}
+	a.publish(&r)
+	return &r, nil
 }
 
 // jitter spreads d by ±10 %, so a fleet recovering together does not arrive at once.

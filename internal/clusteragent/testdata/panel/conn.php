@@ -3,9 +3,13 @@
 //   node <flows.json> <spool dir> <socket>   the stream endpoints' seam calls, as JSON
 //   main                                     MAIN's lines_live row for the viewer
 //   close <remove>                           MAIN closes it: a conn.close command for server 7
+//   ghost <uuid>                             a row for server 7 the node never had (a drift)
+//   digest                                   MAIN's digest of server 7's open connections
+//   seed <socket>                            cluster:seed-connections on the node (MAIN's store → agent)
 require __DIR__ . '/common.php';
 
 use XcVm\Core\Cluster\AgentClient;
+use XcVm\Core\Cluster\AgentConnections;
 use XcVm\Core\Cluster\EventSpool;
 use XcVm\Core\Cluster\NodeFlows;
 use XcVm\Domain\Stream\ConnectionTracker;
@@ -29,6 +33,16 @@ switch ($argv[1]) {
 	case 'main':
 		$rDb->query("SELECT `server_id`, `pid`, `hls_end`, `user_ip` FROM `lines_live` WHERE `uuid` = 'v1'");
 		echo json_encode($rDb->get_rows());
+		break;
+	case 'ghost':
+		$rDb->query('INSERT INTO `lines_live` (`uuid`, `server_id`, `user_id`, `stream_id`, `hls_end`) VALUES (?, 7, 8, 100, 0)', $argv[2]);
+		break;
+	case 'digest':
+		echo json_encode(\XcVm\Domain\Cluster\ConnectionDigest::of(\XcVm\Domain\Cluster\ConnectionDigest::stored(7)));
+		break;
+	case 'seed':
+		AgentClient::useSocket($argv[2]);
+		echo json_encode(AgentConnections::seed(\XcVm\Cli\Commands\ClusterSeedConnectionsCommand::stored(7)));
 		break;
 	case 'close':
 		echo \XcVm\Domain\Cluster\CommandBus::enqueue($rCrypto, 7, 'conn.close', ['uuid' => 'v1', 'remove' => $argv[2] === '1']);
