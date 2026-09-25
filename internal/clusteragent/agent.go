@@ -272,7 +272,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.Exec != nil {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
-		go a.RunCommands(cctx, a.Exec)
+		go a.RunCommands(cctx, a.localExec(a.Exec))
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)

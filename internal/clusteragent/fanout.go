@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -158,5 +159,38 @@ func (a *Agent) spoolMonitor(out *fanoutReply) error {
 func (a *Agent) setFanoutLive(on bool) {
 	if a.fanoutLive.Swap(on) != on {
 		a.logf("cluster: fanout events %s", map[bool]string{true: "followed", false: "not followed"}[on])
+	}
+}
+
+var dropUUID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// localExec runs the commands the agent can serve itself, within its own
+// process: `conn.drop {uuid}` against the fanout's control socket (a daemon
+// viewer, well under the plan's 1 s). Anything else, or a fanout it cannot
+// reach, goes to next (the node's PHP, cluster:exec).
+func (a *Agent) localExec(next Executor) Executor {
+	return func(ctx context.Context, cmd *Command, w WireCommand) (bool, []byte) {
+		if cmd.Type != "conn.drop" || a.FanoutCtl == "" {
+			return next(ctx, cmd, w)
+		}
+		uuid, _ := cmd.Args["uuid"].(string)
+		if !dropUUID.MatchString(uuid) {
+			return false, []byte("refused: bad uuid")
+		}
+		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(dctx, http.MethodDelete, "http://fanout/connections/"+uuid, nil)
+		res, err := fanoutClient(a.FanoutCtl).Do(req)
+		if err != nil {
+			return next(ctx, cmd, w)
+		}
+		res.Body.Close()
+		switch res.StatusCode {
+		case http.StatusNoContent, http.StatusOK:
+			return true, []byte(`{"result":true}`)
+		case http.StatusNotFound:
+			return true, []byte(`{"result":false}`) // not connected here (any more)
+		}
+		return next(ctx, cmd, w)
 	}
 }

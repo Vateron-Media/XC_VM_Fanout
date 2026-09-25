@@ -166,3 +166,63 @@ func TestInteropFanoutEvents(t *testing.T) {
 		t.Fatalf("MAIN holds %+v", got)
 	}
 }
+
+func TestAgentDropsDaemonViewersItself(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "xd")
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "c.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dropped []string
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uuid := strings.TrimPrefix(r.URL.Path, "/connections/")
+		if r.Method != http.MethodDelete {
+			http.Error(w, "no", 405)
+			return
+		}
+		dropped = append(dropped, uuid)
+		if uuid == "live1" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	})}
+	go srv.Serve(l)
+	defer srv.Close()
+
+	var fellBack []string
+	next := func(_ context.Context, cmd *Command, _ WireCommand) (bool, []byte) {
+		fellBack = append(fellBack, cmd.Type)
+		return true, []byte("php")
+	}
+	a := &Agent{Logf: t.Logf, FanoutCtl: sock}
+	run := a.localExec(next)
+	ctx := context.Background()
+	cases := []struct {
+		cmd    *Command
+		ok     bool
+		result string
+	}{
+		{&Command{Type: "conn.drop", Args: map[string]any{"uuid": "live1"}}, true, `{"result":true}`},
+		{&Command{Type: "conn.drop", Args: map[string]any{"uuid": "gone"}}, true, `{"result":false}`},
+		{&Command{Type: "conn.drop", Args: map[string]any{"uuid": "../../x"}}, false, "refused: bad uuid"},
+		{&Command{Type: "node.rpc", Args: map[string]any{"action": "get_pids"}}, true, "php"},
+	}
+	for _, c := range cases {
+		ok, res := run(ctx, c.cmd, WireCommand{})
+		if ok != c.ok || string(res) != c.result {
+			t.Errorf("%s %v: %v %s", c.cmd.Type, c.cmd.Args, ok, res)
+		}
+	}
+	if strings.Join(dropped, ",") != "live1,gone" || strings.Join(fellBack, ",") != "node.rpc" {
+		t.Fatalf("dropped %v, fell back %v", dropped, fellBack)
+	}
+
+	// No fanout to reach: the node's PHP gets it.
+	a.FanoutCtl = filepath.Join(dir, "missing.sock")
+	if ok, res := a.localExec(next)(ctx, &Command{Type: "conn.drop", Args: map[string]any{"uuid": "live1"}}, WireCommand{}); !ok || string(res) != "php" {
+		t.Fatalf("fallback: %v %s", ok, res)
+	}
+}
