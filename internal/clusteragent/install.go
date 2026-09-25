@@ -118,6 +118,7 @@ func Probe(ctx context.Context, panelPub []byte, urls []string) (string, error) 
 type InstallData struct {
 	ServerID     int64    `json:"server_id"`
 	PanelSignPub []byte   `json:"panel_sign_pub"`
+	PanelBoxPub  []byte   `json:"panel_box_pub,omitempty"`
 	MainURLs     []string `json:"main_urls"`
 	PolicyVer    int      `json:"policy_ver"`
 	Epoch        uint64   `json:"epoch"`
@@ -135,7 +136,7 @@ func Install(path string, d InstallData) error {
 	if len(st.PendingEphSk) != 32 || len(st.Epochs) > 0 {
 		return errors.New("clusteragent: no pending enrolment (run keygen first)")
 	}
-	if len(d.PanelSignPub) != ed25519.PublicKeySize || len(d.MainURLs) == 0 || d.Epoch != 1 {
+	if len(d.PanelSignPub) != ed25519.PublicKeySize || len(d.MainURLs) == 0 || d.Epoch != 1 || (len(d.PanelBoxPub) != 0 && len(d.PanelBoxPub) != 32) {
 		return errors.New("clusteragent: install data is incomplete")
 	}
 	tok, _, err := cc.OpenToken(st.PendingEphSk, d.PanelSignPub, st.NodeUUID, d.TokenSealed)
@@ -145,7 +146,7 @@ func Install(path string, d InstallData) error {
 	if tok.Epoch != d.Epoch || tok.ServerID != d.ServerID {
 		return errors.New("clusteragent: first token does not match this node")
 	}
-	st.ServerID, st.PanelSignPub, st.MainURLs, st.PolicyVer = d.ServerID, d.PanelSignPub, d.MainURLs, d.PolicyVer
+	st.ServerID, st.PanelSignPub, st.PanelBoxPub, st.MainURLs, st.PolicyVer = d.ServerID, d.PanelSignPub, d.PanelBoxPub, d.MainURLs, d.PolicyVer
 	st.Epochs = []Epoch{{Epoch: d.Epoch, EphSk: st.PendingEphSk, TokenSealed: d.TokenSealed}}
 	st.PendingEphSk = nil
 	st.Enrolled = false

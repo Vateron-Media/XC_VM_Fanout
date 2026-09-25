@@ -1,6 +1,7 @@
 // Package clusteragent is the LB side of the XC_VM cluster API: the node's
 // persistent identity and token epochs, and a client for MAIN's
-// /cluster/v1/ operations (enrol_complete, hello, heartbeat, token_refresh).
+// /cluster/v1/ operations (enrol_complete, hello, heartbeat, token_refresh,
+// token_rekey).
 //
 // Every reply is authenticated before it is believed: a session reply by its
 // MAC and BOX under the epoch's down keys, a refusal by the pinned panel key
@@ -30,16 +31,18 @@ type Epoch struct {
 
 // State is the node's persistent identity, written 0600 and atomically.
 type State struct {
-	NodeUUID     string   `json:"node_uuid"`
-	ServerID     int64    `json:"server_id"`
-	NodeSignSeed []byte   `json:"node_sign_seed"`
-	NodeBoxSk    []byte   `json:"node_box_sk"`
-	PanelSignPub []byte   `json:"panel_sign_pub"`
-	MainURLs     []string `json:"main_urls"`
-	PolicyVer    int      `json:"policy_ver"`
-	Enrolled     bool     `json:"enrolled"`
-	InstanceID   string   `json:"instance_id"`
-	Epochs       []Epoch  `json:"epochs"` // newest first
+	NodeUUID     string `json:"node_uuid"`
+	ServerID     int64  `json:"server_id"`
+	NodeSignSeed []byte `json:"node_sign_seed"`
+	NodeBoxSk    []byte `json:"node_box_sk"`
+	PanelSignPub []byte `json:"panel_sign_pub"`
+	// PanelBoxPub is the key re-key bodies are sealed to (see rekey.go).
+	PanelBoxPub []byte   `json:"panel_box_pub,omitempty"`
+	MainURLs    []string `json:"main_urls"`
+	PolicyVer   int      `json:"policy_ver"`
+	Enrolled    bool     `json:"enrolled"`
+	InstanceID  string   `json:"instance_id"`
+	Epochs      []Epoch  `json:"epochs"` // newest first
 	// PendingEphSk is the key of a token_refresh whose reply has not arrived.
 	// It is persisted before the request is sent, so a retry after a crash or
 	// a lost reply uses the same key and MAIN re-sends the same token.

@@ -20,7 +20,7 @@ import (
 // TestInteropWithPanel runs this agent against MAIN's real PHP ClusterApi
 // (served by `php -S` from a panel checkout, with the panel's test fake of
 // xcvm_core and a SQLite file): enrolment, hello, heartbeat, and a token
-// refresh including a retried one. Opt-in:
+// refresh including a retried one, and a re-key after every token expired. Opt-in:
 //
 //	XCVM_PANEL_DIR=/path/to/XC_VM go test ./internal/clusteragent -run Interop -v
 func TestInteropWithPanel(t *testing.T) {
@@ -143,11 +143,49 @@ func TestInteropWithPanel(t *testing.T) {
 		t.Fatalf("second refresh: %v %+v", err, tok3)
 	}
 
+	var d *Denial
+	// Every token expires (an outage past exp): the heartbeat is refused, and
+	// the agent re-keys with a challenge. This node was installed without the
+	// panel box key, as nodes enrolled before re-key existed were, so it takes
+	// the key from the signed health document first.
+	expire := exec.Command(php, filepath.Join(harness, "expire.php"))
+	expire.Env = env
+	if out, err := expire.CombinedOutput(); err != nil {
+		t.Fatalf("expire.php: %v\n%s", err, out)
+	}
+	err = c.Call(ctx, "heartbeat", map[string]any{}, &hb, false)
+	if !needsRekey(err) {
+		t.Fatalf("want a re-key signal after expiry, got %v", err)
+	}
+	if len(loaded.PanelBoxPub) != 0 {
+		t.Fatal("the box key should not be known yet")
+	}
+	// Epoch 3 was minted but never used, so MAIN numbers from the node's
+	// current epoch (2); the old epoch 3 row is gone with its z.
+	tok4, err := c.Rekey(ctx, a.identity())
+	if err != nil {
+		t.Fatalf("rekey: %v", err)
+	}
+	if tok4.Epoch != 3 || len(loaded.Epochs) != 1 || loaded.Epochs[0].Epoch != 3 || len(loaded.PanelBoxPub) != 32 {
+		t.Fatalf("after rekey: epoch %d, %d epochs held, box key %d bytes", tok4.Epoch, len(loaded.Epochs), len(loaded.PanelBoxPub))
+	}
+	if err := c.Call(ctx, "heartbeat", map[string]any{}, &hb, false); err != nil {
+		t.Fatalf("heartbeat after rekey: %v", err)
+	}
+	reloaded, err := LoadState(statePath)
+	if err != nil || len(reloaded.Epochs) != 1 || reloaded.Epochs[0].Epoch != 3 {
+		t.Fatalf("the re-keyed epoch was not persisted: %v", err)
+	}
+	// A second attempt within the minute is refused, signed and about this request.
+	_, err = c.Rekey(ctx, a.identity())
+	if !errors.As(err, &d) || d.Reason != "RATE_LIMITED" || retryAfterMs(d) <= 0 {
+		t.Fatalf("want a signed RATE_LIMITED, got %v", err)
+	}
+
 	// A request under an unknown epoch gets a panel-signed refusal about it.
 	s, _ := c.current()
 	s.epoch = 99
 	err = c.call(ctx, s, "heartbeat", map[string]any{}, nil, false)
-	var d *Denial
 	if !errors.As(err, &d) || d.Reason != "TOKEN_EXPIRED" {
 		t.Fatalf("want a signed TOKEN_EXPIRED, got %v", err)
 	}
