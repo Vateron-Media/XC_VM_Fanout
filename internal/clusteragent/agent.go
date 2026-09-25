@@ -27,9 +27,14 @@ type Agent struct {
 	FlowsFile string
 	// Exec runs MAIN's commands (commands.go); nil leaves the commands lane off.
 	Exec Executor
+	// SpoolDir is where the node's PHP spools events for MAIN (events.go);
+	// "" leaves the event lanes off.
+	SpoolDir string
 
 	flowsSeen string
 	flows     atomic.Int64 // the flow bits from MAIN's latest reply
+	// MAIN's event cursors from the latest hello, plus one (0: not known yet).
+	cursorP0, cursorP1 atomic.Int64
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -42,7 +47,12 @@ type Reply struct {
 	// PolicyVer, in heartbeat replies, is MAIN's current transport policy;
 	// a newer one than the node holds makes it say hello again to fetch it.
 	PolicyVer int `json:"policy_ver"`
-	Policy    *struct {
+	// Cursors, in hello replies, are the last event numbers MAIN applied per lane.
+	Cursors *struct {
+		P0 int64 `json:"p0"`
+		P1 int64 `json:"p1"`
+	} `json:"cursors"`
+	Policy *struct {
 		PolicyVer int      `json:"policy_ver"`
 		Transport string   `json:"transport"`
 		MainURLs  []string `json:"main_urls"`
@@ -142,6 +152,10 @@ func (a *Agent) publish(r *Reply) {
 	}
 	b, _ := json.Marshal(map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State})
 	if string(b) == a.flowsSeen {
+		// Unchanged: touch it, so the PHP side knows the agent is alive and
+		// keeps spooling events (EventSpool::STALE_AFTER).
+		now := time.Now()
+		os.Chtimes(a.FlowsFile, now, now)
 		return
 	}
 	tmp := a.FlowsFile + ".tmp"
@@ -167,6 +181,10 @@ func (a *Agent) Unpublish() {
 
 func (a *Agent) apply(r *Reply) {
 	a.publish(r)
+	if r != nil && r.Cursors != nil {
+		a.cursorP0.Store(r.Cursors.P0 + 1)
+		a.cursorP1.Store(r.Cursors.P1 + 1)
+	}
 	if r == nil || r.Policy == nil || r.Policy.PolicyVer < a.Client.State.PolicyVer || len(r.Policy.MainURLs) == 0 {
 		return
 	}
@@ -243,6 +261,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
 		go a.RunCommands(cctx, a.Exec)
+	}
+	if a.SpoolDir != "" {
+		ectx, stopEvents := context.WithCancel(ctx)
+		defer stopEvents()
+		for _, lane := range Lanes {
+			go a.RunEvents(ectx, lane)
+		}
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
