@@ -47,6 +47,8 @@ type State struct {
 	// It is persisted before the request is sent, so a retry after a crash or
 	// a lost reply uses the same key and MAIN re-sends the same token.
 	PendingEphSk []byte `json:"pending_eph_sk,omitempty"`
+	// CmdSeq is the highest command seq this node has handled (commands.go).
+	CmdSeq uint64 `json:"cmd_seq,omitempty"`
 
 	path string
 	mu   sync.Mutex

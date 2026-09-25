@@ -8,6 +8,7 @@ import (
 	mrand "math/rand"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,8 +23,11 @@ type Agent struct {
 	// FlowsFile receives the node's mode and flow bits from MAIN's replies,
 	// for the LB's PHP (Core\Cluster\NodeFlows); "" writes nothing.
 	FlowsFile string
+	// Exec runs MAIN's commands (commands.go); nil leaves the commands lane off.
+	Exec Executor
 
 	flowsSeen string
+	flows     atomic.Int64 // the flow bits from MAIN's latest reply
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -127,7 +131,11 @@ func (a *Agent) recover(ctx context.Context) error {
 // publish writes the mode and flows MAIN just sent, when they changed. The
 // file is replaced atomically; PHP reads it at request or loop start.
 func (a *Agent) publish(r *Reply) {
-	if a.FlowsFile == "" || r == nil || r.State == "" {
+	if r == nil || r.State == "" {
+		return
+	}
+	a.flows.Store(int64(r.Flows))
+	if a.FlowsFile == "" {
 		return
 	}
 	b, _ := json.Marshal(map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State})
@@ -228,6 +236,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 		backoff = min(backoff*2, time.Minute)
+	}
+	if a.Exec != nil {
+		cctx, stopCommands := context.WithCancel(ctx)
+		defer stopCommands()
+		go a.RunCommands(cctx, a.Exec)
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
