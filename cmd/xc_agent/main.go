@@ -129,7 +129,8 @@ func main() {
 	case err == nil, errors.Is(err, context.Canceled):
 		log.Printf("xc_agent: stopped")
 	case errors.Is(err, clusteragent.ErrStop):
-		// Exit 3: the supervisor must not restart a node MAIN has stopped.
+		// Exit 3: the supervisor must not restart a node MAIN has stopped
+		// (revoked, unknown, enrolment not completed; expiry re-keys instead).
 		log.Printf("xc_agent: %v", err)
 		os.Exit(3)
 	default:
