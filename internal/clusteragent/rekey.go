@@ -41,13 +41,15 @@ type Challenge struct {
 	Challenge  []byte
 	LicenceOK  bool
 	MainTimeMs int64
+	// Policy is MAIN's transport policy, signed with the challenge (policy.go).
+	Policy *Policy
 }
 
 // Challenge fetches a re-key challenge for this node from the first URL that
 // answers with a document signed by the panel key and naming this node.
 func (c *Client) Challenge(ctx context.Context) (*Challenge, error) {
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		ch, err := c.challenge(ctx, base)
 		if err == nil {
 			return ch, nil
@@ -76,11 +78,12 @@ func (c *Client) challenge(ctx context.Context, base string) (*Challenge, error)
 		return nil, fmt.Errorf("%w: challenge (HTTP %d) from %s", ErrTransport, res.StatusCode, base)
 	}
 	var doc struct {
-		Typ        string `json:"typ"`
-		Cn         string `json:"cn"`
-		Challenge  string `json:"challenge"`
-		MainTimeMs int64  `json:"main_time_ms"`
-		LicenceOK  bool   `json:"licence_ok"`
+		Typ        string  `json:"typ"`
+		Cn         string  `json:"cn"`
+		Challenge  string  `json:"challenge"`
+		MainTimeMs int64   `json:"main_time_ms"`
+		LicenceOK  bool    `json:"licence_ok"`
+		Policy     *Policy `json:"policy"`
 	}
 	if json.Unmarshal(body, &doc) != nil || doc.Typ != "xcvm-challenge" || doc.Cn != c.State.NodeUUID {
 		return nil, ErrTransport
@@ -89,7 +92,7 @@ func (c *Client) challenge(ctx context.Context, base string) (*Challenge, error)
 	if err != nil || len(raw) != 32 {
 		return nil, ErrTransport
 	}
-	return &Challenge{Challenge: raw, LicenceOK: doc.LicenceOK, MainTimeMs: doc.MainTimeMs}, nil
+	return &Challenge{Challenge: raw, LicenceOK: doc.LicenceOK, MainTimeMs: doc.MainTimeMs, Policy: doc.Policy}, nil
 }
 
 // PanelBoxPub is the panel's X25519 key that pre-token bodies are sealed to.
@@ -103,7 +106,7 @@ func (c *Client) PanelBoxPub(ctx context.Context) ([]byte, error) {
 		return have, nil
 	}
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		doc, err := c.Health(ctx, base)
 		if err != nil {
 			lastErr = err
@@ -144,6 +147,18 @@ func (c *Client) Rekey(ctx context.Context, identity map[string]any) (*cc.Token,
 	if !ch.LicenceOK {
 		return nil, ErrUnlicensed
 	}
+	var tok *cc.Token
+	err = withReplay(ctx, c.setMainTime, func() error {
+		var err error
+		tok, err = c.rekeyOnce(ctx, boxPub, ch, identity)
+		return err
+	})
+	return tok, err
+}
+
+// rekeyOnce sends one token_rekey with the challenge: a fresh per-epoch key,
+// nonce and stamp each time.
+func (c *Client) rekeyOnce(ctx context.Context, boxPub []byte, ch *Challenge, identity map[string]any) (*cc.Token, error) {
 	ephSk, ephPub, err := cc.NewX25519()
 	if err != nil {
 		return nil, err
@@ -185,8 +200,9 @@ func (c *Client) Rekey(ctx context.Context, identity map[string]any) (*cc.Token,
 	h.Set(cc.HNodeSig, hex.EncodeToString(cc.SignNode(c.State.SignKey(), "request", append(append([]byte{}, reqCtx...), cc.SHA256(body)...))))
 
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		st, rh, rb, err := c.post(ctx, strings.TrimRight(base, "/")+"/token_rekey", h, body)
+		c.reached(ctx, base, err)
 		if err != nil {
 			lastErr = err
 			continue
@@ -252,16 +268,8 @@ func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Toke
 	return tok, nil
 }
 
-// retryAfterMs is a RATE_LIMITED denial's retry_after_ms, or 0.
-func retryAfterMs(d *Denial) int64 {
-	var doc struct {
-		RetryAfterMs int64 `json:"retry_after_ms"`
-	}
-	if json.Unmarshal(d.Doc, &doc) != nil {
-		return 0
-	}
-	return doc.RetryAfterMs
-}
+// retryAfterMs is a denial's retry_after_ms, or 0.
+func retryAfterMs(d *Denial) int64 { return d.RetryAfterMs }
 
 // needsRekey reports whether err means the node has no usable token: MAIN
 // says its epoch is gone, or (hard revocation mode) the licence is invalid.

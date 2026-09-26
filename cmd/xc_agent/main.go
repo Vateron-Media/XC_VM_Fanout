@@ -9,6 +9,13 @@
 // takes the server's stats from it. The mode and flows MAIN sends are written
 // to flows.json beside the state for the node's PHP.
 //
+// With CONNECTIONS on, the agent holds the node's viewers (registry.snap,
+// rebuilt against the fanout and the PHP workers after a restart), admits new
+// ones (the adm claim, MAIN's conn_admit, or MAIN's offline policy), and
+// sends HLS touches on the P2 lane when MAIN takes them. Heartbeats go at
+// most 3 s apart; under https_required the agent follows the signed challenge
+// over plain HTTP while HTTPS fails.
+//
 // The node's state file (default /home/xc_vm/config/cluster/agent.json, 0600)
 // is written by the panel's install flow over SSH: node uuid, server id, the
 // node's Ed25519 seed, the pinned panel key, MAIN's URLs and epoch 1.

@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	mrand "math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -46,12 +48,24 @@ type Agent struct {
 	// Run makes it when SpoolDir is set.
 	Registry *Registry
 
+	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
 	flows     atomic.Int64 // the flow bits from MAIN's latest reply
 	// MAIN's event cursors from the latest hello, plus one (0: not known yet).
 	cursorP0, cursorP1 atomic.Int64
-	fanoutLive         atomic.Bool // the fanout's /events feed is being followed
-	snapshotting       atomic.Bool // a conn_snapshot is being sent
+	fanoutLive         atomic.Bool  // the fanout's /events feed is being followed
+	snapshotting       atomic.Bool  // a conn_snapshot is being sent
+	state              atomic.Value // string: the node state in MAIN's latest reply
+	admits             admitCache   // conn_admit's admitting answers (admission.go)
+	p2Touch            atomic.Bool  // HLS touches go on the P2 lane (touch.go)
+	helloing           atomic.Bool  // a hello is being retried in the background
+	refreshing         atomic.Bool  // a token refresh runs in the background
+	stopCh             chan error   // a background loop's fatal refusal, for Run
+	run                Executor     // what runs MAIN's commands (localExec over Exec); nil: none
+	sealedMu           sync.Mutex   // one batch of sealed commands at a time (sealed.go)
+	fenced             atomic.Bool  // MAIN refuses the session for want of a licence
+	acking             atomic.Bool  // sealed commands are being acked
+	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -67,16 +81,18 @@ type Reply struct {
 	// WantConnSnapshot, in heartbeat replies: MAIN's store for this node
 	// drifted from the digest the heartbeat carried; send the registry.
 	WantConnSnapshot bool `json:"want_conn_snapshot"`
+	// OfflineAdmission, in hello and heartbeat replies: the offline policy
+	// for viewers MAIN cannot admit (admission.go); an older MAIN omits it.
+	OfflineAdmission string `json:"offline_admission"`
+	// P2Types, in hello and heartbeat replies: the event types MAIN takes on
+	// the P2 lane (touch.go); an older MAIN omits it.
+	P2Types []string `json:"p2_types"`
 	// Cursors, in hello replies, are the last event numbers MAIN applied per lane.
 	Cursors *struct {
 		P0 int64 `json:"p0"`
 		P1 int64 `json:"p1"`
 	} `json:"cursors"`
-	Policy *struct {
-		PolicyVer int      `json:"policy_ver"`
-		Transport string   `json:"transport"`
-		MainURLs  []string `json:"main_urls"`
-	} `json:"policy"`
+	Policy *Policy `json:"policy"`
 }
 
 // Features are what this agent tells MAIN at hello that it does, so MAIN
@@ -155,6 +171,10 @@ func (a *Agent) recover(ctx context.Context) error {
 		case errors.As(err, &d) && (d.Reason == "LICENCE_INVALID" || d.Reason == "NOT_ACTIVE"):
 			wait = RekeyPoll
 		default:
+			if w, ok := busyWait(err); ok {
+				wait = w // MAIN is starting: no longer backoff
+				break
+			}
 			backoff = min(backoff*2, 5*time.Minute)
 		}
 		a.logf("cluster: re-key: %v (retry in %s)", err, wait)
@@ -170,7 +190,12 @@ func (a *Agent) publish(r *Reply) {
 	if r == nil || r.State == "" {
 		return
 	}
+	a.pubMu.Lock()
+	defer a.pubMu.Unlock()
 	a.flows.Store(int64(r.Flows))
+	a.state.Store(r.State)
+	a.setOfflineAdmission(r.OfflineAdmission)
+	a.setP2(a.p2Wanted(r))
 	if a.FlowsFile == "" {
 		return
 	}
@@ -223,19 +248,11 @@ func (a *Agent) apply(r *Reply) {
 		a.cursorP0.Store(r.Cursors.P0 + 1)
 		a.cursorP1.Store(r.Cursors.P1 + 1)
 	}
-	if r == nil || r.Policy == nil || r.Policy.PolicyVer < a.Client.State.PolicyVer || len(r.Policy.MainURLs) == 0 {
+	if r == nil {
 		return
 	}
-	st := a.Client.State
-	st.mu.Lock()
-	changed := r.Policy.PolicyVer != st.PolicyVer || strings.Join(r.Policy.MainURLs, " ") != strings.Join(st.MainURLs, " ")
-	st.PolicyVer, st.MainURLs = r.Policy.PolicyVer, append([]string{}, r.Policy.MainURLs...)
-	var err error
-	if changed {
-		err = st.saveLocked()
-	}
-	st.mu.Unlock()
-	if err != nil {
+	// A MAC'd reply: a policy not older than the one held is adopted.
+	if _, err := a.Client.State.adoptPolicy(r.Policy, false); err != nil {
 		a.logf("cluster: saving policy: %v", err)
 	}
 }
@@ -276,18 +293,63 @@ func (a *Agent) Run(ctx context.Context) error {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
+	// MAIN's liveness bounds assume heartbeats at most MaxHeartbeatGap apart.
+	interval = min(interval, MaxHeartbeatGap)
 	backoff := interval
+	a.stopCh = make(chan error, 1)
+	if a.Exec != nil && a.run == nil {
+		a.run = a.localExec(a.Exec)
+	}
+	if a.Client.OnDenial == nil {
+		a.Client.OnDenial = func(d *Denial) {
+			if d.Reason == "LICENCE_INVALID" && d.CommandsSealed != "" {
+				go a.takeSealed(ctx, d)
+			}
+			if d.Reason == "HTTPS_REQUIRED" {
+				a.httpsFailing.Store(true)
+			}
+		}
+	}
+	var policyDone sync.WaitGroup
+	defer policyDone.Wait()
+	pctx, stopPolicy := context.WithCancel(ctx)
+	defer stopPolicy()
+	policyDone.Add(1)
+	go func() {
+		defer policyDone.Done()
+		a.RunPolicyRecovery(pctx)
+	}()
 	for {
 		_, err := a.Start(ctx)
 		if err == nil {
+			a.httpsFailing.Store(false)
 			break
 		}
 		if fatal(err) {
 			return errors.Join(ErrStop, err)
 		}
+		a.httpsTrouble(err)
+		if a.licenceGone(err) {
+			// FENCED: ask again at the heartbeat's pace, so the kills MAIN
+			// sends with its refusal keep coming (sealed.go).
+			a.setFenced(true)
+			if !sleep(ctx, interval) {
+				return ctx.Err()
+			}
+			continue
+		}
 		if needsRekey(err) {
 			if err := a.recover(ctx); err != nil {
 				return err
+			}
+			continue
+		}
+		if w, ok := busyWait(err); ok {
+			// MAIN is busy, not failing: come back when it says, with no
+			// longer backoff.
+			a.logf("cluster: start: %v (retry in %s)", err, w)
+			if !sleep(ctx, w) {
+				return ctx.Err()
 			}
 			continue
 		}
@@ -297,14 +359,24 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		backoff = min(backoff*2, time.Minute)
 	}
-	if a.Exec != nil {
+	if a.run != nil {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
-		go a.RunCommands(cctx, a.localExec(a.Exec))
+		go a.RunCommands(cctx, a.run)
 	}
 	if a.Registry == nil && a.SpoolDir != "" {
 		spool := a.SpoolDir
 		a.Registry = NewRegistry(filepath.Join(filepath.Dir(spool), "registry.snap"), func(ev []map[string]any) error { return spoolP0(spool, ev) }, a.logf)
+	}
+	if a.Registry != nil && a.Registry.Admit == nil {
+		a.Registry.Admit = a.admit
+	}
+	if a.Registry != nil && a.Registry.P2 == nil {
+		a.Registry.P2 = a.p2Touch.Load
+	}
+	if a.Registry != nil {
+		// What registry.snap restored, checked against what still serves it.
+		go a.RebuildRegistry(ctx)
 	}
 	if a.Registry != nil {
 		go func() {
@@ -353,6 +425,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		for _, lane := range Lanes {
 			go a.RunEvents(ectx, lane)
 		}
+		if a.Registry != nil {
+			go a.RunTouches(ectx)
+		}
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -360,34 +435,47 @@ func (a *Agent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-a.stopCh:
+			return errors.Join(ErrStop, err)
 		case <-t.C:
 		}
 		if tok, ok := a.Client.Current(); ok && a.Client.MainNowMs()/1000 >= tok.RefreshAt {
-			if _, err := a.Client.Refresh(ctx); err != nil {
-				if fatal(err) {
-					return errors.Join(ErrStop, err)
-				}
-				// The current token lasts to exp; a later heartbeat re-keys if it must.
-				a.logf("cluster: token refresh: %v", err)
-			}
+			a.refreshLater(ctx)
 		}
-		r, err := a.Heartbeat(ctx)
+		hctx, cancel := context.WithTimeout(ctx, MaxHeartbeatGap)
+		r, err := a.Heartbeat(hctx)
+		cancel()
 		if err != nil {
 			if fatal(err) {
 				return errors.Join(ErrStop, err)
+			}
+			if a.licenceGone(err) {
+				a.setFenced(true)
+				continue
 			}
 			if needsRekey(err) {
 				a.logf("cluster: heartbeat: %v; re-keying", err)
 				if err := a.recover(ctx); err != nil {
 					return err
 				}
-				if _, err := a.Start(ctx); err != nil && fatal(err) {
-					return errors.Join(ErrStop, err)
-				}
+				a.helloLater(ctx, "after the re-key")
 				continue
 			}
 			a.logf("cluster: heartbeat: %v", err)
+			a.httpsTrouble(err)
+			if w, ok := busyWait(err); ok && !sleep(ctx, w) {
+				// MAIN is starting: its silence clock starts when it is ready.
+				return ctx.Err()
+			}
 			continue
+		}
+		a.setFenced(false)
+		a.httpsFailing.Store(false)
+		if a.hasUnackedSealed() && a.acking.CompareAndSwap(false, true) {
+			go func() {
+				defer a.acking.Store(false)
+				a.ackSealed(ctx)
+			}()
 		}
 		if r.WantConnSnapshot {
 			go func() {
@@ -396,14 +484,107 @@ func (a *Agent) Run(ctx context.Context) error {
 				}
 			}()
 		}
-		if r.PolicyVer > a.Client.State.PolicyVer {
-			if _, err := a.Start(ctx); err != nil {
-				a.logf("cluster: fetching policy %d: %v", r.PolicyVer, err)
-			}
+		if r.PolicyVer > a.Client.State.policyVer() {
+			a.helloLater(ctx, fmt.Sprintf("fetching policy %d", r.PolicyVer))
 		}
 		if r.State == "quarantined" {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
+	}
+}
+
+// MaxHeartbeatGap is the longest MAIN may go between two of the node's
+// heartbeats (ADR 0004, "The cluster bus (Phase 2, third increment):
+// heartbeats"): the interval is capped at it, and a heartbeat not answered
+// within it is given up so the next one goes out on time. Nothing else runs
+// on the heartbeat loop: a token refresh, and a hello after a re-key or for a
+// newer policy, run beside it.
+var MaxHeartbeatGap = 3 * time.Second
+
+// refreshLater refreshes the token in the background; one runs at a time.
+func (a *Agent) refreshLater(ctx context.Context) {
+	if !a.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.refreshing.Store(false)
+		if _, err := a.Client.Refresh(ctx); err != nil {
+			if fatal(err) {
+				a.stop(err)
+				return
+			}
+			// The current token lasts to exp; a later heartbeat re-keys if it must.
+			a.logf("cluster: token refresh: %v", err)
+		}
+	}()
+}
+
+// setFenced notes whether MAIN refuses the session for want of a licence.
+func (a *Agent) setFenced(on bool) {
+	if a.fenced.Swap(on) == on {
+		return
+	}
+	if on {
+		a.logf("cluster: MAIN's licence is not valid; heartbeats go on for the kills MAIN sends with its refusals")
+	} else {
+		a.logf("cluster: MAIN accepts the session again")
+	}
+}
+
+func (a *Agent) hasUnackedSealed() bool {
+	st := a.Client.State
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, k := range st.SealedCmds {
+		if !k.Acked {
+			return true
+		}
+	}
+	return false
+}
+
+// helloLater says hello in the background, while the heartbeats go on, until
+// it works, MAIN stops the node (Run then returns) or ctx ends. MAIN busy
+// (503 RATE_LIMITED) is retried when MAIN says, anything else with a backoff.
+// One runs at a time.
+func (a *Agent) helloLater(ctx context.Context, why string) {
+	if !a.helloing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.helloing.Store(false)
+		backoff := 2 * time.Second
+		for {
+			_, err := a.Start(ctx)
+			if err == nil {
+				return
+			}
+			if fatal(err) {
+				a.stop(err)
+				return
+			}
+			wait := backoff
+			if w, ok := busyWait(err); ok {
+				wait = w
+			} else {
+				backoff = min(backoff*2, time.Minute)
+			}
+			a.logf("cluster: hello (%s): %v (retry in %s)", why, err, wait)
+			if !sleep(ctx, wait) {
+				return
+			}
+		}
+	}()
+}
+
+// stop hands a background loop's fatal refusal to Run.
+func (a *Agent) stop(err error) {
+	if a.stopCh == nil {
+		return
+	}
+	select {
+	case a.stopCh <- err:
+	default:
 	}
 }
 

@@ -104,7 +104,7 @@ Only the **PHP panel** talks to this surface.
 | `PUT`/`POST` `/ingest/<id>` | Switch the stream into **push** mode, return the socket path. |
 | `DELETE /ingest/<id>` | Tear down a push stream. |
 | `GET /probe/<id>?wait=<ms>` | Warm up the source and wait for data. |
-| `GET /connections` | All uuids of active live-TS viewers. |
+| `GET /connections` | All uuids of active live-TS viewers (`?detail=1`: with stream and attach time, for the node's agent). |
 | `DELETE /connections/<uuid>` | Disconnect a live-TS viewer (panel kick / connection-limit eviction). |
 | `GET /rates` | Per-viewer average delivery rate (KB/s), keyed by uuid. |
 | `POST /signal/<uuid>` | Queue a one-shot admin "send message" text overlay for one viewer. |
@@ -233,6 +233,13 @@ The `fanout_sync` daemon reconciles this set against the `lines_live` rows and c
 no longer appears here — because under X-Accel PHP cannot see a viewer disconnect on its own.
 
 **Response:** `200`, `Content-Type: application/json`, body — for example `["uuid-1","uuid-2"]`.
+
+**`?detail=1`** — for the node's cluster agent (`xc_agent`), which rebuilds its connection registry
+from it after a restart: the same viewers as objects,
+`[{"uuid":"uuid-1","stream_id":"5","since_ms":1800000000000,"refs":1}, …]` — `since_ms` is when the
+uuid attached (unix ms), `refs` how many connections carry it. Without the parameter the answer is
+the bare array above, which `fanout_sync` reads; a daemon that predates the parameter ignores it, and
+the agent reads the bare array too.
 
 ### `DELETE /connections/<uuid>` — disconnect a viewer
 

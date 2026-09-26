@@ -1,0 +1,237 @@
+package clusteragent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// interopNode enrols an agent by code against MAIN's real PHP ClusterApi
+// (XCVM_PANEL_DIR, as TestInteropWithPanel) and returns it with a runner for
+// the harness scripts. The agent has a spool, a registry and a local socket,
+// none of them running yet.
+func interopNode(t *testing.T) (*Agent, func(script string, args ...string) string, context.Context) {
+	a, runPHP, ctx, _ := interopNodeEnv(t)
+	return a, runPHP, ctx
+}
+
+// interopNodeEnv is interopNode, plus a function that restarts MAIN's php -S
+// with extra environment (settings the harness reads from it).
+func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) string, context.Context, func(extra ...string)) {
+	t.Helper()
+	panel := os.Getenv("XCVM_PANEL_DIR")
+	if panel == "" {
+		t.Skip("XCVM_PANEL_DIR not set")
+	}
+	php, err := exec.LookPath("php")
+	if err != nil {
+		t.Skip("php not found")
+	}
+	dir := t.TempDir()
+	harness, _ := filepath.Abs("testdata/panel")
+	port := freePort(t)
+	env := append(os.Environ(), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+filepath.Join(dir, "main.sqlite"), fmt.Sprintf("XCVM_INTEROP_PORT=%d", port))
+	runPHP := func(script string, args ...string) string {
+		cmd := exec.Command(php, append([]string{filepath.Join(harness, script)}, args...)...)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s %v: %v\n%s", script, args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	code := runPHP("enrol_code.php")
+	var srv *exec.Cmd
+	restart := func(extra ...string) {
+		if srv != nil {
+			srv.Process.Kill()
+			srv.Wait()
+		}
+		srv = exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(harness, "router.php"))
+		srv.Env = append(append([]string{}, env...), extra...)
+		if err := srv.Start(); err != nil {
+			t.Fatal(err)
+		}
+		waitPort(t, port)
+	}
+	restart()
+	t.Cleanup(func() { srv.Process.Kill() })
+	old := EnrolPoll
+	EnrolPoll = 100 * time.Millisecond
+	t.Cleanup(func() { EnrolPoll = old })
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	t.Cleanup(cancel)
+	statePath := filepath.Join(dir, "agent.json")
+	sasCh, done := make(chan string, 1), make(chan error, 1)
+	go func() {
+		done <- EnrolByCode(ctx, statePath, code, "xc_agent/interop", false, func(s string) { sasCh <- s })
+	}()
+	runPHP("approve.php", <-sasCh)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	st, _ := LoadState(statePath)
+	sockDir, _ := os.MkdirTemp("", "xc")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	spool := filepath.Join(dir, "spool")
+	a := &Agent{Client: NewClient(st, "xc_agent/interop"), Version: "0.0.0-interop", Logf: t.Logf,
+		FlowsFile: filepath.Join(dir, "flows.json"), SpoolDir: spool, SocketPath: filepath.Join(sockDir, "a.sock")}
+	a.Registry = NewRegistry(filepath.Join(dir, "registry.snap"), func(ev []map[string]any) error { return spoolP0(spool, ev) }, t.Logf)
+	a.Registry.Admit = a.admit
+	return a, runPHP, ctx, restart
+}
+
+func serveSocket(t *testing.T, ctx context.Context, a *Agent) {
+	t.Helper()
+	go a.ServeSocket(ctx, a.SocketPath)
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(a.SocketPath); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the local socket never came up")
+}
+
+// TestInteropAdmission: the node's PHP registers limited viewers with the
+// X-XCVM-Admission header it builds (AgentConnections::admission), the agent
+// asks MAIN's real conn_admit, and PHP reads the agent's answer.
+func TestInteropAdmission(t *testing.T) {
+	a, runPHP, ctx := interopNode(t)
+	runPHP("admission.php", "lines")
+	runPHP("events.php", "flows", "64") // CONNECTIONS
+	r, err := a.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.OfflineAdmission != OfflineLocal || a.OfflineAdmission() != OfflineLocal {
+		t.Fatalf("hello carried offline_admission %q", r.OfflineAdmission)
+	}
+	lctx, stop := context.WithCancel(ctx)
+	defer stop()
+	serveSocket(t, lctx, a)
+
+	var out struct {
+		Header bool `json:"header"`
+		Result any  `json:"result"`
+	}
+	// A valid line: MAIN admits, the viewer is stored.
+	json.Unmarshal([]byte(runPHP("admission.php", "node", a.FlowsFile, a.SocketPath, "70", "okviewer")), &out)
+	if !out.Header || out.Result != true || a.Registry.Get("okviewer") == nil {
+		t.Fatalf("valid line: %+v, stored %v", out, a.Registry.Get("okviewer"))
+	}
+	// An expired line: MAIN refuses, PHP reads the reason, nothing is stored.
+	json.Unmarshal([]byte(runPHP("admission.php", "node", a.FlowsFile, a.SocketPath, "71", "expviewer")), &out)
+	if !out.Header || out.Result != "EXPIRED" || a.Registry.Get("expviewer") != nil {
+		t.Fatalf("expired line: %+v", out)
+	}
+	// An unknown line likewise.
+	json.Unmarshal([]byte(runPHP("admission.php", "node", a.FlowsFile, a.SocketPath, "79", "noline")), &out)
+	if out.Result != "UNKNOWN_LINE" {
+		t.Fatalf("unknown line: %+v", out)
+	}
+	// CONNECTIONS off on MAIN while the agent still thinks it is on: a signed
+	// FLOW_OFF, which admits.
+	runPHP("events.php", "flows", "0")
+	json.Unmarshal([]byte(runPHP("admission.php", "node", a.FlowsFile, a.SocketPath, "71", "flowoff")), &out)
+	if out.Result != true {
+		t.Fatalf("FLOW_OFF must admit: %+v", out)
+	}
+}
+
+// TestInteropP2Touches: with CONNECTIONS on, MAIN lists conn.touch in
+// p2_types; a touch goes on P2 and, without a cluster bus, lands in MAIN's
+// store; the P0 upsert of the open carried the viewer there first.
+func TestInteropP2Touches(t *testing.T) {
+	a, runPHP, ctx := interopNode(t)
+	runPHP("events.php", "flows", "64")
+	a.Registry.P2 = a.p2Touch.Load
+	r, err := a.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.p2Wanted(r) || !a.p2Touch.Load() {
+		t.Fatalf("hello's p2_types %v did not turn P2 on", r.P2Types)
+	}
+	oldLanes := Lanes
+	Lanes = []Lane{{Name: "p0", Interval: 50 * time.Millisecond}}
+	defer func() { Lanes = oldLanes }()
+	lctx, stop := context.WithCancel(ctx)
+	defer stop()
+	go a.RunEvents(lctx, Lanes[0])
+	a.Registry.Put("hlsv", map[string]any{"user_id": 7, "stream_id": 100, "server_id": 7, "user_ip": "10.0.0.9", "user_agent": "VLC", "container": "hls", "pid": nil, "date_start": 1800000000, "hls_last_read": 1800000000, "hls_end": 0})
+	for i := 0; i < 100 && runPHP("touch.php", "hlsv") != "1800000000"; i++ {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := runPHP("touch.php", "hlsv"); got != "1800000000" {
+		t.Fatalf("the open never reached MAIN: %s", got)
+	}
+	a.Registry.Touch("hlsv", 1800000042)
+	if err := a.sendTouches(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := runPHP("touch.php", "hlsv"); got != "1800000042" {
+		t.Fatalf("MAIN's store after the P2 touch: %s", got)
+	}
+}
+
+// TestInteropHTTPSRequiredRecovery: the drill of HttpsRequiredRecoveryTest
+// against the real ClusterApi (over plain HTTP, as php -S serves it): under
+// https_required every op but the challenge is refused with a signed
+// HTTPS_REQUIRED; the agent takes the policy from the signed challenge over
+// HTTP, and is back once the admin picks auto again.
+func TestInteropHTTPSRequiredRecovery(t *testing.T) {
+	a, _, ctx, restart := interopNodeEnv(t)
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	plain := a.Client.State.MainURLs[0]
+	restart("XCVM_INTEROP_TRANSPORT=https_required", "XCVM_INTEROP_POLICY_VER=2")
+	_, err := a.Heartbeat(ctx)
+	var d *Denial
+	if !errors.As(err, &d) || d.Reason != "HTTPS_REQUIRED" || d.Status != 403 {
+		t.Fatalf("a heartbeat over HTTP under https_required: %v", err)
+	}
+	a.httpsTrouble(err)
+	if err := a.PolicyOverHTTP(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st := a.Client.State
+	if st.policyVer() != 2 || st.Transport != "https_required" || !strings.HasPrefix(st.MainURLs[0], "https://main.invalid:1/") {
+		t.Fatalf("policy from the challenge: v%d %s %v", st.PolicyVer, st.Transport, st.MainURLs)
+	}
+	if got := st.plainURLs(); len(got) == 0 || got[0] != plain {
+		t.Fatalf("the plain-HTTP URL was forgotten: %v", got)
+	}
+	// HTTPS does not work (main.invalid): the heartbeats fail.
+	if _, err := a.Heartbeat(ctx); err == nil {
+		t.Fatal("a heartbeat went through without HTTPS")
+	}
+	// The admin switches back to auto (v3): the next challenge over HTTP
+	// brings the node back.
+	restart("XCVM_INTEROP_TRANSPORT=auto", "XCVM_INTEROP_POLICY_VER=3")
+	if err := a.PolicyOverHTTP(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st.policyVer() != 3 || st.Transport != "auto" {
+		t.Fatalf("after the switch: v%d %s", st.PolicyVer, st.Transport)
+	}
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatalf("heartbeat after the switch: %v", err)
+	}
+	// An older policy from a replayed challenge is never adopted.
+	restart("XCVM_INTEROP_TRANSPORT=https_required", "XCVM_INTEROP_POLICY_VER=2")
+	if err := a.PolicyOverHTTP(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st.policyVer() != 3 || st.Transport != "auto" {
+		t.Fatalf("adopted an older policy: v%d %s", st.PolicyVer, st.Transport)
+	}
+}

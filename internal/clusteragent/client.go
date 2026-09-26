@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,10 +32,18 @@ const octet = "application/octet-stream"
 // Denial is a panel-signed refusal that names this node and this request.
 type Denial struct {
 	Status int
-	Reason string          `json:"reason"`
-	Node   string          `json:"node"`
-	Nonce  string          `json:"req_nonce"`
-	Doc    json.RawMessage `json:"-"`
+	Reason string `json:"reason"`
+	Node   string `json:"node"`
+	Nonce  string `json:"req_nonce"`
+	// MainTimeMs is MAIN's clock when it refused; RetryAfterMs and Op are set
+	// on the refusals that ask for a later retry (retry.go).
+	MainTimeMs   int64  `json:"main_time_ms"`
+	RetryAfterMs int64  `json:"retry_after_ms"`
+	Op           string `json:"op"`
+	// CommandsSealed, on a hard-mode LICENCE_INVALID: the node's pending
+	// restrictive commands, sealed to it (sealed.go).
+	CommandsSealed string          `json:"commands_sealed"`
+	Doc            json.RawMessage `json:"-"`
 }
 
 func (d *Denial) Error() string { return fmt.Sprintf("MAIN refused (%d %s)", d.Status, d.Reason) }
@@ -60,10 +69,71 @@ type Client struct {
 	// LongHTTP carries the commands long-poll, which MAIN holds open.
 	LongHTTP *http.Client
 
+	// OnDenial, when set, sees every verified denial of a session op.
+	OnDenial func(*Denial)
+
 	mu       sync.Mutex
 	sessions map[uint64]session
 	offsetMs atomic.Int64 // MAIN time − local time, from authenticated replies
 	now      func() time.Time
+	// failed holds the MAIN URLs that could not be reached (connect, TLS or
+	// timeout), each until it is tried first again (URLRetry).
+	failed map[string]time.Time
+}
+
+// URLRetry is how long a MAIN URL that could not be reached is tried after
+// the others (plan, "Endpoints and HTTPS": fall back, retry HTTPS every 10
+// minutes).
+var URLRetry = 10 * time.Minute
+
+// DialTimeout bounds connecting to one MAIN URL, so a dead URL leaves time
+// for the next within a heartbeat.
+var DialTimeout = 2 * time.Second
+
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: DialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = DialTimeout
+	return t
+}
+
+// urls is MAIN's URLs in the order to try them: the policy's order, with the
+// ones that recently could not be reached last.
+func (c *Client) urls() []string {
+	c.State.mu.Lock()
+	all := append([]string{}, c.State.MainURLs...)
+	c.State.mu.Unlock()
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var good, bad []string
+	for _, u := range all {
+		if until, ok := c.failed[u]; ok && now.Before(until) {
+			bad = append(bad, u)
+			continue
+		}
+		delete(c.failed, u)
+		good = append(good, u)
+	}
+	return append(good, bad...)
+}
+
+// reached notes whether a MAIN URL answered. err is the request's error;
+// a failure the caller's own context caused says nothing of the URL.
+func (c *Client) reached(ctx context.Context, base string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case err == nil:
+		delete(c.failed, base)
+	case ctx.Err() == nil:
+		if c.failed == nil {
+			c.failed = map[string]time.Time{}
+		}
+		if _, ok := c.failed[base]; !ok {
+			c.failed[base] = c.now().Add(URLRetry)
+		}
+	}
 }
 
 // NewClient opens every stored epoch's token (verifying the panel signature)
@@ -71,8 +141,8 @@ type Client struct {
 func NewClient(st *State, agent string) *Client {
 	c := &Client{
 		State:    st,
-		HTTP:     &http.Client{Timeout: 10 * time.Second},
-		LongHTTP: &http.Client{Timeout: 45 * time.Second},
+		HTTP:     &http.Client{Timeout: 10 * time.Second, Transport: newTransport()},
+		LongHTTP: &http.Client{Timeout: 45 * time.Second, Transport: newTransport()},
 		Agent:    agent,
 		sessions: map[uint64]session{},
 		now:      time.Now,
@@ -136,11 +206,20 @@ func (c *Client) Call(ctx context.Context, op string, payload, out any, signNode
 	return c.call(ctx, s, op, payload, out, signNode)
 }
 
+// A REPLAY that says when a request stamped anew will pass is retried once
+// (retry.go).
 func (c *Client) call(ctx context.Context, s session, op string, payload, out any, signNode bool) error {
 	plain, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
+	return withReplay(ctx, c.setMainTime, func() error { return c.callOnce(ctx, s, op, plain, out, signNode) })
+}
+
+// setMainTime takes MAIN's clock from an authenticated main_time_ms.
+func (c *Client) setMainTime(mainMs int64) { c.offsetMs.Store(mainMs - c.now().UnixMilli()) }
+
+func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byte, out any, signNode bool) error {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return err
@@ -172,12 +251,13 @@ func (c *Client) call(ctx context.Context, s session, op string, payload, out an
 	}
 
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		hc := c.HTTP
 		if op == "commands" && c.LongHTTP != nil {
 			hc = c.LongHTTP
 		}
 		st, rh, rb, err := c.postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
+		c.reached(ctx, base, err)
 		if err != nil {
 			lastErr = err
 			continue
@@ -186,6 +266,9 @@ func (c *Client) call(ctx context.Context, s session, op string, payload, out an
 			return c.openReply(s, reqCtx, st, rh, rb, out)
 		}
 		if d := c.denial(st, rh, rb, nonce); d != nil {
+			if c.OnDenial != nil {
+				c.OnDenial(d)
+			}
 			return d
 		}
 		lastErr = fmt.Errorf("%w: HTTP %d from %s", ErrTransport, st, base)
@@ -234,7 +317,7 @@ func (c *Client) openReply(s session, reqCtx []byte, status int, h http.Header, 
 		MainTimeMs int64 `json:"main_time_ms"`
 	}
 	if json.Unmarshal(plain, &probe) == nil && probe.MainTimeMs > 0 {
-		c.offsetMs.Store(probe.MainTimeMs - c.now().UnixMilli())
+		c.setMainTime(probe.MainTimeMs)
 	}
 	if out == nil {
 		return nil

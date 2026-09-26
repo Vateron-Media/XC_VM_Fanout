@@ -135,8 +135,20 @@ func (cl *codeClient) pin(ctx context.Context) (boxPub []byte, err error) {
 }
 
 // call sends one code op and returns the verified reply body and its headers,
-// or a verified *Denial.
+// or a verified *Denial. A REPLAY that says when a request stamped anew will
+// pass is retried once (retry.go).
 func (cl *codeClient) call(ctx context.Context, op, contentType string, body func(reqCtx []byte) ([]byte, error), signKey ed25519.PrivateKey) ([]byte, http.Header, error) {
+	var rb []byte
+	var h http.Header
+	err := withReplay(ctx, func(mainMs int64) { cl.offsetMs = mainMs - time.Now().UnixMilli() }, func() error {
+		var err error
+		rb, h, err = cl.callOnce(ctx, op, contentType, body, signKey)
+		return err
+	})
+	return rb, h, err
+}
+
+func (cl *codeClient) callOnce(ctx context.Context, op, contentType string, body func(reqCtx []byte) ([]byte, error), signKey ed25519.PrivateKey) ([]byte, http.Header, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, nil, err

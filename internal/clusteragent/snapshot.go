@@ -12,12 +12,17 @@ import (
 // from the digest the heartbeat carried. It goes in chunks of SnapshotChunk
 // records, numbered from 0; MAIN applies it with the last one. A chunk MAIN
 // refuses as out of order (409 SNAP_GAP) ends this snapshot: MAIN asks again
-// if the drift stays.
+// if the drift stays. A chunk refused as busy (503 RATE_LIMITED) goes again,
+// with the same snap_id and seq, after retry_after_ms.
 //
 //	{snap_id, seq, last, records: [record, …]}
 
 // SnapshotChunk is the most records one conn_snapshot call carries.
 var SnapshotChunk = 1000
+
+// SnapshotBusyRetries is how often one chunk is sent again while MAIN answers
+// that it is busy (503 RATE_LIMITED) before the snapshot is given up.
+var SnapshotBusyRetries = 20
 
 // SendSnapshot sends the registry to MAIN. Only one runs at a time; a request
 // while one is running is ignored.
@@ -39,7 +44,20 @@ func (a *Agent) SendSnapshot(ctx context.Context) error {
 			Dropped int `json:"dropped"`
 		}
 		last := end == len(records)
-		if err := a.Client.Call(ctx, "conn_snapshot", map[string]any{"snap_id": snap, "seq": seq, "last": last, "records": chunk}, &out, false); err != nil {
+		err := a.Client.Call(ctx, "conn_snapshot", map[string]any{"snap_id": snap, "seq": seq, "last": last, "records": chunk}, &out, false)
+		for busy := 0; busy < SnapshotBusyRetries; busy++ {
+			// MAIN is busy: the same chunk again (same snap_id and seq) when
+			// it says. It keeps the chunks it took.
+			w, ok := busyWait(err)
+			if !ok {
+				break
+			}
+			if !sleep(ctx, w) {
+				return ctx.Err()
+			}
+			err = a.Client.Call(ctx, "conn_snapshot", map[string]any{"snap_id": snap, "seq": seq, "last": last, "records": chunk}, &out, false)
+		}
+		if err != nil {
 			var d *Denial
 			if errors.As(err, &d) && d.Reason == "SNAP_GAP" {
 				a.logf("cluster: connection snapshot: MAIN lost the order; it asks again if it must")

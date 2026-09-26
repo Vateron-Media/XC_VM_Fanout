@@ -143,7 +143,7 @@ func (a *Agent) spoolFanout(out *fanoutReply) error {
 	}
 	still := gone[:0]
 	for _, uuid := range gone {
-		if !live[uuid] {
+		if _, on := live[uuid]; !on {
 			still = append(still, uuid)
 		}
 	}
@@ -154,11 +154,20 @@ func (a *Agent) spoolFanout(out *fanoutReply) error {
 	return err
 }
 
-// fanoutConnections is the set of viewer uuids connected to the fanout now.
-func fanoutConnections(sock string) (map[string]bool, error) {
+// fanoutConn is one live-TS viewer the fanout serves. StreamID and SinceMs
+// are "" and 0 from a daemon that predates GET /connections?detail=1.
+type fanoutConn struct {
+	StreamID string
+	SinceMs  int64
+}
+
+// fanoutConnections is the set of viewers connected to the fanout now, by
+// uuid. It asks for the detailed shape and reads the bare uuid list an older
+// daemon answers instead.
+func fanoutConnections(sock string) (map[string]fanoutConn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://fanout/connections", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://fanout/connections?detail=1", nil)
 	res, err := fanoutClient(sock).Do(req)
 	if err != nil {
 		return nil, err
@@ -167,13 +176,30 @@ func fanoutConnections(sock string) (map[string]bool, error) {
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fanout /connections: HTTP %d", res.StatusCode)
 	}
-	var uuids []string
-	if err := json.NewDecoder(res.Body).Decode(&uuids); err != nil {
+	var items []json.RawMessage
+	if err := json.NewDecoder(res.Body).Decode(&items); err != nil {
 		return nil, err
 	}
-	out := make(map[string]bool, len(uuids))
-	for _, u := range uuids {
-		out[u] = true
+	out := make(map[string]fanoutConn, len(items))
+	for _, raw := range items {
+		var uuid string
+		if json.Unmarshal(raw, &uuid) == nil {
+			out[uuid] = fanoutConn{}
+			continue
+		}
+		var c struct {
+			UUID     string `json:"uuid"`
+			StreamID any    `json:"stream_id"`
+			SinceMs  int64  `json:"since_ms"`
+		}
+		if json.Unmarshal(raw, &c) != nil || c.UUID == "" {
+			continue
+		}
+		sid := ""
+		if c.StreamID != nil {
+			sid = fmt.Sprint(c.StreamID)
+		}
+		out[c.UUID] = fanoutConn{StreamID: sid, SinceMs: c.SinceMs}
 	}
 	return out, nil
 }
