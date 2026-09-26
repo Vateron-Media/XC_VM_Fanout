@@ -47,7 +47,7 @@ type Challenge struct {
 // answers with a document signed by the panel key and naming this node.
 func (c *Client) Challenge(ctx context.Context) (*Challenge, error) {
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		ch, err := c.challenge(ctx, base)
 		if err == nil {
 			return ch, nil
@@ -103,7 +103,7 @@ func (c *Client) PanelBoxPub(ctx context.Context) ([]byte, error) {
 		return have, nil
 	}
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		doc, err := c.Health(ctx, base)
 		if err != nil {
 			lastErr = err
@@ -197,8 +197,9 @@ func (c *Client) rekeyOnce(ctx context.Context, boxPub []byte, ch *Challenge, id
 	h.Set(cc.HNodeSig, hex.EncodeToString(cc.SignNode(c.State.SignKey(), "request", append(append([]byte{}, reqCtx...), cc.SHA256(body)...))))
 
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		st, rh, rb, err := c.post(ctx, strings.TrimRight(base, "/")+"/token_rekey", h, body)
+		c.reached(ctx, base, err)
 		if err != nil {
 			lastErr = err
 			continue

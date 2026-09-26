@@ -57,6 +57,7 @@ type Agent struct {
 	admits             admitCache   // conn_admit's admitting answers (admission.go)
 	p2Touch            atomic.Bool  // HLS touches go on the P2 lane (touch.go)
 	helloing           atomic.Bool  // a hello is being retried in the background
+	refreshing         atomic.Bool  // a token refresh runs in the background
 	stopCh             chan error   // a background loop's fatal refusal, for Run
 }
 
@@ -295,6 +296,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
+	// MAIN's liveness bounds assume heartbeats at most MaxHeartbeatGap apart.
+	interval = min(interval, MaxHeartbeatGap)
 	backoff := interval
 	a.stopCh = make(chan error, 1)
 	for {
@@ -403,15 +406,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-t.C:
 		}
 		if tok, ok := a.Client.Current(); ok && a.Client.MainNowMs()/1000 >= tok.RefreshAt {
-			if _, err := a.Client.Refresh(ctx); err != nil {
-				if fatal(err) {
-					return errors.Join(ErrStop, err)
-				}
-				// The current token lasts to exp; a later heartbeat re-keys if it must.
-				a.logf("cluster: token refresh: %v", err)
-			}
+			a.refreshLater(ctx)
 		}
-		r, err := a.Heartbeat(ctx)
+		hctx, cancel := context.WithTimeout(ctx, MaxHeartbeatGap)
+		r, err := a.Heartbeat(hctx)
+		cancel()
 		if err != nil {
 			if fatal(err) {
 				return errors.Join(ErrStop, err)
@@ -445,6 +444,32 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
 	}
+}
+
+// MaxHeartbeatGap is the longest MAIN may go between two of the node's
+// heartbeats (ADR 0004, "The cluster bus (Phase 2, third increment):
+// heartbeats"): the interval is capped at it, and a heartbeat not answered
+// within it is given up so the next one goes out on time. Nothing else runs
+// on the heartbeat loop: a token refresh, and a hello after a re-key or for a
+// newer policy, run beside it.
+var MaxHeartbeatGap = 3 * time.Second
+
+// refreshLater refreshes the token in the background; one runs at a time.
+func (a *Agent) refreshLater(ctx context.Context) {
+	if !a.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.refreshing.Store(false)
+		if _, err := a.Client.Refresh(ctx); err != nil {
+			if fatal(err) {
+				a.stop(err)
+				return
+			}
+			// The current token lasts to exp; a later heartbeat re-keys if it must.
+			a.logf("cluster: token refresh: %v", err)
+		}
+	}()
 }
 
 // helloLater says hello in the background, while the heartbeats go on, until

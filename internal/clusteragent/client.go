@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -69,6 +70,64 @@ type Client struct {
 	sessions map[uint64]session
 	offsetMs atomic.Int64 // MAIN time − local time, from authenticated replies
 	now      func() time.Time
+	// failed holds the MAIN URLs that could not be reached (connect, TLS or
+	// timeout), each until it is tried first again (URLRetry).
+	failed map[string]time.Time
+}
+
+// URLRetry is how long a MAIN URL that could not be reached is tried after
+// the others (plan, "Endpoints and HTTPS": fall back, retry HTTPS every 10
+// minutes).
+var URLRetry = 10 * time.Minute
+
+// DialTimeout bounds connecting to one MAIN URL, so a dead URL leaves time
+// for the next within a heartbeat.
+var DialTimeout = 2 * time.Second
+
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: DialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = DialTimeout
+	return t
+}
+
+// urls is MAIN's URLs in the order to try them: the policy's order, with the
+// ones that recently could not be reached last.
+func (c *Client) urls() []string {
+	c.State.mu.Lock()
+	all := append([]string{}, c.State.MainURLs...)
+	c.State.mu.Unlock()
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var good, bad []string
+	for _, u := range all {
+		if until, ok := c.failed[u]; ok && now.Before(until) {
+			bad = append(bad, u)
+			continue
+		}
+		delete(c.failed, u)
+		good = append(good, u)
+	}
+	return append(good, bad...)
+}
+
+// reached notes whether a MAIN URL answered. err is the request's error;
+// a failure the caller's own context caused says nothing of the URL.
+func (c *Client) reached(ctx context.Context, base string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case err == nil:
+		delete(c.failed, base)
+	case ctx.Err() == nil:
+		if c.failed == nil {
+			c.failed = map[string]time.Time{}
+		}
+		if _, ok := c.failed[base]; !ok {
+			c.failed[base] = c.now().Add(URLRetry)
+		}
+	}
 }
 
 // NewClient opens every stored epoch's token (verifying the panel signature)
@@ -76,8 +135,8 @@ type Client struct {
 func NewClient(st *State, agent string) *Client {
 	c := &Client{
 		State:    st,
-		HTTP:     &http.Client{Timeout: 10 * time.Second},
-		LongHTTP: &http.Client{Timeout: 45 * time.Second},
+		HTTP:     &http.Client{Timeout: 10 * time.Second, Transport: newTransport()},
+		LongHTTP: &http.Client{Timeout: 45 * time.Second, Transport: newTransport()},
 		Agent:    agent,
 		sessions: map[uint64]session{},
 		now:      time.Now,
@@ -186,12 +245,13 @@ func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byt
 	}
 
 	var lastErr error = ErrTransport
-	for _, base := range c.State.MainURLs {
+	for _, base := range c.urls() {
 		hc := c.HTTP
 		if op == "commands" && c.LongHTTP != nil {
 			hc = c.LongHTTP
 		}
 		st, rh, rb, err := c.postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
+		c.reached(ctx, base, err)
 		if err != nil {
 			lastErr = err
 			continue
