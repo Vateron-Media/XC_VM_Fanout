@@ -38,6 +38,9 @@ type rekeyMain struct {
 	rekeys     int
 	reply      func(doc map[string]any) (tag string, body map[string]any)
 	healthDoc  []byte
+	replays    int      // token_rekey requests to refuse with REPLAY and retry_after_ms first
+	stamps     []uint64 // X-XCVM-Ts of every token_rekey
+	nonces     []string
 }
 
 func newRekeyMain(t *testing.T) (*rekeyMain, *State, *httptest.Server) {
@@ -111,6 +114,14 @@ func (m *rekeyMain) rekey(w http.ResponseWriter, r *http.Request) {
 	if err != nil || r.Header.Get(cc.HEpoch) != "0" || r.Header.Get(cc.HSig) != "" || !cc.VerifyNode(m.nodePub, "request", append(append([]byte{}, reqCtx...), cc.SHA256(body)...), sig) {
 		m.t.Errorf("re-key request is not node-signed epoch 0 without a MAC")
 		w.WriteHeader(400)
+		return
+	}
+	m.stamps, m.nonces = append(m.stamps, ts), append(m.nonces, hex.EncodeToString(nonce))
+	if m.replays > 0 {
+		// MAIN's bus just started: it cannot vouch for the nonce yet. Nothing
+		// is consumed, the challenge included.
+		m.replays--
+		m.signed(w, 401, "den", map[string]any{"reason": "REPLAY", "node": m.uuid, "req_nonce": hex.EncodeToString(nonce), "main_time_ms": time.Now().UnixMilli() + 3000, "retry_after_ms": 80})
 		return
 	}
 	plain, err := cc.Open(m.boxSk, "rekey", string(reqCtx), body)

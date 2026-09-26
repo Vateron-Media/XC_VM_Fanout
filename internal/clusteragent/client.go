@@ -31,10 +31,15 @@ const octet = "application/octet-stream"
 // Denial is a panel-signed refusal that names this node and this request.
 type Denial struct {
 	Status int
-	Reason string          `json:"reason"`
-	Node   string          `json:"node"`
-	Nonce  string          `json:"req_nonce"`
-	Doc    json.RawMessage `json:"-"`
+	Reason string `json:"reason"`
+	Node   string `json:"node"`
+	Nonce  string `json:"req_nonce"`
+	// MainTimeMs is MAIN's clock when it refused; RetryAfterMs and Op are set
+	// on the refusals that ask for a later retry (retry.go).
+	MainTimeMs   int64           `json:"main_time_ms"`
+	RetryAfterMs int64           `json:"retry_after_ms"`
+	Op           string          `json:"op"`
+	Doc          json.RawMessage `json:"-"`
 }
 
 func (d *Denial) Error() string { return fmt.Sprintf("MAIN refused (%d %s)", d.Status, d.Reason) }
@@ -136,11 +141,20 @@ func (c *Client) Call(ctx context.Context, op string, payload, out any, signNode
 	return c.call(ctx, s, op, payload, out, signNode)
 }
 
+// A REPLAY that says when a request stamped anew will pass is retried once
+// (retry.go).
 func (c *Client) call(ctx context.Context, s session, op string, payload, out any, signNode bool) error {
 	plain, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
+	return withReplay(ctx, c.setMainTime, func() error { return c.callOnce(ctx, s, op, plain, out, signNode) })
+}
+
+// setMainTime takes MAIN's clock from an authenticated main_time_ms.
+func (c *Client) setMainTime(mainMs int64) { c.offsetMs.Store(mainMs - c.now().UnixMilli()) }
+
+func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byte, out any, signNode bool) error {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return err
@@ -234,7 +248,7 @@ func (c *Client) openReply(s session, reqCtx []byte, status int, h http.Header, 
 		MainTimeMs int64 `json:"main_time_ms"`
 	}
 	if json.Unmarshal(plain, &probe) == nil && probe.MainTimeMs > 0 {
-		c.offsetMs.Store(probe.MainTimeMs - c.now().UnixMilli())
+		c.setMainTime(probe.MainTimeMs)
 	}
 	if out == nil {
 		return nil

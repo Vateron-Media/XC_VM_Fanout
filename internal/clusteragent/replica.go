@@ -382,10 +382,15 @@ func ReplicaDeltas(dir string) []string {
 // RunReplica keeps the replica current until ctx ends.
 func (a *Agent) RunReplica(ctx context.Context) {
 	for {
+		wait := jitter(ReplicaPoll)
 		if err := a.SyncReplica(ctx); err != nil && ctx.Err() == nil {
-			a.logf("cluster: replica: %v", err)
+			if w, ok := busyWait(err); ok {
+				// MAIN is busy: ask again when it says, not a minute later.
+				wait = w
+			}
+			a.logf("cluster: replica: %v (next in %s)", err, wait.Round(time.Second))
 		}
-		if !sleep(ctx, jitter(ReplicaPoll)) {
+		if !sleep(ctx, wait) {
 			return
 		}
 	}

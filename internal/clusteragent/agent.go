@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	mrand "math/rand"
 	"os"
@@ -55,6 +56,8 @@ type Agent struct {
 	state              atomic.Value // string: the node state in MAIN's latest reply
 	admits             admitCache   // conn_admit's admitting answers (admission.go)
 	p2Touch            atomic.Bool  // HLS touches go on the P2 lane (touch.go)
+	helloing           atomic.Bool  // a hello is being retried in the background
+	stopCh             chan error   // a background loop's fatal refusal, for Run
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -289,6 +292,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		interval = 2 * time.Second
 	}
 	backoff := interval
+	a.stopCh = make(chan error, 1)
 	for {
 		_, err := a.Start(ctx)
 		if err == nil {
@@ -300,6 +304,15 @@ func (a *Agent) Run(ctx context.Context) error {
 		if needsRekey(err) {
 			if err := a.recover(ctx); err != nil {
 				return err
+			}
+			continue
+		}
+		if w, ok := busyWait(err); ok {
+			// MAIN is busy, not failing: come back when it says, with no
+			// longer backoff.
+			a.logf("cluster: start: %v (retry in %s)", err, w)
+			if !sleep(ctx, w) {
+				return ctx.Err()
 			}
 			continue
 		}
@@ -381,6 +394,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-a.stopCh:
+			return errors.Join(ErrStop, err)
 		case <-t.C:
 		}
 		if tok, ok := a.Client.Current(); ok && a.Client.MainNowMs()/1000 >= tok.RefreshAt {
@@ -402,9 +417,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				if err := a.recover(ctx); err != nil {
 					return err
 				}
-				if _, err := a.Start(ctx); err != nil && fatal(err) {
-					return errors.Join(ErrStop, err)
-				}
+				a.helloLater(ctx, "after the re-key")
 				continue
 			}
 			a.logf("cluster: heartbeat: %v", err)
@@ -418,13 +431,56 @@ func (a *Agent) Run(ctx context.Context) error {
 			}()
 		}
 		if r.PolicyVer > a.Client.State.PolicyVer {
-			if _, err := a.Start(ctx); err != nil {
-				a.logf("cluster: fetching policy %d: %v", r.PolicyVer, err)
-			}
+			a.helloLater(ctx, fmt.Sprintf("fetching policy %d", r.PolicyVer))
 		}
 		if r.State == "quarantined" {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
+	}
+}
+
+// helloLater says hello in the background, while the heartbeats go on, until
+// it works, MAIN stops the node (Run then returns) or ctx ends. MAIN busy
+// (503 RATE_LIMITED) is retried when MAIN says, anything else with a backoff.
+// One runs at a time.
+func (a *Agent) helloLater(ctx context.Context, why string) {
+	if !a.helloing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.helloing.Store(false)
+		backoff := 2 * time.Second
+		for {
+			_, err := a.Start(ctx)
+			if err == nil {
+				return
+			}
+			if fatal(err) {
+				a.stop(err)
+				return
+			}
+			wait := backoff
+			if w, ok := busyWait(err); ok {
+				wait = w
+			} else {
+				backoff = min(backoff*2, time.Minute)
+			}
+			a.logf("cluster: hello (%s): %v (retry in %s)", why, err, wait)
+			if !sleep(ctx, wait) {
+				return
+			}
+		}
+	}()
+}
+
+// stop hands a background loop's fatal refusal to Run.
+func (a *Agent) stop(err error) {
+	if a.stopCh == nil {
+		return
+	}
+	select {
+	case a.stopCh <- err:
+	default:
 	}
 }
 

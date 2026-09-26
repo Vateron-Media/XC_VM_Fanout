@@ -144,6 +144,18 @@ func (c *Client) Rekey(ctx context.Context, identity map[string]any) (*cc.Token,
 	if !ch.LicenceOK {
 		return nil, ErrUnlicensed
 	}
+	var tok *cc.Token
+	err = withReplay(ctx, c.setMainTime, func() error {
+		var err error
+		tok, err = c.rekeyOnce(ctx, boxPub, ch, identity)
+		return err
+	})
+	return tok, err
+}
+
+// rekeyOnce sends one token_rekey with the challenge: a fresh per-epoch key,
+// nonce and stamp each time.
+func (c *Client) rekeyOnce(ctx context.Context, boxPub []byte, ch *Challenge, identity map[string]any) (*cc.Token, error) {
 	ephSk, ephPub, err := cc.NewX25519()
 	if err != nil {
 		return nil, err
@@ -252,16 +264,8 @@ func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Toke
 	return tok, nil
 }
 
-// retryAfterMs is a RATE_LIMITED denial's retry_after_ms, or 0.
-func retryAfterMs(d *Denial) int64 {
-	var doc struct {
-		RetryAfterMs int64 `json:"retry_after_ms"`
-	}
-	if json.Unmarshal(d.Doc, &doc) != nil {
-		return 0
-	}
-	return doc.RetryAfterMs
-}
+// retryAfterMs is a denial's retry_after_ms, or 0.
+func retryAfterMs(d *Denial) int64 { return d.RetryAfterMs }
 
 // needsRekey reports whether err means the node has no usable token: MAIN
 // says its epoch is gone, or (hard revocation mode) the licence is invalid.
