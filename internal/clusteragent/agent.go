@@ -64,6 +64,7 @@ type Agent struct {
 	sealedMu           sync.Mutex   // one batch of sealed commands at a time (sealed.go)
 	fenced             atomic.Bool  // MAIN refuses the session for want of a licence
 	acking             atomic.Bool  // sealed commands are being acked
+	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -90,11 +91,7 @@ type Reply struct {
 		P0 int64 `json:"p0"`
 		P1 int64 `json:"p1"`
 	} `json:"cursors"`
-	Policy *struct {
-		PolicyVer int      `json:"policy_ver"`
-		Transport string   `json:"transport"`
-		MainURLs  []string `json:"main_urls"`
-	} `json:"policy"`
+	Policy *Policy `json:"policy"`
 }
 
 // Features are what this agent tells MAIN at hello that it does, so MAIN
@@ -248,19 +245,11 @@ func (a *Agent) apply(r *Reply) {
 		a.cursorP0.Store(r.Cursors.P0 + 1)
 		a.cursorP1.Store(r.Cursors.P1 + 1)
 	}
-	if r == nil || r.Policy == nil || r.Policy.PolicyVer < a.Client.State.PolicyVer || len(r.Policy.MainURLs) == 0 {
+	if r == nil {
 		return
 	}
-	st := a.Client.State
-	st.mu.Lock()
-	changed := r.Policy.PolicyVer != st.PolicyVer || strings.Join(r.Policy.MainURLs, " ") != strings.Join(st.MainURLs, " ")
-	st.PolicyVer, st.MainURLs = r.Policy.PolicyVer, append([]string{}, r.Policy.MainURLs...)
-	var err error
-	if changed {
-		err = st.saveLocked()
-	}
-	st.mu.Unlock()
-	if err != nil {
+	// A MAC'd reply: a policy not older than the one held is adopted.
+	if _, err := a.Client.State.adoptPolicy(r.Policy, false); err != nil {
 		a.logf("cluster: saving policy: %v", err)
 	}
 }
@@ -313,16 +302,30 @@ func (a *Agent) Run(ctx context.Context) error {
 			if d.Reason == "LICENCE_INVALID" && d.CommandsSealed != "" {
 				go a.takeSealed(ctx, d)
 			}
+			if d.Reason == "HTTPS_REQUIRED" {
+				a.httpsFailing.Store(true)
+			}
 		}
 	}
+	var policyDone sync.WaitGroup
+	defer policyDone.Wait()
+	pctx, stopPolicy := context.WithCancel(ctx)
+	defer stopPolicy()
+	policyDone.Add(1)
+	go func() {
+		defer policyDone.Done()
+		a.RunPolicyRecovery(pctx)
+	}()
 	for {
 		_, err := a.Start(ctx)
 		if err == nil {
+			a.httpsFailing.Store(false)
 			break
 		}
 		if fatal(err) {
 			return errors.Join(ErrStop, err)
 		}
+		a.httpsTrouble(err)
 		if a.licenceGone(err) {
 			// FENCED: ask again at the heartbeat's pace, so the kills MAIN
 			// sends with its refusal keep coming (sealed.go).
@@ -452,6 +455,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				continue
 			}
 			a.logf("cluster: heartbeat: %v", err)
+			a.httpsTrouble(err)
 			if w, ok := busyWait(err); ok && !sleep(ctx, w) {
 				// MAIN is starting: its silence clock starts when it is ready.
 				return ctx.Err()
@@ -459,6 +463,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			continue
 		}
 		a.setFenced(false)
+		a.httpsFailing.Store(false)
 		if a.hasUnackedSealed() && a.acking.CompareAndSwap(false, true) {
 			go func() {
 				defer a.acking.Store(false)
@@ -472,7 +477,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				}
 			}()
 		}
-		if r.PolicyVer > a.Client.State.PolicyVer {
+		if r.PolicyVer > a.Client.State.policyVer() {
 			a.helloLater(ctx, fmt.Sprintf("fetching policy %d", r.PolicyVer))
 		}
 		if r.State == "quarantined" {

@@ -3,6 +3,7 @@ package clusteragent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +18,13 @@ import (
 // the harness scripts. The agent has a spool, a registry and a local socket,
 // none of them running yet.
 func interopNode(t *testing.T) (*Agent, func(script string, args ...string) string, context.Context) {
+	a, runPHP, ctx, _ := interopNodeEnv(t)
+	return a, runPHP, ctx
+}
+
+// interopNodeEnv is interopNode, plus a function that restarts MAIN's php -S
+// with extra environment (settings the harness reads from it).
+func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) string, context.Context, func(extra ...string)) {
 	t.Helper()
 	panel := os.Getenv("XCVM_PANEL_DIR")
 	if panel == "" {
@@ -40,13 +48,21 @@ func interopNode(t *testing.T) (*Agent, func(script string, args ...string) stri
 		return strings.TrimSpace(string(out))
 	}
 	code := runPHP("enrol_code.php")
-	srv := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(harness, "router.php"))
-	srv.Env = env
-	if err := srv.Start(); err != nil {
-		t.Fatal(err)
+	var srv *exec.Cmd
+	restart := func(extra ...string) {
+		if srv != nil {
+			srv.Process.Kill()
+			srv.Wait()
+		}
+		srv = exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(harness, "router.php"))
+		srv.Env = append(append([]string{}, env...), extra...)
+		if err := srv.Start(); err != nil {
+			t.Fatal(err)
+		}
+		waitPort(t, port)
 	}
+	restart()
 	t.Cleanup(func() { srv.Process.Kill() })
-	waitPort(t, port)
 	old := EnrolPoll
 	EnrolPoll = 100 * time.Millisecond
 	t.Cleanup(func() { EnrolPoll = old })
@@ -69,7 +85,7 @@ func interopNode(t *testing.T) (*Agent, func(script string, args ...string) stri
 		FlowsFile: filepath.Join(dir, "flows.json"), SpoolDir: spool, SocketPath: filepath.Join(sockDir, "a.sock")}
 	a.Registry = NewRegistry(filepath.Join(dir, "registry.snap"), func(ev []map[string]any) error { return spoolP0(spool, ev) }, t.Logf)
 	a.Registry.Admit = a.admit
-	return a, runPHP, ctx
+	return a, runPHP, ctx, restart
 }
 
 func serveSocket(t *testing.T, ctx context.Context, a *Agent) {
@@ -163,5 +179,59 @@ func TestInteropP2Touches(t *testing.T) {
 	}
 	if got := runPHP("touch.php", "hlsv"); got != "1800000042" {
 		t.Fatalf("MAIN's store after the P2 touch: %s", got)
+	}
+}
+
+// TestInteropHTTPSRequiredRecovery: the drill of HttpsRequiredRecoveryTest
+// against the real ClusterApi (over plain HTTP, as php -S serves it): under
+// https_required every op but the challenge is refused with a signed
+// HTTPS_REQUIRED; the agent takes the policy from the signed challenge over
+// HTTP, and is back once the admin picks auto again.
+func TestInteropHTTPSRequiredRecovery(t *testing.T) {
+	a, _, ctx, restart := interopNodeEnv(t)
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	plain := a.Client.State.MainURLs[0]
+	restart("XCVM_INTEROP_TRANSPORT=https_required", "XCVM_INTEROP_POLICY_VER=2")
+	_, err := a.Heartbeat(ctx)
+	var d *Denial
+	if !errors.As(err, &d) || d.Reason != "HTTPS_REQUIRED" || d.Status != 403 {
+		t.Fatalf("a heartbeat over HTTP under https_required: %v", err)
+	}
+	a.httpsTrouble(err)
+	if err := a.PolicyOverHTTP(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st := a.Client.State
+	if st.policyVer() != 2 || st.Transport != "https_required" || !strings.HasPrefix(st.MainURLs[0], "https://main.invalid:1/") {
+		t.Fatalf("policy from the challenge: v%d %s %v", st.PolicyVer, st.Transport, st.MainURLs)
+	}
+	if got := st.plainURLs(); len(got) == 0 || got[0] != plain {
+		t.Fatalf("the plain-HTTP URL was forgotten: %v", got)
+	}
+	// HTTPS does not work (main.invalid): the heartbeats fail.
+	if _, err := a.Heartbeat(ctx); err == nil {
+		t.Fatal("a heartbeat went through without HTTPS")
+	}
+	// The admin switches back to auto (v3): the next challenge over HTTP
+	// brings the node back.
+	restart("XCVM_INTEROP_TRANSPORT=auto", "XCVM_INTEROP_POLICY_VER=3")
+	if err := a.PolicyOverHTTP(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st.policyVer() != 3 || st.Transport != "auto" {
+		t.Fatalf("after the switch: v%d %s", st.PolicyVer, st.Transport)
+	}
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatalf("heartbeat after the switch: %v", err)
+	}
+	// An older policy from a replayed challenge is never adopted.
+	restart("XCVM_INTEROP_TRANSPORT=https_required", "XCVM_INTEROP_POLICY_VER=2")
+	if err := a.PolicyOverHTTP(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st.policyVer() != 3 || st.Transport != "auto" {
+		t.Fatalf("adopted an older policy: v%d %s", st.PolicyVer, st.Transport)
 	}
 }

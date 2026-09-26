@@ -41,6 +41,8 @@ type Challenge struct {
 	Challenge  []byte
 	LicenceOK  bool
 	MainTimeMs int64
+	// Policy is MAIN's transport policy, signed with the challenge (policy.go).
+	Policy *Policy
 }
 
 // Challenge fetches a re-key challenge for this node from the first URL that
@@ -76,11 +78,12 @@ func (c *Client) challenge(ctx context.Context, base string) (*Challenge, error)
 		return nil, fmt.Errorf("%w: challenge (HTTP %d) from %s", ErrTransport, res.StatusCode, base)
 	}
 	var doc struct {
-		Typ        string `json:"typ"`
-		Cn         string `json:"cn"`
-		Challenge  string `json:"challenge"`
-		MainTimeMs int64  `json:"main_time_ms"`
-		LicenceOK  bool   `json:"licence_ok"`
+		Typ        string  `json:"typ"`
+		Cn         string  `json:"cn"`
+		Challenge  string  `json:"challenge"`
+		MainTimeMs int64   `json:"main_time_ms"`
+		LicenceOK  bool    `json:"licence_ok"`
+		Policy     *Policy `json:"policy"`
 	}
 	if json.Unmarshal(body, &doc) != nil || doc.Typ != "xcvm-challenge" || doc.Cn != c.State.NodeUUID {
 		return nil, ErrTransport
@@ -89,7 +92,7 @@ func (c *Client) challenge(ctx context.Context, base string) (*Challenge, error)
 	if err != nil || len(raw) != 32 {
 		return nil, ErrTransport
 	}
-	return &Challenge{Challenge: raw, LicenceOK: doc.LicenceOK, MainTimeMs: doc.MainTimeMs}, nil
+	return &Challenge{Challenge: raw, LicenceOK: doc.LicenceOK, MainTimeMs: doc.MainTimeMs, Policy: doc.Policy}, nil
 }
 
 // PanelBoxPub is the panel's X25519 key that pre-token bodies are sealed to.

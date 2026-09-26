@@ -40,9 +40,14 @@ type State struct {
 	PanelBoxPub []byte   `json:"panel_box_pub,omitempty"`
 	MainURLs    []string `json:"main_urls"`
 	PolicyVer   int      `json:"policy_ver"`
-	Enrolled    bool     `json:"enrolled"`
-	InstanceID  string   `json:"instance_id"`
-	Epochs      []Epoch  `json:"epochs"` // newest first
+	// Transport is the policy's cluster_transport; HTTPURLs the plain-HTTP
+	// MAIN URLs of every policy held, for the challenge while HTTPS fails
+	// under https_required (policy.go).
+	Transport  string   `json:"transport,omitempty"`
+	HTTPURLs   []string `json:"http_urls,omitempty"`
+	Enrolled   bool     `json:"enrolled"`
+	InstanceID string   `json:"instance_id"`
+	Epochs     []Epoch  `json:"epochs"` // newest first
 	// PendingEphSk is the key of a token_refresh whose reply has not arrived.
 	// It is persisted before the request is sent, so a retry after a crash or
 	// a lost reply uses the same key and MAIN re-sends the same token.

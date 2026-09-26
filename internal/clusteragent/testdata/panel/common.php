@@ -47,8 +47,13 @@ if ($rNew) {
 }
 DatabaseFactory::set($rDb);
 $rSettings = ['cluster_api_enabled' => 1, 'lb_token_rotation_min' => (int) (getenv('XCVM_INTEROP_ROTATION') ?: 60), 'lb_new_node_mode' => 'legacy'];
+if (getenv('XCVM_INTEROP_TRANSPORT')) {
+	// The transport policy as an admin set it (https_required drill).
+	$rSettings['cluster_transport'] = (string) getenv('XCVM_INTEROP_TRANSPORT');
+	$rSettings['cluster_policy_ver'] = (int) getenv('XCVM_INTEROP_POLICY_VER');
+}
 SettingsManager::set($rSettings);
-$rMain = ['server_ip' => '127.0.0.1', 'http_broadcast_port' => (int) getenv('XCVM_INTEROP_PORT')];
+$rMain = ['server_ip' => '127.0.0.1', 'http_broadcast_port' => (int) getenv('XCVM_INTEROP_PORT'), 'enable_https' => 1, 'domain_name' => 'main.invalid', 'https_broadcast_port' => 1];
 $rCrypto = new \XcVm\Tests\Support\FakeClusterCrypto();
 if (class_exists(\XcVm\Domain\Cluster\ConnectionDigest::class)) {
 	// Every heartbeat's digest is checked, and snapshots are staged next to the DB.
