@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,6 +177,49 @@ func TestInteropWithPanel(t *testing.T) {
 	if err != nil || len(reloaded.Epochs) != 1 || reloaded.Epochs[0].Epoch != 3 {
 		t.Fatalf("the re-keyed epoch was not persisted: %v", err)
 	}
+	// The replica (config op): the whole blocklist once, then deltas, each
+	// stored only after it opens for this node and verifies.
+	if _, err := os.Stat(filepath.Join(panel, "src/Domain/Cluster/ReplicaBuilder.php")); err == nil {
+		block := func(args ...string) {
+			cmd := exec.Command(php, append([]string{filepath.Join(harness, "block.php")}, args...)...)
+			cmd.Env = env
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("block.php: %v\n%s", err, out)
+			}
+		}
+		a.ReplicaDir = filepath.Join(dir, "replica")
+		block("203.0.113.1")
+		if err := a.SyncReplica(ctx); err != nil {
+			t.Fatalf("replica: %v", err)
+		}
+		sealedRep, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "blocklist.rep"))
+		payload, err := c.OpenRecord(sealedRep, "rep")
+		if err != nil || !strings.Contains(string(payload), `"ip":["203.0.113.1"]`) {
+			t.Fatalf("stored section: %v %s", err, payload)
+		}
+		block("203.0.113.2")
+		block("203.0.113.1", "del")
+		if err := a.SyncReplica(ctx); err != nil {
+			t.Fatalf("replica delta: %v", err)
+		}
+		deltas := ReplicaDeltas(a.ReplicaDir)
+		if len(deltas) != 1 {
+			t.Fatalf("deltas %v", deltas)
+		}
+		sealedBlk, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "blocklist.d", deltas[0]))
+		payload, err = c.OpenRecord(sealedBlk, "blk")
+		if err != nil || !strings.Contains(string(payload), `"add":["203.0.113.2"],"remove":["203.0.113.1"]`) {
+			t.Fatalf("stored delta: %v %s", err, payload)
+		}
+		if st := LoadReplicaState(a.ReplicaDir); st.BlocklistSeq != 3 || len(st.BlocklistEtag) != 64 {
+			t.Fatalf("replica state %+v", st)
+		}
+		// A record sealed to this node but under another tag does not verify.
+		if _, err := c.OpenRecord(sealedBlk, "rep"); err == nil {
+			t.Fatal("a blk record verified as rep")
+		}
+	}
+
 	// A second attempt within the minute is refused, signed and about this request.
 	_, err = c.Rekey(ctx, a.identity())
 	if !errors.As(err, &d) || d.Reason != "RATE_LIMITED" || retryAfterMs(d) <= 0 {
