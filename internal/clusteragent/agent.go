@@ -39,6 +39,9 @@ type Agent struct {
 	// ReplicaDir is where the node keeps its replica (replica.go); "" leaves
 	// it off.
 	ReplicaDir string
+	// Apply applies the materialised replica after it changed (cluster:apply);
+	// nil applies nothing.
+	Apply func(ctx context.Context) error
 	// Registry holds the node's viewers while CONNECTIONS is on (registry.go);
 	// Run makes it when SpoolDir is set.
 	Registry *Registry
