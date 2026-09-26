@@ -39,6 +39,7 @@ type fanoutEvent struct {
 	Type   string          `json:"type"`
 	Stream string          `json:"stream"`
 	State  json.RawMessage `json:"state"`
+	UUID   string          `json:"uuid"` // conn_close
 }
 
 type fanoutReply struct {
@@ -84,7 +85,7 @@ func (a *Agent) RunFanoutEvents(ctx context.Context) {
 		}
 		backoff = time.Second
 		if len(out.Events) > 0 {
-			if err := a.spoolMonitor(out); err != nil {
+			if err := a.spoolFanout(out); err != nil {
 				a.logf("cluster: fanout events: %v", err)
 				a.setFanoutLive(false)
 				sleep(ctx, backoff)
@@ -112,6 +113,69 @@ func fanoutPoll(ctx context.Context, hc *http.Client, boot string, seq uint64) (
 		return nil, err
 	}
 	return &out, nil
+}
+
+// spoolFanout hands on what the feed carried: the monitor transitions, then
+// the daemon viewers that left (conn_close), which end in the connection
+// registry while CONNECTIONS is on (Registry.FanoutClosed).
+func (a *Agent) spoolFanout(out *fanoutReply) error {
+	if err := a.spoolMonitor(out); err != nil {
+		return err
+	}
+	if a.Registry == nil || a.flows.Load()&FlowConnections == 0 {
+		return nil
+	}
+	var gone []string
+	for _, e := range out.Events {
+		if e.Type == "conn_close" && connUUID.MatchString(e.UUID) {
+			gone = append(gone, e.UUID)
+		}
+	}
+	if len(gone) == 0 {
+		return nil
+	}
+	// A viewer that reconnected with the same uuid since is connected again:
+	// only what the fanout no longer holds ends. Without an answer nothing
+	// ends here; fanout_sync's reconcile catches it.
+	live, err := fanoutConnections(a.FanoutCtl)
+	if err != nil {
+		return nil
+	}
+	still := gone[:0]
+	for _, uuid := range gone {
+		if !live[uuid] {
+			still = append(still, uuid)
+		}
+	}
+	n, err := a.Registry.FanoutClosed(still)
+	if n > 0 {
+		a.logf("cluster: %d daemon viewer(s) left the fanout", n)
+	}
+	return err
+}
+
+// fanoutConnections is the set of viewer uuids connected to the fanout now.
+func fanoutConnections(sock string) (map[string]bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://fanout/connections", nil)
+	res, err := fanoutClient(sock).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fanout /connections: HTTP %d", res.StatusCode)
+	}
+	var uuids []string
+	if err := json.NewDecoder(res.Body).Decode(&uuids); err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(uuids))
+	for _, u := range uuids {
+		out[u] = true
+	}
+	return out, nil
 }
 
 // spoolMonitor writes the transitions as one P0 spool file.

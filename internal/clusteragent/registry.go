@@ -230,6 +230,41 @@ func (r *Registry) Oldest(userID any) map[string]any {
 	return clone(best)
 }
 
+// FanoutClosed ends the daemon-served TS viewers the fanout reports gone
+// (its GET /events conn_close): one P0 `conn.close {uuid}` each, which MAIN
+// applies as a close of its own row (activity log, store), spooled before the
+// records leave the registry. Only open, non-HLS records with pid 0 qualify: a
+// PHP-served viewer has a worker to watch, and an HLS one the reaper.
+func (r *Registry) FanoutClosed(uuids []string) (int, error) {
+	r.mu.Lock()
+	var events []map[string]any
+	var gone []string
+	for _, uuid := range uuids {
+		c := r.conns[uuid]
+		if c == nil || fmt.Sprint(c["container"]) == "hls" || num(c["hls_end"]) != 0 || intOf(c["pid"]) != 0 {
+			continue
+		}
+		events = append(events, map[string]any{"type": "conn.close", "d": map[string]any{"uuid": uuid}})
+		gone = append(gone, uuid)
+	}
+	r.mu.Unlock()
+	if len(events) == 0 {
+		return 0, nil
+	}
+	if err := r.emit(events); err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	for _, uuid := range gone {
+		delete(r.conns, uuid)
+		delete(r.sentAt, uuid)
+		delete(r.readAt, uuid)
+	}
+	r.dirty = true
+	r.mu.Unlock()
+	return len(gone), nil
+}
+
 // Delete removes a connection and tells MAIN.
 func (r *Registry) Delete(uuid string) error {
 	if err := r.emit([]map[string]any{{"type": "conn.remove", "d": map[string]any{"uuid": uuid}}}); err != nil {
