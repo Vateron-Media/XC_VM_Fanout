@@ -321,17 +321,19 @@ func TestP0CompactsPastItsSizeToTheLatestStatePerKey(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, fmt.Sprintf("%019d-1-0000.ndjson", seq)), []byte(strings.Join(lines, "\n")+"\n"), 0o640)
 	}
 	write(1, `{"type":"stream.state","t":1,"d":{"stream_id":5,"server_id":7,"fields":{"pid":1,"stream_status":2}}}`,
-		`{"type":"recording.state","t":1,"d":{"id":3,"status":1}}`)
+		`{"type":"recording.state","t":1,"d":{"id":3,"status":1}}`,
+		`{"type":"node.state","t":1,"d":{"fields":{"certbot_ssl":"a","sysctl":"s"}}}`)
 	write(2, `{"type":"stream.state","t":2,"d":{"stream_id":5,"server_id":7,"fields":{"pid":2}}}`,
 		`{"type":"future.thing","t":2,"d":{"x":1}}`,
-		`{"type":"recording.state","t":2,"d":{"id":3,"status":2}}`)
+		`{"type":"recording.state","t":2,"d":{"id":3,"status":2}}`,
+		`{"type":"node.state","t":2,"d":{"fields":{"certbot_ssl":"b"}}}`)
 	ls.lane.Compact = 1 << 30
 	if n, _ := ls.compact(); n != 0 {
 		t.Fatal("compacted below its size")
 	}
 	ls.lane.Compact = 10
 	n, err := ls.compact()
-	if err != nil || n != 2 {
+	if err != nil || n != 3 {
 		t.Fatalf("folded %d, %v", n, err)
 	}
 	files, _ := ls.spooled()
@@ -347,6 +349,7 @@ func TestP0CompactsPastItsSizeToTheLatestStatePerKey(t *testing.T) {
 		`{"d":{"fields":{"pid":2,"stream_status":2},"server_id":7,"stream_id":5},"t":2,"type":"stream.state"}`,
 		`{"d":{"x":1},"t":2,"type":"future.thing"}`,
 		`{"d":{"id":3,"status":2},"t":2,"type":"recording.state"}`,
+		`{"d":{"fields":{"certbot_ssl":"b","sysctl":"s"}},"t":2,"type":"node.state"}`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("compacted:\n%s", strings.Join(got, "\n"))

@@ -457,6 +457,8 @@ func compactKey(ev map[string]any, i int) (string, string) {
 		return "recording:" + id("id"), ""
 	case "vod.analysis":
 		return "vod:" + id("stream_id"), "props"
+	case "node.state":
+		return "node", "fields"
 	}
 	return fmt.Sprintf("keep:%d", i), ""
 }
