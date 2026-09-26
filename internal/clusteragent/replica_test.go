@@ -23,9 +23,10 @@ import (
 // replicaMain answers config with whatever the test queued next.
 type replicaMain struct {
 	*fakeMain
-	boxPub []byte
-	next   []map[string]any
-	asked  []map[string]any
+	boxPub   []byte
+	next     []map[string]any
+	settings []map[string]any // sent with the next replies, one each
+	asked    []map[string]any
 }
 
 func newReplicaMain(t *testing.T) (*replicaMain, *Agent) {
@@ -50,6 +51,10 @@ func (m *replicaMain) answer(w http.ResponseWriter, r *http.Request, reqCtx, non
 	if len(m.next) > 0 {
 		out = map[string]any{"blocklist": m.next[0]}
 		m.next = m.next[1:]
+	}
+	if len(m.settings) > 0 {
+		out["settings"] = m.settings[0]
+		m.settings = m.settings[1:]
 	}
 	ts := uint64(time.Now().UnixMilli())
 	rn := make([]byte, 16)
@@ -158,5 +163,39 @@ func TestReplicaStoresOnlyWhatOpensAndVerifies(t *testing.T) {
 	last := m.asked[len(m.asked)-1]
 	if last["blocklist_since"] != float64(0) || last["have"].(map[string]any)["blocklist"] != etag || LoadReplicaState(a.ReplicaDir).BlocklistSeq != 10 {
 		t.Fatalf("daily reload asked %v", last)
+	}
+}
+
+func TestReplicaKeepsTheSettingsSectionForPHP(t *testing.T) {
+	m, a := newReplicaMain(t)
+	ctx := context.Background()
+	applied := 0
+	a.Apply = func(context.Context) error { applied++; return nil }
+	etag := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	section := func(node string) map[string]any {
+		return map[string]any{"etag": etag, "sealed": m.record(t, m.panel, "rep", map[string]any{
+			"v": 1, "section": "settings", "node": node, "gen": 1, "etag": etag, "data": map[string]any{"seg_time": "6"},
+		})}
+	}
+
+	m.settings = append(m.settings, section("11111111-1111-4111-8111-111111111111"))
+	if err := a.SyncReplica(ctx); err == nil {
+		t.Fatal("kept another node's settings")
+	}
+	m.settings = append(m.settings, section(m.uuid))
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "settings.json"))
+	if string(b) != `{"data":{"seg_time":"6"},"etag":"`+etag+`"}` || applied != 1 || LoadReplicaState(a.ReplicaDir).SettingsEtag != etag {
+		t.Fatalf("settings.json %s (applied %d)", b, applied)
+	}
+	// The next request names the ETag held; unchanged applies nothing.
+	m.settings = append(m.settings, map[string]any{"unchanged": true})
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if have := m.asked[len(m.asked)-1]["have"].(map[string]any)["settings"]; have != etag || applied != 1 {
+		t.Fatalf("asked with %v, applied %d", have, applied)
 	}
 }

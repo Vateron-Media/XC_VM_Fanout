@@ -27,6 +27,8 @@ import (
 //	replica/blocklist.rep              the last whole blocklist section (rep)
 //	replica/blocklist.d/<seq>.blk      blk deltas since that section, in seq order
 //	replica/blocklist.json             the section with its deltas applied, for PHP
+//	replica/settings.rep               the settings section (rep), sent whole
+//	replica/settings.json              its data, for PHP
 //
 // A record is only written once it opens for this node and verifies against
 // the pinned panel key; a rep record must name this node. A new section
@@ -55,6 +57,14 @@ type ReplicaState struct {
 	BlocklistSeq  int64  `json:"blocklist_seq"`
 	BlocklistEtag string `json:"blocklist_etag"`
 	FullAt        int64  `json:"full_at"` // unix seconds of the last whole section
+	SettingsEtag  string `json:"settings_etag"`
+}
+
+// wholeReply is a section MAIN sends whole: unchanged, or the sealed record.
+type wholeReply struct {
+	Unchanged bool   `json:"unchanged"`
+	Etag      string `json:"etag"`
+	Sealed    string `json:"sealed"`
 }
 
 type configReply struct {
@@ -68,6 +78,7 @@ type configReply struct {
 			Sealed string `json:"sealed"`
 		} `json:"section"`
 	} `json:"blocklist"`
+	Settings *wholeReply `json:"settings"`
 }
 
 // OpenRecord opens a replica record sealed to this node and checks the panel
@@ -127,17 +138,19 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 		return err
 	}
 	st := LoadReplicaState(dir)
-	changed := false
+	changed, settingsChanged := false, false
 	defer func() {
 		if _, err := os.Stat(filepath.Join(dir, "blocklist.json")); changed || (err != nil && st.BlocklistEtag != "") {
 			if err := a.materialise(dir, st); err != nil {
 				a.logf("cluster: replica: %v", err)
-				return
+				changed = false
+			} else {
+				changed = true
 			}
-			if a.Apply != nil {
-				if err := a.Apply(ctx); err != nil {
-					a.logf("cluster: replica: apply: %v", err)
-				}
+		}
+		if (changed || settingsChanged) && a.Apply != nil {
+			if err := a.Apply(ctx); err != nil {
+				a.logf("cluster: replica: apply: %v", err)
 			}
 		}
 	}()
@@ -148,9 +161,16 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 			since = 0
 		}
 		var r configReply
-		payload := map[string]any{"blocklist_since": since, "have": map[string]string{"blocklist": st.BlocklistEtag}}
+		payload := map[string]any{"blocklist_since": since, "have": map[string]string{"blocklist": st.BlocklistEtag, "settings": st.SettingsEtag}}
 		if err := a.Client.Call(ctx, "config", payload, &r, false); err != nil {
 			return err
+		}
+		if r.Settings != nil && !r.Settings.Unchanged {
+			if err := a.storeWhole(dir, "settings", r.Settings); err != nil {
+				return err
+			}
+			st.SettingsEtag = r.Settings.Etag
+			settingsChanged = true
 		}
 		b := r.Blocklist
 		switch {
@@ -211,6 +231,33 @@ func (a *Agent) storeSection(dir, deltas, etag, sealedB64 string, seq int64) err
 		os.Remove(filepath.Join(deltas, e.Name()))
 	}
 	return nil
+}
+
+// storeWhole keeps a section sent whole once it verifies, and writes its data
+// for PHP (<name>.json: {etag, data}).
+func (a *Agent) storeWhole(dir, name string, w *wholeReply) error {
+	sealed, err := base64.StdEncoding.DecodeString(w.Sealed)
+	if err != nil || !etagRe.MatchString(w.Etag) {
+		return fmt.Errorf("clusteragent: config: bad %s section", name)
+	}
+	payload, err := a.Client.OpenRecord(sealed, "rep")
+	if err != nil {
+		return err
+	}
+	var doc struct {
+		Section string          `json:"section"`
+		Node    string          `json:"node"`
+		Etag    string          `json:"etag"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil || doc.Section != name || doc.Node != a.Client.State.NodeUUID || doc.Etag != w.Etag || len(doc.Data) == 0 {
+		return fmt.Errorf("clusteragent: config: the %s section is not this node's, or not the one announced", name)
+	}
+	if err := writeFileAtomic(filepath.Join(dir, name+".rep"), sealed); err != nil {
+		return err
+	}
+	out, _ := json.Marshal(map[string]any{"etag": doc.Etag, "data": doc.Data})
+	return writeFileAtomic(filepath.Join(dir, name+".json"), out)
 }
 
 func (a *Agent) storeDelta(deltas, sealedB64 string, after, seq int64) error {
