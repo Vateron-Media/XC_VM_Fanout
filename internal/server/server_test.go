@@ -322,6 +322,33 @@ func TestConnectionTrackingAndReconcileList(t *testing.T) {
 	}
 }
 
+// The agent's shape (?detail=1): each viewer with its stream, attach time and
+// refcount; the bare array stays what the panel reads.
+func TestConnectionsDetailForTheAgent(t *testing.T) {
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
+	before := time.Now().UnixMilli()
+	mgr.GetOrCreate("5").addConn("uuidA")
+	mgr.GetOrCreate("5").addConn("uuidA")
+	mgr.GetOrCreate("9").addConn("uuidB")
+	ts := httptest.NewServer(mgr.ControlHandler())
+	defer ts.Close()
+
+	var got []connDetail
+	getJSON(t, ts.URL+"/connections?detail=1", &got)
+	by := map[string]connDetail{}
+	for _, c := range got {
+		by[c.UUID] = c
+	}
+	if len(got) != 2 || by["uuidA"].StreamID != "5" || by["uuidA"].Refs != 2 || by["uuidB"].StreamID != "9" || by["uuidA"].SinceMs < before {
+		t.Fatalf("/connections?detail=1 = %+v", got)
+	}
+	var bare []string
+	getJSON(t, ts.URL+"/connections", &bare)
+	if len(bare) != 2 {
+		t.Fatalf("the bare shape changed: %v", bare)
+	}
+}
+
 // TestRatesEndpoint verifies the per-viewer delivery-rate telemetry (P4): the
 // daemon reports each active uuid's average KB/s since attach, and drops it on
 // disconnect. fanout_sync turns this into lines_live.divergence.

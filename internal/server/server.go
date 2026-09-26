@@ -331,6 +331,24 @@ func (s *Stream) connUUIDs() []string {
 	return out
 }
 
+// connDetail is one live-TS viewer as GET /connections?detail=1 reports it.
+type connDetail struct {
+	UUID     string `json:"uuid"`
+	StreamID string `json:"stream_id"`
+	SinceMs  int64  `json:"since_ms"`
+	Refs     int    `json:"refs"`
+}
+
+func (s *Stream) connDetails() []connDetail {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	out := make([]connDetail, 0, len(s.conns))
+	for u, cs := range s.conns {
+		out = append(out, connDetail{UUID: u, StreamID: s.id, SinceMs: cs.since.UnixMilli(), Refs: cs.refs})
+	}
+	return out
+}
+
 // connRates returns, per active viewer uuid, the average delivery rate in KB/s
 // since the connection attached (bytes / elapsed / 1024). This is the daemon-side
 // replacement for the legacy chase-read loop's DIVERGENCE_TMP_PATH speed file:
@@ -1559,8 +1577,18 @@ func (m *Manager) ControlHandler() http.Handler {
 }
 
 // serveConnections returns every currently-connected live-TS viewer uuid across
-// all streams (the ?c= values), for the fanout_sync reconciler.
-func (m *Manager) serveConnections(w http.ResponseWriter, _ *http.Request) {
+// all streams (the ?c= values), for the fanout_sync reconciler: a JSON array of
+// strings, the shape the panel's FanoutClient reads.
+//
+// With ?detail=1 each viewer is an object instead, for the node's agent, which
+// rebuilds its connection registry from it after a restart:
+//
+//	[{"uuid", "stream_id", "since_ms", "refs"}, …]
+//
+// since_ms is when the uuid attached (unix ms), refs how many connections carry
+// it. A daemon that predates the parameter ignores it and answers the bare
+// array, which the agent reads too.
+func (m *Manager) serveConnections(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	streams := make([]*Stream, 0, len(m.streams))
 	for _, st := range m.streams {
@@ -1568,12 +1596,19 @@ func (m *Manager) serveConnections(w http.ResponseWriter, _ *http.Request) {
 	}
 	m.mu.Unlock()
 
+	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Query().Get("detail") == "1" {
+		out := make([]connDetail, 0)
+		for _, st := range streams {
+			out = append(out, st.connDetails()...)
+		}
+		_ = json.NewEncoder(w).Encode(out)
+		return
+	}
 	uuids := make([]string, 0)
 	for _, st := range streams {
 		uuids = append(uuids, st.connUUIDs()...)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(uuids)
 }
 
