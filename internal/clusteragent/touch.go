@@ -209,6 +209,9 @@ func (a *Agent) RunTouches(ctx context.Context) {
 			a.logf("cluster: events p2: %v", err)
 		}
 		backoff = min(max(time.Second, TouchLoop*2), 30*time.Second)
+		if w, ok := busyWait(err); ok {
+			backoff = max(backoff, w)
+		}
 	}
 }
 

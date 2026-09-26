@@ -105,6 +105,9 @@ func (a *Agent) RunEvents(ctx context.Context, lane Lane) {
 				a.logf("cluster: events %s: %v", lane.Name, err)
 			}
 			backoff = min(max(time.Second, lane.Interval*2), 30*time.Second)
+			if w, ok := busyWait(err); ok {
+				backoff = max(backoff, w) // MAIN is starting or busy: when it says
+			}
 		}
 	}
 }

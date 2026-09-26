@@ -23,6 +23,15 @@ import (
 //     busy, not failing: wait retry_after_ms ±10 % (1–60 s) and send the op
 //     again, without raising its backoff. A 429 RATE_LIMITED is token_rekey's
 //     once-a-minute slot, handled by recover.
+//
+// And from MAIN's front controller (ADR 0004, "The cluster pools (Phase 2,
+// second increment)"):
+//
+//   - 503 STARTING with retry_after_ms (5000): MAIN's cluster pools are not
+//     up yet (a boot, a restart, an update). Every op but health gets it, and
+//     health is never gated. It is never fatal: every loop backs off for
+//     retry_after_ms and tries again. An unsigned STARTING (MAIN cannot sign
+//     at all) is a transport error like any other.
 
 // ReplayWaitMax caps the wait before a REPLAY is retried.
 var ReplayWaitMax = 10 * time.Second
@@ -60,8 +69,9 @@ func withReplay(ctx context.Context, setClock func(mainMs int64), send func() er
 	return send()
 }
 
-// busyWait is how long to wait before sending an op MAIN refused as busy
-// (a verified 503 RATE_LIMITED); ok is false for anything else.
+// busyWait is how long to wait before sending an op MAIN refused as busy or
+// starting (a verified 503 RATE_LIMITED or STARTING); ok is false for
+// anything else.
 func busyWait(err error) (time.Duration, bool) {
 	var d *Denial
 	if !errors.As(err, &d) || d.Status != 503 {
@@ -73,6 +83,11 @@ func busyWait(err error) (time.Duration, bool) {
 		ms = d.RetryAfterMs
 		if ms <= 0 {
 			ms = 1000
+		}
+	case "STARTING":
+		ms = d.RetryAfterMs
+		if ms <= 0 {
+			ms = 5000
 		}
 	default:
 		return 0, false

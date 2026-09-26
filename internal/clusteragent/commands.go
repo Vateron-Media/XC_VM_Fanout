@@ -211,6 +211,13 @@ func (a *Agent) RunCommands(ctx context.Context, run Executor) {
 			if !errors.Is(err, ErrNoEpoch) {
 				a.logf("cluster: commands: %v", err)
 			}
+			if w, ok := busyWait(err); ok {
+				// MAIN is starting: poll again when it says.
+				if !sleep(ctx, w) {
+					return
+				}
+				continue
+			}
 			if !sleep(ctx, backoff) {
 				return
 			}

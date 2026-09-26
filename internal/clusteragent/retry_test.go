@@ -207,3 +207,35 @@ func TestHelloIsRetriedWhenMainIsBusy(t *testing.T) {
 		t.Fatalf("start after a busy hello took %s", d)
 	}
 }
+
+func TestStartingIsNeverFatal(t *testing.T) {
+	m, c := newReplayMain(t)
+	c.State.Enrolled = true
+	a := &Agent{Client: c, Logf: t.Logf, Interval: 50 * time.Millisecond}
+	starting := func() map[string]any { return map[string]any{"retry_after_ms": 1000} }
+	if w, ok := busyWait(&Denial{Status: 503, Reason: "STARTING"}); !ok || w < 4*time.Second || w > 6*time.Second {
+		t.Fatalf("STARTING without retry_after_ms waits %s, want about 5 s", w)
+	}
+	m.queue("hello", 1, 503, "STARTING", starting)
+	m.queue("heartbeat", 2, 503, "STARTING", starting)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	for m.count("heartbeat") < 4 && ctx.Err() == nil {
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run ended with %v", err)
+	}
+	if m.count("hello") != 2 || m.count("heartbeat") < 4 {
+		t.Fatalf("hello %d, heartbeat %d", m.count("hello"), m.count("heartbeat"))
+	}
+	// The heartbeats after a STARTING waited for it: two STARTINGs of about
+	// 1 s each, then the 50 ms cadence.
+	st := m.stamps["heartbeat"]
+	if gap := st[2] - st[1]; gap < 900 {
+		t.Fatalf("a heartbeat followed a STARTING after %d ms", gap)
+	}
+}

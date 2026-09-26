@@ -167,6 +167,10 @@ func (a *Agent) recover(ctx context.Context) error {
 		case errors.As(err, &d) && (d.Reason == "LICENCE_INVALID" || d.Reason == "NOT_ACTIVE"):
 			wait = RekeyPoll
 		default:
+			if w, ok := busyWait(err); ok {
+				wait = w // MAIN is starting: no longer backoff
+				break
+			}
 			backoff = min(backoff*2, 5*time.Minute)
 		}
 		a.logf("cluster: re-key: %v (retry in %s)", err, wait)
@@ -421,6 +425,10 @@ func (a *Agent) Run(ctx context.Context) error {
 				continue
 			}
 			a.logf("cluster: heartbeat: %v", err)
+			if w, ok := busyWait(err); ok && !sleep(ctx, w) {
+				// MAIN is starting: its silence clock starts when it is ready.
+				return ctx.Err()
+			}
 			continue
 		}
 		if r.WantConnSnapshot {
