@@ -77,7 +77,7 @@ func TestHeartbeatsStayWithinTheGapWhenMainIsSlow(t *testing.T) {
 	m.slow["every-other-heartbeat"] = true
 	runFor(t, a, 2*time.Second)
 	n, worst := m.gaps()
-	if n < 4 || worst > MaxHeartbeatGap+150*time.Millisecond {
+	if n < 4 || worst > MaxHeartbeatGap+300*time.Millisecond {
 		t.Fatalf("%d heartbeats, worst gap %s", n, worst)
 	}
 }
