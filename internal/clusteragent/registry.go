@@ -292,12 +292,18 @@ func (r *Registry) Oldest(userID any) map[string]any {
 // records leave the registry. Only open, non-HLS records with pid 0 qualify: a
 // PHP-served viewer has a worker to watch, and an HLS one the reaper.
 func (r *Registry) FanoutClosed(uuids []string) (int, error) {
+	return r.closeWhere(uuids, func(c map[string]any) bool { return intOf(c["pid"]) == 0 })
+}
+
+// closeWhere ends the open, non-HLS records of uuids that also pass keep:
+// one P0 `conn.close {uuid}` each, spooled before they leave the registry.
+func (r *Registry) closeWhere(uuids []string, pass func(map[string]any) bool) (int, error) {
 	r.mu.Lock()
 	var events []map[string]any
 	var gone []string
 	for _, uuid := range uuids {
 		c := r.conns[uuid]
-		if c == nil || fmt.Sprint(c["container"]) == "hls" || num(c["hls_end"]) != 0 || intOf(c["pid"]) != 0 {
+		if c == nil || fmt.Sprint(c["container"]) == "hls" || num(c["hls_end"]) != 0 || !pass(c) {
 			continue
 		}
 		events = append(events, map[string]any{"type": "conn.close", "d": map[string]any{"uuid": uuid}})

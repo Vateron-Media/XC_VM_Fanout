@@ -372,6 +372,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.Registry.P2 = a.p2Touch.Load
 	}
 	if a.Registry != nil {
+		// What registry.snap restored, checked against what still serves it.
+		go a.RebuildRegistry(ctx)
+	}
+	if a.Registry != nil {
 		go func() {
 			t := time.NewTicker(time.Second)
 			defer t.Stop()
