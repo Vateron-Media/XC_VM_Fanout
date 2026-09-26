@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -24,11 +26,14 @@ import (
 //	replica/state.json                 {blocklist_seq, blocklist_etag}
 //	replica/blocklist.rep              the last whole blocklist section (rep)
 //	replica/blocklist.d/<seq>.blk      blk deltas since that section, in seq order
+//	replica/blocklist.json             the section with its deltas applied, for PHP
 //
 // A record is only written once it opens for this node and verifies against
 // the pinned panel key; a rep record must name this node. A new section
-// replaces the deltas. Nothing here applies the replica yet: cluster:apply
-// reads these files (the replica is in shadow until the CONFIG flow is on).
+// replaces the deltas. After a change the agent writes blocklist.json from
+// the verified records (PHP holds no key to open them) and runs Apply
+// (cluster:apply), which diffs it against the node's own caches in shadow and
+// writes them once the CONFIG flow is on.
 
 // ReplicaPoll is how often the agent asks MAIN for what changed.
 var ReplicaPoll = 60 * time.Second
@@ -122,6 +127,20 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 		return err
 	}
 	st := LoadReplicaState(dir)
+	changed := false
+	defer func() {
+		if _, err := os.Stat(filepath.Join(dir, "blocklist.json")); changed || (err != nil && st.BlocklistEtag != "") {
+			if err := a.materialise(dir, st); err != nil {
+				a.logf("cluster: replica: %v", err)
+				return
+			}
+			if a.Apply != nil {
+				if err := a.Apply(ctx); err != nil {
+					a.logf("cluster: replica: apply: %v", err)
+				}
+			}
+		}
+	}()
 	for round := 0; round < 100; round++ {
 		since := st.BlocklistSeq
 		now := time.Now().Unix()
@@ -140,6 +159,7 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 				return err
 			}
 			st = ReplicaState{BlocklistSeq: b.Seq, BlocklistEtag: b.Section.Etag, FullAt: now}
+			changed = true
 		case b.Unchanged:
 			st.BlocklistSeq, st.FullAt = b.Seq, now
 		case b.Delta != "":
@@ -147,6 +167,7 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 				return err
 			}
 			st.BlocklistSeq = b.Seq
+			changed = true
 		default:
 			if b.Seq > st.BlocklistSeq {
 				st.BlocklistSeq = b.Seq
@@ -210,6 +231,92 @@ func (a *Agent) storeDelta(deltas, sealedB64 string, after, seq int64) error {
 		return errors.New("clusteragent: config: the blocklist delta is not the one announced")
 	}
 	return writeFileAtomic(filepath.Join(deltas, fmt.Sprintf("%019d.blk", seq)), sealed)
+}
+
+// materialise writes blocklist.json: the stored section with its deltas
+// applied in seq order, each opened and verified again.
+func (a *Agent) materialise(dir string, st ReplicaState) error {
+	sealed, err := os.ReadFile(filepath.Join(dir, "blocklist.rep"))
+	if err != nil {
+		return err
+	}
+	payload, err := a.Client.OpenRecord(sealed, "rep")
+	if err != nil {
+		return err
+	}
+	var doc struct {
+		Node string                     `json:"node"`
+		Seq  int64                      `json:"seq"`
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil || doc.Node != a.Client.State.NodeUUID {
+		return errors.New("clusteragent: replica: the stored section is not this node's")
+	}
+	if doc.Data == nil {
+		doc.Data = map[string]json.RawMessage{}
+	}
+	var ips []string
+	if raw, ok := doc.Data["ip"]; ok {
+		if err := json.Unmarshal(raw, &ips); err != nil {
+			return errors.New("clusteragent: replica: the section's ip list")
+		}
+	}
+	set := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		set[ip] = true
+	}
+	seq := doc.Seq
+	for _, name := range ReplicaDeltas(dir) {
+		b, err := os.ReadFile(filepath.Join(dir, "blocklist.d", name))
+		if err != nil {
+			return err
+		}
+		p, err := a.Client.OpenRecord(b, "blk")
+		if err != nil {
+			return err
+		}
+		var d struct {
+			Seq    int64    `json:"seq"`
+			Add    []string `json:"add"`
+			Remove []string `json:"remove"`
+		}
+		if err := json.Unmarshal(p, &d); err != nil || d.Seq <= seq {
+			return errors.New("clusteragent: replica: a stored delta is out of order")
+		}
+		for _, ip := range d.Remove {
+			delete(set, ip)
+		}
+		for _, ip := range d.Add {
+			set[ip] = true
+		}
+		seq = d.Seq
+	}
+	ips = ips[:0]
+	for ip := range set {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	ipJSON, _ := json.Marshal(ips)
+	doc.Data["ip"] = ipJSON
+	out, err := json.Marshal(map[string]any{"seq": seq, "etag": st.BlocklistEtag, "data": doc.Data})
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dir, "blocklist.json"), out)
+}
+
+// ApplyViaPHP runs the node's `console.php cluster:apply`, which applies the
+// materialised replica (shadow diff, or the caches once CONFIG is on).
+func ApplyViaPHP(php, console string, timeout time.Duration) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, php, console, "cluster:apply").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("cluster:apply: %v: %s", err, bytes.TrimSpace(out))
+		}
+		return nil
+	}
 }
 
 // ReplicaDeltas lists the stored deltas in seq order (for cluster:apply and tests).

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,8 @@ func (m *replicaMain) delta(t *testing.T, key ed25519.PrivateKey, seq int64) map
 func TestReplicaStoresOnlyWhatOpensAndVerifies(t *testing.T) {
 	m, a := newReplicaMain(t)
 	ctx := context.Background()
+	applied := 0
+	a.Apply = func(context.Context) error { applied++; return nil }
 	etag := hex.EncodeToString(make([]byte, 32))
 
 	// Another node's section is refused, and nothing is kept.
@@ -125,6 +128,18 @@ func TestReplicaStoresOnlyWhatOpensAndVerifies(t *testing.T) {
 	}
 	if got := m.asked[len(m.asked)-1]["blocklist_since"]; got != float64(5) {
 		t.Fatalf("asked since %v", got)
+	}
+	// The section with its delta applied, for PHP, and cluster:apply run.
+	var mat struct {
+		Seq  int64 `json:"seq"`
+		Etag string
+		Data struct {
+			IP []string `json:"ip"`
+		} `json:"data"`
+	}
+	b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "blocklist.json"))
+	if err := json.Unmarshal(b, &mat); err != nil || mat.Seq != 6 || mat.Etag != etag || strings.Join(mat.Data.IP, ",") != "203.0.113.1,203.0.113.2" || applied != 2 {
+		t.Fatalf("materialised %s (applied %d)", b, applied)
 	}
 
 	// A new section replaces the deltas; one the node holds is not sent again.
