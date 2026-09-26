@@ -49,6 +49,9 @@ type State struct {
 	PendingEphSk []byte `json:"pending_eph_sk,omitempty"`
 	// CmdSeq is the highest command seq this node has handled (commands.go).
 	CmdSeq uint64 `json:"cmd_seq,omitempty"`
+	// OfflineAdmission is MAIN's lb_offline_admission from the last hello or
+	// heartbeat reply (admission.go); "" until one arrives (local).
+	OfflineAdmission string `json:"offline_admission,omitempty"`
 
 	path string
 	mu   sync.Mutex

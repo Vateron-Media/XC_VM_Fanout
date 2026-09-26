@@ -50,8 +50,10 @@ type Agent struct {
 	flows     atomic.Int64 // the flow bits from MAIN's latest reply
 	// MAIN's event cursors from the latest hello, plus one (0: not known yet).
 	cursorP0, cursorP1 atomic.Int64
-	fanoutLive         atomic.Bool // the fanout's /events feed is being followed
-	snapshotting       atomic.Bool // a conn_snapshot is being sent
+	fanoutLive         atomic.Bool  // the fanout's /events feed is being followed
+	snapshotting       atomic.Bool  // a conn_snapshot is being sent
+	state              atomic.Value // string: the node state in MAIN's latest reply
+	admits             admitCache   // conn_admit's admitting answers (admission.go)
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -68,6 +70,12 @@ type Reply struct {
 	// drifted from the digest the heartbeat carried; send the registry.
 	WantConnSnapshot bool `json:"want_conn_snapshot"`
 	// Cursors, in hello replies, are the last event numbers MAIN applied per lane.
+	// OfflineAdmission, in hello and heartbeat replies: the offline policy
+	// for viewers MAIN cannot admit (admission.go); an older MAIN omits it.
+	OfflineAdmission string `json:"offline_admission"`
+	// P2Types, in hello and heartbeat replies: the event types MAIN takes on
+	// the P2 lane (touch.go); an older MAIN omits it.
+	P2Types []string `json:"p2_types"`
 	Cursors *struct {
 		P0 int64 `json:"p0"`
 		P1 int64 `json:"p1"`
@@ -171,6 +179,8 @@ func (a *Agent) publish(r *Reply) {
 		return
 	}
 	a.flows.Store(int64(r.Flows))
+	a.state.Store(r.State)
+	a.setOfflineAdmission(r.OfflineAdmission)
 	if a.FlowsFile == "" {
 		return
 	}
@@ -305,6 +315,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.Registry == nil && a.SpoolDir != "" {
 		spool := a.SpoolDir
 		a.Registry = NewRegistry(filepath.Join(filepath.Dir(spool), "registry.snap"), func(ev []map[string]any) error { return spoolP0(spool, ev) }, a.logf)
+	}
+	if a.Registry != nil && a.Registry.Admit == nil {
+		a.Registry.Admit = a.admit
 	}
 	if a.Registry != nil {
 		go func() {

@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -35,7 +36,9 @@ import (
 // as a `conn.close {uuid, remove}` command, applied here without an event:
 // MAIN already did it.
 //
-//	PUT    /v1/conn/{uuid}         upsert, body: the record
+//	PUT    /v1/conn/{uuid}         upsert, body: the record; with X-XCVM-Admission,
+//	                               a new viewer admitted first, or refused with
+//	                               403 {admit: false, reason} (admission.go)
 //	GET    /v1/conn/{uuid}         the record, or 404
 //	POST   /v1/conn/find           {match: {column: value}} → the first match, or 404
 //	POST   /v1/conn/oldest         {user_id} → the line's oldest open connection, or 404
@@ -79,6 +82,11 @@ type Registry struct {
 	emit   func(events []map[string]any) error
 	now    func() time.Time
 	logf   func(string, ...any)
+
+	// Admit decides a PUT that carries an X-XCVM-Admission header
+	// (admission.go): "" admits, anything else is the refusal's reason. nil
+	// admits every viewer.
+	Admit func(ctx context.Context, arrived time.Time, uuid string, rec map[string]any, header string) string
 }
 
 // NewRegistry loads the node's registry from its snapshot (if any). emit
@@ -495,6 +503,7 @@ func spoolP0(dir string, events []map[string]any) error {
 
 // connHandler serves /v1/conn on the local socket.
 func (r *Registry) connHandler(w http.ResponseWriter, req *http.Request) {
+	arrived := time.Now()
 	path := strings.TrimPrefix(req.URL.Path, "/v1/conn/")
 	body := map[string]any{}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
@@ -548,6 +557,15 @@ func (r *Registry) connHandler(w http.ResponseWriter, req *http.Request) {
 	case !connUUID.MatchString(path):
 		http.Error(w, "bad request", http.StatusBadRequest)
 	case req.Method == http.MethodPut:
+		if h := req.Header.Get(AdmissionHeader); h != "" && r.Admit != nil {
+			if reason := r.Admit(req.Context(), arrived, path, body, h); reason != "" {
+				// Refused: nothing is stored and no event goes to MAIN.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]any{"admit": false, "reason": reason})
+				return
+			}
+		}
 		err := r.Put(path, body)
 		reply(body, err)
 	case req.Method == http.MethodGet:
