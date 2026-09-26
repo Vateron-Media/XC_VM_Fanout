@@ -46,10 +46,23 @@ import (
 //
 // Every heartbeat carries the registry's Digest. When MAIN's store for the
 // node drifts from it, MAIN asks for the whole registry (conn_snapshot).
+//
+// The HLS reaper (Reap): an HLS viewer has no worker to watch, only its
+// playlist requests. One that has made none for HLSReapAfter is ended here
+// (hls_end 1, a P0 conn.upsert), and MAIN closes it as it closes any ended
+// viewer. The time is the node's own: when a request last changed the
+// record's hls_last_read, so neither a clock step nor MAIN being out of reach
+// ends anyone. MAIN leaves its own 30 s rule for such nodes (the agent says
+// "hls_reaper" at hello) until the node falls silent for longer than
+// cluster_orphan_conn_ttl_sec.
 
 // TouchEvery is the most often a change of hls_last_read alone reaches MAIN.
-// MAIN's reaper closes an HLS viewer after 30 s without one.
+// A panel that predates the agent's reaper closes an HLS viewer after 30 s
+// without one, so it stays under that.
 var TouchEvery = 10 * time.Second
+
+// HLSReapAfter is how long an HLS viewer may go without a playlist request.
+var HLSReapAfter = 30 * time.Second
 
 // FlowConnections is the CONNECTIONS flow bit: the registry holds the node's viewers.
 const FlowConnections = 64
@@ -60,6 +73,7 @@ type Registry struct {
 	mu     sync.Mutex
 	conns  map[string]map[string]any
 	sentAt map[string]time.Time // last conn.upsert per uuid
+	readAt map[string]time.Time // last change of hls_last_read per uuid (node clock)
 	snap   string
 	dirty  bool
 	emit   func(events []map[string]any) error
@@ -70,13 +84,16 @@ type Registry struct {
 // NewRegistry loads the node's registry from its snapshot (if any). emit
 // spools events for MAIN.
 func NewRegistry(snap string, emit func([]map[string]any) error, logf func(string, ...any)) *Registry {
-	r := &Registry{conns: map[string]map[string]any{}, sentAt: map[string]time.Time{}, snap: snap, emit: emit, now: time.Now, logf: logf}
+	r := &Registry{conns: map[string]map[string]any{}, sentAt: map[string]time.Time{}, readAt: map[string]time.Time{}, snap: snap, emit: emit, now: time.Now, logf: logf}
 	if b, err := os.ReadFile(snap); err == nil {
 		var saved map[string]map[string]any
 		if json.Unmarshal(b, &saved) == nil {
 			for k, v := range saved {
 				if connUUID.MatchString(k) {
 					r.conns[k] = v
+					// A restart is not a read, but it gives every viewer a
+					// full HLSReapAfter to show up again.
+					r.readAt[k] = r.now()
 				}
 			}
 		}
@@ -99,6 +116,9 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 		}
 	}
 	r.mu.Lock()
+	if old == nil || norm(old["hls_last_read"]) != norm(rec["hls_last_read"]) {
+		r.readAt[uuid] = r.now()
+	}
 	r.conns[uuid] = rec
 	r.dirty = true
 	if send {
@@ -106,6 +126,50 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+// Reap ends the open HLS viewers with no playlist request for after, and
+// returns how many it ended. Each goes to MAIN as a P0 conn.upsert with
+// hls_end 1 before the registry changes; one whose event cannot be spooled
+// stays open and is tried again on the next pass.
+func (r *Registry) Reap(after time.Duration) int {
+	r.mu.Lock()
+	now := r.now()
+	var stale []map[string]any
+	for uuid, c := range r.conns {
+		if fmt.Sprint(c["container"]) != "hls" || num(c["hls_end"]) != 0 {
+			continue
+		}
+		at, ok := r.readAt[uuid]
+		if !ok {
+			r.readAt[uuid] = now
+			continue
+		}
+		if now.Sub(at) >= after {
+			ended := clone(c)
+			ended["hls_end"] = 1
+			stale = append(stale, ended)
+		}
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, rec := range stale {
+		uuid, _ := rec["uuid"].(string)
+		if err := r.emit([]map[string]any{{"type": "conn.upsert", "d": map[string]any{"record": rec}}}); err != nil {
+			r.logf("cluster: ending HLS viewer %s: %v", uuid, err)
+			continue
+		}
+		r.mu.Lock()
+		// Unless a request re-opened it meanwhile.
+		if c := r.conns[uuid]; c != nil && num(c["hls_end"]) == 0 && norm(c["hls_last_read"]) == norm(rec["hls_last_read"]) {
+			r.conns[uuid] = rec
+			r.sentAt[uuid] = r.now()
+			r.dirty = true
+			n++
+		}
+		r.mu.Unlock()
+	}
+	return n
 }
 
 // Get returns a copy of a record.
@@ -177,6 +241,7 @@ func (r *Registry) Delete(uuid string) error {
 		r.dirty = true
 	}
 	delete(r.sentAt, uuid)
+	delete(r.readAt, uuid)
 	r.mu.Unlock()
 	return nil
 }
@@ -189,6 +254,7 @@ func (r *Registry) Close(uuid string, remove bool) {
 	if remove {
 		delete(r.conns, uuid)
 		delete(r.sentAt, uuid)
+		delete(r.readAt, uuid)
 	} else if c := r.conns[uuid]; c != nil {
 		c["hls_end"] = 1
 	}
@@ -289,6 +355,7 @@ func (r *Registry) Seed(records []map[string]any, reset bool) int {
 	if reset {
 		r.conns = map[string]map[string]any{}
 		r.sentAt = map[string]time.Time{}
+		r.readAt = map[string]time.Time{}
 	}
 	n := 0
 	for _, c := range records {
@@ -298,6 +365,7 @@ func (r *Registry) Seed(records []map[string]any, reset bool) int {
 		}
 		r.conns[uuid] = c
 		r.sentAt[uuid] = r.now()
+		r.readAt[uuid] = r.now()
 		n++
 	}
 	r.dirty = true

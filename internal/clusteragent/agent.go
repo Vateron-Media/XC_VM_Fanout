@@ -73,6 +73,10 @@ type Reply struct {
 	} `json:"policy"`
 }
 
+// Features are what this agent tells MAIN at hello that it does, so MAIN
+// stands down its own copy: "hls_reaper" (Registry.Reap).
+var Features = []string{"hls_reaper"}
+
 // ErrStop is returned when MAIN has told the node to stop: it was revoked or
 // is unknown, or its enrolment was never completed in time. An expired token
 // is not a stop: the node re-keys.
@@ -165,9 +169,18 @@ func (a *Agent) publish(r *Reply) {
 		return
 	}
 	doc := map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State}
+	var features []string
 	if a.fanoutLive.Load() {
 		// PHP's reconcile leaves the supervised streams' state to these events.
-		doc["features"] = []string{"fanout_events"}
+		features = append(features, "fanout_events")
+	}
+	if a.Registry != nil {
+		// The node's own reaper (UsersCronJob, MySQL mode) leaves idle HLS
+		// viewers to the registry's.
+		features = append(features, "hls_reaper")
+	}
+	if features != nil {
+		doc["features"] = features
 	}
 	b, _ := json.Marshal(doc)
 	if string(b) == a.flowsSeen {
@@ -240,7 +253,9 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 		a.logf("cluster: enrolled (state %s, mode %d)", r.State, r.Mode)
 	}
 	var r Reply
-	if err := a.Client.Call(ctx, "hello", a.identity(), &r, false); err != nil {
+	hello := a.identity()
+	hello["features"] = Features
+	if err := a.Client.Call(ctx, "hello", hello, &r, false); err != nil {
 		return nil, err
 	}
 	a.apply(&r)
@@ -289,12 +304,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		go func() {
 			t := time.NewTicker(time.Second)
 			defer t.Stop()
-			for {
+			for tick := 1; ; tick++ {
 				select {
 				case <-ctx.Done():
 					a.Registry.Save()
 					return
 				case <-t.C:
+					if tick%5 == 0 && a.flows.Load()&FlowConnections != 0 {
+						if n := a.Registry.Reap(HLSReapAfter); n > 0 {
+							a.logf("cluster: ended %d idle HLS viewer(s)", n)
+						}
+					}
 					if err := a.Registry.Save(); err != nil {
 						a.logf("cluster: saving the connection registry: %v", err)
 					}
