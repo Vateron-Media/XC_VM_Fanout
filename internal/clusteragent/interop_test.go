@@ -214,6 +214,10 @@ func TestInteropWithPanel(t *testing.T) {
 		if st := LoadReplicaState(a.ReplicaDir); st.BlocklistSeq != 3 || len(st.BlocklistEtag) != 64 {
 			t.Fatalf("replica state %+v", st)
 		}
+		// The settings section came with the first sync: allowlisted keys only.
+		if b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "settings.json")); !strings.Contains(string(b), `"server_name":"Interop"`) || strings.Contains(string(b), "secret") {
+			t.Fatalf("settings.json %s", b)
+		}
 		// A record sealed to this node but under another tag does not verify.
 		if _, err := c.OpenRecord(sealedBlk, "rep"); err == nil {
 			t.Fatal("a blk record verified as rep")
