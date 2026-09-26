@@ -36,6 +36,9 @@ type Agent struct {
 	// FanoutCtl is xc_fanout's control socket, whose GET /events the agent
 	// follows while STREAMS is on (fanout.go); "" leaves it off.
 	FanoutCtl string
+	// ReplicaDir is where the node keeps its replica (replica.go); "" leaves
+	// it off.
+	ReplicaDir string
 	// Registry holds the node's viewers while CONNECTIONS is on (registry.go);
 	// Run makes it when SpoolDir is set.
 	Registry *Registry
@@ -335,6 +338,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		fctx, stopFanout := context.WithCancel(ctx)
 		defer stopFanout()
 		go a.RunFanoutEvents(fctx)
+	}
+	if a.ReplicaDir != "" {
+		rctx, stopReplica := context.WithCancel(ctx)
+		defer stopReplica()
+		go a.RunReplica(rctx)
 	}
 	if a.SpoolDir != "" {
 		ectx, stopEvents := context.WithCancel(ctx)
