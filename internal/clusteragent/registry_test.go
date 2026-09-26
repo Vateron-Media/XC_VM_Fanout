@@ -318,3 +318,71 @@ func TestInteropConnections(t *testing.T) {
 		t.Fatalf("the seed carried a line column: %v", secret)
 	}
 }
+
+func TestRegistryReapsIdleHLSViewers(t *testing.T) {
+	r, s, now := newTestRegistry(t)
+	r.Put("a", rec(7, "10.0.0.1", 100, 100))
+	ts := rec(8, "10.0.0.2", 100, 100)
+	ts["container"] = "ts" // a worker or the fanout closes it, never the reaper
+	r.Put("b", ts)
+	r.Put("c", rec(9, "10.0.0.3", 100, 100))
+	*now = now.Add(20 * time.Second)
+	r.Put("c", rec(9, "10.0.0.3", 100, 120)) // c's playlist request
+	*now = now.Add(15 * time.Second)
+	s.events = nil
+
+	if n := r.Reap(30 * time.Second); n != 1 {
+		t.Fatalf("reaped %d, want 1 (a)", n)
+	}
+	if s.types() != "conn.upsert" {
+		t.Fatalf("events %s", s.types())
+	}
+	sent := s.events[0]["d"].(map[string]any)["record"].(map[string]any)
+	if sent["uuid"] != "a" || fmt.Sprint(sent["hls_end"]) != "1" {
+		t.Fatalf("sent %v", sent)
+	}
+	if fmt.Sprint(r.Get("a")["hls_end"]) != "1" || fmt.Sprint(r.Get("c")["hls_end"]) != "0" || fmt.Sprint(r.Get("b")["hls_end"]) != "0" {
+		t.Fatalf("a %v, b %v, c %v", r.Get("a"), r.Get("b"), r.Get("c"))
+	}
+	if d := r.Digest(); d.Count != 2 {
+		t.Fatalf("digest counts the ended viewer: %+v", d)
+	}
+	if n := r.Reap(30 * time.Second); n != 0 {
+		t.Fatalf("an ended viewer was reaped again (%d)", n)
+	}
+
+	// A full spool: c stays open and is ended on a later pass.
+	*now = now.Add(30 * time.Second)
+	s.fail = true
+	if n := r.Reap(30 * time.Second); n != 0 || fmt.Sprint(r.Get("c")["hls_end"]) != "0" {
+		t.Fatalf("reaped %d with the spool full; c %v", n, r.Get("c"))
+	}
+	s.fail = false
+	if n := r.Reap(30 * time.Second); n != 1 || fmt.Sprint(r.Get("c")["hls_end"]) != "1" {
+		t.Fatalf("reaped %d after the spool recovered; c %v", n, r.Get("c"))
+	}
+
+	// A viewer that comes back is re-opened by its next request as before.
+	r.Put("a", rec(7, "10.0.0.1", 100, 200))
+	if fmt.Sprint(r.Get("a")["hls_end"]) != "0" || r.Reap(30*time.Second) != 0 {
+		t.Fatalf("a %v", r.Get("a"))
+	}
+}
+
+func TestRegistryRestartGivesHLSViewersAFullWindow(t *testing.T) {
+	r, _, _ := newTestRegistry(t)
+	r.Put("a", rec(7, "10.0.0.1", 100, 100)) // last read long ago
+	if err := r.Save(); err != nil {
+		t.Fatal(err)
+	}
+	// NewRegistry stamps every loaded viewer with its own clock (real time here).
+	again := NewRegistry(r.snap, (&sink{}).emit, t.Logf)
+	if n := again.Reap(30 * time.Second); n != 0 {
+		t.Fatalf("reaped %d right after a restart", n)
+	}
+	later := time.Now().Add(31 * time.Second)
+	again.now = func() time.Time { return later }
+	if n := again.Reap(30 * time.Second); n != 1 {
+		t.Fatalf("reaped %d after the window", n)
+	}
+}

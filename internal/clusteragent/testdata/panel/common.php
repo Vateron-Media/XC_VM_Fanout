@@ -24,6 +24,7 @@ if ($rNew) {
 	$rDb->exec('ALTER TABLE `cluster_node_epochs` ADD COLUMN `agent_eph_pub` binary(32) DEFAULT NULL');
 	$rDb->exec('ALTER TABLE `cluster_enrol_requests` ADD COLUMN `agent_eph_pub` binary(32) DEFAULT NULL');
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `root_ready` tinyint(1) NOT NULL DEFAULT 0');
+	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `features` varchar(255) DEFAULT NULL');
 	$rDb->exec('CREATE TABLE `servers` (`id` INTEGER PRIMARY KEY, `status` int NOT NULL DEFAULT 0)');
 	$rDb->exec('INSERT INTO `servers` (`id`, `status`) VALUES (7, 0)');
 	$rDb->exec('CREATE TABLE `streams_servers` (`server_stream_id` INTEGER PRIMARY KEY, `stream_id` int, `server_id` int, `parent_id` int, `pid` int, `to_analyze` int, `current_source` text, `monitor_pid` int, `stream_status` int DEFAULT 0, `stream_started` int, `stream_info` text, `audio_codec` text, `video_codec` text, `resolution` int, `bitrate` int, `compatible` int)');
