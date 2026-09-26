@@ -1,12 +1,18 @@
 // Package clusteragent is the LB side of the XC_VM cluster API: the node's
 // persistent identity and token epochs, and a client for MAIN's
 // /cluster/v1/ operations (enrol_complete, hello, heartbeat, token_refresh,
-// token_rekey).
+// token_rekey, commands, ack, events, conn_snapshot, conn_admit, config).
 //
 // Every reply is authenticated before it is believed: a session reply by its
 // MAC and BOX under the epoch's down keys, a refusal by the pinned panel key
 // and by naming this node and this request's nonce. Anything else is a
 // transport error and changes nothing.
+//
+// Refusals that ask for a later retry (REPLAY with retry_after_ms, a busy or
+// starting MAIN's 503) are in retry.go; the transport policy and the
+// https_required recovery in policy.go; the kills a hard-mode LICENCE_INVALID
+// carries in sealed.go; viewer admission in admission.go; the P2 lane in
+// touch.go; the registry's rebuild after a restart in rebuild.go.
 package clusteragent
 
 import (

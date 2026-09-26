@@ -48,6 +48,7 @@ type Agent struct {
 	// Run makes it when SpoolDir is set.
 	Registry *Registry
 
+	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
 	flows     atomic.Int64 // the flow bits from MAIN's latest reply
 	// MAIN's event cursors from the latest hello, plus one (0: not known yet).
@@ -80,13 +81,13 @@ type Reply struct {
 	// WantConnSnapshot, in heartbeat replies: MAIN's store for this node
 	// drifted from the digest the heartbeat carried; send the registry.
 	WantConnSnapshot bool `json:"want_conn_snapshot"`
-	// Cursors, in hello replies, are the last event numbers MAIN applied per lane.
 	// OfflineAdmission, in hello and heartbeat replies: the offline policy
 	// for viewers MAIN cannot admit (admission.go); an older MAIN omits it.
 	OfflineAdmission string `json:"offline_admission"`
 	// P2Types, in hello and heartbeat replies: the event types MAIN takes on
 	// the P2 lane (touch.go); an older MAIN omits it.
 	P2Types []string `json:"p2_types"`
+	// Cursors, in hello replies, are the last event numbers MAIN applied per lane.
 	Cursors *struct {
 		P0 int64 `json:"p0"`
 		P1 int64 `json:"p1"`
@@ -189,6 +190,8 @@ func (a *Agent) publish(r *Reply) {
 	if r == nil || r.State == "" {
 		return
 	}
+	a.pubMu.Lock()
+	defer a.pubMu.Unlock()
 	a.flows.Store(int64(r.Flows))
 	a.state.Store(r.State)
 	a.setOfflineAdmission(r.OfflineAdmission)
