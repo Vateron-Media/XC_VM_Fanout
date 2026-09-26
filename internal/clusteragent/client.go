@@ -37,10 +37,13 @@ type Denial struct {
 	Nonce  string `json:"req_nonce"`
 	// MainTimeMs is MAIN's clock when it refused; RetryAfterMs and Op are set
 	// on the refusals that ask for a later retry (retry.go).
-	MainTimeMs   int64           `json:"main_time_ms"`
-	RetryAfterMs int64           `json:"retry_after_ms"`
-	Op           string          `json:"op"`
-	Doc          json.RawMessage `json:"-"`
+	MainTimeMs   int64  `json:"main_time_ms"`
+	RetryAfterMs int64  `json:"retry_after_ms"`
+	Op           string `json:"op"`
+	// CommandsSealed, on a hard-mode LICENCE_INVALID: the node's pending
+	// restrictive commands, sealed to it (sealed.go).
+	CommandsSealed string          `json:"commands_sealed"`
+	Doc            json.RawMessage `json:"-"`
 }
 
 func (d *Denial) Error() string { return fmt.Sprintf("MAIN refused (%d %s)", d.Status, d.Reason) }
@@ -65,6 +68,9 @@ type Client struct {
 
 	// LongHTTP carries the commands long-poll, which MAIN holds open.
 	LongHTTP *http.Client
+
+	// OnDenial, when set, sees every verified denial of a session op.
+	OnDenial func(*Denial)
 
 	mu       sync.Mutex
 	sessions map[uint64]session
@@ -260,6 +266,9 @@ func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byt
 			return c.openReply(s, reqCtx, st, rh, rb, out)
 		}
 		if d := c.denial(st, rh, rb, nonce); d != nil {
+			if c.OnDenial != nil {
+				c.OnDenial(d)
+			}
 			return d
 		}
 		lastErr = fmt.Errorf("%w: HTTP %d from %s", ErrTransport, st, base)

@@ -157,6 +157,11 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 			return // already handled: a redelivery
 		}
 		w.Seq = probe.Seq
+	} else if k, done := c.State.kept(cmd.CmdID); done {
+		// Run already from a LICENCE_INVALID denial (sealed.go): ack its
+		// result, never run it twice.
+		id, ok, result = cmd.CmdID, k.OK, k.Result
+		w.Seq = cmd.Seq
 	} else {
 		id = cmd.CmdID
 		ok, result = run(ctx, cmd, w)

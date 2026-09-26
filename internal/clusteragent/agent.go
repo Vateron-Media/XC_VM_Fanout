@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -59,6 +60,10 @@ type Agent struct {
 	helloing           atomic.Bool  // a hello is being retried in the background
 	refreshing         atomic.Bool  // a token refresh runs in the background
 	stopCh             chan error   // a background loop's fatal refusal, for Run
+	run                Executor     // what runs MAIN's commands (localExec over Exec); nil: none
+	sealedMu           sync.Mutex   // one batch of sealed commands at a time (sealed.go)
+	fenced             atomic.Bool  // MAIN refuses the session for want of a licence
+	acking             atomic.Bool  // sealed commands are being acked
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -300,6 +305,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	interval = min(interval, MaxHeartbeatGap)
 	backoff := interval
 	a.stopCh = make(chan error, 1)
+	if a.Exec != nil && a.run == nil {
+		a.run = a.localExec(a.Exec)
+	}
+	if a.Client.OnDenial == nil {
+		a.Client.OnDenial = func(d *Denial) {
+			if d.Reason == "LICENCE_INVALID" && d.CommandsSealed != "" {
+				go a.takeSealed(ctx, d)
+			}
+		}
+	}
 	for {
 		_, err := a.Start(ctx)
 		if err == nil {
@@ -307,6 +322,15 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		if fatal(err) {
 			return errors.Join(ErrStop, err)
+		}
+		if a.licenceGone(err) {
+			// FENCED: ask again at the heartbeat's pace, so the kills MAIN
+			// sends with its refusal keep coming (sealed.go).
+			a.setFenced(true)
+			if !sleep(ctx, interval) {
+				return ctx.Err()
+			}
+			continue
 		}
 		if needsRekey(err) {
 			if err := a.recover(ctx); err != nil {
@@ -329,10 +353,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		backoff = min(backoff*2, time.Minute)
 	}
-	if a.Exec != nil {
+	if a.run != nil {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
-		go a.RunCommands(cctx, a.localExec(a.Exec))
+		go a.RunCommands(cctx, a.run)
 	}
 	if a.Registry == nil && a.SpoolDir != "" {
 		spool := a.SpoolDir
@@ -415,6 +439,10 @@ func (a *Agent) Run(ctx context.Context) error {
 			if fatal(err) {
 				return errors.Join(ErrStop, err)
 			}
+			if a.licenceGone(err) {
+				a.setFenced(true)
+				continue
+			}
 			if needsRekey(err) {
 				a.logf("cluster: heartbeat: %v; re-keying", err)
 				if err := a.recover(ctx); err != nil {
@@ -429,6 +457,13 @@ func (a *Agent) Run(ctx context.Context) error {
 				return ctx.Err()
 			}
 			continue
+		}
+		a.setFenced(false)
+		if a.hasUnackedSealed() && a.acking.CompareAndSwap(false, true) {
+			go func() {
+				defer a.acking.Store(false)
+				a.ackSealed(ctx)
+			}()
 		}
 		if r.WantConnSnapshot {
 			go func() {
@@ -470,6 +505,30 @@ func (a *Agent) refreshLater(ctx context.Context) {
 			a.logf("cluster: token refresh: %v", err)
 		}
 	}()
+}
+
+// setFenced notes whether MAIN refuses the session for want of a licence.
+func (a *Agent) setFenced(on bool) {
+	if a.fenced.Swap(on) == on {
+		return
+	}
+	if on {
+		a.logf("cluster: MAIN's licence is not valid; heartbeats go on for the kills MAIN sends with its refusals")
+	} else {
+		a.logf("cluster: MAIN accepts the session again")
+	}
+}
+
+func (a *Agent) hasUnackedSealed() bool {
+	st := a.Client.State
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, k := range st.SealedCmds {
+		if !k.Acked {
+			return true
+		}
+	}
+	return false
 }
 
 // helloLater says hello in the background, while the heartbeats go on, until

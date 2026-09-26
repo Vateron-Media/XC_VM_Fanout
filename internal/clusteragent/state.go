@@ -52,6 +52,9 @@ type State struct {
 	// OfflineAdmission is MAIN's lb_offline_admission from the last hello or
 	// heartbeat reply (admission.go); "" until one arrives (local).
 	OfflineAdmission string `json:"offline_admission,omitempty"`
+	// SealedCmds are the commands run from LICENCE_INVALID denials, kept
+	// until they expire (sealed.go).
+	SealedCmds []SealedCmd `json:"sealed_cmds,omitempty"`
 
 	path string
 	mu   sync.Mutex
