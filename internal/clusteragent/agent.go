@@ -54,6 +54,7 @@ type Agent struct {
 	snapshotting       atomic.Bool  // a conn_snapshot is being sent
 	state              atomic.Value // string: the node state in MAIN's latest reply
 	admits             admitCache   // conn_admit's admitting answers (admission.go)
+	p2Touch            atomic.Bool  // HLS touches go on the P2 lane (touch.go)
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -181,6 +182,7 @@ func (a *Agent) publish(r *Reply) {
 	a.flows.Store(int64(r.Flows))
 	a.state.Store(r.State)
 	a.setOfflineAdmission(r.OfflineAdmission)
+	a.setP2(a.p2Wanted(r))
 	if a.FlowsFile == "" {
 		return
 	}
@@ -319,6 +321,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.Registry != nil && a.Registry.Admit == nil {
 		a.Registry.Admit = a.admit
 	}
+	if a.Registry != nil && a.Registry.P2 == nil {
+		a.Registry.P2 = a.p2Touch.Load
+	}
 	if a.Registry != nil {
 		go func() {
 			t := time.NewTicker(time.Second)
@@ -365,6 +370,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		defer stopEvents()
 		for _, lane := range Lanes {
 			go a.RunEvents(ectx, lane)
+		}
+		if a.Registry != nil {
+			go a.RunTouches(ectx)
 		}
 	}
 	t := time.NewTicker(interval)

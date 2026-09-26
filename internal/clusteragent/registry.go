@@ -29,7 +29,8 @@ import (
 // read, stays current:
 //
 //	conn.upsert {record}   a new or changed connection (a change of
-//	                       hls_last_read alone at most every TouchEvery)
+//	                       hls_last_read alone at most every TouchEvery, or
+//	                       none while touches go on P2, touch.go)
 //	conn.remove {uuid}     the node removed it
 //
 // A close decided on MAIN (a kick, a limit, MAIN's reaper) reaches the node
@@ -77,11 +78,23 @@ type Registry struct {
 	conns  map[string]map[string]any
 	sentAt map[string]time.Time // last conn.upsert per uuid
 	readAt map[string]time.Time // last change of hls_last_read per uuid (node clock)
-	snap   string
-	dirty  bool
-	emit   func(events []map[string]any) error
-	now    func() time.Time
-	logf   func(string, ...any)
+	// The P2 touches (touch.go): the latest hls_last_read per uuid not sent
+	// yet, the last value sent on P0 (it reached MAIN's store) and on either
+	// lane (MAIN has it), and when each uuid's touch last went on P2.
+	pending map[string]int64
+	lastP0  map[string]int64
+	lastAny map[string]int64
+	p2At    map[string]time.Time
+	snap    string
+	dirty   bool
+	emit    func(events []map[string]any) error
+	now     func() time.Time
+	logf    func(string, ...any)
+
+	// P2 reports whether a change of hls_last_read alone goes on the P2 lane
+	// as a pending touch (touch.go) instead of a throttled P0 upsert; nil is
+	// never.
+	P2 func() bool
 
 	// Admit decides a PUT that carries an X-XCVM-Admission header
 	// (admission.go): "" admits, anything else is the refusal's reason. nil
@@ -92,7 +105,8 @@ type Registry struct {
 // NewRegistry loads the node's registry from its snapshot (if any). emit
 // spools events for MAIN.
 func NewRegistry(snap string, emit func([]map[string]any) error, logf func(string, ...any)) *Registry {
-	r := &Registry{conns: map[string]map[string]any{}, sentAt: map[string]time.Time{}, readAt: map[string]time.Time{}, snap: snap, emit: emit, now: time.Now, logf: logf}
+	r := &Registry{conns: map[string]map[string]any{}, snap: snap, emit: emit, now: time.Now, logf: logf}
+	r.reset()
 	if b, err := os.ReadFile(snap); err == nil {
 		var saved map[string]map[string]any
 		if json.Unmarshal(b, &saved) == nil {
@@ -116,7 +130,9 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 	rec["uuid"] = uuid
 	r.mu.Lock()
 	old := r.conns[uuid]
-	send := old == nil || !sameBut(old, rec, "hls_last_read") || r.now().Sub(r.sentAt[uuid]) >= TouchEvery
+	touchOnly := old != nil && sameBut(old, rec, "hls_last_read")
+	p2 := touchOnly && r.P2 != nil && r.P2()
+	send := !p2 && (old == nil || !touchOnly || r.now().Sub(r.sentAt[uuid]) >= TouchEvery)
 	r.mu.Unlock()
 	if send {
 		if err := r.emit([]map[string]any{{"type": "conn.upsert", "d": map[string]any{"record": rec}}}); err != nil {
@@ -126,14 +142,46 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 	r.mu.Lock()
 	if old == nil || norm(old["hls_last_read"]) != norm(rec["hls_last_read"]) {
 		r.readAt[uuid] = r.now()
+		if p2 {
+			r.pending[uuid] = intOf(rec["hls_last_read"])
+		}
 	}
 	r.conns[uuid] = rec
 	r.dirty = true
 	if send {
-		r.sentAt[uuid] = r.now()
+		r.sentP0Locked(uuid, rec)
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+// sentP0Locked notes a P0 conn.upsert of the whole record: it carried the
+// current hls_last_read, so no touch of it is pending.
+func (r *Registry) sentP0Locked(uuid string, rec map[string]any) {
+	r.sentAt[uuid] = r.now()
+	v := intOf(rec["hls_last_read"])
+	r.lastP0[uuid], r.lastAny[uuid] = v, v
+	delete(r.pending, uuid)
+}
+
+// forgetLocked drops everything the registry keeps about a uuid but the record.
+func (r *Registry) forgetLocked(uuid string) {
+	delete(r.sentAt, uuid)
+	delete(r.readAt, uuid)
+	delete(r.pending, uuid)
+	delete(r.lastP0, uuid)
+	delete(r.lastAny, uuid)
+	delete(r.p2At, uuid)
+}
+
+// reset empties the per-uuid bookkeeping.
+func (r *Registry) reset() {
+	r.sentAt = map[string]time.Time{}
+	r.readAt = map[string]time.Time{}
+	r.pending = map[string]int64{}
+	r.lastP0 = map[string]int64{}
+	r.lastAny = map[string]int64{}
+	r.p2At = map[string]time.Time{}
 }
 
 // Reap ends the open HLS viewers with no playlist request for after, and
@@ -171,7 +219,7 @@ func (r *Registry) Reap(after time.Duration) int {
 		// Unless a request re-opened it meanwhile.
 		if c := r.conns[uuid]; c != nil && num(c["hls_end"]) == 0 && norm(c["hls_last_read"]) == norm(rec["hls_last_read"]) {
 			r.conns[uuid] = rec
-			r.sentAt[uuid] = r.now()
+			r.sentP0Locked(uuid, rec)
 			r.dirty = true
 			n++
 		}
@@ -265,8 +313,7 @@ func (r *Registry) FanoutClosed(uuids []string) (int, error) {
 	r.mu.Lock()
 	for _, uuid := range gone {
 		delete(r.conns, uuid)
-		delete(r.sentAt, uuid)
-		delete(r.readAt, uuid)
+		r.forgetLocked(uuid)
 	}
 	r.dirty = true
 	r.mu.Unlock()
@@ -283,8 +330,7 @@ func (r *Registry) Delete(uuid string) error {
 		delete(r.conns, uuid)
 		r.dirty = true
 	}
-	delete(r.sentAt, uuid)
-	delete(r.readAt, uuid)
+	r.forgetLocked(uuid)
 	r.mu.Unlock()
 	return nil
 }
@@ -296,10 +342,10 @@ func (r *Registry) Close(uuid string, remove bool) {
 	defer r.mu.Unlock()
 	if remove {
 		delete(r.conns, uuid)
-		delete(r.sentAt, uuid)
-		delete(r.readAt, uuid)
+		r.forgetLocked(uuid)
 	} else if c := r.conns[uuid]; c != nil {
 		c["hls_end"] = 1
+		delete(r.pending, uuid)
 	}
 	r.dirty = true
 }
@@ -397,8 +443,7 @@ func (r *Registry) Seed(records []map[string]any, reset bool) int {
 	defer r.mu.Unlock()
 	if reset {
 		r.conns = map[string]map[string]any{}
-		r.sentAt = map[string]time.Time{}
-		r.readAt = map[string]time.Time{}
+		r.reset()
 	}
 	n := 0
 	for _, c := range records {
@@ -407,7 +452,7 @@ func (r *Registry) Seed(records []map[string]any, reset bool) int {
 			continue
 		}
 		r.conns[uuid] = c
-		r.sentAt[uuid] = r.now()
+		r.sentP0Locked(uuid, c) // MAIN's store holds it as it is
 		r.readAt[uuid] = r.now()
 		n++
 	}

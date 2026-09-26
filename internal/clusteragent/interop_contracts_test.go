@@ -129,3 +129,39 @@ func TestInteropAdmission(t *testing.T) {
 		t.Fatalf("FLOW_OFF must admit: %+v", out)
 	}
 }
+
+// TestInteropP2Touches: with CONNECTIONS on, MAIN lists conn.touch in
+// p2_types; a touch goes on P2 and, without a cluster bus, lands in MAIN's
+// store; the P0 upsert of the open carried the viewer there first.
+func TestInteropP2Touches(t *testing.T) {
+	a, runPHP, ctx := interopNode(t)
+	runPHP("events.php", "flows", "64")
+	a.Registry.P2 = a.p2Touch.Load
+	r, err := a.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.p2Wanted(r) || !a.p2Touch.Load() {
+		t.Fatalf("hello's p2_types %v did not turn P2 on", r.P2Types)
+	}
+	oldLanes := Lanes
+	Lanes = []Lane{{Name: "p0", Interval: 50 * time.Millisecond}}
+	defer func() { Lanes = oldLanes }()
+	lctx, stop := context.WithCancel(ctx)
+	defer stop()
+	go a.RunEvents(lctx, Lanes[0])
+	a.Registry.Put("hlsv", map[string]any{"user_id": 7, "stream_id": 100, "server_id": 7, "user_ip": "10.0.0.9", "user_agent": "VLC", "container": "hls", "pid": nil, "date_start": 1800000000, "hls_last_read": 1800000000, "hls_end": 0})
+	for i := 0; i < 100 && runPHP("touch.php", "hlsv") != "1800000000"; i++ {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := runPHP("touch.php", "hlsv"); got != "1800000000" {
+		t.Fatalf("the open never reached MAIN: %s", got)
+	}
+	a.Registry.Touch("hlsv", 1800000042)
+	if err := a.sendTouches(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := runPHP("touch.php", "hlsv"); got != "1800000042" {
+		t.Fatalf("MAIN's store after the P2 touch: %s", got)
+	}
+}
