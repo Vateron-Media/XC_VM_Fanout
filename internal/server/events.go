@@ -17,14 +17,20 @@ import (
 // state as GET /monitor/<id> reports it, each time it changes, in order.
 //
 //	GET /events?boot=<boot>&since=<seq>&wait=<sec>
-//	→ {"boot", "seq", "reset", "events": [{"seq", "type": "monitor", "stream", "state"}]}
+//	→ {"boot", "seq", "reset", "events": [{"seq", "type": "monitor", "stream", "state"}
+//	                                     | {"seq", "type": "conn_close", "stream", "uuid"}]}
 //
 // Events after `since` come back at once; with none, the request is held up
 // to `wait` seconds (at most 25) for the next. A consumer that is new, behind
 // the ring, or talking to another daemon life (`boot` differs) gets `reset`
 // and every supervised stream's current state instead, then carries on from
-// `seq`. Viewer open/close joins the feed with the connection registry
-// (Phase 6).
+// `seq`.
+//
+// conn_close (Phase 6): a live-TS viewer's last connection for its uuid left
+// the stream (the client went, or the panel dropped it). The node's agent ends
+// the viewer in its connection registry at once, instead of waiting for
+// fanout_sync to find the row gone from GET /connections. A reset carries no
+// past closes: fanout_sync's reconcile still catches any the agent missed.
 
 // EventsRing is how many transitions the daemon keeps for consumers catching up.
 var EventsRing = 4096
@@ -37,10 +43,11 @@ var EventsWatch = 250 * time.Millisecond
 const EventsMaxWait = 25 * time.Second
 
 type monitorEvent struct {
-	Seq    uint64           `json:"seq"`
-	Type   string           `json:"type"`
-	Stream string           `json:"stream"`
-	State  monitorStateView `json:"state"`
+	Seq    uint64            `json:"seq"`
+	Type   string            `json:"type"`
+	Stream string            `json:"stream"`
+	State  *monitorStateView `json:"state,omitempty"`
+	UUID   string            `json:"uuid,omitempty"`
 }
 
 type eventLog struct {
@@ -91,7 +98,8 @@ func (l *eventLog) observe(states map[string]monitorStateView) {
 		}
 		l.last[id] = fp
 		l.seq++
-		l.ring = append(l.ring, monitorEvent{Seq: l.seq, Type: "monitor", Stream: id, State: v})
+		sv := v
+		l.ring = append(l.ring, monitorEvent{Seq: l.seq, Type: "monitor", Stream: id, State: &sv})
 		changed = true
 	}
 	for id := range l.last {
@@ -107,6 +115,19 @@ func (l *eventLog) observe(states map[string]monitorStateView) {
 		close(l.wake)
 		l.wake = make(chan struct{})
 	}
+}
+
+// connClosed publishes that a live-TS viewer uuid left a stream.
+func (l *eventLog) connClosed(stream, uuid string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.seq++
+	l.ring = append(l.ring, monitorEvent{Seq: l.seq, Type: "conn_close", Stream: stream, UUID: uuid})
+	if over := len(l.ring) - EventsRing; over > 0 {
+		l.ring = append([]monitorEvent(nil), l.ring[over:]...)
+	}
+	close(l.wake)
+	l.wake = make(chan struct{})
 }
 
 type eventsReply struct {
@@ -128,7 +149,8 @@ func (l *eventLog) since(boot string, seq uint64) (*eventsReply, <-chan struct{}
 	if boot != l.boot || seq > l.seq || seq+1 < oldest {
 		out := &eventsReply{Boot: l.boot, Seq: l.seq, Reset: true, Events: []monitorEvent{}}
 		for id, v := range l.latest {
-			out.Events = append(out.Events, monitorEvent{Seq: l.seq, Type: "monitor", Stream: id, State: v})
+			sv := v
+			out.Events = append(out.Events, monitorEvent{Seq: l.seq, Type: "monitor", Stream: id, State: &sv})
 		}
 		return out, nil
 	}

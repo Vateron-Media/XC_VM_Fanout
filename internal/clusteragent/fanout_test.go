@@ -226,3 +226,75 @@ func TestAgentDropsDaemonViewersItself(t *testing.T) {
 		t.Fatalf("fallback: %v %s", ok, res)
 	}
 }
+
+// fakeConnections answers GET /connections with the uuids still connected.
+func fakeConnections(t *testing.T, live ...string) string {
+	dir, _ := os.MkdirTemp("", "xf")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "c.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(live)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/connections" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(b)
+	})}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+	return sock
+}
+
+func TestAgentEndsDaemonViewersTheFanoutReportsGone(t *testing.T) {
+	r, s, _ := newTestRegistry(t)
+	ts := func(pid int) map[string]any {
+		c := rec(7, "10.0.0.1", 100, 100)
+		c["container"], c["pid"] = "ts", pid
+		return c
+	}
+	r.Put("gone", ts(0))
+	r.Put("back", ts(0)) // reconnected with the same uuid since
+	r.Put("hls", rec(7, "10.0.0.2", 100, 100))
+	r.Put("php", ts(55)) // a PHP worker serves it
+	s.events = nil
+	a := &Agent{Logf: t.Logf, Registry: r, FanoutCtl: fakeConnections(t, "back")}
+	out := &fanoutReply{Events: []fanoutEvent{
+		{Type: "conn_close", Stream: "1", UUID: "gone"},
+		{Type: "conn_close", Stream: "1", UUID: "back"},
+		{Type: "conn_close", Stream: "1", UUID: "hls"},
+		{Type: "conn_close", Stream: "1", UUID: "php"},
+		{Type: "conn_close", Stream: "1", UUID: "nobody"},
+		{Type: "conn_close", Stream: "1", UUID: "bad uuid!"},
+	}}
+
+	if err := a.spoolFanout(out); err != nil || len(s.events) != 0 {
+		t.Fatalf("CONNECTIONS off: err %v, events %s", err, s.types())
+	}
+	a.flows.Store(FlowStreams | FlowCommands | FlowConnections)
+	if err := a.spoolFanout(out); err != nil {
+		t.Fatal(err)
+	}
+	if s.types() != "conn.close" || s.events[0]["d"].(map[string]any)["uuid"] != "gone" {
+		t.Fatalf("events %s %v", s.types(), s.events)
+	}
+	if r.Get("gone") != nil || r.Get("back") == nil || r.Get("hls") == nil || r.Get("php") == nil {
+		t.Fatal("wrong records ended")
+	}
+
+	// A full spool: nothing ends, and the same feed comes again.
+	r.Put("gone", ts(0))
+	s.events, s.fail = nil, true
+	if err := a.spoolFanout(out); err == nil || r.Get("gone") == nil {
+		t.Fatalf("err %v", err)
+	}
+	// A fanout that does not answer: nothing ends here (fanout_sync still reconciles).
+	s.fail = false
+	a.FanoutCtl = filepath.Join(t.TempDir(), "none.sock")
+	if err := a.spoolFanout(out); err != nil || r.Get("gone") == nil || len(s.events) != 0 {
+		t.Fatalf("err %v, events %s", err, s.types())
+	}
+}

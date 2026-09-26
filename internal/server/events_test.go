@@ -79,3 +79,27 @@ func TestEventsLongPollWakesOnATransition(t *testing.T) {
 		t.Fatalf("empty poll: %s", rec.Body.String())
 	}
 }
+
+func TestEventsPublishAViewersLastClose(t *testing.T) {
+	m := &Manager{events: newEventLog()}
+	st := &Stream{id: "9", mgr: m}
+	st.addConn("abc")
+	st.addConn("abc") // a second connection with the same uuid (a reconnect overlap)
+	st.removeConn("abc")
+	if out, _ := m.events.since(m.events.boot, 0); out != nil {
+		t.Fatalf("published while a connection remains: %+v", out)
+	}
+	st.removeConn("abc")
+	out, _ := m.events.since(m.events.boot, 0)
+	if out == nil || len(out.Events) != 1 || out.Events[0].Type != "conn_close" || out.Events[0].Stream != "9" || out.Events[0].UUID != "abc" {
+		t.Fatalf("%+v", out)
+	}
+	b, _ := json.Marshal(out.Events[0])
+	if string(b) != `{"seq":1,"type":"conn_close","stream":"9","uuid":"abc"}` {
+		t.Fatalf("wire form %s", b)
+	}
+	st.removeConn("abc") // unknown now: nothing more
+	if out, _ := m.events.since(m.events.boot, 1); out != nil {
+		t.Fatalf("%+v", out)
+	}
+}

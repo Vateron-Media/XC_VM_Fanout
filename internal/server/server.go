@@ -303,16 +303,22 @@ func (s *Stream) dropConn(uuid string) bool {
 }
 
 func (s *Stream) removeConn(uuid string) {
+	gone := false
 	s.connMu.Lock()
 	if s.conns != nil {
 		if cs := s.conns[uuid]; cs != nil {
 			cs.refs--
 			if cs.refs <= 0 {
 				delete(s.conns, uuid)
+				gone = true
 			}
 		}
 	}
 	s.connMu.Unlock()
+	// The viewer's last connection left: the agent ends it (GET /events).
+	if gone && s.mgr != nil && s.mgr.events != nil {
+		s.mgr.events.connClosed(s.id, uuid)
+	}
 }
 
 func (s *Stream) connUUIDs() []string {
