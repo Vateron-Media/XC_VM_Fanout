@@ -648,6 +648,9 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 	if a.Telemetry != nil {
 		payload["telemetry"] = a.Telemetry()
 	}
+	if audit := a.readAudit(); audit != nil {
+		payload["audit"] = audit
+	}
 	if a.Registry != nil && a.flows.Load()&FlowConnections != 0 {
 		payload["conn_digest"] = a.Registry.Digest()
 	}
