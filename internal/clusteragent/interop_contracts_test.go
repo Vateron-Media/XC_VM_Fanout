@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	cc "github.com/Vateron-Media/XC_VM_Fanout/internal/clustercrypto"
 )
 
 // interopNode enrols an agent by code against MAIN's real PHP ClusterApi
@@ -49,6 +51,7 @@ func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) s
 	}
 	code := runPHP("enrol_code.php")
 	var srv *exec.Cmd
+	dumpRouterLog(t, filepath.Join(dir, "main.sqlite"))
 	restart := func(extra ...string) {
 		if srv != nil {
 			srv.Process.Kill()
@@ -103,6 +106,31 @@ func serveSocket(t *testing.T, ctx context.Context, a *Agent) {
 // TestInteropAdmission: the node's PHP registers limited viewers with the
 // X-XCVM-Admission header it builds (AgentConnections::admission), the agent
 // asks MAIN's real conn_admit, and PHP reads the agent's answer.
+// The lease MAIN signs travels in the approval an enrol code gets, and the node
+// keeps it: PHP's LeaseService mints the bytes, the extension's `lea` tag signs
+// them and Go verifies them. It is the one place the two languages meet over
+// this document.
+func TestInteropTheApprovedEnrolCarriesALease(t *testing.T) {
+	a, _, _ := interopNode(t)
+	st := a.Client.State
+	if st.Lease == nil {
+		t.Fatalf("no lease after enrolling by code: refused=%q", st.LeaseRefused)
+	}
+	if st.LeaseRefused != "" {
+		t.Fatalf("refusal recorded: %q", st.LeaseRefused)
+	}
+	if st.Lease.ServerID != st.ServerID || st.Lease.Gen == 0 {
+		t.Fatalf("lease %+v for server %d", st.Lease, st.ServerID)
+	}
+	if !cc.VerifyPanel(st.PanelSignPub, "lea", st.Lease.Payload, st.Lease.Sig) {
+		t.Fatal("the stored bytes do not verify under the panel key MAIN sent")
+	}
+	// MAIN's cap, applied by the extension side and not by the agent.
+	if w := st.Lease.Exp - st.Lease.Iat; w <= 0 || w > MaxLeaseSec {
+		t.Fatalf("window %d s", w)
+	}
+}
+
 func TestInteropAdmission(t *testing.T) {
 	a, runPHP, ctx := interopNode(t)
 	runPHP("admission.php", "lines")

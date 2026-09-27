@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -123,6 +124,9 @@ type InstallData struct {
 	PolicyVer    int      `json:"policy_ver"`
 	Epoch        uint64   `json:"epoch"`
 	TokenSealed  []byte   `json:"token_sealed"`
+	// Lease is MAIN's lease for this node, raw so a malformed one costs the
+	// node its lease and not its enrolment (lease.go).
+	Lease json.RawMessage `json:"lease,omitempty"`
 }
 
 // Install completes the state with MAIN's first token after checking it opens
@@ -148,6 +152,12 @@ func Install(path string, d InstallData) error {
 	}
 	st.ServerID, st.PanelSignPub, st.PanelBoxPub, st.MainURLs, st.PolicyVer = d.ServerID, d.PanelSignPub, d.PanelBoxPub, d.MainURLs, d.PolicyVer
 	st.Epochs = []Epoch{{Epoch: d.Epoch, EphSk: st.PendingEphSk, TokenSealed: d.TokenSealed}}
+	// After the identity above: the lease is checked against this node's uuid,
+	// its server id and the panel key it was just given. Nothing is printed
+	// either way — MAIN's install flow compares this command's whole output to
+	// "OK" — and a refused lease is left to `xc_agent lease` and to MAIN's own
+	// `node.lease_refused` audit.
+	acceptLease(st, d.Lease)
 	st.PendingEphSk = nil
 	st.Enrolled = false
 	// A previous enrolment's (or MAIN's) URL sets are never dialled.

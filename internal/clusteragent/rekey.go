@@ -239,12 +239,13 @@ func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Toke
 		return nil, ErrTransport
 	}
 	var doc struct {
-		Typ         string `json:"typ"`
-		Node        string `json:"node"`
-		Nonce       string `json:"req_nonce"`
-		TokenSealed string `json:"token_sealed"`
-		Epoch       uint64 `json:"epoch"`
-		MainTimeMs  int64  `json:"main_time_ms"`
+		Typ         string          `json:"typ"`
+		Node        string          `json:"node"`
+		Nonce       string          `json:"req_nonce"`
+		TokenSealed string          `json:"token_sealed"`
+		Epoch       uint64          `json:"epoch"`
+		MainTimeMs  int64           `json:"main_time_ms"`
+		Lease       json.RawMessage `json:"lease"`
 	}
 	if json.Unmarshal(body, &doc) != nil || doc.Typ != "xcvm-rekey" || doc.Node != c.State.NodeUUID || doc.Nonce != hex.EncodeToString(nonce) {
 		return nil, ErrTransport
@@ -270,6 +271,9 @@ func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Toke
 	c.State.mu.Lock()
 	c.State.Epochs = []Epoch{e}
 	c.State.PendingEphSk = nil
+	// A re-key is how a node whose tokens all expired comes back; the lease that
+	// arrives with the new token is the one it serves on from here.
+	acceptLease(c.State, doc.Lease)
 	err = c.State.saveLocked()
 	c.State.mu.Unlock()
 	if err != nil {

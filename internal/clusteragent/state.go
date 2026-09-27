@@ -80,6 +80,16 @@ type State struct {
 	// node.root commands waiting behind one, until they are acked
 	// (artefact.go).
 	HeldCmds []HeldCmd `json:"held_cmds,omitempty"`
+	// Lease is MAIN's statement of how long this node may keep serving without
+	// reaching it, as it arrived beside a token (lease.go). Nil until MAIN sends
+	// one; nothing acts on it yet.
+	Lease *Lease `json:"lease,omitempty"`
+	// LeaseRefused is why the last lease MAIN sent was not kept, or "" when the
+	// one held was the last one sent. It is written here rather than logged
+	// because the paths a lease arrives on do not log (the Client is silent by
+	// design) and because an operator reads it after the fact, on a node that
+	// may have been restarted since.
+	LeaseRefused string `json:"lease_refused,omitempty"`
 
 	path string
 	mu   sync.Mutex

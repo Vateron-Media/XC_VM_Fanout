@@ -39,7 +39,8 @@ func TestInteropWithPanel(t *testing.T) {
 	harness, _ := filepath.Abs("testdata/panel")
 	port := freePort(t)
 	// A policy version other than 0, so MAIN recording it proves the agent said it.
-	env := append(os.Environ(), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+filepath.Join(dir, "main.sqlite"), fmt.Sprintf("XCVM_INTEROP_PORT=%d", port), "XCVM_INTEROP_POLICY_VER=5")
+	dbPath := filepath.Join(dir, "main.sqlite")
+	env := append(os.Environ(), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+dbPath, fmt.Sprintf("XCVM_INTEROP_PORT=%d", port), "XCVM_INTEROP_POLICY_VER=5")
 	// What MAIN keeps for the node: the policy it dials, the port, the audit.
 	mainNode := func() (row struct {
 		PolicyVer json.Number `json:"policy_ver"`
@@ -72,8 +73,9 @@ func TestInteropWithPanel(t *testing.T) {
 		t.Fatalf("enrol.php: %v\n%s", err, out)
 	}
 	var first struct {
-		TokenSealed  string `json:"token_sealed"`
-		PanelSignPub string `json:"panel_sign_pub"`
+		TokenSealed  string          `json:"token_sealed"`
+		PanelSignPub string          `json:"panel_sign_pub"`
+		Lease        json.RawMessage `json:"lease"`
 		Cluster      struct {
 			ServerID int64 `json:"server_id"`
 			Policy   struct {
@@ -90,6 +92,7 @@ func TestInteropWithPanel(t *testing.T) {
 
 	srv := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(harness, "router.php"))
 	srv.Env = env
+	dumpRouterLog(t, dbPath)
 	if err := srv.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -104,9 +107,22 @@ func TestInteropWithPanel(t *testing.T) {
 	if _, err := Probe(ctx, make([]byte, 32), first.Cluster.Policy.MainURLs); err == nil {
 		t.Fatal("probe accepted a health document under the wrong panel key")
 	}
-	if err := Install(statePath, InstallData{ServerID: first.Cluster.ServerID, PanelSignPub: panelPub, MainURLs: first.Cluster.Policy.MainURLs, PolicyVer: first.Cluster.Policy.PolicyVer, Epoch: 1, TokenSealed: sealed}); err != nil {
+	if err := Install(statePath, InstallData{ServerID: first.Cluster.ServerID, PanelSignPub: panelPub, MainURLs: first.Cluster.Policy.MainURLs, PolicyVer: first.Cluster.Policy.PolicyVer, Epoch: 1, TokenSealed: sealed, Lease: first.Lease}); err != nil {
 		t.Fatalf("install: %v", err)
 	}
+	// The lease MAIN's own LeaseService signed, verified here against the panel
+	// key: the one place the two languages meet over these bytes.
+	installed, err := loadRaw(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.Lease == nil {
+		t.Fatalf("the install data's lease was not kept: %s", installed.LeaseRefused)
+	}
+	if installed.Lease.ServerID != first.Cluster.ServerID || installed.Lease.Gen == 0 || installed.LeaseRefused != "" {
+		t.Fatalf("lease from MAIN: %+v refused=%q", installed.Lease, installed.LeaseRefused)
+	}
+	firstLeaseIat := installed.Lease.Iat
 	st := &State{MainURLs: first.Cluster.Policy.MainURLs}
 
 	loaded, err := LoadState(statePath)
@@ -180,6 +196,14 @@ func TestInteropWithPanel(t *testing.T) {
 	tok3, err := c.Refresh(ctx)
 	if err != nil || tok3.Epoch != 3 {
 		t.Fatalf("second refresh: %v %+v", err, tok3)
+	}
+	// Both refreshes carried a lease of MAIN's, the retried one included; the
+	// node holds the last it was sent, never an older copy.
+	if loaded.Lease == nil || loaded.LeaseRefused != "" {
+		t.Fatalf("no lease after the refreshes: refused=%q", loaded.LeaseRefused)
+	}
+	if loaded.Lease.Iat < firstLeaseIat {
+		t.Fatalf("the refresh replaced the lease with an older one: %d < %d", loaded.Lease.Iat, firstLeaseIat)
 	}
 
 	var d *Denial
@@ -345,4 +369,20 @@ func waitPort(t *testing.T, port int) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("php -S did not start")
+}
+
+// dumpRouterLog prints the harness router's log (its requests, and the text of
+// any throwable MAIN's code raised) when the test fails. Without it a fatal in
+// the panel reads as a bare "HTTP 500" on the agent's side: php -S does not pass
+// the router script's STDERR through.
+func dumpRouterLog(t *testing.T, dbPath string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		if b, err := os.ReadFile(dbPath + ".log"); err == nil && len(b) > 0 {
+			t.Logf("MAIN harness log:\n%s", b)
+		}
+	})
 }

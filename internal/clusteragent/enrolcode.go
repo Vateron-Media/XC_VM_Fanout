@@ -320,6 +320,7 @@ func (cl *codeClient) install(st *State, body []byte, h http.Header, boxPub []by
 				MainURLs  []string `json:"main_urls"`
 			} `json:"policy"`
 		} `json:"cluster"`
+		Lease json.RawMessage `json:"lease"`
 	}
 	if json.Unmarshal(body, &doc) != nil || doc.NodeUUID != st.NodeUUID || doc.ServerID != int64(cl.code.ServerID) || doc.Epoch != 1 {
 		return errors.New("clusteragent: the approval is not for this node")
@@ -338,6 +339,9 @@ func (cl *codeClient) install(st *State, body []byte, h http.Header, boxPub []by
 	}
 	st.ServerID, st.PanelSignPub, st.PanelBoxPub, st.MainURLs, st.PolicyVer = doc.ServerID, cl.panelPub, boxPub, urls, doc.Cluster.Policy.PolicyVer
 	st.Epochs = []Epoch{{Epoch: 1, EphSk: st.PendingEphSk, TokenSealed: sealed}}
+	// After the identity above, as in Install: the approval's lease is for this
+	// node, this server and the key the code pinned.
+	acceptLease(st, doc.Lease)
 	st.PendingEphSk = nil
 	st.Enrolled = false
 	// A previous enrolment's (or MAIN's) URL sets are never dialled.
