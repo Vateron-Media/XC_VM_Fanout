@@ -235,3 +235,88 @@ func TestInteropHTTPSRequiredRecovery(t *testing.T) {
 		t.Fatalf("adopted an older policy: v%d %s", st.PolicyVer, st.Transport)
 	}
 }
+
+// TestInteropIngestLaneRefusals: MAIN's real ingest permits, on a cluster bus
+// (a redis-server of the test's) with one permit per lane. While a request
+// MAIN is serving holds a lane's permit, the agent's config (bulk) and P0
+// events are refused with the lane named; the agent counts the refusal,
+// logs no error, and its next try after MAIN's wait is served.
+func TestInteropIngestLaneRefusals(t *testing.T) {
+	redis, err := exec.LookPath("redis-server")
+	if err != nil {
+		t.Skip("redis-server not found")
+	}
+	a, runPHP, ctx, restart := interopNodeEnv(t)
+	sockDir, _ := os.MkdirTemp("", "xcbus")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	bus := filepath.Join(sockDir, "bus.sock")
+	rs := exec.Command(redis, "--port", "0", "--unixsocket", bus, "--save", "", "--appendonly", "no")
+	if err := rs.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rs.Process.Kill(); rs.Wait() })
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(bus); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	restart("XCVM_INTEROP_BUS=" + bus)
+	logs := &logSink{}
+	a.Logf = logs.logf(t)
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(20 * time.Second); !ok(); time.Sleep(20 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+		}
+	}
+
+	// Bulk: config is refused while bulk's one permit is held.
+	held := runPHP("permit.php", bus, "hold", "bulk")
+	a.ReplicaDir = filepath.Join(t.TempDir(), "replica")
+	old := ReplicaPoll
+	ReplicaPoll = time.Hour
+	t.Cleanup(func() { ReplicaPoll = old })
+	rctx, stopReplica := context.WithCancel(ctx)
+	replicaDone := make(chan struct{})
+	go func() { a.RunReplica(rctx); close(replicaDone) }()
+	waitFor("config's lane refusal", func() bool { return a.BusyRefusals() >= 1 })
+	runPHP("permit.php", bus, "release", "bulk", held)
+	waitFor("the replica after the busy wait", func() bool { return LoadReplicaState(a.ReplicaDir).SettingsEtag != "" })
+	stopReplica()
+	<-replicaDone
+
+	// P0: a batch is refused while P0's one permit is held, then sent again.
+	before := a.BusyRefusals()
+	held = runPHP("permit.php", bus, "hold", "p0")
+	spool(t, a.SpoolDir, "p0", 1, "a")
+	ectx, stopEvents := context.WithCancel(ctx)
+	eventsDone := make(chan struct{})
+	go func() { a.RunEvents(ectx, Lanes[0]); close(eventsDone) }()
+	waitFor("P0's lane refusal", func() bool { return a.BusyRefusals() > before })
+	if _, err := os.Stat(filepath.Join(a.SpoolDir, "p0.inflight")); err != nil {
+		t.Fatalf("the refused batch is not kept in flight: %v", err)
+	}
+	runPHP("permit.php", bus, "release", "p0", held)
+	waitFor("the P0 batch after the busy wait", func() bool {
+		_, err := os.Stat(filepath.Join(a.SpoolDir, "p0.inflight"))
+		return os.IsNotExist(err)
+	})
+	stopEvents()
+	<-eventsDone
+	var state struct {
+		P0 int64 `json:"p0"`
+	}
+	if err := json.Unmarshal([]byte(runPHP("events.php", "state")), &state); err != nil || state.P0 < 1 {
+		t.Fatalf("MAIN's P0 cursor %d: %v", state.P0, err)
+	}
+	// Logged as an error, a refusal would read "MAIN refused (503 RATE_LIMITED)".
+	if logs.has("RATE_LIMITED") || logs.has("cluster: replica:") {
+		t.Fatalf("a busy refusal was logged as an error: %v", logs.lines)
+	}
+}

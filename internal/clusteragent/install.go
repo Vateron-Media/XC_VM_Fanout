@@ -150,5 +150,7 @@ func Install(path string, d InstallData) error {
 	st.Epochs = []Epoch{{Epoch: d.Epoch, EphSk: st.PendingEphSk, TokenSealed: d.TokenSealed}}
 	st.PendingEphSk = nil
 	st.Enrolled = false
+	// A previous enrolment's (or MAIN's) URL sets are never dialled.
+	st.KnownGoodURLs = nil
 	return st.Save()
 }

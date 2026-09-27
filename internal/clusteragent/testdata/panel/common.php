@@ -9,6 +9,43 @@ $rPanel = rtrim((string) getenv('XCVM_PANEL_DIR'), '/');
 $rDbFile = (string) getenv('XCVM_INTEROP_DB');
 require $rPanel . '/tests/bootstrap.php';
 
+/**
+ * A table of the panel's install schema (src/bin/install/database.sql) as
+ * SQLite takes it, so the harness's tables have every column the panel's
+ * code reads and do not drift from it: KEY lines, collations, `unsigned`,
+ * comments and ON UPDATE go; an AUTO_INCREMENT column becomes SQLite's
+ * INTEGER PRIMARY KEY AUTOINCREMENT; an enum is text.
+ */
+function interopTable(string $rPanel, string $rName): string {
+	static $rSchema = null;
+	$rSchema ??= (string) file_get_contents($rPanel . '/src/bin/install/database.sql');
+	if (!preg_match('/CREATE TABLE IF NOT EXISTS `' . preg_quote($rName, '/') . '` \((.*?)\n\) ENGINE=[^;]*;/s', $rSchema, $rMatch)) {
+		throw new RuntimeException('database.sql has no table ' . $rName);
+	}
+	$rAuto = null;
+	$rCols = [];
+	foreach (explode("\n", trim($rMatch[1])) as $rLine) {
+		$rLine = rtrim(trim($rLine), ',');
+		if ($rLine === '' || preg_match('/^(UNIQUE |FULLTEXT |SPATIAL )?(KEY|INDEX) /', $rLine) || str_starts_with($rLine, 'CONSTRAINT ')) {
+			continue;
+		}
+		if (preg_match('/^`(\w+)` .*AUTO_INCREMENT/', $rLine, $rCol)) {
+			$rAuto = $rCol[1];
+			$rCols[] = '`' . $rAuto . '` INTEGER PRIMARY KEY AUTOINCREMENT';
+			continue;
+		}
+		if (str_starts_with($rLine, 'PRIMARY KEY')) {
+			if ($rAuto === null) {
+				$rCols[] = (string) preg_replace('/ USING \w+$/', '', $rLine);
+			}
+			continue;
+		}
+		$rLine = (string) preg_replace(["/ COMMENT '(?:[^'\\\\]|\\\\.)*'/", '/ (COLLATE|CHARACTER SET) \w+/', '/ unsigned/', '/ ON UPDATE CURRENT_TIMESTAMP(\(\))?/', "/ (enum|set)\('[^)]*\)/"], ['', '', '', '', ' text'], $rLine);
+		$rCols[] = $rLine;
+	}
+	return 'CREATE TABLE `' . $rName . '` (' . implode(', ', $rCols) . ')';
+}
+
 $rNew = !file_exists($rDbFile);
 $rDb = new TestDb(new PDO('sqlite:' . $rDbFile));
 if ($rNew) {
@@ -25,14 +62,27 @@ if ($rNew) {
 	$rDb->exec('ALTER TABLE `cluster_enrol_requests` ADD COLUMN `agent_eph_pub` binary(32) DEFAULT NULL');
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `root_ready` tinyint(1) NOT NULL DEFAULT 0');
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `features` varchar(255) DEFAULT NULL');
-	$rDb->exec('CREATE TABLE `servers` (`id` INTEGER PRIMARY KEY, `status` int NOT NULL DEFAULT 0)');
-	$rDb->exec('INSERT INTO `servers` (`id`, `status`) VALUES (7, 0)');
-	$rDb->exec('CREATE TABLE `streams_servers` (`server_stream_id` INTEGER PRIMARY KEY, `stream_id` int, `server_id` int, `parent_id` int, `pid` int, `to_analyze` int, `current_source` text, `monitor_pid` int, `stream_status` int DEFAULT 0, `stream_started` int, `stream_info` text, `audio_codec` text, `video_codec` text, `resolution` int, `bitrate` int, `compatible` int)');
+	// Migrations 045 and 046: the node's audit, and the MAIN port it last reached.
+	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `audit` text DEFAULT NULL');
+	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `main_port` int DEFAULT NULL');
+	// The tables the panel's code under test reads, from its own install
+	// schema. The replica's servers and node sections read every column.
+	foreach (['servers', 'crontab', 'streams_servers', 'streams', 'recordings', 'settings', 'cluster_stream_ver'] as $rTable) {
+		$rDb->exec(interopTable($rPanel, $rTable));
+	}
+	$rDb->exec("INSERT INTO `servers` (`id`, `status`, `server_name`, `http_broadcast_port`, `total_clients`) VALUES (7, 0, 'LB 7', 8080, 1000)");
+	// The crontab section: enabled rows whose role fits the node's mode.
+	$rDb->exec("INSERT INTO `crontab` (`filename`, `time`, `enabled`, `role`) VALUES ('cache', '* * * * *', 1, 'all'), ('users', '*/5 * * * *', 1, 'legacy'), ('epg', '0 */6 * * *', 1, 'main'), ('servers', '* * * * *', 0, 'all')");
 	$rDb->exec('INSERT INTO `streams_servers` (`server_stream_id`, `stream_id`, `server_id`, `pid`) VALUES (70, 100, 7, 0)');
-	$rDb->exec('CREATE TABLE `streams` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `type` int, `stream_display_name` text, `stream_source` text, `target_container` text, `year` text, `movie_properties` text, `rating` int, `read_native` int, `movie_symlink` int, `remove_subtitles` int, `transcode_profile_id` int, `order` int, `added` int, `category_id` text, `tv_archive_server_id` int, `tv_archive_pid` int)');
 	$rDb->exec("INSERT INTO `streams` (`id`, `type`, `tv_archive_server_id`) VALUES (100, 1, 7)");
-	$rDb->exec('CREATE TABLE `recordings` (`id` INTEGER PRIMARY KEY, `created_id` int, `category_id` text, `bouquets` text, `title` text, `description` text, `start` int, `end` int, `source_id` int, `status` int)');
-	$rDb->exec("INSERT INTO `recordings` VALUES (1, NULL, '[]', '[]', 'Match', '', 1800000000, 1800003600, 7, 1)");
+	// The recording of stream 100 on server 7 the content test finishes.
+	$rDb->exec("INSERT INTO `recordings` (`id`, `stream_id`, `created_id`, `category_id`, `bouquets`, `title`, `description`, `start`, `end`, `source_id`, `status`) VALUES (1, 100, NULL, '[]', '[]', 'Match', '', 1800000000, 1800003600, 7, 1)");
+	// Migration 047's data: every server holding a stream gets its row at
+	// version 0, and the counter starts at 1 (R2 streams versions).
+	$rDb->exec('INSERT OR IGNORE INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `server_id`, `stream_id`, 0, 0 FROM `streams_servers` WHERE `server_id` > 0 AND `stream_id` > 0');
+	$rDb->exec('INSERT OR IGNORE INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `tv_archive_server_id`, `id`, 0, 0 FROM `streams` WHERE `tv_archive_server_id` > 0');
+	$rDb->exec('INSERT OR IGNORE INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `source_id`, `stream_id`, 0, 0 FROM `recordings` WHERE `source_id` > 0 AND `stream_id` > 0');
+	$rDb->exec("INSERT OR IGNORE INTO `cluster_meta` (`name`, `value`, `updated_at`) VALUES ('stream_ver', '1', 0)");
 	$rDb->exec('CREATE TABLE `lines_live` (`activity_id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_id` int, `stream_id` int, `server_id` int, `proxy_id` int, `user_agent` text, `user_ip` text, `container` text, `pid` int, `date_start` int, `geoip_country_code` text, `isp` text, `external_device` text, `hls_last_read` int, `hls_end` int DEFAULT 0, `hmac_id` int, `hmac_identifier` text, `uuid` text)');
 	$rDb->exec('CREATE TABLE `bouquets` (`id` INTEGER PRIMARY KEY, `bouquet_movies` text)');
 	$rDb->exec('CREATE TABLE `cluster_changes` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `section` varchar(32), `op` varchar(8), `kind` varchar(16), `value` varchar(255), `time` int)');
@@ -40,8 +90,8 @@ if ($rNew) {
 	$rDb->exec('CREATE TABLE `blocked_uas` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_agent` varchar(255), `exact_match` int DEFAULT 0)');
 	$rDb->exec('CREATE TABLE `blocked_isps` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `isp` text, `blocked` int DEFAULT 0)');
 	$rDb->exec('CREATE TABLE `blocked_asns` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `asn` int, `blocked` int DEFAULT 0)');
-	$rDb->exec('CREATE TABLE `settings` (`id` int, `server_name` text, `seg_time` int, `api_pass` text)');
-	$rDb->exec("INSERT INTO `settings` VALUES (1, 'Interop', 6, 'secret')");
+	// live_streaming_pass is the secrets section's; the settings section withholds it.
+	$rDb->exec("INSERT INTO `settings` (`id`, `server_name`, `seg_time`, `api_pass`, `live_streaming_pass`, `cloudflare`) VALUES (1, 'Interop', 6, 'secret', 'InteropStreamPass', 0)");
 	$rDb->exec('CREATE TABLE `rtmp_ips` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `ip` varchar(255), `password` varchar(128), `push` int, `pull` int)');
 	$rDb->exec('CREATE TABLE `streams_logs` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `stream_id` int, `server_id` int, `action` text, `source` text, `date` int)');
 }
@@ -50,7 +100,18 @@ $rSettings = ['cluster_api_enabled' => 1, 'lb_token_rotation_min' => (int) (gete
 if (getenv('XCVM_INTEROP_TRANSPORT')) {
 	// The transport policy as an admin set it (https_required drill).
 	$rSettings['cluster_transport'] = (string) getenv('XCVM_INTEROP_TRANSPORT');
+}
+if (getenv('XCVM_INTEROP_POLICY_VER') !== false) {
 	$rSettings['cluster_policy_ver'] = (int) getenv('XCVM_INTEROP_POLICY_VER');
+}
+if (getenv('XCVM_INTEROP_BUS')) {
+	// MAIN's cluster bus (a redis-server the test runs), with one ingest permit per lane.
+	\XcVm\Domain\Cluster\ClusterBus::useSocket((string) getenv('XCVM_INTEROP_BUS'));
+	$rSettings['cluster_ingest_concurrency'] = 1;
+}
+if (method_exists(\XcVm\Core\Config\OpensslExtra::class, 'usePrevFile')) {
+	// The secrets section's previous OPENSSL_EXTRA: none, and never the deploy root's config/.
+	\XcVm\Core\Config\OpensslExtra::usePrevFile(dirname($rDbFile) . '/openssl_extra.prev');
 }
 SettingsManager::set($rSettings);
 $rMain = ['server_ip' => '127.0.0.1', 'http_broadcast_port' => (int) getenv('XCVM_INTEROP_PORT'), 'enable_https' => 1, 'domain_name' => 'main.invalid', 'https_broadcast_port' => 1];

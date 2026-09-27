@@ -14,7 +14,16 @@
 // ones (the adm claim, MAIN's conn_admit, or MAIN's offline policy), and
 // sends HLS touches on the P2 lane when MAIN takes them. Heartbeats go at
 // most 3 s apart; under https_required the agent follows the signed challenge
-// over plain HTTP while HTTPS fails.
+// over plain HTTP while HTTPS fails. Hello and heartbeat say which policy the
+// agent dials (policy_ver), and it keeps its last 3 known-good MAIN URL sets
+// to fall back on. P0 events have a connection of their own, and a busy
+// refusal of an ingest lane is waited out, not logged.
+//
+// The node replica (replica/ beside the state) holds the blocklist and the
+// sections MAIN sends whole (settings, servers, node, crontab, cluster, and
+// secrets, 0600 and never logged); `console.php cluster:apply` runs after a
+// change, and config.changed fetches at once. Heartbeats relay the node's
+// audit.json (at most 16 KiB) as `audit`.
 //
 // The node's state file (default /home/xc_vm/config/cluster/agent.json, 0600)
 // is written by the panel's install flow over SSH: node uuid, server id, the

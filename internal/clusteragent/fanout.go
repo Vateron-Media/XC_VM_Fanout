@@ -243,6 +243,12 @@ var dropUUID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 // reach, goes to next (the node's PHP, cluster:exec).
 func (a *Agent) localExec(next Executor) Executor {
 	return func(ctx context.Context, cmd *Command, w WireCommand) (bool, []byte) {
+		if cmd.Type == "config.changed" && a.ReplicaDir != "" {
+			// Another node's key changed hands: fetch the replica now, and
+			// ack without waiting for the sync.
+			a.ConfigChanged()
+			return true, []byte(`{"result":true}`)
+		}
 		if cmd.Type == "conn.close" && a.Registry != nil {
 			uuid, _ := cmd.Args["uuid"].(string)
 			if !connUUID.MatchString(uuid) {

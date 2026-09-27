@@ -26,6 +26,8 @@ type replicaMain struct {
 	boxPub   []byte
 	next     []map[string]any
 	settings []map[string]any // sent with the next replies, one each
+	whole    []map[string]any // whole sections by name, merged into the next replies, one each
+	deny     string           // refuse the next request with this 503 reason
 	asked    []map[string]any
 }
 
@@ -47,6 +49,12 @@ func (m *replicaMain) answer(w http.ResponseWriter, r *http.Request, reqCtx, non
 	var req map[string]any
 	json.Unmarshal(plain, &req)
 	m.asked = append(m.asked, req)
+	if m.deny != "" {
+		reason := m.deny
+		m.deny = ""
+		m.fakeMain.refuse(w, 503, nonce, reason, nil)
+		return
+	}
 	out := map[string]any{"blocklist": map[string]any{"seq": 0, "more": false}}
 	if len(m.next) > 0 {
 		out = map[string]any{"blocklist": m.next[0]}
@@ -55,6 +63,12 @@ func (m *replicaMain) answer(w http.ResponseWriter, r *http.Request, reqCtx, non
 	if len(m.settings) > 0 {
 		out["settings"] = m.settings[0]
 		m.settings = m.settings[1:]
+	}
+	if len(m.whole) > 0 {
+		for k, v := range m.whole[0] {
+			out[k] = v
+		}
+		m.whole = m.whole[1:]
 	}
 	ts := uint64(time.Now().UnixMilli())
 	rn := make([]byte, 16)

@@ -127,7 +127,7 @@ func laneFor(a *Agent, name string) *laneSpool {
 func drain(t *testing.T, a *Agent, ls *laneSpool, next int64) int64 {
 	t.Helper()
 	for i := 0; i < 20; i++ {
-		n, err := a.shipOnce(context.Background(), ls, next)
+		n, _, err := a.shipOnce(context.Background(), ls, next)
 		if err != nil {
 			t.Logf("ship: %v", err)
 		}

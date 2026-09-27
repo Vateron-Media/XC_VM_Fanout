@@ -183,20 +183,34 @@ func (a *Agent) setP2(on bool) {
 }
 
 // RunTouches is the P2 loop: every TouchLoop, one request with the touches
-// due, until ctx ends or MAIN stops the node.
+// due (at most one batch: a larger backlog goes a batch per interval), until
+// ctx ends or MAIN stops the node.
+//
+// A refusal of the bulk lane (503 RATE_LIMITED with lane "bulk") stretches
+// the loop's interval (laneInterval): the touches due then go after the
+// longer of the busy wait and the doubled interval, and each batch MAIN
+// serves halves it back toward TouchLoop.
 func (a *Agent) RunTouches(ctx context.Context) {
+	iv := newLaneInterval(TouchLoop)
 	backoff := TouchLoop
 	for sleep(ctx, backoff) {
-		backoff = TouchLoop
+		backoff = iv.cur
 		if a.Registry == nil || !a.p2Touch.Load() {
 			continue
 		}
-		err := a.sendTouches(ctx)
+		served, err := a.sendTouchBatch(ctx)
+		wait, busy := iv.next(served, err)
+		backoff = wait
 		if err == nil {
 			continue
 		}
 		if fatal(err) || ctx.Err() != nil {
 			return
+		}
+		if busy {
+			// MAIN's bulk permits are all held: busy, not failing.
+			a.busyRefusals.Add(1)
+			continue
 		}
 		var d *Denial
 		if errors.As(err, &d) && d.Status == 400 && d.Reason == "BAD_REQUEST" {
@@ -208,43 +222,46 @@ func (a *Agent) RunTouches(ctx context.Context) {
 		if !errors.Is(err, ErrNoEpoch) {
 			a.logf("cluster: events p2: %v", err)
 		}
-		backoff = min(max(time.Second, TouchLoop*2), 30*time.Second)
-		if w, ok := busyWait(err); ok {
-			backoff = max(backoff, w)
+	}
+}
+
+// sendTouches sends every touch due, a batch after another, one request at
+// a time.
+func (a *Agent) sendTouches(ctx context.Context) error {
+	for {
+		served, err := a.sendTouchBatch(ctx)
+		if err != nil || !served {
+			return err
 		}
 	}
 }
 
-// sendTouches sends the touches due in batches of at most MaxBatchEvents
-// events and MaxBatchBytes, one request at a time.
-func (a *Agent) sendTouches(ctx context.Context) error {
-	for {
-		due := a.Registry.dueTouches(MaxBatchEvents)
-		if len(due) == 0 {
-			return nil
-		}
-		var events []map[string]any
-		var sent []touch
-		size := 0
-		for _, t := range due {
-			ev := map[string]any{"type": P2Touch, "t": touchNowMs(), "d": map[string]any{"uuid": t.uuid, "hls_last_read": t.value}}
-			b, _ := json.Marshal(ev)
-			if len(events) > 0 && size+len(b)+1 > MaxBatchBytes {
-				break
-			}
-			size += len(b) + 1
-			events, sent = append(events, ev), append(sent, t)
-		}
-		var out EventsResult
-		if err := a.Client.Call(ctx, "events", map[string]any{"lane": "p2", "events": events}, &out, false); err != nil {
-			return err
-		}
-		if out.Dropped > 0 {
-			a.logf("cluster: events p2: MAIN dropped %d of %d touch(es)", out.Dropped, len(events))
-		}
-		a.Registry.touchesSent(sent)
-		if len(due) < MaxBatchEvents && len(sent) == len(due) {
-			return nil
-		}
+// sendTouchBatch sends one batch of the touches due, at most MaxBatchEvents
+// events and MaxBatchBytes, and reports whether MAIN served one.
+func (a *Agent) sendTouchBatch(ctx context.Context) (bool, error) {
+	due := a.Registry.dueTouches(MaxBatchEvents)
+	if len(due) == 0 {
+		return false, nil
 	}
+	var events []map[string]any
+	var sent []touch
+	size := 0
+	for _, t := range due {
+		ev := map[string]any{"type": P2Touch, "t": touchNowMs(), "d": map[string]any{"uuid": t.uuid, "hls_last_read": t.value}}
+		b, _ := json.Marshal(ev)
+		if len(events) > 0 && size+len(b)+1 > MaxBatchBytes {
+			break
+		}
+		size += len(b) + 1
+		events, sent = append(events, ev), append(sent, t)
+	}
+	var out EventsResult
+	if err := a.Client.Call(ctx, "events", map[string]any{"lane": "p2", "events": events}, &out, false); err != nil {
+		return false, err
+	}
+	if out.Dropped > 0 {
+		a.logf("cluster: events p2: MAIN dropped %d of %d touch(es)", out.Dropped, len(events))
+	}
+	a.Registry.touchesSent(sent)
+	return true, nil
 }

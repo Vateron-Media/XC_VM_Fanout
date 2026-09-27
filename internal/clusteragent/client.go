@@ -40,6 +40,10 @@ type Denial struct {
 	MainTimeMs   int64  `json:"main_time_ms"`
 	RetryAfterMs int64  `json:"retry_after_ms"`
 	Op           string `json:"op"`
+	// Lane, on a 503 RATE_LIMITED to an ingest op: the ingest permit's lane
+	// ("p0" or "bulk") that had none free (retry.go). A per-op semaphore's
+	// refusal has none.
+	Lane string `json:"lane"`
 	// CommandsSealed, on a hard-mode LICENCE_INVALID: the node's pending
 	// restrictive commands, sealed to it (sealed.go).
 	CommandsSealed string          `json:"commands_sealed"`
@@ -68,6 +72,10 @@ type Client struct {
 
 	// LongHTTP carries the commands long-poll, which MAIN holds open.
 	LongHTTP *http.Client
+	// P0HTTP carries P0 events alone, over a keep-alive connection of their
+	// own with one request in flight, so a bulk upload never queues them
+	// (ADR 0004, ingest permits).
+	P0HTTP *http.Client
 
 	// OnDenial, when set, sees every verified denial of a session op.
 	OnDenial func(*Denial)
@@ -79,6 +87,10 @@ type Client struct {
 	// failed holds the MAIN URLs that could not be reached (connect, TLS or
 	// timeout), each until it is tried first again (URLRetry).
 	failed map[string]time.Time
+	// fellBack is set when MAIN answered through a fallback URL only (a
+	// known-good set's URL the current policy does not list); the agent then
+	// says hello to fetch MAIN's policy (Agent.Run).
+	fellBack atomic.Bool
 }
 
 // URLRetry is how long a MAIN URL that could not be reached is tried after
@@ -97,11 +109,22 @@ func newTransport() *http.Transport {
 	return t
 }
 
-// urls is MAIN's URLs in the order to try them: the policy's order, with the
-// ones that recently could not be reached last.
+// newP0Transport is P0's own: one connection to a MAIN URL, kept alive, so
+// one P0 request is in flight at a time and never waits behind bulk.
+func newP0Transport() *http.Transport {
+	t := newTransport()
+	t.MaxConnsPerHost = 1
+	t.MaxIdleConnsPerHost = 1
+	return t
+}
+
+// urls is MAIN's URLs in the order to try them: the current policy's URLs,
+// then the fallback URLs of the known-good sets (known.go), each group in its
+// order, with the ones that recently could not be reached last (the current
+// ones, then the fallback ones).
 func (c *Client) urls() []string {
 	c.State.mu.Lock()
-	all := append([]string{}, c.State.MainURLs...)
+	all := append(append([]string{}, c.State.MainURLs...), c.State.fallbackURLsLocked()...)
 	c.State.mu.Unlock()
 	now := c.now()
 	c.mu.Lock()
@@ -118,8 +141,10 @@ func (c *Client) urls() []string {
 	return append(good, bad...)
 }
 
-// reached notes whether a MAIN URL answered. err is the request's error;
-// a failure the caller's own context caused says nothing of the URL.
+// reached notes whether a MAIN URL answered. err is the request's error, or
+// ErrTransport for an answer that did not authenticate; a failure the
+// caller's own context caused says nothing of the URL. A URL that failed is
+// only tried after the others for URLRetry, never dropped.
 func (c *Client) reached(ctx context.Context, base string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -143,6 +168,7 @@ func NewClient(st *State, agent string) *Client {
 		State:    st,
 		HTTP:     &http.Client{Timeout: 10 * time.Second, Transport: newTransport()},
 		LongHTTP: &http.Client{Timeout: 45 * time.Second, Transport: newTransport()},
+		P0HTTP:   &http.Client{Timeout: 10 * time.Second, Transport: newP0Transport()},
 		Agent:    agent,
 		sessions: map[uint64]session{},
 		now:      time.Now,
@@ -206,20 +232,34 @@ func (c *Client) Call(ctx context.Context, op string, payload, out any, signNode
 	return c.call(ctx, s, op, payload, out, signNode)
 }
 
+// CallP0 sends a P0 events batch over P0's own connection (P0HTTP).
+func (c *Client) CallP0(ctx context.Context, payload, out any) error {
+	s, ok := c.current()
+	if !ok {
+		return ErrNoEpoch
+	}
+	return c.callVia(ctx, c.P0HTTP, s, "events", payload, out, false)
+}
+
 // A REPLAY that says when a request stamped anew will pass is retried once
 // (retry.go).
 func (c *Client) call(ctx context.Context, s session, op string, payload, out any, signNode bool) error {
+	return c.callVia(ctx, nil, s, op, payload, out, signNode)
+}
+
+// callVia is call over hc; nil takes the op's usual client.
+func (c *Client) callVia(ctx context.Context, hc *http.Client, s session, op string, payload, out any, signNode bool) error {
 	plain, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	return withReplay(ctx, c.setMainTime, func() error { return c.callOnce(ctx, s, op, plain, out, signNode) })
+	return withReplay(ctx, c.setMainTime, func() error { return c.callOnce(ctx, hc, s, op, plain, out, signNode) })
 }
 
 // setMainTime takes MAIN's clock from an authenticated main_time_ms.
 func (c *Client) setMainTime(mainMs int64) { c.offsetMs.Store(mainMs - c.now().UnixMilli()) }
 
-func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byte, out any, signNode bool) error {
+func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op string, plain []byte, out any, signNode bool) error {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return err
@@ -250,22 +290,43 @@ func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byt
 		h.Set(cc.HNodeSig, hex.EncodeToString(cc.SignNode(c.State.SignKey(), "request", append(append([]byte{}, reqCtx...), cc.SHA256(body)...))))
 	}
 
-	var lastErr error = ErrTransport
-	for _, base := range c.urls() {
-		hc := c.HTTP
+	if hc == nil {
+		hc = c.HTTP
 		if op == "commands" && c.LongHTTP != nil {
 			hc = c.LongHTTP
 		}
+	}
+	var lastErr error = ErrTransport
+	for _, base := range c.urls() {
 		st, rh, rb, err := c.postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
-		c.reached(ctx, base, err)
 		if err != nil {
+			c.reached(ctx, base, err)
 			lastErr = err
 			continue
 		}
 		if st == http.StatusOK && strings.EqualFold(rh.Get("Content-Type"), octet) {
-			return c.openReply(s, reqCtx, st, rh, rb, out)
+			err := c.openReply(s, reqCtx, st, rh, rb, out)
+			if errors.Is(err, ErrTransport) {
+				// An answer that does not authenticate is this URL's failure
+				// (ADR 0004, "MAIN endpoint changes (Phase 3, third
+				// increment)"): whoever answers there now is not MAIN.
+				c.reached(ctx, base, ErrTransport)
+				lastErr = err
+				continue
+			}
+			// The MAC verified and the BOX opened: MAIN answered here, and
+			// that is final even when the reply does not decode into out.
+			c.reached(ctx, base, nil)
+			c.answered(base)
+			return err
 		}
+		c.reached(ctx, base, nil)
 		if d := c.denial(st, rh, rb, nonce); d != nil {
+			if d.Reason != "HTTPS_REQUIRED" {
+				// Reached MAIN, but one that refuses ops over this URL is no
+				// known-good answer.
+				c.answered(base)
+			}
 			if c.OnDenial != nil {
 				c.OnDenial(d)
 			}

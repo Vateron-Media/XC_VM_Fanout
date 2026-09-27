@@ -66,6 +66,19 @@ type Agent struct {
 	fenced             atomic.Bool  // MAIN refuses the session for want of a licence
 	acking             atomic.Bool  // sealed commands are being acked
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
+	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
+	replicaMu          sync.Mutex   // one replica sync or check at a time (replica.go)
+	replicaKeys        string       // the keys the stored records were last checked with (replicaMu)
+	kickOnce           sync.Once
+	syncKick           chan struct{} // config.changed: sync now (replica.go)
+	applyKick          chan struct{} // the CONFIG flow changed: apply now
+	applyMu            sync.Mutex    // one cluster:apply at a time
+	lastApply          time.Time
+	configSeen         atomic.Int64 // the CONFIG bit of the flows last published, +1 (0: none yet)
+	// When the agent last said hello because MAIN answered through a
+	// fallback URL only, and under which policy version (Run's loop only).
+	fallbackHelloAt  time.Time
+	fallbackHelloVer int
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -98,6 +111,23 @@ type Reply struct {
 // Features are what this agent tells MAIN at hello that it does, so MAIN
 // stands down its own copy: "hls_reaper" (Registry.Reap).
 var Features = []string{"hls_reaper"}
+
+// FeatureConfigChanged, said at hello by an agent that keeps the replica and
+// runs MAIN's commands, has MAIN send it config.changed (replica.go).
+const FeatureConfigChanged = "config_changed"
+
+// features is what this agent says at hello.
+func (a *Agent) features() []string {
+	out := append([]string{}, Features...)
+	if a.ReplicaDir != "" && (a.Exec != nil || a.run != nil) {
+		out = append(out, FeatureConfigChanged)
+	}
+	return out
+}
+
+// BusyRefusals counts the ingest lane refusals MAIN has sent (503
+// RATE_LIMITED with lane): busy, not failing, so never logged as errors.
+func (a *Agent) BusyRefusals() int64 { return a.busyRefusals.Load() }
 
 // ErrStop is returned when MAIN has told the node to stop: it was revoked or
 // is unknown, or its enrolment was never completed in time. An expired token
@@ -197,6 +227,7 @@ func (a *Agent) publish(r *Reply) {
 	a.setOfflineAdmission(r.OfflineAdmission)
 	a.setP2(a.p2Wanted(r))
 	if a.FlowsFile == "" {
+		a.configFlow(r.Flows)
 		return
 	}
 	doc := map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State}
@@ -231,6 +262,8 @@ func (a *Agent) publish(r *Reply) {
 		return
 	}
 	a.flowsSeen = string(b)
+	// The caches change hands once PHP can read the new CONFIG bit.
+	a.configFlow(r.Flows)
 	a.logf("cluster: mode %d, flows %d (%s)", r.Mode, r.Flows, r.State)
 }
 
@@ -277,7 +310,9 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 	}
 	var r Reply
 	hello := a.identity()
-	hello["features"] = Features
+	hello["features"] = a.features()
+	// The policy whose main_urls the agent dials (adopted, never merely seen).
+	hello["policy_ver"] = st.policyVer()
 	if err := a.Client.Call(ctx, "hello", hello, &r, false); err != nil {
 		return nil, err
 	}
@@ -415,9 +450,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		go a.RunFanoutEvents(fctx)
 	}
 	if a.ReplicaDir != "" {
+		// Stopped and waited for on return, like the policy recovery: its
+		// sync and cluster:apply end with rctx.
 		rctx, stopReplica := context.WithCancel(ctx)
+		var replicaDone sync.WaitGroup
+		replicaDone.Add(1)
+		defer replicaDone.Wait()
 		defer stopReplica()
-		go a.RunReplica(rctx)
+		go func() {
+			defer replicaDone.Done()
+			a.RunReplica(rctx)
+		}()
 	}
 	if a.SpoolDir != "" {
 		ectx, stopEvents := context.WithCancel(ctx)
@@ -445,6 +488,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		hctx, cancel := context.WithTimeout(ctx, MaxHeartbeatGap)
 		r, err := a.Heartbeat(hctx)
 		cancel()
+		a.fallbackHello(ctx)
 		if err != nil {
 			if fatal(err) {
 				return errors.Join(ErrStop, err)
@@ -478,11 +522,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			}()
 		}
 		if r.WantConnSnapshot {
-			go func() {
-				if err := a.SendSnapshot(ctx); err != nil {
-					a.logf("cluster: connection snapshot: %v", err)
-				}
-			}()
+			go a.snapshot(ctx)
 		}
 		if r.PolicyVer > a.Client.State.policyVer() {
 			a.helloLater(ctx, fmt.Sprintf("fetching policy %d", r.PolicyVer))
@@ -491,6 +531,36 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
 	}
+}
+
+// snapshot sends the registry MAIN asked for. A snapshot given up while
+// MAIN's bulk lane stays busy is not an error: MAIN asks again while its
+// store drifts.
+func (a *Agent) snapshot(ctx context.Context) {
+	err := a.SendSnapshot(ctx)
+	switch {
+	case err == nil:
+	case laneRefusal(err) != nil:
+		a.logf("cluster: connection snapshot: MAIN stayed busy; left for MAIN to ask again")
+	default:
+		a.logf("cluster: connection snapshot: %v", err)
+	}
+}
+
+// fallbackHello says hello when MAIN answered through a fallback URL only
+// (known.go), to fetch MAIN's policy: at most once per URLRetry for the same
+// policy version, since a MAIN whose policy is the one held answers each
+// hello with it again while its URLs stay unreachable.
+func (a *Agent) fallbackHello(ctx context.Context) {
+	if !a.Client.fellBack.Swap(false) {
+		return
+	}
+	ver := a.Client.State.policyVer()
+	if ver == a.fallbackHelloVer && !a.fallbackHelloAt.IsZero() && time.Since(a.fallbackHelloAt) < URLRetry {
+		return
+	}
+	a.fallbackHelloAt, a.fallbackHelloVer = time.Now(), ver
+	a.helloLater(ctx, "MAIN answered through a fallback URL")
 }
 
 // MaxHeartbeatGap is the longest MAIN may go between two of the node's
@@ -591,9 +661,12 @@ func (a *Agent) stop(err error) {
 // Heartbeat sends one heartbeat and publishes the reply's mode and flows. A
 // node whose CONNECTIONS flow is on adds its registry's digest.
 func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
-	payload := map[string]any{"root_ready": RootReady(a.Client.State)}
+	payload := map[string]any{"root_ready": RootReady(a.Client.State), "policy_ver": a.Client.State.policyVer()}
 	if a.Telemetry != nil {
 		payload["telemetry"] = a.Telemetry()
+	}
+	if audit := a.readAudit(); audit != nil {
+		payload["audit"] = audit
 	}
 	if a.Registry != nil && a.flows.Load()&FlowConnections != 0 {
 		payload["conn_digest"] = a.Registry.Digest()

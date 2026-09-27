@@ -202,17 +202,30 @@ func (c *Client) rekeyOnce(ctx context.Context, boxPub []byte, ch *Challenge, id
 	var lastErr error = ErrTransport
 	for _, base := range c.urls() {
 		st, rh, rb, err := c.post(ctx, strings.TrimRight(base, "/")+"/token_rekey", h, body)
-		c.reached(ctx, base, err)
 		if err != nil {
+			c.reached(ctx, base, err)
 			lastErr = err
 			continue
 		}
 		if st == http.StatusOK {
-			if tok, err := c.acceptRekey(rh, rb, nonce, ephSk); err == nil {
+			tok, err := c.acceptRekey(rh, rb, nonce, ephSk)
+			if err == nil {
+				c.reached(ctx, base, nil)
 				return tok, nil
 			}
-		} else if d := c.denial(st, rh, rb, nonce); d != nil {
-			return nil, d
+			if errors.Is(err, ErrTransport) {
+				// A 200 whose panel signature or document does not check is
+				// this URL's failure, as in callOnce.
+				c.reached(ctx, base, ErrTransport)
+				lastErr = fmt.Errorf("%w: an unsigned re-key reply from %s", ErrTransport, base)
+				continue
+			}
+		}
+		c.reached(ctx, base, nil)
+		if st != http.StatusOK {
+			if d := c.denial(st, rh, rb, nonce); d != nil {
+				return nil, d
+			}
 		}
 		lastErr = fmt.Errorf("%w: HTTP %d from %s", ErrTransport, st, base)
 	}

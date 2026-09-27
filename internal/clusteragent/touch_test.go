@@ -17,6 +17,8 @@ type p2Main struct {
 	batches []map[string]any
 	status  int // 0: take; else refuse with this status
 	reason  string
+	extra   map[string]any // the refusal's other fields
+	at      []time.Time    // when each batch arrived
 }
 
 func newTouchAgent(t *testing.T) (*p2Main, *Agent, *sink, *time.Time) {
@@ -30,10 +32,14 @@ func newTouchAgent(t *testing.T) (*p2Main, *Agent, *sink, *time.Time) {
 		}
 		m.mu.Lock()
 		m.batches = append(m.batches, req)
-		status, reason := m.status, m.reason
+		m.at = append(m.at, time.Now())
+		status, reason, extra := m.status, m.reason, m.extra
+		if extra != nil {
+			m.status, m.extra = 0, nil // a busy refusal is refused once
+		}
 		m.mu.Unlock()
 		if status != 0 {
-			m.refuse(w, status, nonce, reason, nil)
+			m.refuse(w, status, nonce, reason, extra)
 			return
 		}
 		evs, _ := req["events"].([]any)

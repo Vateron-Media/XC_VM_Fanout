@@ -340,6 +340,8 @@ func (cl *codeClient) install(st *State, body []byte, h http.Header, boxPub []by
 	st.Epochs = []Epoch{{Epoch: 1, EphSk: st.PendingEphSk, TokenSealed: sealed}}
 	st.PendingEphSk = nil
 	st.Enrolled = false
+	// A previous enrolment's (or MAIN's) URL sets are never dialled.
+	st.KnownGoodURLs = nil
 	return st.Save()
 }
 

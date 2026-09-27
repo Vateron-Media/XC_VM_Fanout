@@ -12,7 +12,10 @@
 // starting MAIN's 503) are in retry.go; the transport policy and the
 // https_required recovery in policy.go; the kills a hard-mode LICENCE_INVALID
 // carries in sealed.go; viewer admission in admission.go; the P2 lane in
-// touch.go; the registry's rebuild after a restart in rebuild.go.
+// touch.go; the registry's rebuild after a restart in rebuild.go; the
+// ingest lanes' busy refusals in retry.go; the known-good URL sets in
+// known.go; the node replica's sections in replica.go; the connect audit
+// the heartbeat relays in audit.go.
 package clusteragent
 
 import (
@@ -49,11 +52,14 @@ type State struct {
 	// Transport is the policy's cluster_transport; HTTPURLs the plain-HTTP
 	// MAIN URLs of every policy held, for the challenge while HTTPS fails
 	// under https_required (policy.go).
-	Transport  string   `json:"transport,omitempty"`
-	HTTPURLs   []string `json:"http_urls,omitempty"`
-	Enrolled   bool     `json:"enrolled"`
-	InstanceID string   `json:"instance_id"`
-	Epochs     []Epoch  `json:"epochs"` // newest first
+	Transport string   `json:"transport,omitempty"`
+	HTTPURLs  []string `json:"http_urls,omitempty"`
+	// KnownGoodURLs are the last KnownGoodSets URL sets MAIN answered on,
+	// newest first (known.go).
+	KnownGoodURLs []URLSet `json:"known_good_urls,omitempty"`
+	Enrolled      bool     `json:"enrolled"`
+	InstanceID    string   `json:"instance_id"`
+	Epochs        []Epoch  `json:"epochs"` // newest first
 	// PendingEphSk is the key of a token_refresh whose reply has not arrived.
 	// It is persisted before the request is sent, so a retry after a crash or
 	// a lost reply uses the same key and MAIN re-sends the same token.

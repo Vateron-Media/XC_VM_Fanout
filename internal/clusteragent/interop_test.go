@@ -21,7 +21,9 @@ import (
 // TestInteropWithPanel runs this agent against MAIN's real PHP ClusterApi
 // (served by `php -S` from a panel checkout, with the panel's test fake of
 // xcvm_core and a SQLite file): enrolment, hello, heartbeat, and a token
-// refresh including a retried one, and a re-key after every token expired. Opt-in:
+// refresh including a retried one, and a re-key after every token expired;
+// the policy version it dials and its audit, as MAIN records them; the
+// replica's blocklist and whole sections, secrets included. Opt-in:
 //
 //	XCVM_PANEL_DIR=/path/to/XC_VM go test ./internal/clusteragent -run Interop -v
 func TestInteropWithPanel(t *testing.T) {
@@ -36,7 +38,24 @@ func TestInteropWithPanel(t *testing.T) {
 	dir := t.TempDir()
 	harness, _ := filepath.Abs("testdata/panel")
 	port := freePort(t)
-	env := append(os.Environ(), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+filepath.Join(dir, "main.sqlite"), fmt.Sprintf("XCVM_INTEROP_PORT=%d", port))
+	// A policy version other than 0, so MAIN recording it proves the agent said it.
+	env := append(os.Environ(), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+filepath.Join(dir, "main.sqlite"), fmt.Sprintf("XCVM_INTEROP_PORT=%d", port), "XCVM_INTEROP_POLICY_VER=5")
+	// What MAIN keeps for the node: the policy it dials, the port, the audit.
+	mainNode := func() (row struct {
+		PolicyVer json.Number `json:"policy_ver"`
+		MainPort  json.Number `json:"main_port"`
+		Audit     *string     `json:"audit"`
+		Features  *string     `json:"features"`
+	}) {
+		t.Helper()
+		cmd := exec.Command(php, filepath.Join(harness, "node.php"))
+		cmd.Env = env
+		out, err := cmd.Output()
+		if err != nil || json.Unmarshal(out, &row) != nil {
+			t.Fatalf("node.php: %v\n%s", err, out)
+		}
+		return row
+	}
 
 	// The install flow, as LbInstallFlow::provisionCluster runs it over SSH:
 	// keygen on the node, epoch 1 minted by MAIN, probe, install.
@@ -108,6 +127,25 @@ func TestInteropWithPanel(t *testing.T) {
 	}
 	if r.State != "active" || !loaded.Enrolled {
 		t.Fatalf("after start: %+v enrolled=%v", r, loaded.Enrolled)
+	}
+	// Hello said which policy the agent dials, and MAIN recorded it with the
+	// port it was reached on.
+	if first.Cluster.Policy.PolicyVer != 5 {
+		t.Fatalf("installed policy %d", first.Cluster.Policy.PolicyVer)
+	}
+	if row := mainNode(); row.PolicyVer.String() != "5" || row.MainPort.String() != fmt.Sprint(port) {
+		t.Fatalf("MAIN recorded policy_ver %s, main_port %s", row.PolicyVer, row.MainPort)
+	}
+	// The node's audit.json rides the heartbeat and MAIN keeps it.
+	audit := `{"settings_misses":{"allowed_ips_admin":3},"sql_connects":2,"redis_connects":1,"sites":{"sql src/Core/Database/Database.php:120":2},"connects_since":1790000000}`
+	if err := os.WriteFile(filepath.Join(dir, "audit.json"), []byte(audit), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatalf("heartbeat with audit: %v", err)
+	}
+	if row := mainNode(); row.Audit == nil || !strings.Contains(*row.Audit, `"allowed_ips_admin":3`) || !strings.Contains(*row.Audit, `"sql_connects":2`) || !strings.Contains(*row.Audit, `"connects_since":1790000000`) {
+		t.Fatalf("MAIN kept audit %v", row.Audit)
 	}
 	var hb Reply
 	if err := c.Call(ctx, "heartbeat", map[string]any{"telemetry": map[string]int{"cpu": 1}}, &hb, false); err != nil {
@@ -217,6 +255,50 @@ func TestInteropWithPanel(t *testing.T) {
 		// The settings section came with the first sync: allowlisted keys only.
 		if b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "settings.json")); !strings.Contains(string(b), `"server_name":"Interop"`) || strings.Contains(string(b), "secret") {
 			t.Fatalf("settings.json %s", b)
+		}
+		// Every whole section came too, each stored as MAIN signed it for
+		// this node: secrets private to xc_vm, with MAIN's values.
+		held := LoadReplicaState(a.ReplicaDir)
+		for _, name := range WholeSections {
+			rep, err := os.ReadFile(filepath.Join(a.ReplicaDir, name+".rep"))
+			if err != nil {
+				t.Fatalf("%s.rep: %v", name, err)
+			}
+			doc, err := a.openWhole(rep, name, held.etag(name))
+			if err != nil || len(held.etag(name)) != 64 {
+				t.Fatalf("%s: %v (ETag %q)", name, err, held.etag(name))
+			}
+			stored := readJSON(t, filepath.Join(a.ReplicaDir, name+".json"))
+			want, _ := json.Marshal(json.RawMessage(doc.Data))
+			got, _ := json.Marshal(stored["data"])
+			var w, g any
+			json.Unmarshal(want, &w)
+			json.Unmarshal(got, &g)
+			if fmt.Sprint(w) != fmt.Sprint(g) || stored["etag"] != held.etag(name) {
+				t.Fatalf("%s.json is not the signed data", name)
+			}
+		}
+		for _, f := range []string{"secrets.rep", "secrets.json"} {
+			if fi, err := os.Stat(filepath.Join(a.ReplicaDir, f)); err != nil || fi.Mode().Perm() != 0o600 {
+				t.Fatalf("%s: %v", f, err)
+			}
+		}
+		secrets := readJSON(t, filepath.Join(a.ReplicaDir, "secrets.json"))["data"].(map[string]any)
+		if secrets["live_streaming_pass"].(map[string]any)["current"] != "InteropStreamPass" || secrets["openssl_extra"].(map[string]any)["current"] != "test-openssl-extra" {
+			t.Fatalf("secrets %v", secrets)
+		}
+		if b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "crontab.json")); !strings.Contains(string(b), `"filename":"cache"`) || !strings.Contains(string(b), `"filename":"users"`) || strings.Contains(string(b), `"epg"`) {
+			t.Fatalf("crontab.json %s", b)
+		}
+		if b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "cluster.json")); !strings.Contains(string(b), `"policy_ver":5`) {
+			t.Fatalf("cluster.json %s", b)
+		}
+		// Named with their ETags, MAIN answers them unchanged.
+		if err := a.SyncReplica(ctx); err != nil {
+			t.Fatalf("replica again: %v", err)
+		}
+		if again := LoadReplicaState(a.ReplicaDir); fmt.Sprint(again.WholeEtags) != fmt.Sprint(held.WholeEtags) || again.SettingsEtag != held.SettingsEtag {
+			t.Fatal("the held ETags moved on an unchanged reply")
 		}
 		// A record sealed to this node but under another tag does not verify.
 		if _, err := c.OpenRecord(sealedBlk, "rep"); err == nil {

@@ -94,3 +94,105 @@ func busyWait(err error) (time.Duration, bool) {
 	}
 	return max(time.Second, min(time.Minute, jitter(time.Duration(ms)*time.Millisecond))), true
 }
+
+// Ingest permits (ADR 0004, "The cluster bus (Phase 2, fourth increment):
+// ingest permits"): every ingest op (events, config, conn_snapshot,
+// recording_complete) holds a permit of its lane while MAIN runs it, and
+// gets a 503 RATE_LIMITED carrying `lane` when none is free. Such a refusal
+// means busy, not failing: it is counted (Agent.BusyRefusals), never logged
+// as an error nor counted as a failure, and the op goes again:
+//
+//   - lane p0 (a P0 events batch): after retry_after_ms (250–750), jitter only
+//     adding, up to 10 %, clamped to P0BusyMin–P0BusyMax; the same in-flight
+//     batch, before any later one; the lane's interval stays.
+//   - lane bulk, events P1 and P2: the lane's current interval doubles, up to
+//     BulkIntervalMax, and the lane sends again after the longer of the busy
+//     wait and that interval; each batch MAIN serves halves it back toward
+//     the lane's normal interval (laneInterval).
+//   - lane bulk, config and conn_snapshot: again after the busy wait, as for
+//     the per-op refusal; recording_complete within the socket's deadline
+//     (socket.go).
+//
+// A 503 RATE_LIMITED without `lane` is a per-op semaphore's, handled above.
+
+var (
+	// P0BusyMin and P0BusyMax clamp P0's wait after a p0 lane refusal.
+	P0BusyMin = 100 * time.Millisecond
+	P0BusyMax = 5 * time.Second
+	// BulkIntervalMax caps a bulk lane's stretched interval.
+	BulkIntervalMax = 60 * time.Second
+)
+
+// laneRefusal returns the verified 503 RATE_LIMITED naming an ingest lane
+// that err is, or nil.
+func laneRefusal(err error) *Denial {
+	var d *Denial
+	if !errors.As(err, &d) || d.Status != 503 || d.Reason != "RATE_LIMITED" || d.Lane == "" {
+		return nil
+	}
+	return d
+}
+
+// p0Wait is how long a P0 batch waits after its lane was refused: MAIN's
+// retry_after_ms, jitter only adding (up to 10 %), with no 1 s floor.
+func p0Wait(d *Denial) time.Duration {
+	w := time.Duration(d.RetryAfterMs) * time.Millisecond
+	if w <= 0 {
+		w = 500 * time.Millisecond // the middle of MAIN's 250–750
+	}
+	w += time.Duration(mrand.Int63n(int64(w/10) + 1))
+	return max(P0BusyMin, min(P0BusyMax, w))
+}
+
+// laneInterval is a bulk lane's current interval: it starts at the lane's
+// normal one, doubles (up to BulkIntervalMax) on each lane refusal and
+// halves back toward the normal one after each batch MAIN serves. Any other
+// failure leaves it as it is.
+type laneInterval struct {
+	normal, cur time.Duration
+}
+
+func newLaneInterval(normal time.Duration) *laneInterval {
+	return &laneInterval{normal: normal, cur: normal}
+}
+
+// refused stretches the interval and returns how long to wait before the
+// lane sends again: the longer of the busy wait and the new interval.
+func (l *laneInterval) refused(err error) time.Duration {
+	l.cur = min(max(l.cur, l.normal)*2, max(BulkIntervalMax, l.normal))
+	w, _ := busyWait(err)
+	return max(w, l.cur)
+}
+
+// served halves the interval back toward the normal one and returns it.
+func (l *laneInterval) served() time.Duration {
+	l.cur = max(l.normal, l.cur/2)
+	return l.cur
+}
+
+// next is how long the lane waits before it sends again, after a send that
+// had a batch served (or not) and ended with err; busy reports a lane
+// refusal, which the caller counts and does not log. A p0 refusal waits
+// p0Wait; a bulk one stretches the interval. Any other failure keeps the
+// lanes' usual backoff (twice the normal interval, 1–30 s, or a busy or
+// starting MAIN's wait if longer) and leaves the interval as it is.
+func (l *laneInterval) next(served bool, err error) (wait time.Duration, busy bool) {
+	wait = l.cur
+	if served {
+		wait = l.served()
+	}
+	if err == nil {
+		return wait, false
+	}
+	if d := laneRefusal(err); d != nil {
+		if d.Lane == "p0" {
+			return p0Wait(d), true
+		}
+		return l.refused(err), true
+	}
+	wait = min(max(time.Second, l.normal*2), 30*time.Second)
+	if w, ok := busyWait(err); ok {
+		wait = max(wait, w) // MAIN is starting or busy: when it says
+	}
+	return wait, false
+}
