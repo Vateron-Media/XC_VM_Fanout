@@ -19,10 +19,13 @@
 // to fall back on. P0 events have a connection of their own, and a busy
 // refusal of an ingest lane is waited out, not logged.
 //
-// The node replica (replica/ beside the state) holds the blocklist and the
-// sections MAIN sends whole (settings, servers, node, crontab, cluster, and
-// secrets, 0600 and never logged); `console.php cluster:apply` runs after a
-// change, and config.changed fetches at once. Heartbeats relay the node's
+// The node replica (replica/ beside the state) holds the blocklist, the
+// sections MAIN sends whole (settings, servers, node, crontab, cluster,
+// secrets, bouquets and categories; secrets 0600 and never logged) and,
+// while STREAMS is on, the R2 streams section (replica/streams/, one record
+// per stream held, kept by deltas, full passes and a resync every 5
+// minutes); `console.php cluster:apply` runs after a change, and
+// config.changed fetches at once. Heartbeats relay the node's
 // audit.json (at most 16 KiB) as `audit`.
 //
 // The node's state file (default /home/xc_vm/config/cluster/agent.json, 0600)

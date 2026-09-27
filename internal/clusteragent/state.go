@@ -14,8 +14,8 @@
 // carries in sealed.go; viewer admission in admission.go; the P2 lane in
 // touch.go; the registry's rebuild after a restart in rebuild.go; the
 // ingest lanes' busy refusals in retry.go; the known-good URL sets in
-// known.go; the node replica's sections in replica.go; the connect audit
-// the heartbeat relays in audit.go.
+// known.go; the node replica's sections in replica.go and its R2 streams
+// section in streams.go; the connect audit the heartbeat relays in audit.go.
 package clusteragent
 
 import (
