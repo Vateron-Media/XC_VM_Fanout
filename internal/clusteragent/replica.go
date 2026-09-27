@@ -67,7 +67,7 @@ const replicaPurpose = "replica"
 var etagRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // WholeSections are the sections MAIN sends whole, as named in `have`.
-var WholeSections = []string{"settings", "servers", "node", "crontab", "cluster", "secrets"}
+var WholeSections = []string{"settings", "servers", "node", "crontab", "cluster", "secrets", "bouquets", "categories"}
 
 // secretSection is the one section that carries secrets.
 const secretSection = "secrets"
@@ -110,6 +110,9 @@ type wholeReply struct {
 	Unchanged bool   `json:"unchanged"`
 	Etag      string `json:"etag"`
 	Sealed    string `json:"sealed"`
+	// TooLarge: the section's sealed record would pass MAIN's bound (4 MiB
+	// of base64), so MAIN sends only its ETag; the copy held is dropped.
+	TooLarge bool `json:"too_large"`
 }
 
 type configReply struct {
@@ -262,7 +265,13 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 		var firstErr error
 		for _, name := range WholeSections {
 			w, ok, err := wholePart(parts, name)
-			if err == nil && ok {
+			if err == nil && ok && w.TooLarge {
+				err = a.dropWhole(dir, name, w.Etag)
+				if err == nil {
+					st.setEtag(name, w.Etag)
+					wholeChanged = true
+				}
+			} else if err == nil && ok {
 				err = a.storeWhole(dir, name, w)
 				if err == nil {
 					st.setEtag(name, w.Etag)
@@ -320,7 +329,7 @@ func wholePart(parts map[string]json.RawMessage, name string) (*wholeReply, bool
 	if json.Unmarshal(raw, &w) != nil {
 		return nil, false, fmt.Errorf("clusteragent: config: bad %s section", name)
 	}
-	if w.Unchanged || (w.Etag == "" && w.Sealed == "") {
+	if w.Unchanged || (w.Etag == "" && w.Sealed == "" && !w.TooLarge) {
 		return nil, false, nil
 	}
 	return &w, true, nil
@@ -396,6 +405,23 @@ func (a *Agent) storeWhole(dir, name string, w *wholeReply) error {
 func wholeJSON(etag string, data json.RawMessage) []byte {
 	out := append([]byte(`{"data":`), data...)
 	return append(out, `,"etag":"`+etag+`"}`...)
+}
+
+// dropWhole deletes a section MAIN answered too_large: its .rep, then its
+// .json, so PHP stops owning that cache and the node's readers go back to
+// MAIN's database. Its ETag is kept, so MAIN answers unchanged until the
+// section changes.
+func (a *Agent) dropWhole(dir, name, etag string) error {
+	if !etagRe.MatchString(etag) {
+		return fmt.Errorf("clusteragent: config: bad %s section", name)
+	}
+	for _, f := range []string{name + ".rep", name + ".json"} {
+		if err := os.Remove(filepath.Join(dir, f)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("clusteragent: config: dropping the %s section", name)
+		}
+	}
+	a.logf("cluster: replica: MAIN's %s section is too large to send; the copy held is dropped", name)
+	return nil
 }
 
 type wholeDoc struct {
