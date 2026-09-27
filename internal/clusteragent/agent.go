@@ -66,6 +66,7 @@ type Agent struct {
 	fenced             atomic.Bool  // MAIN refuses the session for want of a licence
 	acking             atomic.Bool  // sealed commands are being acked
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
+	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -98,6 +99,10 @@ type Reply struct {
 // Features are what this agent tells MAIN at hello that it does, so MAIN
 // stands down its own copy: "hls_reaper" (Registry.Reap).
 var Features = []string{"hls_reaper"}
+
+// BusyRefusals counts the ingest lane refusals MAIN has sent (503
+// RATE_LIMITED with lane): busy, not failing, so never logged as errors.
+func (a *Agent) BusyRefusals() int64 { return a.busyRefusals.Load() }
 
 // ErrStop is returned when MAIN has told the node to stop: it was revoked or
 // is unknown, or its enrolment was never completed in time. An expired token

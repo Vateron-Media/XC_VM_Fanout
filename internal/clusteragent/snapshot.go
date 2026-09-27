@@ -52,6 +52,9 @@ func (a *Agent) SendSnapshot(ctx context.Context) error {
 			if !ok {
 				break
 			}
+			if laneRefusal(err) != nil {
+				a.busyRefusals.Add(1)
+			}
 			if !sleep(ctx, w) {
 				return ctx.Err()
 			}

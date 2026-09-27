@@ -29,6 +29,38 @@ var SocketOps = map[string]bool{"recording_complete": true}
 // MaxSocketBody caps a request from PHP.
 const MaxSocketBody = 1 << 20
 
+// SocketDeadline is how long after a request's arrival the agent answers
+// the socket: the node's PHP waits 15 s (ADR 0004, ingest permits).
+var SocketDeadline = 12 * time.Second
+
+// callForSocket calls MAIN for the node's PHP. A refusal of MAIN's bulk
+// ingest lane (503 RATE_LIMITED with lane) is sent again after the busy wait
+// only while that wait and a whole try (the MAIN client's timeout) still end
+// by SocketDeadline after the request arrived; otherwise the refusal goes
+// back at once, as a 409, and the PHP caller asks again on its own.
+func (a *Agent) callForSocket(ctx context.Context, arrived time.Time, op string, body json.RawMessage, out *json.RawMessage) error {
+	ctx, cancel := context.WithDeadline(ctx, arrived.Add(SocketDeadline))
+	defer cancel()
+	try := 10 * time.Second
+	if a.Client.HTTP != nil && a.Client.HTTP.Timeout > 0 {
+		try = a.Client.HTTP.Timeout
+	}
+	for {
+		err := a.Client.Call(ctx, op, body, out, false)
+		if laneRefusal(err) == nil {
+			return err
+		}
+		a.busyRefusals.Add(1)
+		w, _ := busyWait(err)
+		if time.Now().Add(w + try).After(arrived.Add(SocketDeadline)) {
+			return err
+		}
+		if !sleep(ctx, w) {
+			return err
+		}
+	}
+}
+
 // ServeSocket listens on path until ctx ends.
 func (a *Agent) ServeSocket(ctx context.Context, path string) error {
 	os.Remove(path) // a stale socket from a previous run
@@ -55,6 +87,7 @@ func (a *Agent) ServeSocket(ctx context.Context, path string) error {
 
 func (a *Agent) socketHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived := time.Now()
 		if strings.HasPrefix(r.URL.Path, "/v1/conn/") {
 			if a.Registry == nil {
 				http.Error(w, "no registry", http.StatusServiceUnavailable)
@@ -74,13 +107,15 @@ func (a *Agent) socketHandler() http.Handler {
 			return
 		}
 		var out json.RawMessage
-		if err := a.Client.Call(r.Context(), op, json.RawMessage(body), &out, false); err != nil {
+		if err := a.callForSocket(r.Context(), arrived, op, json.RawMessage(body), &out); err != nil {
 			status := http.StatusBadGateway
 			var d *Denial
 			if errors.As(err, &d) {
 				status = http.StatusConflict
 			}
-			a.logf("cluster: socket %s: %v", op, err)
+			if laneRefusal(err) == nil { // MAIN busy is not an error
+				a.logf("cluster: socket %s: %v", op, err)
+			}
 			http.Error(w, err.Error(), status)
 			return
 		}

@@ -184,19 +184,34 @@ func (a *Agent) setP2(on bool) {
 
 // RunTouches is the P2 loop: every TouchLoop, one request with the touches
 // due, until ctx ends or MAIN stops the node.
+//
+// A refusal of the bulk lane (503 RATE_LIMITED with lane "bulk") stretches
+// the loop's interval (laneInterval): the touches due then go after the
+// longer of the busy wait and the doubled interval, and each batch MAIN
+// serves halves it back toward TouchLoop.
 func (a *Agent) RunTouches(ctx context.Context) {
+	iv := newLaneInterval(TouchLoop)
 	backoff := TouchLoop
 	for sleep(ctx, backoff) {
-		backoff = TouchLoop
+		backoff = iv.cur
 		if a.Registry == nil || !a.p2Touch.Load() {
 			continue
 		}
-		err := a.sendTouches(ctx)
+		served, err := a.sendTouchBatches(ctx)
+		for ; served > 0; served-- {
+			backoff = iv.served()
+		}
 		if err == nil {
 			continue
 		}
 		if fatal(err) || ctx.Err() != nil {
 			return
+		}
+		if laneRefusal(err) != nil {
+			// MAIN's bulk permits are all held: busy, not failing.
+			a.busyRefusals.Add(1)
+			backoff = iv.refused(err)
+			continue
 		}
 		var d *Denial
 		if errors.As(err, &d) && d.Status == 400 && d.Reason == "BAD_REQUEST" {
@@ -218,10 +233,17 @@ func (a *Agent) RunTouches(ctx context.Context) {
 // sendTouches sends the touches due in batches of at most MaxBatchEvents
 // events and MaxBatchBytes, one request at a time.
 func (a *Agent) sendTouches(ctx context.Context) error {
+	_, err := a.sendTouchBatches(ctx)
+	return err
+}
+
+// sendTouchBatches is sendTouches, counting the batches MAIN served.
+func (a *Agent) sendTouchBatches(ctx context.Context) (int, error) {
+	served := 0
 	for {
 		due := a.Registry.dueTouches(MaxBatchEvents)
 		if len(due) == 0 {
-			return nil
+			return served, nil
 		}
 		var events []map[string]any
 		var sent []touch
@@ -237,14 +259,15 @@ func (a *Agent) sendTouches(ctx context.Context) error {
 		}
 		var out EventsResult
 		if err := a.Client.Call(ctx, "events", map[string]any{"lane": "p2", "events": events}, &out, false); err != nil {
-			return err
+			return served, err
 		}
+		served++
 		if out.Dropped > 0 {
 			a.logf("cluster: events p2: MAIN dropped %d of %d touch(es)", out.Dropped, len(events))
 		}
 		a.Registry.touchesSent(sent)
 		if len(due) < MaxBatchEvents && len(sent) == len(due) {
-			return nil
+			return served, nil
 		}
 	}
 }

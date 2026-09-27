@@ -83,9 +83,10 @@ func (a *Agent) cursor(lane string) int64 {
 func (a *Agent) RunEvents(ctx context.Context, lane Lane) {
 	ls := &laneSpool{lane: lane, dir: filepath.Join(a.SpoolDir, lane.Name), state: filepath.Join(a.SpoolDir, lane.Name+".inflight")}
 	var next int64 // the number the next event gets; 0 until MAIN's cursor is known
+	iv := newLaneInterval(lane.Interval)
 	backoff := lane.Interval
 	for sleep(ctx, backoff) {
-		backoff = lane.Interval
+		backoff = iv.cur
 		if next == 0 {
 			c := a.cursor(lane.Name)
 			if c < 0 {
@@ -93,13 +94,27 @@ func (a *Agent) RunEvents(ctx context.Context, lane Lane) {
 			}
 			next = c + 1
 		}
-		n, err := a.shipOnce(ctx, ls, next)
+		n, served, err := a.shipOnce(ctx, ls, next)
 		if n > 0 {
 			next = n
+		}
+		if served {
+			backoff = iv.served()
 		}
 		if err != nil {
 			if fatal(err) || ctx.Err() != nil {
 				return
+			}
+			if d := laneRefusal(err); d != nil {
+				// MAIN's permits for the lane are all held: busy, not
+				// failing. The in-flight batch goes again, before any other.
+				a.busyRefusals.Add(1)
+				if d.Lane == "p0" {
+					backoff = p0Wait(d)
+				} else {
+					backoff = iv.refused(err)
+				}
+				continue
 			}
 			if !errors.Is(err, ErrNoEpoch) {
 				a.logf("cluster: events %s: %v", lane.Name, err)
@@ -113,11 +128,11 @@ func (a *Agent) RunEvents(ctx context.Context, lane Lane) {
 }
 
 // shipOnce sends at most one batch (resending an in-flight one first) and
-// returns the next number to use.
-func (a *Agent) shipOnce(ctx context.Context, ls *laneSpool, next int64) (int64, error) {
+// returns the next number to use, and whether MAIN served a batch.
+func (a *Agent) shipOnce(ctx context.Context, ls *laneSpool, next int64) (int64, bool, error) {
 	fl, err := ls.loadInflight()
 	if err != nil {
-		return next, err
+		return next, false, err
 	}
 	switch {
 	case fl == nil:
@@ -133,64 +148,69 @@ func (a *Agent) shipOnce(ctx context.Context, ls *laneSpool, next int64) (int64,
 		}
 		files, events, err := ls.collect()
 		if err != nil || len(events) == 0 {
-			return next, err
+			return next, false, err
 		}
 		fl = &inflight{First: next, Count: len(events), Files: files}
 		if err := ls.saveInflight(fl); err != nil {
-			return next, err
+			return next, false, err
 		}
 	case fl.First+int64(fl.Count)-1 < next:
 		// Resumed after a restart and MAIN's cursor already covers it: applied.
 		ls.finish(fl)
-		return next, nil
+		return next, false, nil
 	case fl.First != next:
 		// Not applied, and MAIN expects another number (its cursor moved back).
 		fl.First = next
 		if err := ls.saveInflight(fl); err != nil {
-			return next, err
+			return next, false, err
 		}
 	}
 	events, err := ls.read(fl.Files)
 	if err != nil {
-		return next, err
+		return next, false, err
 	}
 	if len(events) != fl.Count {
 		// Only this loop deletes spool files; a count that changed means the
 		// spool was tampered with. Drop the batch rather than guess.
 		a.logf("cluster: events %s: in-flight batch changed on disk; dropping it", ls.lane.Name)
 		ls.finish(fl)
-		return next, nil
+		return next, false, nil
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		var out EventsResult
-		err = a.Client.Call(ctx, "events", map[string]any{"lane": ls.lane.Name, "first_useq": fl.First, "events": events}, &out, false)
+		batch := map[string]any{"lane": ls.lane.Name, "first_useq": fl.First, "events": events}
+		if ls.lane.Name == "p0" {
+			err = a.Client.CallP0(ctx, batch, &out)
+		} else {
+			err = a.Client.Call(ctx, "events", batch, &out, false)
+		}
 		var d *Denial
 		if errors.As(err, &d) && d.Reason == "USEQ_GAP" {
 			expected := expectedUseq(d)
 			if expected <= 0 {
-				return next, err
+				return next, false, err
 			}
 			if expected > fl.First+int64(fl.Count)-1 {
 				ls.finish(fl) // already applied
-				return expected, nil
+				return expected, false, nil
 			}
 			fl.First = expected
 			if err := ls.saveInflight(fl); err != nil {
-				return next, err
+				return next, false, err
 			}
 			next = expected
 			continue
 		}
 		if err != nil {
-			return next, err
+			return next, false, err
 		}
 		if out.Dropped > 0 {
 			a.logf("cluster: events %s: MAIN refused %d of %d (flow off?)", ls.lane.Name, out.Dropped, fl.Count)
 		}
 		ls.finish(fl)
-		return max(fl.First+int64(fl.Count), out.Useq+1), nil
+		return max(fl.First+int64(fl.Count), out.Useq+1), true, nil
 	}
-	return next, errors.New("clusteragent: events kept hitting a gap")
+	return next, false, errors.New("clusteragent: events kept hitting a gap")
 }
 
 func expectedUseq(d *Denial) int64 {

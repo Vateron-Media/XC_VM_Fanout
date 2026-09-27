@@ -388,7 +388,11 @@ func (a *Agent) RunReplica(ctx context.Context) {
 				// MAIN is busy: ask again when it says, not a minute later.
 				wait = w
 			}
-			a.logf("cluster: replica: %v (next in %s)", err, wait.Round(time.Second))
+			if laneRefusal(err) != nil {
+				a.busyRefusals.Add(1) // busy, not failing: no error logged
+			} else {
+				a.logf("cluster: replica: %v (next in %s)", err, wait.Round(time.Second))
+			}
 		}
 		if !sleep(ctx, wait) {
 			return

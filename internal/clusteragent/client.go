@@ -40,6 +40,10 @@ type Denial struct {
 	MainTimeMs   int64  `json:"main_time_ms"`
 	RetryAfterMs int64  `json:"retry_after_ms"`
 	Op           string `json:"op"`
+	// Lane, on a 503 RATE_LIMITED to an ingest op: the ingest permit's lane
+	// ("p0" or "bulk") that had none free (retry.go). A per-op semaphore's
+	// refusal has none.
+	Lane string `json:"lane"`
 	// CommandsSealed, on a hard-mode LICENCE_INVALID: the node's pending
 	// restrictive commands, sealed to it (sealed.go).
 	CommandsSealed string          `json:"commands_sealed"`
@@ -68,6 +72,10 @@ type Client struct {
 
 	// LongHTTP carries the commands long-poll, which MAIN holds open.
 	LongHTTP *http.Client
+	// P0HTTP carries P0 events alone, over a keep-alive connection of their
+	// own with one request in flight, so a bulk upload never queues them
+	// (ADR 0004, ingest permits).
+	P0HTTP *http.Client
 
 	// OnDenial, when set, sees every verified denial of a session op.
 	OnDenial func(*Denial)
@@ -99,6 +107,15 @@ func newTransport() *http.Transport {
 
 // urls is MAIN's URLs in the order to try them: the policy's order, with the
 // ones that recently could not be reached last.
+// newP0Transport is P0's own: one connection to a MAIN URL, kept alive, so
+// one P0 request is in flight at a time and never waits behind bulk.
+func newP0Transport() *http.Transport {
+	t := newTransport()
+	t.MaxConnsPerHost = 1
+	t.MaxIdleConnsPerHost = 1
+	return t
+}
+
 func (c *Client) urls() []string {
 	c.State.mu.Lock()
 	all := append([]string{}, c.State.MainURLs...)
@@ -143,6 +160,7 @@ func NewClient(st *State, agent string) *Client {
 		State:    st,
 		HTTP:     &http.Client{Timeout: 10 * time.Second, Transport: newTransport()},
 		LongHTTP: &http.Client{Timeout: 45 * time.Second, Transport: newTransport()},
+		P0HTTP:   &http.Client{Timeout: 10 * time.Second, Transport: newP0Transport()},
 		Agent:    agent,
 		sessions: map[uint64]session{},
 		now:      time.Now,
@@ -206,20 +224,34 @@ func (c *Client) Call(ctx context.Context, op string, payload, out any, signNode
 	return c.call(ctx, s, op, payload, out, signNode)
 }
 
+// CallP0 sends a P0 events batch over P0's own connection (P0HTTP).
+func (c *Client) CallP0(ctx context.Context, payload, out any) error {
+	s, ok := c.current()
+	if !ok {
+		return ErrNoEpoch
+	}
+	return c.callVia(ctx, c.P0HTTP, s, "events", payload, out, false)
+}
+
 // A REPLAY that says when a request stamped anew will pass is retried once
 // (retry.go).
 func (c *Client) call(ctx context.Context, s session, op string, payload, out any, signNode bool) error {
+	return c.callVia(ctx, nil, s, op, payload, out, signNode)
+}
+
+// callVia is call over hc; nil takes the op's usual client.
+func (c *Client) callVia(ctx context.Context, hc *http.Client, s session, op string, payload, out any, signNode bool) error {
 	plain, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	return withReplay(ctx, c.setMainTime, func() error { return c.callOnce(ctx, s, op, plain, out, signNode) })
+	return withReplay(ctx, c.setMainTime, func() error { return c.callOnce(ctx, hc, s, op, plain, out, signNode) })
 }
 
 // setMainTime takes MAIN's clock from an authenticated main_time_ms.
 func (c *Client) setMainTime(mainMs int64) { c.offsetMs.Store(mainMs - c.now().UnixMilli()) }
 
-func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byte, out any, signNode bool) error {
+func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op string, plain []byte, out any, signNode bool) error {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return err
@@ -250,12 +282,14 @@ func (c *Client) callOnce(ctx context.Context, s session, op string, plain []byt
 		h.Set(cc.HNodeSig, hex.EncodeToString(cc.SignNode(c.State.SignKey(), "request", append(append([]byte{}, reqCtx...), cc.SHA256(body)...))))
 	}
 
-	var lastErr error = ErrTransport
-	for _, base := range c.urls() {
-		hc := c.HTTP
+	if hc == nil {
+		hc = c.HTTP
 		if op == "commands" && c.LongHTTP != nil {
 			hc = c.LongHTTP
 		}
+	}
+	var lastErr error = ErrTransport
+	for _, base := range c.urls() {
 		st, rh, rb, err := c.postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
 		c.reached(ctx, base, err)
 		if err != nil {
