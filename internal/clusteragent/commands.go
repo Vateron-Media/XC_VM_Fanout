@@ -21,9 +21,10 @@ import (
 // `ack`s it with the result. Delivery is at least once; the high-water,
 // persisted before the ack, keeps a replay from running a command twice.
 //
-// This increment hands every command to the node's PHP (`console.php
-// cluster:exec`), which verifies it again and runs it with the legacy
-// handlers; root actions are not carried yet.
+// Every command goes to the node's PHP (`console.php cluster:exec`), which
+// verifies it again and runs it with the legacy handlers, or hands a
+// node.root to root. A command that carries an artefact grant waits for its
+// download beside the loop first (artefact.go).
 
 // Command is a signed command document.
 type Command struct {
@@ -162,6 +163,13 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 		// result, never run it twice.
 		id, ok, result = cmd.CmdID, k.OK, k.Result
 		w.Seq = cmd.Seq
+	} else if held, refusal := a.holdCommand(cmd, w); held {
+		// Its artefact downloads beside this loop (artefact.go): kept, with
+		// the high-water past it, and acked once it is handed on.
+		return
+	} else if refusal != nil {
+		id, result = cmd.CmdID, refusal
+		w.Seq = cmd.Seq
 	} else {
 		id = cmd.CmdID
 		ok, result = run(ctx, cmd, w)
@@ -179,21 +187,26 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 	if id == "" {
 		return
 	}
+	a.ack(ctx, id, ok, result)
+}
+
+// ack sends a command's outcome, trying three times; it returns the last
+// error.
+func (a *Agent) ack(ctx context.Context, id string, ok bool, result []byte) error {
+	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		var r struct {
 			OK bool `json:"ok"`
 		}
-		err := c.Call(ctx, "ack", map[string]any{"cmd_id": id, "ok": ok, "result": string(result)}, &r, false)
-		if err == nil {
-			return
-		}
-		if fatal(err) || ctx.Err() != nil {
-			return
+		err = a.Client.Call(ctx, "ack", map[string]any{"cmd_id": id, "ok": ok, "result": string(result)}, &r, false)
+		if err == nil || fatal(err) || ctx.Err() != nil {
+			return err
 		}
 		if !sleep(ctx, time.Duration(attempt+1)*time.Second) {
-			return
+			return err
 		}
 	}
+	return err
 }
 
 // RunCommands keeps a commands long-poll open until ctx ends.

@@ -28,6 +28,13 @@
 // config.changed fetches at once. Heartbeats relay the node's
 // audit.json (at most 16 KiB) as `audit`.
 //
+// Artefacts MAIN grants (an off-air video's artefact.fetch, a node.root
+// carrying a module archive or the pinned agent) download into artefacts/
+// beside the state, in chunks over the bulk lane, beside the command loop;
+// the agent checks their size and SHA-256 before it hands the command to
+// `console.php cluster:exec`, and says `artefact` at hello only while
+// `cluster:exec --types` lists artefact.fetch.
+//
 // The node's state file (default /home/xc_vm/config/cluster/agent.json, 0600)
 // is written by the panel's install flow over SSH: node uuid, server id, the
 // node's Ed25519 seed, the pinned panel key, MAIN's URLs and epoch 1.
@@ -179,7 +186,8 @@ func main() {
 	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
 		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
 		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl,
-		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute)}
+		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute),
+		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute)}
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
 	switch {

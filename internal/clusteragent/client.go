@@ -76,6 +76,9 @@ type Client struct {
 	// own with one request in flight, so a bulk upload never queues them
 	// (ADR 0004, ingest permits).
 	P0HTTP *http.Client
+	// BulkHTTP carries the artefact op: one request in flight, under its
+	// own timeout (ArtefactTimeout).
+	BulkHTTP *http.Client
 
 	// OnDenial, when set, sees every verified denial of a session op.
 	OnDenial func(*Denial)
@@ -169,6 +172,7 @@ func NewClient(st *State, agent string) *Client {
 		HTTP:     &http.Client{Timeout: 10 * time.Second, Transport: newTransport()},
 		LongHTTP: &http.Client{Timeout: 45 * time.Second, Transport: newTransport()},
 		P0HTTP:   &http.Client{Timeout: 10 * time.Second, Transport: newP0Transport()},
+		BulkHTTP: &http.Client{Timeout: ArtefactTimeout, Transport: newP0Transport()},
 		Agent:    agent,
 		sessions: map[uint64]session{},
 		now:      time.Now,
