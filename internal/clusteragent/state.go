@@ -15,7 +15,8 @@
 // touch.go; the registry's rebuild after a restart in rebuild.go; the
 // ingest lanes' busy refusals in retry.go; the known-good URL sets in
 // known.go; the node replica's sections in replica.go and its R2 streams
-// section in streams.go; the connect audit the heartbeat relays in audit.go.
+// section in streams.go; the connect audit the heartbeat relays in audit.go;
+// the artefacts MAIN grants in artefact.go.
 package clusteragent
 
 import (
@@ -72,6 +73,10 @@ type State struct {
 	// SealedCmds are the commands run from LICENCE_INVALID denials, kept
 	// until they expire (sealed.go).
 	SealedCmds []SealedCmd `json:"sealed_cmds,omitempty"`
+	// HeldCmds are the commands kept for their artefact's download, and the
+	// node.root commands waiting behind one, until they are acked
+	// (artefact.go).
+	HeldCmds []HeldCmd `json:"held_cmds,omitempty"`
 
 	path string
 	mu   sync.Mutex

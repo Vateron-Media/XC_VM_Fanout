@@ -47,6 +47,12 @@ type Agent struct {
 	// Registry holds the node's viewers while CONNECTIONS is on (registry.go);
 	// Run makes it when SpoolDir is set.
 	Registry *Registry
+	// ArtefactDir is where the agent downloads the artefacts MAIN grants
+	// (config/cluster/artefacts, artefact.go); "" fetches none.
+	ArtefactDir string
+	// Types lists the command types the node's PHP runs (TypesViaPHP),
+	// asked before each hello; nil says no artefact feature.
+	Types func(ctx context.Context) ([]string, error)
 
 	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
@@ -89,6 +95,10 @@ type Agent struct {
 	streamsBad       map[int64]bool
 	streamsResyncNow bool
 	streamsEvery     time.Duration
+	artefactOn       atomic.Bool // the node's PHP runs artefact.fetch: say FeatureArtefact
+	typesSeen        atomic.Bool
+	artefactOnce     sync.Once
+	artefactKick     chan struct{} // a command was kept: look now (artefact.go)
 	// When the agent last said hello because MAIN answered through a
 	// fallback URL only, and under which policy version (Run's loop only).
 	fallbackHelloAt  time.Time
@@ -128,7 +138,8 @@ var Features = []string{"hls_reaper"}
 
 // FeatureConfigChanged, said at hello by an agent that keeps the replica and
 // runs MAIN's commands, has MAIN send it config.changed (replica.go); an
-// agent that keeps the replica also says FeatureStreams (streams.go).
+// agent that keeps the replica also says FeatureStreams (streams.go), and
+// one whose node's PHP runs artefact.fetch FeatureArtefact (artefact.go).
 const FeatureConfigChanged = "config_changed"
 
 // features is what this agent says at hello.
@@ -140,6 +151,10 @@ func (a *Agent) features() []string {
 	if a.ReplicaDir != "" {
 		// The R2 streams section, kept as streams.go does.
 		out = append(out, FeatureStreams)
+	}
+	if a.ArtefactDir != "" && (a.Exec != nil || a.run != nil) && a.artefactOn.Load() {
+		// Only while the node's PHP runs artefact.fetch (artefact.go).
+		out = append(out, FeatureArtefact)
 	}
 	return out
 }
@@ -331,6 +346,7 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 	}
 	var r Reply
 	hello := a.identity()
+	a.checkTypes(ctx)
 	hello["features"] = a.features()
 	// The policy whose main_urls the agent dials (adopted, never merely seen).
 	hello["policy_ver"] = st.policyVer()
@@ -419,6 +435,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
 		go a.RunCommands(cctx, a.run)
+	}
+	if a.run != nil && a.ArtefactDir != "" {
+		// Stopped and waited for on return: a download writes beside the state.
+		actx, stopArtefacts := context.WithCancel(ctx)
+		var artefactsDone sync.WaitGroup
+		artefactsDone.Add(1)
+		defer artefactsDone.Wait()
+		defer stopArtefacts()
+		go func() {
+			defer artefactsDone.Done()
+			a.RunArtefacts(actx)
+		}()
 	}
 	if a.Registry == nil && a.SpoolDir != "" {
 		spool := a.SpoolDir
