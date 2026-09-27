@@ -12,7 +12,10 @@
 // starting MAIN's 503) are in retry.go; the transport policy and the
 // https_required recovery in policy.go; the kills a hard-mode LICENCE_INVALID
 // carries in sealed.go; viewer admission in admission.go; the P2 lane in
-// touch.go; the registry's rebuild after a restart in rebuild.go.
+// touch.go; the registry's rebuild after a restart in rebuild.go; the
+// ingest lanes' busy refusals in retry.go; the known-good URL sets in
+// known.go; the node replica's sections in replica.go; the connect audit
+// the heartbeat relays in audit.go.
 package clusteragent
 
 import (
