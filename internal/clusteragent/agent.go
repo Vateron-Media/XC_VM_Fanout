@@ -74,7 +74,15 @@ type Agent struct {
 	applyKick          chan struct{} // the CONFIG flow changed: apply now
 	applyMu            sync.Mutex    // one cluster:apply at a time
 	lastApply          time.Time
-	configSeen         atomic.Int64 // the CONFIG bit of the flows last published, +1 (0: none yet)
+	configSeen         atomic.Int64 // the CONFIG and STREAMS bits of the flows last published, +1 (0: none yet)
+	streamsSeen        atomic.Int32 // the STREAMS bit last published: 0 none yet, 1 off, 2 on
+	streamsFileMu      sync.Mutex   // streams.json against the flow turning off (streams.go)
+	// The stream records that did not verify at the last check, left out
+	// of the next resync's hashes, and whether that resync is due now; the
+	// resync interval (replicaMu).
+	streamsBad       map[int64]bool
+	streamsResyncNow bool
+	streamsEvery     time.Duration
 	// When the agent last said hello because MAIN answered through a
 	// fallback URL only, and under which policy version (Run's loop only).
 	fallbackHelloAt  time.Time
@@ -113,7 +121,8 @@ type Reply struct {
 var Features = []string{"hls_reaper"}
 
 // FeatureConfigChanged, said at hello by an agent that keeps the replica and
-// runs MAIN's commands, has MAIN send it config.changed (replica.go).
+// runs MAIN's commands, has MAIN send it config.changed (replica.go); an
+// agent that keeps the replica also says FeatureStreams (streams.go).
 const FeatureConfigChanged = "config_changed"
 
 // features is what this agent says at hello.
@@ -121,6 +130,10 @@ func (a *Agent) features() []string {
 	out := append([]string{}, Features...)
 	if a.ReplicaDir != "" && (a.Exec != nil || a.run != nil) {
 		out = append(out, FeatureConfigChanged)
+	}
+	if a.ReplicaDir != "" {
+		// The R2 streams section, kept as streams.go does.
+		out = append(out, FeatureStreams)
 	}
 	return out
 }
@@ -223,11 +236,13 @@ func (a *Agent) publish(r *Reply) {
 	a.pubMu.Lock()
 	defer a.pubMu.Unlock()
 	a.flows.Store(int64(r.Flows))
+	// With STREAMS off, streams.json says 0 before flows.json says so.
+	a.streamsFlow(r.Flows)
 	a.state.Store(r.State)
 	a.setOfflineAdmission(r.OfflineAdmission)
 	a.setP2(a.p2Wanted(r))
 	if a.FlowsFile == "" {
-		a.configFlow(r.Flows)
+		a.flowsApply(r.Flows)
 		return
 	}
 	doc := map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State}
@@ -263,7 +278,7 @@ func (a *Agent) publish(r *Reply) {
 	}
 	a.flowsSeen = string(b)
 	// The caches change hands once PHP can read the new CONFIG bit.
-	a.configFlow(r.Flows)
+	a.flowsApply(r.Flows)
 	a.logf("cluster: mode %d, flows %d (%s)", r.Mode, r.Flows, r.State)
 }
 

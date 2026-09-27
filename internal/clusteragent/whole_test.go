@@ -304,11 +304,15 @@ func TestConfigChangedSyncsAtOnceAndAcks(t *testing.T) {
 		t.Fatal("config.changed handed to cluster:exec")
 		return false, nil
 	}}
-	if f := a.features(); strings.Join(f, ",") != "hls_reaper,config_changed" {
+	// streams: the agent keeps the R2 streams section (streams.go).
+	if f := a.features(); strings.Join(f, ",") != "hls_reaper,config_changed,streams" {
 		t.Fatalf("features %v", f)
 	}
-	if f := (&Agent{Client: c, ReplicaDir: a.ReplicaDir}).features(); strings.Join(f, ",") != "hls_reaper" {
+	if f := (&Agent{Client: c, ReplicaDir: a.ReplicaDir}).features(); strings.Join(f, ",") != "hls_reaper,streams" {
 		t.Fatalf("features without commands %v", f)
+	}
+	if f := (&Agent{Client: c}).features(); strings.Join(f, ",") != "hls_reaper" {
+		t.Fatalf("features without a replica %v", f)
 	}
 	run := a.localExec(a.Exec)
 	for i := 0; i < 3; i++ { // coalesced: one sync pending
@@ -330,7 +334,7 @@ func TestHelloSaysConfigChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	f, _ := json.Marshal(m.bodies["hello"][0]["features"])
-	if string(f) != `["hls_reaper","config_changed"]` {
+	if string(f) != `["hls_reaper","config_changed","streams"]` {
 		t.Fatalf("hello features %s", f)
 	}
 }
@@ -447,5 +451,70 @@ func TestAgentJSONKeepsItsNamesAndEncodings(t *testing.T) {
 		if err != nil || !bytes.Equal(b, want) || len(b) != 32 || !strings.HasSuffix(s, "=") {
 			t.Fatalf("%s = %q", key, s)
 		}
+	}
+}
+
+func TestCatalogueSectionsAndTooLarge(t *testing.T) {
+	m, a := newReplicaMain(t)
+	ctx := context.Background()
+	applied := 0
+	a.Apply = func(context.Context) error { applied++; return nil }
+	ApplyDebounce = 0
+	t.Cleanup(func() { ApplyDebounce = time.Second })
+	bouquets := map[string]any{"bouquets": []any{map[string]any{"id": 1, "bouquet_name": "News", "bouquet_channels": "[1,2]", "bouquet_order": 1}}}
+	categories := map[string]any{"categories": []any{map[string]any{"id": 3, "category_name": "Sport", "category_type": "live"}}}
+	m.whole = append(m.whole, map[string]any{
+		"bouquets":   m.wholeSection(t, "bouquets", m.uuid, etagOf("b1"), bouquets),
+		"categories": m.wholeSection(t, "categories", m.uuid, etagOf("c1"), categories),
+	})
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	have := m.asked[0]["have"].(map[string]any)
+	if have["bouquets"] != "" || have["categories"] != "" {
+		t.Fatalf("have %v", have)
+	}
+	for _, name := range []string{"bouquets", "categories"} {
+		if _, err := os.Stat(filepath.Join(a.ReplicaDir, name+".json")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Too large: the copy held is dropped, its ETag kept, cluster:apply run.
+	n := applied
+	m.whole = append(m.whole, map[string]any{"bouquets": map[string]any{"too_large": true, "etag": etagOf("b2")}})
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"bouquets.rep", "bouquets.json"} {
+		if _, err := os.Stat(filepath.Join(a.ReplicaDir, f)); !os.IsNotExist(err) {
+			t.Fatalf("%s kept", f)
+		}
+	}
+	if st := LoadReplicaState(a.ReplicaDir); st.WholeEtags["bouquets"] != etagOf("b2") || st.WholeEtags["categories"] != etagOf("c1") || applied != n+1 {
+		t.Fatalf("state %v, applied %d", st.WholeEtags, applied-n)
+	}
+	// Named with that ETag, MAIN answers unchanged: nothing to do.
+	m.whole = append(m.whole, map[string]any{"bouquets": map[string]any{"unchanged": true}})
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if m.asked[len(m.asked)-1]["have"].(map[string]any)["bouquets"] != etagOf("b2") || applied != n+1 {
+		t.Fatal("the too_large ETag not named")
+	}
+	// A malformed ETag is refused and changes nothing.
+	m.whole = append(m.whole, map[string]any{"categories": map[string]any{"too_large": true, "etag": "nope"}})
+	if err := a.SyncReplica(ctx); err == nil {
+		t.Fatal("a too_large without an ETag taken")
+	}
+	if _, err := os.Stat(filepath.Join(a.ReplicaDir, "categories.json")); err != nil {
+		t.Fatal("categories dropped on a malformed answer")
+	}
+	// The section comes back once it fits.
+	m.whole = append(m.whole, map[string]any{"bouquets": m.wholeSection(t, "bouquets", m.uuid, etagOf("b3"), bouquets)})
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(a.ReplicaDir, "bouquets.json")); err != nil || LoadReplicaState(a.ReplicaDir).WholeEtags["bouquets"] != etagOf("b3") {
+		t.Fatal("bouquets not stored again")
 	}
 }

@@ -320,3 +320,104 @@ func TestInteropIngestLaneRefusals(t *testing.T) {
 		t.Fatalf("a busy refusal was logged as an error: %v", logs.lines)
 	}
 }
+
+// TestInteropStreams: the R2 streams section against MAIN's real streams op
+// (StreamReplica), with the node's STREAMS flow on and the feature said at
+// hello: a new node's full pass, a delta that adds, changes and removes a
+// stream, a resync that finds a change no delta carries, and a full pass
+// again after every stream changed at once.
+func TestInteropStreams(t *testing.T) {
+	a, runPHP, ctx := interopNode(t)
+	a.ReplicaDir = filepath.Join(t.TempDir(), "replica")
+	runPHP("events.php", "flows", "8") // STREAMS
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	stored := func() string {
+		var ids []string
+		for _, id := range heldStreams(a.ReplicaDir) {
+			ids = append(ids, fmt.Sprint(id))
+		}
+		return strings.Join(ids, ",")
+	}
+	sync := func(what string) {
+		t.Helper()
+		if err := a.SyncStreams(ctx); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	record := func(id int64) string {
+		t.Helper()
+		rep, err := os.ReadFile(streamFile(a, id, ".rep"))
+		if err != nil {
+			t.Fatalf("stream %d: %v", id, err)
+		}
+		doc, err := a.openStream(rep, id)
+		if err != nil {
+			t.Fatalf("stream %d does not verify: %v", id, err)
+		}
+		if storedStreamEtag(a.ReplicaDir, id) != doc.Etag {
+			t.Fatalf("stream %d: .json and .rep disagree", id)
+		}
+		return string(doc.Data)
+	}
+	head := func() int64 {
+		var n int64
+		fmt.Sscan(runPHP("stream.php", "head"), &n)
+		return n
+	}
+
+	// A new node: the full pass takes stream 100 (assigned, archived and
+	// recorded on server 7), and the cursor becomes MAIN's head.
+	sync("full pass")
+	if stored() != "100" || !strings.Contains(record(100), `"stream_display_name":`) {
+		t.Fatalf("after the pass: %q", stored())
+	}
+	if since := streamsSince(a.ReplicaDir); since < 1 || since != head() {
+		t.Fatalf("cursor %d, MAIN's head %d", since, head())
+	}
+	for _, f := range []string{streamFile(a, 100, ".rep"), streamFile(a, 100, ".json")} {
+		if fi, err := os.Stat(f); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Fatalf("%s: %v", f, err)
+		}
+	}
+
+	// Deltas: a stream added, one edited, then one taken off the node.
+	runPHP("stream.php", "add", "200")
+	runPHP("stream.php", "edit", "100", "Edited")
+	sync("delta")
+	if stored() != "100,200" || !strings.Contains(record(100), `"stream_display_name":"Edited"`) || streamsSince(a.ReplicaDir) != head() {
+		t.Fatalf("after the delta: %q", stored())
+	}
+	runPHP("stream.php", "drop", "200")
+	sync("removal")
+	if stored() != "100" || streamsSince(a.ReplicaDir) != head() {
+		t.Fatalf("after the removal: %q", stored())
+	}
+	if _, err := os.Stat(streamFile(a, 200, ".rep")); !os.IsNotExist(err) {
+		t.Fatal("the removed stream's record kept")
+	}
+
+	// A change no version carries: only the resync finds it, cursor unchanged.
+	runPHP("stream.php", "quiet", "100", "Quiet")
+	cursor := streamsSince(a.ReplicaDir)
+	sync("idle delta")
+	if strings.Contains(record(100), `"Quiet"`) {
+		t.Fatal("a delta carried a change without a version")
+	}
+	st := LoadReplicaState(a.ReplicaDir)
+	st.StreamsResyncAt = 0
+	a.saveReplicaState(a.ReplicaDir, st)
+	sync("resync")
+	if !strings.Contains(record(100), `"stream_display_name":"Quiet"`) || streamsSince(a.ReplicaDir) != cursor {
+		t.Fatalf("after the resync: cursor %d", streamsSince(a.ReplicaDir))
+	}
+
+	// Every stream at once (the floor raised): MAIN answers full, the node
+	// walks again and takes the new head.
+	runPHP("stream.php", "reset")
+	sync("full again")
+	if stored() != "100" || streamsSince(a.ReplicaDir) != head() || streamsSince(a.ReplicaDir) <= cursor {
+		t.Fatalf("after the reset: cursor %d, head %d", streamsSince(a.ReplicaDir), head())
+	}
+}

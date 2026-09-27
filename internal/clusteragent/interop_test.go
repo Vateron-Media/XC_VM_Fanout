@@ -259,7 +259,13 @@ func TestInteropWithPanel(t *testing.T) {
 		// Every whole section came too, each stored as MAIN signed it for
 		// this node: secrets private to xc_vm, with MAIN's values.
 		held := LoadReplicaState(a.ReplicaDir)
+		// A panel before the twelfth Phase 7 increment serves neither
+		// catalogue section; one with it must serve both.
+		_, catalogue := os.Stat(filepath.Join(panel, "src/Core/Cluster/ReplicaStreamCache.php"))
 		for _, name := range WholeSections {
+			if (name == "bouquets" || name == "categories") && catalogue != nil {
+				continue
+			}
 			rep, err := os.ReadFile(filepath.Join(a.ReplicaDir, name+".rep"))
 			if err != nil {
 				t.Fatalf("%s.rep: %v", name, err)

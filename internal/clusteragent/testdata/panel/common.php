@@ -67,7 +67,7 @@ if ($rNew) {
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `main_port` int DEFAULT NULL');
 	// The tables the panel's code under test reads, from its own install
 	// schema. The replica's servers and node sections read every column.
-	foreach (['servers', 'crontab', 'streams_servers', 'streams', 'recordings', 'settings', 'cluster_stream_ver'] as $rTable) {
+	foreach (['servers', 'crontab', 'streams_servers', 'streams', 'recordings', 'settings', 'cluster_stream_ver', 'streams_types', 'profiles', 'streams_options', 'streams_arguments', 'bouquets', 'streams_categories'] as $rTable) {
 		$rDb->exec(interopTable($rPanel, $rTable));
 	}
 	$rDb->exec("INSERT INTO `servers` (`id`, `status`, `server_name`, `http_broadcast_port`, `total_clients`) VALUES (7, 0, 'LB 7', 8080, 1000)");
@@ -84,7 +84,6 @@ if ($rNew) {
 	$rDb->exec('INSERT OR IGNORE INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `source_id`, `stream_id`, 0, 0 FROM `recordings` WHERE `source_id` > 0 AND `stream_id` > 0');
 	$rDb->exec("INSERT OR IGNORE INTO `cluster_meta` (`name`, `value`, `updated_at`) VALUES ('stream_ver', '1', 0)");
 	$rDb->exec('CREATE TABLE `lines_live` (`activity_id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_id` int, `stream_id` int, `server_id` int, `proxy_id` int, `user_agent` text, `user_ip` text, `container` text, `pid` int, `date_start` int, `geoip_country_code` text, `isp` text, `external_device` text, `hls_last_read` int, `hls_end` int DEFAULT 0, `hmac_id` int, `hmac_identifier` text, `uuid` text)');
-	$rDb->exec('CREATE TABLE `bouquets` (`id` INTEGER PRIMARY KEY, `bouquet_movies` text)');
 	$rDb->exec('CREATE TABLE `cluster_changes` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `section` varchar(32), `op` varchar(8), `kind` varchar(16), `value` varchar(255), `time` int)');
 	$rDb->exec('CREATE TABLE `blocked_ips` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `ip` varchar(39), `notes` text, `date` int)');
 	$rDb->exec('CREATE TABLE `blocked_uas` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_agent` varchar(255), `exact_match` int DEFAULT 0)');
