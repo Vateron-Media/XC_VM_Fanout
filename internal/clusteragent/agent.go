@@ -67,6 +67,13 @@ type Agent struct {
 	acking             atomic.Bool  // sealed commands are being acked
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
+	replicaMu          sync.Mutex   // one replica sync or check at a time (replica.go)
+	kickOnce           sync.Once
+	syncKick           chan struct{} // config.changed: sync now (replica.go)
+	applyKick          chan struct{} // the CONFIG flow changed: apply now
+	applyMu            sync.Mutex    // one cluster:apply at a time
+	lastApply          time.Time
+	configSeen         atomic.Int64 // the CONFIG bit of the flows last published, +1 (0: none yet)
 	// When the agent last said hello because MAIN answered through a
 	// fallback URL only, and under which policy version (Run's loop only).
 	fallbackHelloAt  time.Time
@@ -103,6 +110,19 @@ type Reply struct {
 // Features are what this agent tells MAIN at hello that it does, so MAIN
 // stands down its own copy: "hls_reaper" (Registry.Reap).
 var Features = []string{"hls_reaper"}
+
+// FeatureConfigChanged, said at hello by an agent that keeps the replica and
+// runs MAIN's commands, has MAIN send it config.changed (replica.go).
+const FeatureConfigChanged = "config_changed"
+
+// features is what this agent says at hello.
+func (a *Agent) features() []string {
+	out := append([]string{}, Features...)
+	if a.ReplicaDir != "" && (a.Exec != nil || a.run != nil) {
+		out = append(out, FeatureConfigChanged)
+	}
+	return out
+}
 
 // BusyRefusals counts the ingest lane refusals MAIN has sent (503
 // RATE_LIMITED with lane): busy, not failing, so never logged as errors.
@@ -202,6 +222,7 @@ func (a *Agent) publish(r *Reply) {
 	a.pubMu.Lock()
 	defer a.pubMu.Unlock()
 	a.flows.Store(int64(r.Flows))
+	a.configFlow(r.Flows)
 	a.state.Store(r.State)
 	a.setOfflineAdmission(r.OfflineAdmission)
 	a.setP2(a.p2Wanted(r))
@@ -283,10 +304,12 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 		}
 		a.apply(&r)
 		a.logf("cluster: enrolled (state %s, mode %d)", r.State, r.Mode)
+		// The records a previous identity stored no longer verify.
+		a.recheckReplica()
 	}
 	var r Reply
 	hello := a.identity()
-	hello["features"] = Features
+	hello["features"] = a.features()
 	// The policy whose main_urls the agent dials (adopted, never merely seen).
 	hello["policy_ver"] = st.policyVer()
 	if err := a.Client.Call(ctx, "hello", hello, &r, false); err != nil {
@@ -353,6 +376,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			if err := a.recover(ctx); err != nil {
 				return err
 			}
+			a.recheckReplica()
 			continue
 		}
 		if w, ok := busyWait(err); ok {
@@ -470,6 +494,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				if err := a.recover(ctx); err != nil {
 					return err
 				}
+				a.recheckReplica()
 				a.helloLater(ctx, "after the re-key")
 				continue
 			}

@@ -27,15 +27,28 @@ import (
 //	replica/blocklist.rep              the last whole blocklist section (rep)
 //	replica/blocklist.d/<seq>.blk      blk deltas since that section, in seq order
 //	replica/blocklist.json             the section with its deltas applied, for PHP
-//	replica/settings.rep               the settings section (rep), sent whole
-//	replica/settings.json              its data, for PHP
+//	replica/<name>.rep                 a section sent whole (rep): settings,
+//	                                   servers, node, crontab, cluster, secrets
+//	replica/<name>.json                its data, for PHP: {etag, data}
 //
 // A record is only written once it opens for this node and verifies against
-// the pinned panel key; a rep record must name this node. A new section
-// replaces the deltas. After a change the agent writes blocklist.json from
-// the verified records (PHP holds no key to open them) and runs Apply
-// (cluster:apply), which diffs it against the node's own caches in shadow and
-// writes them once the CONFIG flow is on.
+// the pinned panel key; a rep record must name this node, and a whole
+// section its name and the ETag MAIN announced. Each .rep is written before
+// its .json: PHP reads a section only where its .json exists, and then
+// verifies the .rep. A new blocklist section replaces the deltas. After a
+// change the agent writes blocklist.json from the verified records (PHP
+// holds no key to open them) and runs Apply (cluster:apply), which diffs the
+// replica against the node's own caches in shadow and writes them once the
+// CONFIG flow is on.
+//
+// The whole sections (ADR 0004, Phase 7, fourth to sixth increments) are
+// asked for by the ETag held (config's `have`, "" for none) and kept per
+// name in state.json (settings_etag, whole_etags). MAIN answers a name with
+// {"unchanged": true}, with {etag, sealed}, or not at all ("not served":
+// keep what is held; so is a 503 DB to the whole call). `secrets` carries
+// the node's stream secret and OPENSSL_EXTRA: its files are 0600, and the
+// agent never logs it in any form (data, record, sealed bytes, ETag or kid);
+// an error names the section only.
 
 // ReplicaPoll is how often the agent asks MAIN for what changed.
 var ReplicaPoll = 60 * time.Second
@@ -52,12 +65,43 @@ const replicaPurpose = "replica"
 
 var etagRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// WholeSections are the sections MAIN sends whole, as named in `have`.
+var WholeSections = []string{"settings", "servers", "node", "crontab", "cluster", "secrets"}
+
+// secretSection is the one section that carries secrets.
+const secretSection = "secrets"
+
 // ReplicaState is where the node's replica stands.
 type ReplicaState struct {
 	BlocklistSeq  int64  `json:"blocklist_seq"`
 	BlocklistEtag string `json:"blocklist_etag"`
 	FullAt        int64  `json:"full_at"` // unix seconds of the last whole section
 	SettingsEtag  string `json:"settings_etag"`
+	// WholeEtags is the ETag held per whole section but settings.
+	WholeEtags map[string]string `json:"whole_etags,omitempty"`
+}
+
+// etag is the ETag held for a whole section, "" for none.
+func (st *ReplicaState) etag(name string) string {
+	if name == "settings" {
+		return st.SettingsEtag
+	}
+	return st.WholeEtags[name]
+}
+
+func (st *ReplicaState) setEtag(name, etag string) {
+	if name == "settings" {
+		st.SettingsEtag = etag
+		return
+	}
+	if st.WholeEtags == nil {
+		st.WholeEtags = map[string]string{}
+	}
+	if etag == "" {
+		delete(st.WholeEtags, name)
+		return
+	}
+	st.WholeEtags[name] = etag
 }
 
 // wholeReply is a section MAIN sends whole: unchanged, or the sealed record.
@@ -78,7 +122,6 @@ type configReply struct {
 			Sealed string `json:"sealed"`
 		} `json:"section"`
 	} `json:"blocklist"`
-	Settings *wholeReply `json:"settings"`
 }
 
 // OpenRecord opens a replica record sealed to this node and checks the panel
@@ -114,31 +157,57 @@ func LoadReplicaState(dir string) ReplicaState {
 	return st
 }
 
-func writeFileAtomic(path string, b []byte) error {
+func writeFileAtomic(path string, b []byte) error { return writeFileMode(path, b, 0o640) }
+
+// writeFileMode writes path atomically (temp file, fsync, rename) with mode
+// perm, whatever the umask or a stale temp file.
+func writeFileMode(path string, b []byte, perm os.FileMode) error {
 	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp")
-	if err := os.WriteFile(tmp, b, 0o640); err != nil {
+	os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	defer os.Remove(tmp)
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
 		return err
 	}
-	return nil
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // SyncReplica asks MAIN for what changed since the replica's state and stores
 // it; it repeats while MAIN has more.
 func (a *Agent) SyncReplica(ctx context.Context) error {
+	_, err := a.syncReplica(ctx)
+	return err
+}
+
+// syncReplica is SyncReplica, reporting whether it ran cluster:apply.
+func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 	dir := a.ReplicaDir
 	if dir == "" {
-		return nil
+		return false, nil
 	}
+	a.replicaMu.Lock()
+	defer a.replicaMu.Unlock()
 	deltas := filepath.Join(dir, "blocklist.d")
 	if err := os.MkdirAll(deltas, 0o750); err != nil {
-		return err
+		return false, err
 	}
 	st := LoadReplicaState(dir)
-	changed, settingsChanged := false, false
+	changed, wholeChanged := false, false
 	defer func() {
 		if _, err := os.Stat(filepath.Join(dir, "blocklist.json")); changed || (err != nil && st.BlocklistEtag != "") {
 			if err := a.materialise(dir, st); err != nil {
@@ -148,10 +217,9 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 				changed = true
 			}
 		}
-		if (changed || settingsChanged) && a.Apply != nil {
-			if err := a.Apply(ctx); err != nil {
-				a.logf("cluster: replica: apply: %v", err)
-			}
+		if (changed || wholeChanged) && a.Apply != nil {
+			a.runApply(ctx)
+			applied = true
 		}
 	}()
 	for round := 0; round < 100; round++ {
@@ -160,31 +228,49 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 		if n, _ := os.ReadDir(deltas); len(n) >= ReplicaMaxDeltas || now-st.FullAt >= int64(ReplicaFullEvery/time.Second) {
 			since = 0
 		}
-		var r configReply
-		payload := map[string]any{"blocklist_since": since, "have": map[string]string{"blocklist": st.BlocklistEtag, "settings": st.SettingsEtag}}
-		if err := a.Client.Call(ctx, "config", payload, &r, false); err != nil {
-			return err
+		have := map[string]string{"blocklist": st.BlocklistEtag}
+		for _, name := range WholeSections {
+			have[name] = st.etag(name)
 		}
-		if r.Settings != nil && !r.Settings.Unchanged {
-			if err := a.storeWhole(dir, "settings", r.Settings); err != nil {
-				return err
+		var raw json.RawMessage
+		if err := a.Client.Call(ctx, "config", map[string]any{"blocklist_since": since, "have": have}, &raw, false); err != nil {
+			// A 503 DB among them: keep every file and ETag held.
+			return false, err
+		}
+		var r configReply
+		var parts map[string]json.RawMessage
+		if json.Unmarshal(raw, &r) != nil || json.Unmarshal(raw, &parts) != nil {
+			return false, errors.New("clusteragent: config: unreadable reply")
+		}
+		var firstErr error
+		for _, name := range WholeSections {
+			w, ok, err := wholePart(parts, name)
+			if err == nil && ok {
+				err = a.storeWhole(dir, name, w)
+				if err == nil {
+					st.setEtag(name, w.Etag)
+					wholeChanged = true
+				}
 			}
-			st.SettingsEtag = r.Settings.Etag
-			settingsChanged = true
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 		b := r.Blocklist
 		switch {
 		case b.Section != nil:
 			if err := a.storeSection(dir, deltas, b.Section.Etag, b.Section.Sealed, b.Seq); err != nil {
-				return err
+				a.saveReplicaState(dir, st)
+				return false, err
 			}
-			st = ReplicaState{BlocklistSeq: b.Seq, BlocklistEtag: b.Section.Etag, FullAt: now}
+			st.BlocklistSeq, st.BlocklistEtag, st.FullAt = b.Seq, b.Section.Etag, now
 			changed = true
 		case b.Unchanged:
 			st.BlocklistSeq, st.FullAt = b.Seq, now
 		case b.Delta != "":
 			if err := a.storeDelta(deltas, b.Delta, st.BlocklistSeq, b.Seq); err != nil {
-				return err
+				a.saveReplicaState(dir, st)
+				return false, err
 			}
 			st.BlocklistSeq = b.Seq
 			changed = true
@@ -193,15 +279,39 @@ func (a *Agent) SyncReplica(ctx context.Context) error {
 				st.BlocklistSeq = b.Seq
 			}
 		}
-		out, _ := json.Marshal(st)
-		if err := writeFileAtomic(filepath.Join(dir, "state.json"), out); err != nil {
-			return err
+		if err := a.saveReplicaState(dir, st); err != nil {
+			return false, err
+		}
+		if firstErr != nil {
+			return false, firstErr
 		}
 		if !b.More {
-			return nil
+			return false, nil
 		}
 	}
-	return nil
+	return false, nil
+}
+
+// wholePart is the reply's part for a whole section; ok is false when MAIN
+// did not serve it or it is unchanged. The error names the section only.
+func wholePart(parts map[string]json.RawMessage, name string) (*wholeReply, bool, error) {
+	raw, ok := parts[name]
+	if !ok || string(raw) == "null" {
+		return nil, false, nil
+	}
+	var w wholeReply
+	if json.Unmarshal(raw, &w) != nil {
+		return nil, false, fmt.Errorf("clusteragent: config: bad %s section", name)
+	}
+	if w.Unchanged || (w.Etag == "" && w.Sealed == "") {
+		return nil, false, nil
+	}
+	return &w, true, nil
+}
+
+func (a *Agent) saveReplicaState(dir string, st ReplicaState) error {
+	out, _ := json.Marshal(st)
+	return writeFileAtomic(filepath.Join(dir, "state.json"), out)
 }
 
 func (a *Agent) storeSection(dir, deltas, etag, sealedB64 string, seq int64) error {
@@ -234,30 +344,123 @@ func (a *Agent) storeSection(dir, deltas, etag, sealedB64 string, seq int64) err
 }
 
 // storeWhole keeps a section sent whole once it verifies, and writes its data
-// for PHP (<name>.json: {etag, data}).
+// for PHP (<name>.json: {etag, data}), the .rep first. The secrets section's
+// files are 0600. No error carries a section's content.
 func (a *Agent) storeWhole(dir, name string, w *wholeReply) error {
 	sealed, err := base64.StdEncoding.DecodeString(w.Sealed)
 	if err != nil || !etagRe.MatchString(w.Etag) {
 		return fmt.Errorf("clusteragent: config: bad %s section", name)
 	}
+	data, err := a.openWhole(sealed, name, w.Etag)
+	if err != nil {
+		return err
+	}
+	if tok, ok := a.Client.Current(); ok && data.Gen != nil && *data.Gen != tok.Gen {
+		return fmt.Errorf("clusteragent: config: the %s section is for another generation of this node", name)
+	}
+	perm := os.FileMode(0o640)
+	if name == secretSection {
+		perm = 0o600
+	}
+	if err := writeFileMode(filepath.Join(dir, name+".rep"), sealed, perm); err != nil {
+		return fmt.Errorf("clusteragent: config: writing the %s section", name)
+	}
+	out, _ := json.Marshal(map[string]any{"etag": w.Etag, "data": data.Data})
+	if err := writeFileMode(filepath.Join(dir, name+".json"), out, perm); err != nil {
+		return fmt.Errorf("clusteragent: config: writing the %s section", name)
+	}
+	return nil
+}
+
+type wholeDoc struct {
+	Section string          `json:"section"`
+	Node    string          `json:"node"`
+	Gen     *int64          `json:"gen"`
+	Etag    string          `json:"etag"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// openWhole opens a whole section's record and checks that it is this
+// node's section name with the ETag given.
+func (a *Agent) openWhole(sealed []byte, name, etag string) (*wholeDoc, error) {
+	payload, err := a.Client.OpenRecord(sealed, "rep")
+	if err != nil {
+		return nil, fmt.Errorf("clusteragent: config: the %s section does not verify", name)
+	}
+	var doc wholeDoc
+	if err := json.Unmarshal(payload, &doc); err != nil || doc.Section != name || doc.Node != a.Client.State.NodeUUID || doc.Etag != etag || len(doc.Data) == 0 {
+		return nil, fmt.Errorf("clusteragent: config: the %s section is not this node's, or not the one announced", name)
+	}
+	return &doc, nil
+}
+
+// recheckReplica opens and verifies every stored record with the node's
+// current keys, after a start, an enrolment or a re-key. A whole section
+// whose record fails gets its held ETag reset, and a blocklist that fails
+// its ETag and seq, so the next config call fetches them again: MAIN would
+// otherwise answer unchanged while PHP refuses the stored records.
+func (a *Agent) recheckReplica() {
+	dir := a.ReplicaDir
+	if dir == "" {
+		return
+	}
+	a.replicaMu.Lock()
+	defer a.replicaMu.Unlock()
+	st := LoadReplicaState(dir)
+	changed := false
+	for _, name := range WholeSections {
+		etag := st.etag(name)
+		if etag == "" {
+			continue
+		}
+		sealed, err := os.ReadFile(filepath.Join(dir, name+".rep"))
+		if err == nil {
+			_, err = a.openWhole(sealed, name, etag)
+		}
+		if err != nil {
+			st.setEtag(name, "")
+			changed = true
+			a.logf("cluster: replica: the stored %s section no longer verifies; fetching it again", name)
+		}
+	}
+	if st.BlocklistEtag != "" {
+		if err := a.verifyBlocklist(dir, st.BlocklistEtag); err != nil {
+			st.BlocklistEtag, st.BlocklistSeq, st.FullAt = "", 0, 0
+			changed = true
+			a.logf("cluster: replica: the stored blocklist no longer verifies; fetching it again")
+		}
+	}
+	if changed {
+		if err := a.saveReplicaState(dir, st); err != nil {
+			a.logf("cluster: replica: %v", err)
+		}
+	}
+}
+
+// verifyBlocklist opens the stored blocklist section and its deltas.
+func (a *Agent) verifyBlocklist(dir, etag string) error {
+	sealed, err := os.ReadFile(filepath.Join(dir, "blocklist.rep"))
+	if err != nil {
+		return err
+	}
 	payload, err := a.Client.OpenRecord(sealed, "rep")
 	if err != nil {
 		return err
 	}
-	var doc struct {
-		Section string          `json:"section"`
-		Node    string          `json:"node"`
-		Etag    string          `json:"etag"`
-		Data    json.RawMessage `json:"data"`
+	var doc wholeDoc
+	if err := json.Unmarshal(payload, &doc); err != nil || doc.Section != "blocklist" || doc.Node != a.Client.State.NodeUUID || doc.Etag != etag {
+		return errors.New("clusteragent: replica: the stored blocklist is not this node's")
 	}
-	if err := json.Unmarshal(payload, &doc); err != nil || doc.Section != name || doc.Node != a.Client.State.NodeUUID || doc.Etag != w.Etag || len(doc.Data) == 0 {
-		return fmt.Errorf("clusteragent: config: the %s section is not this node's, or not the one announced", name)
+	for _, name := range ReplicaDeltas(dir) {
+		b, err := os.ReadFile(filepath.Join(dir, "blocklist.d", name))
+		if err != nil {
+			return err
+		}
+		if _, err := a.Client.OpenRecord(b, "blk"); err != nil {
+			return err
+		}
 	}
-	if err := writeFileAtomic(filepath.Join(dir, name+".rep"), sealed); err != nil {
-		return err
-	}
-	out, _ := json.Marshal(map[string]any{"etag": doc.Etag, "data": doc.Data})
-	return writeFileAtomic(filepath.Join(dir, name+".json"), out)
+	return nil
 }
 
 func (a *Agent) storeDelta(deltas, sealedB64 string, after, seq int64) error {
@@ -352,17 +555,87 @@ func (a *Agent) materialise(dir string, st ReplicaState) error {
 	return writeFileAtomic(filepath.Join(dir, "blocklist.json"), out)
 }
 
+// ErrNothingToApply is cluster:apply's exit 2: no replica to apply yet.
+var ErrNothingToApply = errors.New("cluster:apply: no replica to apply")
+
 // ApplyViaPHP runs the node's `console.php cluster:apply`, which applies the
-// materialised replica (shadow diff, or the caches once CONFIG is on).
+// materialised replica (shadow diff, or the caches once CONFIG is on). Its
+// exit codes: 0 applied or compared, 2 nothing to apply (ErrNothingToApply),
+// 3 a part of the report failed; that and any other failure carries the
+// output (one JSON line, which PHP keeps free of secrets) to be logged.
 func ApplyViaPHP(php, console string, timeout time.Duration) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		out, err := exec.CommandContext(ctx, php, console, "cluster:apply").CombinedOutput()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 2 {
+			return ErrNothingToApply
+		}
 		if err != nil {
 			return fmt.Errorf("cluster:apply: %v: %s", err, bytes.TrimSpace(out))
 		}
 		return nil
+	}
+}
+
+// ApplyDebounce is the least time between two runs of cluster:apply: a
+// burst of changes (config.changed, a flows change, a sync) runs it once
+// more at most a second after the one before.
+var ApplyDebounce = time.Second
+
+// runApply runs Apply, one at a time and at most once per ApplyDebounce, and
+// logs a failed run with its output. Nothing is fetched again because of it:
+// cron:cache applies again every minute while CONFIG is on, and the next
+// change runs cluster:apply again.
+func (a *Agent) runApply(ctx context.Context) {
+	if a.Apply == nil {
+		return
+	}
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
+	if wait := ApplyDebounce - time.Since(a.lastApply); !a.lastApply.IsZero() && wait > 0 && !sleep(ctx, wait) {
+		return
+	}
+	a.lastApply = time.Now()
+	if err := a.Apply(ctx); err != nil && !errors.Is(err, ErrNothingToApply) && ctx.Err() == nil {
+		a.logf("cluster: replica: apply: %v", err)
+	}
+}
+
+// FlowConfig is the CONFIG flow bit (MAIN's NodeRegistry::FLOW_CONFIG).
+const FlowConfig = 32
+
+// configFlow notes the flows MAIN sent: a change of the CONFIG bit, either
+// way, runs cluster:apply, since that is when the caches change hands.
+func (a *Agent) configFlow(flows int) {
+	now := int64(flows&FlowConfig) + 1
+	if old := a.configSeen.Swap(now); old != 0 && old != now && a.ReplicaDir != "" {
+		a.kick(a.kickChans().apply)
+	}
+}
+
+type replicaKicks struct{ sync, apply chan struct{} }
+
+func (a *Agent) kickChans() replicaKicks {
+	a.kickOnce.Do(func() {
+		a.syncKick, a.applyKick = make(chan struct{}, 1), make(chan struct{}, 1)
+	})
+	return replicaKicks{a.syncKick, a.applyKick}
+}
+
+func (a *Agent) kick(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default: // one is pending already: coalesced
+	}
+}
+
+// ConfigChanged is the config.changed command: a replica sync at once,
+// coalesced with one already running, without waiting for it.
+func (a *Agent) ConfigChanged() {
+	if a.ReplicaDir != "" {
+		a.kick(a.kickChans().sync)
 	}
 }
 
@@ -379,11 +652,16 @@ func ReplicaDeltas(dir string) []string {
 	return out
 }
 
-// RunReplica keeps the replica current until ctx ends.
+// RunReplica keeps the replica current until ctx ends. It first checks the
+// stored records against the node's keys, and runs cluster:apply once after
+// the first sync (tmp/cache/ does not survive a reboot).
 func (a *Agent) RunReplica(ctx context.Context) {
-	for {
+	a.recheckReplica()
+	kicks := a.kickChans()
+	for first := true; ; first = false {
 		wait := jitter(ReplicaPoll)
-		if err := a.SyncReplica(ctx); err != nil && ctx.Err() == nil {
+		applied, err := a.syncReplica(ctx)
+		if err != nil && ctx.Err() == nil {
 			if w, ok := busyWait(err); ok {
 				// MAIN is busy: ask again when it says, not a minute later.
 				wait = w
@@ -394,8 +672,30 @@ func (a *Agent) RunReplica(ctx context.Context) {
 				a.logf("cluster: replica: %v (next in %s)", err, wait.Round(time.Second))
 			}
 		}
-		if !sleep(ctx, wait) {
+		if first && !applied && ctx.Err() == nil {
+			a.runApply(ctx)
+		}
+		if !a.waitReplica(ctx, wait, kicks) {
 			return
+		}
+	}
+}
+
+// waitReplica waits for the next sync: its time or config.changed. A change
+// of the CONFIG flow meanwhile runs cluster:apply.
+func (a *Agent) waitReplica(ctx context.Context, d time.Duration, kicks replicaKicks) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			return true
+		case <-kicks.sync:
+			return true
+		case <-kicks.apply:
+			a.runApply(ctx)
 		}
 	}
 }
