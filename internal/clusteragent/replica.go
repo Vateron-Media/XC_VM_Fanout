@@ -3,6 +3,7 @@ package clusteragent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -184,7 +185,16 @@ func writeFileMode(path string, b []byte, perm os.FileMode) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// The rename itself durable, so files written in turn (a .rep before
+	// its .json) reach the disk in that order.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // SyncReplica asks MAIN for what changed since the replica's state and stores
@@ -205,6 +215,13 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 	deltas := filepath.Join(dir, "blocklist.d")
 	if err := os.MkdirAll(deltas, 0o750); err != nil {
 		return false, err
+	}
+	// First at the agent's start, then whenever the node's keys changed
+	// (an enrolment, a re-enrolment, a new panel key): records that no
+	// longer verify are asked for again.
+	if keys := a.replicaKeyPrint(); keys != a.replicaKeys {
+		a.recheckLocked(dir)
+		a.replicaKeys = keys
 	}
 	st := LoadReplicaState(dir)
 	changed, wholeChanged := false, false
@@ -309,9 +326,11 @@ func wholePart(parts map[string]json.RawMessage, name string) (*wholeReply, bool
 	return &w, true, nil
 }
 
+// saveReplicaState writes replica/state.json, 0600: it holds the secrets
+// section's ETag, a hash of the secrets.
 func (a *Agent) saveReplicaState(dir string, st ReplicaState) error {
 	out, _ := json.Marshal(st)
-	return writeFileAtomic(filepath.Join(dir, "state.json"), out)
+	return writeFileMode(filepath.Join(dir, "state.json"), out, 0o600)
 }
 
 func (a *Agent) storeSection(dir, deltas, etag, sealedB64 string, seq int64) error {
@@ -365,11 +384,18 @@ func (a *Agent) storeWhole(dir, name string, w *wholeReply) error {
 	if err := writeFileMode(filepath.Join(dir, name+".rep"), sealed, perm); err != nil {
 		return fmt.Errorf("clusteragent: config: writing the %s section", name)
 	}
-	out, _ := json.Marshal(map[string]any{"etag": w.Etag, "data": data.Data})
-	if err := writeFileMode(filepath.Join(dir, name+".json"), out, perm); err != nil {
+	if err := writeFileMode(filepath.Join(dir, name+".json"), wholeJSON(w.Etag, data.Data), perm); err != nil {
 		return fmt.Errorf("clusteragent: config: writing the %s section", name)
 	}
 	return nil
+}
+
+// wholeJSON is <name>.json: {"data": <data exactly as signed>, "etag": …}.
+// Assembled, not marshalled: encoding/json would escape <, > and & in the
+// data. The ETag is 64 hex digits.
+func wholeJSON(etag string, data json.RawMessage) []byte {
+	out := append([]byte(`{"data":`), data...)
+	return append(out, `,"etag":"`+etag+`"}`...)
 }
 
 type wholeDoc struct {
@@ -395,7 +421,9 @@ func (a *Agent) openWhole(sealed []byte, name, etag string) (*wholeDoc, error) {
 }
 
 // recheckReplica opens and verifies every stored record with the node's
-// current keys, after a start, an enrolment or a re-key. A whole section
+// current keys. syncReplica runs it at the agent's start and whenever those
+// keys changed (an enrolment, a re-enrolment, a new panel key), off the
+// heartbeat loop: it waits for a running sync and its apply. A whole section
 // whose record fails gets its held ETag reset, and a blocklist that fails
 // its ETag and seq, so the next config call fetches them again: MAIN would
 // otherwise answer unchanged while PHP refuses the stored records.
@@ -406,6 +434,26 @@ func (a *Agent) recheckReplica() {
 	}
 	a.replicaMu.Lock()
 	defer a.replicaMu.Unlock()
+	a.recheckLocked(dir)
+	a.replicaKeys = a.replicaKeyPrint()
+}
+
+// replicaKeyPrint names the keys the stored records verify under: the
+// node's uuid and box key, and the pinned panel key.
+func (a *Agent) replicaKeyPrint() string {
+	st := a.Client.State
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	h := sha256.New()
+	for _, b := range [][]byte{[]byte(st.NodeUUID), st.NodeBoxSk, st.PanelSignPub} {
+		h.Write(binary.BigEndian.AppendUint32(nil, uint32(len(b))))
+		h.Write(b)
+	}
+	return string(h.Sum(nil))
+}
+
+// recheckLocked is recheckReplica with replicaMu held.
+func (a *Agent) recheckLocked(dir string) {
 	st := LoadReplicaState(dir)
 	changed := false
 	for _, name := range WholeSections {
@@ -652,11 +700,10 @@ func ReplicaDeltas(dir string) []string {
 	return out
 }
 
-// RunReplica keeps the replica current until ctx ends. It first checks the
-// stored records against the node's keys, and runs cluster:apply once after
-// the first sync (tmp/cache/ does not survive a reboot).
+// RunReplica keeps the replica current until ctx ends. Its first sync checks
+// the stored records against the node's keys (syncReplica), and it runs
+// cluster:apply once after that sync (tmp/cache/ does not survive a reboot).
 func (a *Agent) RunReplica(ctx context.Context) {
-	a.recheckReplica()
 	kicks := a.kickChans()
 	for first := true; ; first = false {
 		wait := jitter(ReplicaPoll)

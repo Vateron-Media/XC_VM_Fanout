@@ -68,6 +68,7 @@ type Agent struct {
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
 	replicaMu          sync.Mutex   // one replica sync or check at a time (replica.go)
+	replicaKeys        string       // the keys the stored records were last checked with (replicaMu)
 	kickOnce           sync.Once
 	syncKick           chan struct{} // config.changed: sync now (replica.go)
 	applyKick          chan struct{} // the CONFIG flow changed: apply now
@@ -222,11 +223,11 @@ func (a *Agent) publish(r *Reply) {
 	a.pubMu.Lock()
 	defer a.pubMu.Unlock()
 	a.flows.Store(int64(r.Flows))
-	a.configFlow(r.Flows)
 	a.state.Store(r.State)
 	a.setOfflineAdmission(r.OfflineAdmission)
 	a.setP2(a.p2Wanted(r))
 	if a.FlowsFile == "" {
+		a.configFlow(r.Flows)
 		return
 	}
 	doc := map[string]any{"mode": r.Mode, "flows": r.Flows, "state": r.State}
@@ -261,6 +262,8 @@ func (a *Agent) publish(r *Reply) {
 		return
 	}
 	a.flowsSeen = string(b)
+	// The caches change hands once PHP can read the new CONFIG bit.
+	a.configFlow(r.Flows)
 	a.logf("cluster: mode %d, flows %d (%s)", r.Mode, r.Flows, r.State)
 }
 
@@ -304,8 +307,6 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 		}
 		a.apply(&r)
 		a.logf("cluster: enrolled (state %s, mode %d)", r.State, r.Mode)
-		// The records a previous identity stored no longer verify.
-		a.recheckReplica()
 	}
 	var r Reply
 	hello := a.identity()
@@ -376,7 +377,6 @@ func (a *Agent) Run(ctx context.Context) error {
 			if err := a.recover(ctx); err != nil {
 				return err
 			}
-			a.recheckReplica()
 			continue
 		}
 		if w, ok := busyWait(err); ok {
@@ -450,9 +450,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		go a.RunFanoutEvents(fctx)
 	}
 	if a.ReplicaDir != "" {
+		// Stopped and waited for on return, like the policy recovery: its
+		// sync and cluster:apply end with rctx.
 		rctx, stopReplica := context.WithCancel(ctx)
+		var replicaDone sync.WaitGroup
+		replicaDone.Add(1)
+		defer replicaDone.Wait()
 		defer stopReplica()
-		go a.RunReplica(rctx)
+		go func() {
+			defer replicaDone.Done()
+			a.RunReplica(rctx)
+		}()
 	}
 	if a.SpoolDir != "" {
 		ectx, stopEvents := context.WithCancel(ctx)
@@ -494,7 +502,6 @@ func (a *Agent) Run(ctx context.Context) error {
 				if err := a.recover(ctx); err != nil {
 					return err
 				}
-				a.recheckReplica()
 				a.helloLater(ctx, "after the re-key")
 				continue
 			}
@@ -515,11 +522,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			}()
 		}
 		if r.WantConnSnapshot {
-			go func() {
-				if err := a.SendSnapshot(ctx); err != nil {
-					a.logf("cluster: connection snapshot: %v", err)
-				}
-			}()
+			go a.snapshot(ctx)
 		}
 		if r.PolicyVer > a.Client.State.policyVer() {
 			a.helloLater(ctx, fmt.Sprintf("fetching policy %d", r.PolicyVer))
@@ -527,6 +530,20 @@ func (a *Agent) Run(ctx context.Context) error {
 		if r.State == "quarantined" {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
+	}
+}
+
+// snapshot sends the registry MAIN asked for. A snapshot given up while
+// MAIN's bulk lane stays busy is not an error: MAIN asks again while its
+// store drifts.
+func (a *Agent) snapshot(ctx context.Context) {
+	err := a.SendSnapshot(ctx)
+	switch {
+	case err == nil:
+	case laneRefusal(err) != nil:
+		a.logf("cluster: connection snapshot: MAIN stayed busy; left for MAIN to ask again")
+	default:
+		a.logf("cluster: connection snapshot: %v", err)
 	}
 }
 
