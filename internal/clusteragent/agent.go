@@ -67,6 +67,10 @@ type Agent struct {
 	acking             atomic.Bool  // sealed commands are being acked
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
+	// When the agent last said hello because MAIN answered through a
+	// fallback URL only, and under which policy version (Run's loop only).
+	fallbackHelloAt  time.Time
+	fallbackHelloVer int
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -283,6 +287,8 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 	var r Reply
 	hello := a.identity()
 	hello["features"] = Features
+	// The policy whose main_urls the agent dials (adopted, never merely seen).
+	hello["policy_ver"] = st.policyVer()
 	if err := a.Client.Call(ctx, "hello", hello, &r, false); err != nil {
 		return nil, err
 	}
@@ -450,6 +456,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		hctx, cancel := context.WithTimeout(ctx, MaxHeartbeatGap)
 		r, err := a.Heartbeat(hctx)
 		cancel()
+		a.fallbackHello(ctx)
 		if err != nil {
 			if fatal(err) {
 				return errors.Join(ErrStop, err)
@@ -496,6 +503,22 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logf("cluster: MAIN has quarantined this node; an admin must decide")
 		}
 	}
+}
+
+// fallbackHello says hello when MAIN answered through a fallback URL only
+// (known.go), to fetch MAIN's policy: at most once per URLRetry for the same
+// policy version, since a MAIN whose policy is the one held answers each
+// hello with it again while its URLs stay unreachable.
+func (a *Agent) fallbackHello(ctx context.Context) {
+	if !a.Client.fellBack.Swap(false) {
+		return
+	}
+	ver := a.Client.State.policyVer()
+	if ver == a.fallbackHelloVer && !a.fallbackHelloAt.IsZero() && time.Since(a.fallbackHelloAt) < URLRetry {
+		return
+	}
+	a.fallbackHelloAt, a.fallbackHelloVer = time.Now(), ver
+	a.helloLater(ctx, "MAIN answered through a fallback URL")
 }
 
 // MaxHeartbeatGap is the longest MAIN may go between two of the node's
@@ -596,7 +619,7 @@ func (a *Agent) stop(err error) {
 // Heartbeat sends one heartbeat and publishes the reply's mode and flows. A
 // node whose CONNECTIONS flow is on adds its registry's digest.
 func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
-	payload := map[string]any{"root_ready": RootReady(a.Client.State)}
+	payload := map[string]any{"root_ready": RootReady(a.Client.State), "policy_ver": a.Client.State.policyVer()}
 	if a.Telemetry != nil {
 		payload["telemetry"] = a.Telemetry()
 	}

@@ -87,6 +87,10 @@ type Client struct {
 	// failed holds the MAIN URLs that could not be reached (connect, TLS or
 	// timeout), each until it is tried first again (URLRetry).
 	failed map[string]time.Time
+	// fellBack is set when MAIN answered through a fallback URL only (a
+	// known-good set's URL the current policy does not list); the agent then
+	// says hello to fetch MAIN's policy (Agent.Run).
+	fellBack atomic.Bool
 }
 
 // URLRetry is how long a MAIN URL that could not be reached is tried after
@@ -105,8 +109,6 @@ func newTransport() *http.Transport {
 	return t
 }
 
-// urls is MAIN's URLs in the order to try them: the policy's order, with the
-// ones that recently could not be reached last.
 // newP0Transport is P0's own: one connection to a MAIN URL, kept alive, so
 // one P0 request is in flight at a time and never waits behind bulk.
 func newP0Transport() *http.Transport {
@@ -116,9 +118,13 @@ func newP0Transport() *http.Transport {
 	return t
 }
 
+// urls is MAIN's URLs in the order to try them: the current policy's URLs,
+// then the fallback URLs of the known-good sets (known.go), each group in its
+// order, with the ones that recently could not be reached last (the current
+// ones, then the fallback ones).
 func (c *Client) urls() []string {
 	c.State.mu.Lock()
-	all := append([]string{}, c.State.MainURLs...)
+	all := append(append([]string{}, c.State.MainURLs...), c.State.fallbackURLsLocked()...)
 	c.State.mu.Unlock()
 	now := c.now()
 	c.mu.Lock()
@@ -297,9 +303,19 @@ func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op st
 			continue
 		}
 		if st == http.StatusOK && strings.EqualFold(rh.Get("Content-Type"), octet) {
-			return c.openReply(s, reqCtx, st, rh, rb, out)
+			err := c.openReply(s, reqCtx, st, rh, rb, out)
+			if !errors.Is(err, ErrTransport) {
+				// The MAC verified and the BOX opened: MAIN answered here.
+				c.answered(base)
+			}
+			return err
 		}
 		if d := c.denial(st, rh, rb, nonce); d != nil {
+			if d.Reason != "HTTPS_REQUIRED" {
+				// Reached MAIN, but one that refuses ops over this URL is no
+				// known-good answer.
+				c.answered(base)
+			}
 			if c.OnDenial != nil {
 				c.OnDenial(d)
 			}
