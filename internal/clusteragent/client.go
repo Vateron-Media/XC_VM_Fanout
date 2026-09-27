@@ -94,6 +94,11 @@ type Client struct {
 	// known-good set's URL the current policy does not list); the agent then
 	// says hello to fetch MAIN's policy (Agent.Run).
 	fellBack atomic.Bool
+
+	// httpsAnswered is set once MAIN has answered over an https:// URL: the
+	// node then reports the https feature, which is what lets an operator move
+	// the fleet to https_required (known.go).
+	httpsAnswered atomic.Bool
 }
 
 // URLRetry is how long a MAIN URL that could not be reached is tried after

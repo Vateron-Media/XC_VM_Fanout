@@ -143,6 +143,9 @@ var Features = []string{"hls_reaper"}
 // one whose node's PHP runs artefact.fetch FeatureArtefact (artefact.go).
 const FeatureConfigChanged = "config_changed"
 
+// FeatureHTTPS says MAIN has answered this node over HTTPS.
+const FeatureHTTPS = "https"
+
 // features is what this agent says at hello.
 func (a *Agent) features() []string {
 	out := append([]string{}, Features...)
@@ -156,6 +159,11 @@ func (a *Agent) features() []string {
 	if a.ArtefactDir != "" && (a.Exec != nil || a.run != nil) && a.artefactOn.Load() {
 		// Only while the node's PHP runs artefact.fetch (artefact.go).
 		out = append(out, FeatureArtefact)
+	}
+	if a.Client != nil && a.Client.HTTPSAnswered() {
+		// MAIN has answered this node over HTTPS: it may be moved to
+		// https_required without losing it (known.go).
+		out = append(out, FeatureHTTPS)
 	}
 	return out
 }

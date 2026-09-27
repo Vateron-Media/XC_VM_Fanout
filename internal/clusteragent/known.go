@@ -80,11 +80,20 @@ func (st *State) fallbackURLsLocked() []string {
 
 // answered notes that MAIN gave an authenticated answer at base: the current
 // policy's set becomes known-good, and an answer through a fallback URL asks
-// the agent to fetch MAIN's policy.
+// the agent to fetch MAIN's policy. An answer over HTTPS is remembered too, so
+// the node can say it has HTTPS to MAIN (the https feature): MAIN refuses
+// https_required until every node says so.
 func (c *Client) answered(base string) {
+	if strings.HasPrefix(strings.ToLower(base), "https://") {
+		c.httpsAnswered.Store(true)
+	}
 	current, err := c.State.confirmURLs(base)
 	if !current {
 		c.fellBack.Store(true)
 	}
 	_ = err // kept in memory: the next write of the state file carries it
 }
+
+// HTTPSAnswered reports whether MAIN has answered this agent over HTTPS since
+// it started. It says nothing about plain HTTP, which always works.
+func (c *Client) HTTPSAnswered() bool { return c.httpsAnswered.Load() }
