@@ -17,6 +17,8 @@ $rRes = \XcVm\Domain\Cluster\ClusterApi::handle($rCrypto, [
 	'headers' => $rHeaders,
 	'body' => (string) file_get_contents('php://input'),
 	'ip' => $_SERVER['REMOTE_ADDR'] ?? '',
+	// nginx's $server_port: the MAIN port a node reached (ClusterEndpoint::nodeUses).
+	'port' => (int) ($_SERVER['SERVER_PORT'] ?? 0),
 ], $rSettings, $rMain);
 http_response_code($rRes['status']);
 foreach ($rRes['headers'] as $rName => $rValue) {
