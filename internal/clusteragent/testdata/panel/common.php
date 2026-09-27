@@ -65,6 +65,7 @@ if ($rNew) {
 	// Migrations 045 and 046: the node's audit, and the MAIN port it last reached.
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `audit` text DEFAULT NULL');
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `main_port` int DEFAULT NULL');
+	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `arch` varchar(8) DEFAULT NULL');
 	// The tables the panel's code under test reads, from its own install
 	// schema. The replica's servers and node sections read every column.
 	foreach (['servers', 'crontab', 'streams_servers', 'streams', 'recordings', 'settings', 'cluster_stream_ver', 'streams_types', 'profiles', 'streams_options', 'streams_arguments', 'bouquets', 'streams_categories'] as $rTable) {

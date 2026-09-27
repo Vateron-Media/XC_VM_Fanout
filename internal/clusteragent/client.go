@@ -464,8 +464,9 @@ func (c *Client) Refresh(ctx context.Context) (*cc.Token, error) {
 		return nil, err
 	}
 	var reply struct {
-		TokenSealed string `json:"token_sealed"`
-		Epoch       uint64 `json:"epoch"`
+		TokenSealed string          `json:"token_sealed"`
+		Epoch       uint64          `json:"epoch"`
+		Lease       json.RawMessage `json:"lease"`
 	}
 	if err := c.call(ctx, s, "token_refresh", map[string]string{"eph_pub": base64.StdEncoding.EncodeToString(ephPub)}, &reply, true); err != nil {
 		return nil, err
@@ -481,6 +482,10 @@ func (c *Client) Refresh(ctx context.Context) (*cc.Token, error) {
 	c.State.AddEpoch(e)
 	c.State.mu.Lock()
 	c.State.PendingEphSk = nil
+	// The lease this token serves on. A resent token (MAIN re-sends the same one
+	// for the same ephemeral key) comes with a lease minted at that moment, so
+	// this runs on every reply, not only on a new epoch.
+	acceptLease(c.State, reply.Lease)
 	err = c.State.saveLocked()
 	c.State.mu.Unlock()
 	if err != nil {

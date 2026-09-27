@@ -148,9 +148,18 @@ func main() {
 		}
 		fmt.Println("OK")
 		return
+	case "lease":
+		// Its own case, above the group that loads a complete state: an operator
+		// asks this of a node whose enrolment never finished, or one MAIN stopped.
+		out, err := clusteragent.LeaseReport(*statePath, time.Now())
+		if err != nil {
+			log.Fatalf("xc_agent lease: %v", err)
+		}
+		fmt.Print(out)
+		return
 	case "run", "health":
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, keygen, probe, install, enrol, version)\n", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, keygen, probe, install, enrol, lease, version)\n", cmd)
 		os.Exit(2)
 	}
 
