@@ -407,7 +407,7 @@ func TestInteropStreams(t *testing.T) {
 	}
 	st := LoadReplicaState(a.ReplicaDir)
 	st.StreamsResyncAt = 0
-	a.saveReplicaState(a.ReplicaDir, st)
+	a.saveStreamsState(a.ReplicaDir, st)
 	sync("resync")
 	if !strings.Contains(record(100), `"stream_display_name":"Quiet"`) || streamsSince(a.ReplicaDir) != cursor {
 		t.Fatalf("after the resync: cursor %d", streamsSince(a.ReplicaDir))

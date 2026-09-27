@@ -43,6 +43,12 @@ type streamsMain struct {
 	forge    map[int64]bool // records signed under another key
 	refuse   []func(w http.ResponseWriter, nonce []byte)
 	asked    []map[string]any // every streams request, opened
+	// alter rewrites a stream's signed payload (another node, another
+	// section), still sealed to this node and signed by the panel.
+	alter map[int64]func(payload string) string
+	// served runs after each streams reply is built, m.mu held.
+	served  func()
+	configs int // config calls
 }
 
 func newStreamsMain(t *testing.T) (*streamsMain, *Agent) {
@@ -50,7 +56,7 @@ func newStreamsMain(t *testing.T) (*streamsMain, *Agent) {
 	sk, pub, _ := cc.NewX25519()
 	st.NodeBoxSk = sk
 	m := &streamsMain{fakeMain: f, boxPub: pub, data: map[int64]string{}, vers: map[int64]int64{}, head: 1,
-		maxRows: 1000, maxRecs: 200, maxExam: 1000, withhold: map[int64]bool{}, forge: map[int64]bool{}}
+		maxRows: 1000, maxRecs: 200, maxExam: 1000, withhold: map[int64]bool{}, forge: map[int64]bool{}, alter: map[int64]func(string) string{}}
 	f.answer = m.answer
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
@@ -87,6 +93,9 @@ func (m *streamsMain) entry(t testing.TB, id int64) map[string]any {
 	data, ver := m.data[id], m.vers[id]
 	etag := etagFor(data)
 	payload := `{"v":1,"section":"stream","node":"` + m.uuid + `","gen":1,"stream_id":` + strconv.FormatInt(id, 10) + `,"ver":` + strconv.FormatInt(ver, 10) + `,"etag":"` + etag + `","iat":1,"data":` + data + `}`
+	if f := m.alter[id]; f != nil {
+		payload = f(payload)
+	}
 	key := m.panel
 	if m.forge[id] {
 		_, key, _ = ed25519.GenerateKey(nil)
@@ -107,6 +116,9 @@ func (m *streamsMain) answer(w http.ResponseWriter, r *http.Request, reqCtx, non
 	var req map[string]any
 	json.Unmarshal(plain, &req)
 	if op == "config" {
+		m.mu.Lock()
+		m.configs++
+		m.mu.Unlock()
 		m.box(w, reqCtx, map[string]any{"blocklist": map[string]any{"seq": 0}})
 		return
 	}
@@ -124,6 +136,9 @@ func (m *streamsMain) answer(w http.ResponseWriter, r *http.Request, reqCtx, non
 		return
 	}
 	out := m.serve(req)
+	if m.served != nil {
+		m.served()
+	}
 	m.mu.Unlock()
 	m.box(w, reqCtx, out)
 }
@@ -471,7 +486,7 @@ func TestStreamsResyncWalksInPagesWithTheCursorUnchanged(t *testing.T) {
 	}
 	st := LoadReplicaState(a.ReplicaDir)
 	st.StreamsResyncAt -= int64(2 * StreamsResyncEvery / time.Second)
-	a.saveReplicaState(a.ReplicaDir, st)
+	a.saveStreamsState(a.ReplicaDir, st)
 	n := len(m.requests())
 	if err := a.SyncStreams(ctx); err != nil {
 		t.Fatal(err)
@@ -759,9 +774,10 @@ func TestStreamRecordsAreCheckedAtStart(t *testing.T) {
 	a.SyncStreams(ctx)
 	// Stream 2's record no longer verifies (planted, or under old keys).
 	os.WriteFile(streamFile(a, 2, ".rep"), []byte("not a record"), 0o600)
-	a.recheckReplica()
-	if !a.streamsBad[2] || a.streamsBad[1] || !a.streamsResyncNow {
-		t.Fatalf("bad %v", a.streamsBad)
+	// The agent's first config sync checks what is stored under the node's
+	// keys, and has the streams sync check its records.
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
 	}
 	n := len(m.requests())
 	if err := a.SyncStreams(ctx); err != nil {
@@ -776,6 +792,41 @@ func TestStreamRecordsAreCheckedAtStart(t *testing.T) {
 	}
 	if _, err := a.openStream(rep, 2); err != nil {
 		t.Fatal("stream 2 not stored again")
+	}
+	// The same keys: the next config sync checks nothing, so the streams
+	// sync is a delta.
+	os.WriteFile(streamFile(a, 2, ".rep"), []byte("not a record"), 0o600)
+	a.SyncReplica(ctx)
+	n = len(m.requests())
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if req := m.requests()[n:]; len(req) != 1 || req[0]["resync"] != nil {
+		t.Fatalf("checked again under the same keys: %v", req)
+	}
+	// A new box key (a re-enrolment): every record sealed to the old one
+	// fails, and MAIN resends them all.
+	sk, pub, _ := cc.NewX25519()
+	a.Client.State.mu.Lock()
+	a.Client.State.NodeBoxSk = sk
+	a.Client.State.mu.Unlock()
+	m.mu.Lock()
+	m.boxPub = pub
+	m.mu.Unlock()
+	a.SyncReplica(ctx)
+	n = len(m.requests())
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	req = m.requests()[n:]
+	if hashes := req[len(req)-1]["resync"].(map[string]any)["hashes"].(map[string]any); len(hashes) != 0 {
+		t.Fatalf("named records sealed to the old key: %v", hashes)
+	}
+	for _, id := range []int64{1, 2} {
+		rep, _ := os.ReadFile(streamFile(a, id, ".rep"))
+		if _, err := a.openStream(rep, id); err != nil {
+			t.Fatalf("stream %d not stored again under the new key", id)
+		}
 	}
 }
 
@@ -794,6 +845,7 @@ func TestStreamsNeverLogged(t *testing.T) {
 	a.SyncStreams(context.Background())
 	os.WriteFile(streamFile(a, 1, ".rep"), []byte("x"), 0o600)
 	a.recheckReplica()
+	a.SyncStreams(context.Background())
 	logs.mu.Lock()
 	all := strings.Join(logs.lines, "\n") + strings.Join(errs, "\n")
 	logs.mu.Unlock()
@@ -801,5 +853,289 @@ func TestStreamsNeverLogged(t *testing.T) {
 		if strings.Contains(all, leak) {
 			t.Fatalf("logged %q:\n%s", leak, all)
 		}
+	}
+}
+
+func (m *streamsMain) configCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.configs
+}
+
+// countApplies has the agent's cluster:apply record what streams.json said
+// each time it ran.
+func countApplies(a *Agent) func() []int64 {
+	var mu sync.Mutex
+	var seen []int64
+	a.Apply = func(context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, streamsSince(a.ReplicaDir))
+		return nil
+	}
+	return func() []int64 {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]int64(nil), seen...)
+	}
+}
+
+// The streams sync runs on its own loop: while a walk waits out MAIN's
+// busy refusals, config.changed still fetches at once and a flow change
+// still applies at once.
+func TestStreamsWalkHoldsUpNoConfigSync(t *testing.T) {
+	m, a := newStreamsMain(t)
+	applies := countApplies(a)
+	m.set(1, streamData(1, "a"))
+	busy := func(w http.ResponseWriter, nonce []byte) {
+		m.fakeMain.refuse(w, 503, nonce, "RATE_LIMITED", map[string]any{"op": "streams", "lane": "bulk", "retry_after_ms": 1000})
+	}
+	for i := 0; i < StreamsBusyRetries; i++ {
+		m.refuse = append(m.refuse, busy)
+	}
+	a.flowsApply(FlowStreams) // the flows last published
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.RunReplica(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitUntil := func(what string, bound time.Duration, cond func() bool) {
+		t.Helper()
+		for end := time.Now().Add(bound); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+			if cond() {
+				return
+			}
+		}
+		t.Fatalf("%s: not within %s", what, bound)
+	}
+	waitUntil("the walk waiting out a busy refusal", 5*time.Second, func() bool { return len(m.requests()) >= 1 })
+	waitUntil("the first apply", 5*time.Second, func() bool { return len(applies()) >= 1 })
+	configs := m.configCalls()
+	a.ConfigChanged()
+	waitUntil("config.changed's sync", 500*time.Millisecond, func() bool { return m.configCalls() > configs })
+	n := len(applies())
+	a.flowsApply(FlowStreams | FlowConfig)
+	waitUntil("the flow change's apply", 500*time.Millisecond, func() bool { return len(applies()) > n })
+	if len(m.requests()) >= StreamsBusyRetries {
+		t.Fatal("the walk was not still busy: the test proves nothing")
+	}
+}
+
+// The pass's end makes streams.json say a cursor above 0, and PHP gets its
+// cluster:apply then, even when the pass stored nothing.
+func TestStreamsApplyAfterAPassThatStoresNothing(t *testing.T) {
+	t.Run("a new node that holds no stream", func(t *testing.T) {
+		_, a := newStreamsMain(t)
+		applies := countApplies(a)
+		if err := a.SyncStreams(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := applies(); len(got) != 1 || got[0] <= 0 {
+			t.Fatalf("applies saw streams.json %v", got)
+		}
+	})
+	t.Run("STREAMS on, off and on with nothing changed", func(t *testing.T) {
+		m, a := newStreamsMain(t)
+		ctx := context.Background()
+		m.set(1, streamData(1, "a"))
+		a.publish(&Reply{State: "active", Mode: 1, Flows: FlowStreams})
+		a.SyncStreams(ctx)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
+		a.SyncStreams(ctx)
+		applies := countApplies(a)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: FlowStreams})
+		if err := a.SyncStreams(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := applies(); len(got) != 1 || got[0] != m.head {
+			t.Fatalf("applies saw streams.json %v, want [%d]", got, m.head)
+		}
+		// An idle delta applies nothing.
+		a.SyncStreams(ctx)
+		if got := applies(); len(got) != 1 {
+			t.Fatalf("applies %v after an idle delta", got)
+		}
+	})
+}
+
+// cluster:apply runs after a stored record and after a removal.
+func TestStreamsApplyAfterRecordsAndRemovals(t *testing.T) {
+	m, a := newStreamsMain(t)
+	applies := countApplies(a)
+	ctx := context.Background()
+	m.set(1, streamData(1, "a"))
+	m.set(2, streamData(2, "a"))
+	a.SyncStreams(ctx)
+	m.set(1, streamData(1, "b"))
+	a.SyncStreams(ctx)
+	if len(applies()) != 2 {
+		t.Fatalf("applies %v after a stored record", applies())
+	}
+	m.drop(2)
+	a.SyncStreams(ctx)
+	if len(applies()) != 3 || storedIDs(a) != "1" {
+		t.Fatalf("applies %v after a removal (%s)", applies(), storedIDs(a))
+	}
+}
+
+// With STREAMS off streams.json says 0, whatever a pass wrote meanwhile,
+// before flows.json says the flow is off; a write that failed is healed.
+func TestStreamsJSONIsZeroWhileTheFlowIsOff(t *testing.T) {
+	t.Run("a pass ending as the flow goes off", func(t *testing.T) {
+		_, a := newStreamsMain(t)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: FlowStreams})
+		a.writeStreamsSince(a.ReplicaDir, 0) // a new node's pass under way
+		a.streamsFileMu.Lock()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
+		}()
+		time.Sleep(20 * time.Millisecond)
+		// The pass's end, just before the zeroing takes the lock.
+		writeFileMode(filepath.Join(a.ReplicaDir, "streams.json"), []byte(`{"since":7}`), 0o600)
+		a.streamsFileMu.Unlock()
+		<-done
+		if s := streamsSince(a.ReplicaDir); s != 0 {
+			t.Fatalf("streams.json says %d with STREAMS off", s)
+		}
+	})
+	t.Run("zeroed before flows.json is written", func(t *testing.T) {
+		_, a := newStreamsMain(t)
+		// flows.json cannot be written: streams.json is 0 all the same.
+		a.FlowsFile = filepath.Join(t.TempDir(), "flows.json")
+		a.publish(&Reply{State: "active", Mode: 1, Flows: FlowStreams})
+		a.writeStreamsSince(a.ReplicaDir, 7)
+		os.Remove(a.FlowsFile)
+		os.MkdirAll(filepath.Join(a.FlowsFile, "busy"), 0o700)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
+		if s := streamsSince(a.ReplicaDir); s != 0 {
+			t.Fatalf("streams.json says %d when flows.json was to be written", s)
+		}
+	})
+	t.Run("healed by the next sync", func(t *testing.T) {
+		m, a := newStreamsMain(t)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
+		writeFileMode(filepath.Join(a.ReplicaDir, "streams.json"), []byte(`{"since":7}`), 0o600)
+		n := len(m.requests())
+		if err := a.SyncStreams(context.Background()); err != nil || len(m.requests()) != n {
+			t.Fatalf("%v", err)
+		}
+		if s := streamsSince(a.ReplicaDir); s != 0 {
+			t.Fatalf("streams.json still says %d", s)
+		}
+	})
+}
+
+// A record that failed its check is left out of the next walk only: a
+// stream MAIN no longer holds for the node goes at the walk after.
+func TestStreamsFailedRecordIsNamedAgain(t *testing.T) {
+	m, a := newStreamsMain(t)
+	ctx := context.Background()
+	m.set(1, streamData(1, "a"))
+	m.set(2, streamData(2, "a"))
+	a.SyncStreams(ctx)
+	m.mu.Lock()
+	delete(m.data, 2) // no longer the node's, without a row saying so
+	m.mu.Unlock()
+	os.WriteFile(streamFile(a, 2, ".rep"), []byte("not a record"), 0o600)
+	a.SyncReplica(ctx)
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if storedIDs(a) != "1,2" {
+		t.Fatalf("after the first walk: %s", storedIDs(a))
+	}
+	st := LoadReplicaState(a.ReplicaDir)
+	st.StreamsResyncAt = 0
+	a.saveStreamsState(a.ReplicaDir, st)
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if storedIDs(a) != "1" {
+		t.Fatalf("after the second walk: %s", storedIDs(a))
+	}
+}
+
+// A record naming another node or another section is refused with its
+// whole reply, even sealed to this node and signed by the panel.
+func TestStreamsRecordOfAnotherNodeOrSection(t *testing.T) {
+	for name, alter := range map[string]func(string) string{
+		"another node":    func(p string) string { return strings.Replace(p, `"node":"`, `"node":"1`, 1) },
+		"another section": func(p string) string { return strings.Replace(p, `"section":"stream"`, `"section":"servers"`, 1) },
+		"another stream":  func(p string) string { return strings.Replace(p, `"stream_id":2`, `"stream_id":3`, 1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, a := newStreamsMain(t)
+			m.set(1, streamData(1, "a"))
+			m.set(2, streamData(2, "a"))
+			m.alter[2] = alter
+			if err := a.SyncStreams(context.Background()); err == nil || !strings.Contains(err.Error(), "stream 2") {
+				t.Fatalf("got %v", err)
+			}
+			if storedIDs(a) != "" {
+				t.Fatalf("stored %s", storedIDs(a))
+			}
+		})
+	}
+}
+
+// A reply with a removal and a record that does not verify applies
+// nothing: the removed stream's files stay.
+func TestStreamsBadReplyRemovesNothing(t *testing.T) {
+	m, a := newStreamsMain(t)
+	ctx := context.Background()
+	m.set(1, streamData(1, "a"))
+	m.set(2, streamData(2, "a"))
+	a.SyncStreams(ctx)
+	m.drop(1)
+	m.set(2, streamData(2, "b"))
+	m.forge[2] = true
+	if err := a.SyncStreams(ctx); err == nil {
+		t.Fatal("a forged record was taken")
+	}
+	for _, ext := range []string{".json", ".rep"} {
+		if _, err := os.Stat(streamFile(a, 1, ext)); err != nil {
+			t.Fatalf("stream 1's %s went with a reply that did not verify", ext)
+		}
+	}
+}
+
+// MAIN's head moving during a pass of several pages: the cursor is the
+// first reply's head, so a stream changed after it was walked comes in the
+// next delta.
+func TestStreamsPassCursorIsTheFirstHead(t *testing.T) {
+	m, a := newStreamsMain(t)
+	ctx := context.Background()
+	for id := int64(1); id <= 3; id++ {
+		m.set(id, streamData(id, "a"))
+	}
+	m.maxRecs = 1
+	first := m.head
+	bumped := false
+	m.served = func() {
+		if !bumped {
+			bumped = true
+			m.head++
+			m.data[1], m.vers[1] = streamData(1, "b"), m.head
+		}
+	}
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := LoadReplicaState(a.ReplicaDir).StreamsSince; got != first {
+		t.Fatalf("cursor %d, want the first reply's head %d", got, first)
+	}
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(streamFile(a, 1, ".json"))
+	if !strings.Contains(string(b), "live/b1.ts") {
+		t.Fatalf("the change made mid-pass never came: %s", b)
 	}
 }

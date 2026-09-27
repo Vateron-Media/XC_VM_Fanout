@@ -342,8 +342,26 @@ func wholePart(parts map[string]json.RawMessage, name string) (*wholeReply, bool
 
 // saveReplicaState writes replica/state.json, 0600: it holds the secrets
 // section's ETag, a hash of the secrets.
+//
+// The config sync and the streams sync (RunStreams) run apart, so each
+// writes only its own fields: saveReplicaState keeps the streams fields as
+// stored, saveStreamsState the others.
 func (a *Agent) saveReplicaState(dir string, st ReplicaState) error {
+	a.stateFileMu.Lock()
+	defer a.stateFileMu.Unlock()
+	cur := LoadReplicaState(dir)
+	st.StreamsSince, st.StreamsPass, st.StreamsResyncAt = cur.StreamsSince, cur.StreamsPass, cur.StreamsResyncAt
 	out, _ := json.Marshal(st)
+	return writeFileMode(filepath.Join(dir, "state.json"), out, 0o600)
+}
+
+// saveStreamsState writes state.json's streams fields from st.
+func (a *Agent) saveStreamsState(dir string, st ReplicaState) error {
+	a.stateFileMu.Lock()
+	defer a.stateFileMu.Unlock()
+	cur := LoadReplicaState(dir)
+	cur.StreamsSince, cur.StreamsPass, cur.StreamsResyncAt = st.StreamsSince, st.StreamsPass, st.StreamsResyncAt
+	out, _ := json.Marshal(cur)
 	return writeFileMode(filepath.Join(dir, "state.json"), out, 0o600)
 }
 
@@ -514,7 +532,8 @@ func (a *Agent) recheckLocked(dir string) {
 			a.logf("cluster: replica: %v", err)
 		}
 	}
-	a.recheckStreams(dir)
+	// The stream records are checked by the streams sync, on its own loop.
+	a.streamsRecheck.Store(true)
 }
 
 // verifyBlocklist opens the stored blocklist section and its deltas.
@@ -696,13 +715,13 @@ func (a *Agent) flowsApply(flows int) {
 	}
 }
 
-type replicaKicks struct{ sync, apply chan struct{} }
+type replicaKicks struct{ sync, apply, streams chan struct{} }
 
 func (a *Agent) kickChans() replicaKicks {
 	a.kickOnce.Do(func() {
-		a.syncKick, a.applyKick = make(chan struct{}, 1), make(chan struct{}, 1)
+		a.syncKick, a.applyKick, a.streamsKick = make(chan struct{}, 1), make(chan struct{}, 1), make(chan struct{}, 1)
 	})
-	return replicaKicks{a.syncKick, a.applyKick}
+	return replicaKicks{a.syncKick, a.applyKick, a.streamsKick}
 }
 
 func (a *Agent) kick(ch chan struct{}) {
@@ -738,6 +757,15 @@ func ReplicaDeltas(dir string) []string {
 // cluster:apply once after that sync (tmp/cache/ does not survive a reboot).
 func (a *Agent) RunReplica(ctx context.Context) {
 	kicks := a.kickChans()
+	// The R2 streams section syncs on a loop of its own, after each config
+	// sync: its walks and busy waits hold up neither the config sync nor
+	// the config.changed and flow kicks.
+	streamsDone := make(chan struct{})
+	go func() {
+		defer close(streamsDone)
+		a.RunStreams(ctx, kicks.streams)
+	}()
+	defer func() { <-streamsDone }()
 	for first := true; ; first = false {
 		wait := jitter(ReplicaPoll)
 		applied, err := a.syncReplica(ctx)
@@ -756,13 +784,7 @@ func (a *Agent) RunReplica(ctx context.Context) {
 			a.runApply(ctx)
 		}
 		// The R2 streams section: a delta after every config sync.
-		if err := a.SyncStreams(ctx); err != nil && ctx.Err() == nil {
-			if laneRefusal(err) != nil {
-				a.busyRefusals.Add(1)
-			} else {
-				a.logf("cluster: replica: streams: %v", err)
-			}
-		}
+		a.kick(kicks.streams)
 		if !a.waitReplica(ctx, wait, kicks) {
 			return
 		}
