@@ -304,11 +304,15 @@ func TestConfigChangedSyncsAtOnceAndAcks(t *testing.T) {
 		t.Fatal("config.changed handed to cluster:exec")
 		return false, nil
 	}}
-	if f := a.features(); strings.Join(f, ",") != "hls_reaper,config_changed" {
+	// streams: the agent keeps the R2 streams section (streams.go).
+	if f := a.features(); strings.Join(f, ",") != "hls_reaper,config_changed,streams" {
 		t.Fatalf("features %v", f)
 	}
-	if f := (&Agent{Client: c, ReplicaDir: a.ReplicaDir}).features(); strings.Join(f, ",") != "hls_reaper" {
+	if f := (&Agent{Client: c, ReplicaDir: a.ReplicaDir}).features(); strings.Join(f, ",") != "hls_reaper,streams" {
 		t.Fatalf("features without commands %v", f)
+	}
+	if f := (&Agent{Client: c}).features(); strings.Join(f, ",") != "hls_reaper" {
+		t.Fatalf("features without a replica %v", f)
 	}
 	run := a.localExec(a.Exec)
 	for i := 0; i < 3; i++ { // coalesced: one sync pending
@@ -330,7 +334,7 @@ func TestHelloSaysConfigChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	f, _ := json.Marshal(m.bodies["hello"][0]["features"])
-	if string(f) != `["hls_reaper","config_changed"]` {
+	if string(f) != `["hls_reaper","config_changed","streams"]` {
 		t.Fatalf("hello features %s", f)
 	}
 }
