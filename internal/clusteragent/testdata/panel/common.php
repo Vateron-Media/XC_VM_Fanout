@@ -103,6 +103,10 @@ if (getenv('XCVM_INTEROP_TRANSPORT')) {
 if (getenv('XCVM_INTEROP_POLICY_VER') !== false) {
 	$rSettings['cluster_policy_ver'] = (int) getenv('XCVM_INTEROP_POLICY_VER');
 }
+if (getenv('XCVM_INTEROP_OFFAIR')) {
+	// The admin's not_on_air video, which the artefact op serves (ArtefactRegistry).
+	$rSettings['not_on_air_video_path'] = (string) getenv('XCVM_INTEROP_OFFAIR');
+}
 if (getenv('XCVM_INTEROP_BUS')) {
 	// MAIN's cluster bus (a redis-server the test runs), with one ingest permit per lane.
 	\XcVm\Domain\Cluster\ClusterBus::useSocket((string) getenv('XCVM_INTEROP_BUS'));
