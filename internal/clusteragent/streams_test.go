@@ -1022,12 +1022,67 @@ func TestStreamsJSONIsZeroWhileTheFlowIsOff(t *testing.T) {
 		m, a := newStreamsMain(t)
 		a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
 		writeFileMode(filepath.Join(a.ReplicaDir, "streams.json"), []byte(`{"since":7}`), 0o600)
+		applies := countApplies(a)
 		n := len(m.requests())
 		if err := a.SyncStreams(context.Background()); err != nil || len(m.requests()) != n {
 			t.Fatalf("%v", err)
 		}
 		if s := streamsSince(a.ReplicaDir); s != 0 {
 			t.Fatalf("streams.json still says %d", s)
+		}
+		// PHP applies the section's change of hands.
+		if got := applies(); len(got) != 1 || got[0] != 0 {
+			t.Fatalf("applies saw streams.json %v, want [0]", got)
+		}
+	})
+	t.Run("a pass ending after the flow went off", func(t *testing.T) {
+		_, a := newStreamsMain(t)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: FlowStreams})
+		a.writeStreamsSince(a.ReplicaDir, 0)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
+		// The pass's end, just after the zeroing.
+		a.writeStreamsSince(a.ReplicaDir, 7)
+		if s := streamsSince(a.ReplicaDir); s != 0 {
+			t.Fatalf("streams.json says %d with STREAMS off", s)
+		}
+	})
+	t.Run("the flow reads off before the zeroing runs", func(t *testing.T) {
+		_, a := newStreamsMain(t)
+		a.publish(&Reply{State: "active", Mode: 1, Flows: FlowStreams})
+		a.writeStreamsSince(a.ReplicaDir, 7)
+		a.streamsFileMu.Lock()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
+		}()
+		// While the zeroing waits for the lock, a pass ending now must
+		// already find the flow off.
+		off := false
+		for end := time.Now().Add(time.Second); time.Now().Before(end) && !off; time.Sleep(time.Millisecond) {
+			off = a.flows.Load()&FlowStreams == 0
+		}
+		a.streamsFileMu.Unlock()
+		<-done
+		if !off {
+			t.Fatal("the flow still read on while streams.json was being zeroed")
+		}
+	})
+	t.Run("streams.json is 0 when flows.json lands", func(t *testing.T) {
+		_, a := newStreamsMain(t)
+		a.FlowsFile = filepath.Join(t.TempDir(), "flows.json")
+		a.publish(&Reply{State: "active", Mode: 1, Flows: FlowStreams})
+		a.writeStreamsSince(a.ReplicaDir, 7)
+		// publish logs the new flows once flows.json is renamed into place.
+		seen := int64(-2)
+		a.Logf = func(format string, args ...any) {
+			if strings.HasPrefix(format, "cluster: mode") {
+				seen = streamsSince(a.ReplicaDir)
+			}
+		}
+		a.publish(&Reply{State: "active", Mode: 1, Flows: 0})
+		if seen != 0 {
+			t.Fatalf("streams.json said %d when flows.json said STREAMS off", seen)
 		}
 	})
 }
@@ -1137,5 +1192,95 @@ func TestStreamsPassCursorIsTheFirstHead(t *testing.T) {
 	b, _ := os.ReadFile(streamFile(a, 1, ".json"))
 	if !strings.Contains(string(b), "live/b1.ts") {
 		t.Fatalf("the change made mid-pass never came: %s", b)
+	}
+}
+
+// A failed record a resumed pass never covered (below where it resumed)
+// stays out of the walks until one covers it: the next resync, at once.
+func TestStreamsResumedPassKeepsFailedRecordsBelowIt(t *testing.T) {
+	m, a := newStreamsMain(t)
+	ctx := context.Background()
+	for id := int64(1); id <= 3; id++ {
+		m.set(id, streamData(id, "a"))
+	}
+	a.SyncStreams(ctx)
+	// A restart finds stream 1's record failing and a pass in progress
+	// above it.
+	os.WriteFile(streamFile(a, 1, ".rep"), []byte("not a record"), 0o600)
+	st := LoadReplicaState(a.ReplicaDir)
+	st.StreamsPass = &StreamPass{Head: st.StreamsSince, From: 2}
+	a.saveStreamsState(a.ReplicaDir, st)
+	a.SyncReplica(ctx)
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !a.streamsBad[1] || !a.streamsResyncNow {
+		t.Fatalf("the resumed pass cleared a record it never covered: bad %v, resync now %v", a.streamsBad, a.streamsResyncNow)
+	}
+	n := len(m.requests())
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var walk map[string]any
+	for _, r := range m.requests()[n:] {
+		if rs, ok := r["resync"].(map[string]any); ok {
+			walk = rs
+			break
+		}
+	}
+	if walk == nil || walk["from"] != float64(0) || walk["hashes"].(map[string]any)["1"] != nil {
+		t.Fatalf("the next walk: %v", walk)
+	}
+	rep, _ := os.ReadFile(streamFile(a, 1, ".rep"))
+	if _, err := a.openStream(rep, 1); err != nil || len(a.streamsBad) != 0 || a.streamsResyncNow {
+		t.Fatalf("stream 1 not healed: %v, bad %v", err, a.streamsBad)
+	}
+}
+
+// A failed record whose page MAIN withheld records from (no licence) stays
+// out of the walks, and is resent once MAIN signs again.
+func TestStreamsWithheldPageKeepsFailedRecords(t *testing.T) {
+	m, a := newStreamsMain(t)
+	ctx := context.Background()
+	m.set(1, streamData(1, "a"))
+	m.set(2, streamData(2, "a"))
+	a.SyncStreams(ctx)
+	os.WriteFile(streamFile(a, 1, ".rep"), []byte("not a record"), 0o600)
+	a.SyncReplica(ctx)
+	m.mu.Lock()
+	m.withhold[1] = true
+	m.mu.Unlock()
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !a.streamsBad[1] || !a.streamsResyncNow {
+		t.Fatalf("cleared a record MAIN withheld: bad %v", a.streamsBad)
+	}
+	m.mu.Lock()
+	delete(m.withhold, 1)
+	m.mu.Unlock()
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rep, _ := os.ReadFile(streamFile(a, 1, ".rep"))
+	if _, err := a.openStream(rep, 1); err != nil || len(a.streamsBad) != 0 {
+		t.Fatalf("stream 1 not resent once MAIN signs again: %v", err)
+	}
+}
+
+// A delta that moves the cursor while storing nothing (a removal of a
+// stream never stored) runs cluster:apply, which sees the new cursor.
+func TestStreamsApplyWhenTheCursorMoves(t *testing.T) {
+	m, a := newStreamsMain(t)
+	ctx := context.Background()
+	m.set(1, streamData(1, "a"))
+	applies := countApplies(a)
+	a.SyncStreams(ctx)
+	m.drop(99)
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := applies(); len(got) != 2 || got[1] != m.head {
+		t.Fatalf("applies saw streams.json %v, want a second at %d", got, m.head)
 	}
 }

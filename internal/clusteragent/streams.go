@@ -219,10 +219,12 @@ func (a *Agent) SyncStreams(ctx context.Context) error {
 	st := LoadReplicaState(dir)
 	if a.flows.Load()&FlowStreams == 0 {
 		if streamsSince(dir) > 0 {
-			// Left above 0 by a write that failed as the flow went off.
+			// Left above 0 by a write that failed as the flow went off:
+			// zeroed now, and PHP applies the section's change of hands.
 			if err := a.zeroStreamsSince(dir); err != nil {
 				return err
 			}
+			a.runApply(ctx)
 		}
 		if st.StreamsSince != 0 || st.StreamsPass != nil {
 			st.StreamsSince, st.StreamsPass = 0, nil
@@ -272,6 +274,9 @@ type streamSync struct {
 	st      ReplicaState
 	cursor  int64
 	changed bool
+	// answered: the failed records this walk left out of a page MAIN
+	// answered in full (walked).
+	answered map[int64]bool
 }
 
 func (s *streamSync) save() error {
@@ -279,15 +284,15 @@ func (s *streamSync) save() error {
 	return s.a.saveStreamsState(s.dir, s.st)
 }
 
-// writeSince writes the cursor to streams.json. The section becoming whole
-// there (0 to above 0) is a change PHP applies, even when the pass that got
-// it there stored nothing.
+// writeSince writes the cursor to streams.json. A new cursor there above 0
+// (the section becoming whole, or moving on) is a change PHP applies, even
+// when the sync that moved it stored nothing.
 func (s *streamSync) writeSince() error {
 	was := streamsSince(s.dir)
 	if err := s.a.writeStreamsSince(s.dir, s.cursor); err != nil {
 		return err
 	}
-	if was <= 0 && streamsSince(s.dir) > 0 {
+	if now := streamsSince(s.dir); now > 0 && now != was {
 		s.changed = true
 	}
 	return nil
@@ -356,13 +361,18 @@ func (s *streamSync) fullPass(ctx context.Context) error {
 }
 
 // walked notes a walk that went to its end: the next resync is due in full
-// time, and the records that failed their check, left out of this walk (so
-// MAIN resent what it holds), are named again in the next one (so MAIN
-// removes what it no longer holds).
+// time. A record that failed its check and that this walk left out of a
+// page MAIN answered in full (so MAIN resent it if it holds it) is named
+// again in the next walk (so MAIN removes it if it does not). One the walk
+// never covered (a pass resumed above it) or whose page MAIN withheld
+// records from stays out, and a resync runs at once for it.
 func (s *streamSync) walked() {
 	s.st.StreamsResyncAt = time.Now().Unix()
-	s.a.streamsResyncNow = false
-	s.a.streamsBad = nil
+	for id := range s.answered {
+		delete(s.a.streamsBad, id)
+	}
+	s.answered = nil
+	s.a.streamsResyncNow = len(s.a.streamsBad) > 0
 }
 
 // resync walks the section hashes with the cursor unchanged.
@@ -395,6 +405,18 @@ func (s *streamSync) walk(ctx context.Context, from int64, done func(r *streamsR
 				return fmt.Errorf("clusteragent: streams: MAIN's next %d is outside %d..%d", *r.Next, from, to)
 			}
 			next = *r.Next
+		}
+		if r.Withheld == 0 {
+			// MAIN answered for from..next-1 in full: the failed records
+			// left out of it were resent or are not held.
+			for id := range s.a.streamsBad {
+				if id >= from && id < next {
+					if s.answered == nil {
+						s.answered = map[int64]bool{}
+					}
+					s.answered[id] = true
+				}
+			}
 		}
 		if err := done(r, next); err != nil {
 			return err
