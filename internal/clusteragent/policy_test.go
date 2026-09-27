@@ -43,6 +43,46 @@ func TestPolicyVersionsNeverGoBack(t *testing.T) {
 	}
 }
 
+// The fleet's heartbeat is MAIN's to set: the setting
+// (lb_telemetry_interval_sec) travels with the policy, because the agent's
+// -interval flag is passed by nothing and every node kept the built-in 2 s.
+func TestHeartbeatFollowsThePolicy(t *testing.T) {
+	_, st := newFake(t)
+	a := &Agent{Client: NewClient(st, "xc_agent/test"), Logf: t.Logf}
+	urls := []string{"http://main:25461/cluster/v1/"}
+
+	if got := a.heartbeatEvery(); got != 2*time.Second {
+		t.Fatalf("with no policy and no flag: %s, want 2s", got)
+	}
+
+	st.adoptPolicy(&Policy{PolicyVer: 1, Transport: "auto", MainURLs: urls, HeartbeatSec: 1}, false)
+	if got := a.heartbeatEvery(); got != time.Second {
+		t.Fatalf("policy asked for 1s, got %s", got)
+	}
+	if back, _ := loadRaw(st.path); back.HeartbeatSec != 1 {
+		t.Fatalf("state file kept %d, want 1", back.HeartbeatSec)
+	}
+
+	// Out of MAIN's own bounds: clamped, never taken as asked.
+	st.adoptPolicy(&Policy{PolicyVer: 2, Transport: "auto", MainURLs: urls, HeartbeatSec: 30}, false)
+	if got := a.heartbeatEvery(); got != MaxHeartbeat {
+		t.Fatalf("policy asked for 30s, got %s, want %s", got, MaxHeartbeat)
+	}
+
+	// A policy that says nothing keeps the pace the node holds.
+	st.adoptPolicy(&Policy{PolicyVer: 3, Transport: "auto", MainURLs: urls}, false)
+	if got := a.heartbeatEvery(); got != MaxHeartbeat {
+		t.Fatalf("a policy with no heartbeat changed the pace to %s", got)
+	}
+
+	// The flag still decides while no policy has (a node run by hand).
+	_, st2 := newFake(t)
+	b := &Agent{Client: NewClient(st2, "xc_agent/test"), Interval: 3 * time.Second, Logf: t.Logf}
+	if got := b.heartbeatEvery(); got != 3*time.Second {
+		t.Fatalf("the -interval flag: %s", got)
+	}
+}
+
 // httpsDrillMain is MAIN over plain HTTP under https_required: the signed
 // challenge (with the policy it holds now) and a signed HTTPS_REQUIRED for
 // every other op, until the admin switches back to auto.

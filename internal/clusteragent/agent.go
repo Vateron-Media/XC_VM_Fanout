@@ -208,6 +208,24 @@ func assetArch() string {
 	return runtime.GOARCH
 }
 
+// heartbeatEvery is the pace MAIN's policy asks for (heartbeat_sec), else the
+// -interval flag, else 2 s. MAIN's liveness assumes heartbeats at most
+// MaxHeartbeatGap apart, so that bounds either. Only the policy's value is held
+// to MinHeartbeat: the flag is for a node run by hand (and for a test that
+// wants the loop to spin), and it was never bounded below.
+func (a *Agent) heartbeatEvery() time.Duration {
+	d := a.Interval
+	if d <= 0 {
+		d = 2 * time.Second
+	}
+	if a.Client != nil && a.Client.State != nil {
+		if sec := a.Client.State.heartbeatSec(); sec > 0 {
+			d = max(time.Duration(sec)*time.Second, MinHeartbeat)
+		}
+	}
+	return min(d, MaxHeartbeatGap)
+}
+
 // fatal reports whether a refusal means the loop must stop.
 func fatal(err error) bool {
 	var d *Denial
@@ -380,12 +398,7 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 // and retry; they never change the node's state. A node whose tokens are gone
 // re-keys and carries on.
 func (a *Agent) Run(ctx context.Context) error {
-	interval := a.Interval
-	if interval <= 0 {
-		interval = 2 * time.Second
-	}
-	// MAIN's liveness bounds assume heartbeats at most MaxHeartbeatGap apart.
-	interval = min(interval, MaxHeartbeatGap)
+	interval := a.heartbeatEvery()
 	backoff := interval
 	a.stopCh = make(chan error, 1)
 	if a.Exec != nil && a.run == nil {
@@ -549,6 +562,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		case err := <-a.stopCh:
 			return errors.Join(ErrStop, err)
 		case <-t.C:
+		}
+		// The fleet's pace is MAIN's to set (lb_telemetry_interval_sec, carried
+		// by the policy): a change reaches this node with the policy its next
+		// hello adopts, and the ticker follows without a restart.
+		if want := a.heartbeatEvery(); want != interval {
+			a.logf("cluster: heartbeat every %s (was %s)", want, interval)
+			interval, backoff = want, want
+			t.Reset(want)
 		}
 		if tok, ok := a.Client.Current(); ok && a.Client.MainNowMs()/1000 >= tok.RefreshAt {
 			a.refreshLater(ctx)
