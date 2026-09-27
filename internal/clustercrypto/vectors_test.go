@@ -3,6 +3,7 @@ package clustercrypto
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -290,4 +291,33 @@ func TestNodeSignatureDomain(t *testing.T) {
 			t.Fatalf("node signature verified as panel tag %s", tag)
 		}
 	}
+}
+
+// TestVectorFilesAreThePanelsCopies guards the copies in testdata against the
+// panel's originals (XC_VM/tests/Support/): each side only tests itself against
+// the file it holds, so a regenerated file that is not copied over leaves the
+// two speaking different protocols while both suites pass. The panel's
+// ClusterVectorsTest records the same digests, so whichever side changes first
+// fails until both are updated.
+//
+// Regenerating the vectors is a protocol change (ADR 0004): copy both files
+// here, update the digests in both tests, raise proto and keep accepting N-1.
+func TestVectorFilesAreThePanelsCopies(t *testing.T) {
+	for name, want := range map[string]string{
+		"cluster_vectors.json":           "6cb3272fc1f97e2bc547105b8d5e42c77dcbf805e53d3eae78c89798d8f89645",
+		"cluster_canonical_vectors.json": "ee0fd4b297f02e2e1c1277a1433d1febe9c520414ce107addb524ff2b16799c3",
+	} {
+		b, err := os.ReadFile("testdata/" + name)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := hex.EncodeToString(sha256Sum(b)); got != want {
+			t.Errorf("%s: sha256 %s, want %s — copy it from the panel's tests/Support/ and update both digests", name, got, want)
+		}
+	}
+}
+
+func sha256Sum(b []byte) []byte {
+	sum := sha256.Sum256(b)
+	return sum[:]
 }

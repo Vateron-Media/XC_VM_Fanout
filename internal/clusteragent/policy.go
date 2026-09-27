@@ -40,7 +40,19 @@ type Policy struct {
 	PolicyVer int      `json:"policy_ver"`
 	Transport string   `json:"transport"`
 	MainURLs  []string `json:"main_urls"`
+	// HeartbeatSec is the fleet's heartbeat in seconds
+	// (lb_telemetry_interval_sec). Zero means MAIN did not say, and the node
+	// keeps the pace it has.
+	HeartbeatSec int `json:"heartbeat_sec,omitempty"`
 }
+
+// MinHeartbeat and MaxHeartbeat bound the pace a policy may ask for, as MAIN's
+// own setting is bounded: a node never beats faster than MAIN's liveness needs
+// nor slower than it tolerates (MaxHeartbeatGap).
+const (
+	MinHeartbeat = time.Second
+	MaxHeartbeat = 3 * time.Second
+)
 
 func isHTTP(u string) bool { return strings.HasPrefix(strings.ToLower(u), "http://") }
 
@@ -56,7 +68,11 @@ func (st *State) adoptPolicy(p *Policy, newer bool) (bool, error) {
 	if p.PolicyVer < st.PolicyVer || (newer && p.PolicyVer == st.PolicyVer) {
 		return false, nil
 	}
+	beat := heartbeatOf(p.HeartbeatSec)
 	changed := p.PolicyVer != st.PolicyVer || p.Transport != st.Transport || strings.Join(p.MainURLs, " ") != strings.Join(st.MainURLs, " ")
+	if beat != 0 && beat != st.HeartbeatSec {
+		st.HeartbeatSec, changed = beat, true
+	}
 	st.PolicyVer, st.Transport, st.MainURLs = p.PolicyVer, p.Transport, append([]string{}, p.MainURLs...)
 	known := map[string]bool{}
 	var urls []string
@@ -73,6 +89,26 @@ func (st *State) adoptPolicy(p *Policy, newer bool) (bool, error) {
 		return true, nil
 	}
 	return true, st.saveLocked()
+}
+
+// heartbeatOf is a policy's heartbeat in its bounds, or 0 when it says none.
+func heartbeatOf(sec int) int {
+	if sec <= 0 {
+		return 0
+	}
+	if d := time.Duration(sec) * time.Second; d < MinHeartbeat {
+		return int(MinHeartbeat / time.Second)
+	} else if d > MaxHeartbeat {
+		return int(MaxHeartbeat / time.Second)
+	}
+	return sec
+}
+
+// heartbeatSec is the pace the node holds, or 0 before any policy set one.
+func (st *State) heartbeatSec() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.HeartbeatSec
 }
 
 func (st *State) policyVer() int {

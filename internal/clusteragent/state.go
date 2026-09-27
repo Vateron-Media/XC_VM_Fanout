@@ -55,6 +55,9 @@ type State struct {
 	// under https_required (policy.go).
 	Transport string   `json:"transport,omitempty"`
 	HTTPURLs  []string `json:"http_urls,omitempty"`
+	// HeartbeatSec is the pace MAIN's policy sets (lb_telemetry_interval_sec,
+	// 1-3 s), kept here so a restart holds it before the first hello answers.
+	HeartbeatSec int `json:"heartbeat_sec,omitempty"`
 	// KnownGoodURLs are the last KnownGoodSets URL sets MAIN answered on,
 	// newest first (known.go).
 	KnownGoodURLs []URLSet `json:"known_good_urls,omitempty"`

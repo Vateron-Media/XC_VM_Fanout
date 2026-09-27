@@ -10,6 +10,7 @@ import (
 	mrand "math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,6 +143,9 @@ var Features = []string{"hls_reaper"}
 // one whose node's PHP runs artefact.fetch FeatureArtefact (artefact.go).
 const FeatureConfigChanged = "config_changed"
 
+// FeatureHTTPS says MAIN has answered this node over HTTPS.
+const FeatureHTTPS = "https"
+
 // features is what this agent says at hello.
 func (a *Agent) features() []string {
 	out := append([]string{}, Features...)
@@ -155,6 +159,11 @@ func (a *Agent) features() []string {
 	if a.ArtefactDir != "" && (a.Exec != nil || a.run != nil) && a.artefactOn.Load() {
 		// Only while the node's PHP runs artefact.fetch (artefact.go).
 		out = append(out, FeatureArtefact)
+	}
+	if a.Client != nil && a.Client.HTTPSAnswered() {
+		// MAIN has answered this node over HTTPS: it may be moved to
+		// https_required without losing it (known.go).
+		out = append(out, FeatureHTTPS)
 	}
 	return out
 }
@@ -186,7 +195,35 @@ func bootID() string {
 }
 
 func (a *Agent) identity() map[string]any {
-	return map[string]any{"instance_id": a.Client.State.InstanceID, "boot_id": bootID(), "agent_version": a.Version}
+	return map[string]any{"instance_id": a.Client.State.InstanceID, "boot_id": bootID(), "agent_version": a.Version, "arch": assetArch()}
+}
+
+// assetArch names this machine as the xc_agent release assets do
+// (xc_agent-linux-<arch>), so MAIN can offer the node the binary it pinned for
+// it rather than guess which one it can run.
+func assetArch() string {
+	if runtime.GOARCH == "arm" {
+		return "armv7"
+	}
+	return runtime.GOARCH
+}
+
+// heartbeatEvery is the pace MAIN's policy asks for (heartbeat_sec), else the
+// -interval flag, else 2 s. MAIN's liveness assumes heartbeats at most
+// MaxHeartbeatGap apart, so that bounds either. Only the policy's value is held
+// to MinHeartbeat: the flag is for a node run by hand (and for a test that
+// wants the loop to spin), and it was never bounded below.
+func (a *Agent) heartbeatEvery() time.Duration {
+	d := a.Interval
+	if d <= 0 {
+		d = 2 * time.Second
+	}
+	if a.Client != nil && a.Client.State != nil {
+		if sec := a.Client.State.heartbeatSec(); sec > 0 {
+			d = max(time.Duration(sec)*time.Second, MinHeartbeat)
+		}
+	}
+	return min(d, MaxHeartbeatGap)
 }
 
 // fatal reports whether a refusal means the loop must stop.
@@ -361,12 +398,7 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 // and retry; they never change the node's state. A node whose tokens are gone
 // re-keys and carries on.
 func (a *Agent) Run(ctx context.Context) error {
-	interval := a.Interval
-	if interval <= 0 {
-		interval = 2 * time.Second
-	}
-	// MAIN's liveness bounds assume heartbeats at most MaxHeartbeatGap apart.
-	interval = min(interval, MaxHeartbeatGap)
+	interval := a.heartbeatEvery()
 	backoff := interval
 	a.stopCh = make(chan error, 1)
 	if a.Exec != nil && a.run == nil {
@@ -530,6 +562,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		case err := <-a.stopCh:
 			return errors.Join(ErrStop, err)
 		case <-t.C:
+		}
+		// The fleet's pace is MAIN's to set (lb_telemetry_interval_sec, carried
+		// by the policy): a change reaches this node with the policy its next
+		// hello adopts, and the ticker follows without a restart.
+		if want := a.heartbeatEvery(); want != interval {
+			a.logf("cluster: heartbeat every %s (was %s)", want, interval)
+			interval, backoff = want, want
+			t.Reset(want)
 		}
 		if tok, ok := a.Client.Current(); ok && a.Client.MainNowMs()/1000 >= tok.RefreshAt {
 			a.refreshLater(ctx)

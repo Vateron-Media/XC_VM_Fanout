@@ -157,6 +157,41 @@ func TestAgentChecksEveryCommand(t *testing.T) {
 	}
 }
 
+// token.rotate_now is the one command the agent runs itself: the token it
+// rotates is the agent's, and the node's PHP would refuse the type ("unknown
+// command type"). An operator's rotation must therefore never reach the
+// executor, and must still be acked.
+func TestRotateNowIsTheAgentsOwn(t *testing.T) {
+	f, st := newFake(t)
+	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
+	now := time.Now().Unix()
+	wire := func(typ string, seq uint64) WireCommand {
+		doc := map[string]any{"v": 1, "type": typ, "exp": now + 600, "iat": now, "cmd_id": strings.Repeat("b", 32), "seq": seq,
+			"node_uuid": f.uuid, "gen": 1, "dedupe_key": nil, "args": map[string]any{}}
+		b, _ := json.Marshal(doc)
+		return WireCommand{Doc: string(b), Sig: base64.RawURLEncoding.EncodeToString(ed25519.Sign(f.panel, cc.PanelSigInput("cmd", b))), Seq: seq}
+	}
+	ran := 0
+	run := func(context.Context, *Command, WireCommand) (bool, []byte) {
+		ran++
+		return true, []byte("php ran it")
+	}
+
+	a.handleCommand(context.Background(), wire(TypeRotateNow, 1), run)
+	if ran != 0 {
+		t.Fatalf("the rotation reached the executor %d time(s)", ran)
+	}
+	if st.CmdSeq != 1 {
+		t.Fatalf("high-water %d, want 1 (a redelivery must not rotate twice)", st.CmdSeq)
+	}
+
+	// Every other type still goes to the node's PHP.
+	a.handleCommand(context.Background(), wire("node.rpc", 2), run)
+	if ran != 1 {
+		t.Fatalf("node.rpc reached the executor %d time(s), want 1", ran)
+	}
+}
+
 func TestRootReadyFollowsRootsPin(t *testing.T) {
 	_, st := newFake(t)
 	old := RootPinDir
