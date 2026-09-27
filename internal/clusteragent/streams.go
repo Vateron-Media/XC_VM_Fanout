@@ -166,9 +166,39 @@ func (a *Agent) streamsFlow(flows int) {
 	if old := a.streamsSeen.Swap(seen); old == seen || on {
 		return
 	}
-	if s := streamsSince(a.ReplicaDir); s > 0 {
-		if err := a.writeStreamsSince(a.ReplicaDir, 0); err != nil {
-			a.logf("cluster: replica: streams: %v", err)
+	// Under streams.json's lock, whatever it holds: a pass ending now
+	// either wrote first or finds the flow off. A failed write is healed by
+	// the streams sync's next run.
+	if err := a.zeroStreamsSince(a.ReplicaDir); err != nil {
+		a.logf("cluster: replica: streams: %v", err)
+	}
+}
+
+// zeroStreamsSince rewrites an existing streams.json with a cursor of 0.
+func (a *Agent) zeroStreamsSince(dir string) error {
+	a.streamsFileMu.Lock()
+	defer a.streamsFileMu.Unlock()
+	name := filepath.Join(dir, "streams.json")
+	if _, err := os.Stat(name); os.IsNotExist(err) {
+		return nil
+	}
+	return writeFileMode(name, []byte(`{"since":0}`), 0o600)
+}
+
+// RunStreams syncs the streams section each time kick fires, until ctx ends.
+func (a *Agent) RunStreams(ctx context.Context, kick <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-kick:
+		}
+		if err := a.SyncStreams(ctx); err != nil && ctx.Err() == nil {
+			if laneRefusal(err) != nil {
+				a.busyRefusals.Add(1)
+			} else {
+				a.logf("cluster: replica: streams: %v", err)
+			}
 		}
 	}
 }
@@ -181,13 +211,22 @@ func (a *Agent) SyncStreams(ctx context.Context) error {
 	if dir == "" {
 		return nil
 	}
-	a.replicaMu.Lock()
-	defer a.replicaMu.Unlock()
+	a.streamsMu.Lock()
+	defer a.streamsMu.Unlock()
+	if a.streamsRecheck.Swap(false) {
+		a.recheckStreams(dir)
+	}
 	st := LoadReplicaState(dir)
 	if a.flows.Load()&FlowStreams == 0 {
+		if streamsSince(dir) > 0 {
+			// Left above 0 by a write that failed as the flow went off.
+			if err := a.zeroStreamsSince(dir); err != nil {
+				return err
+			}
+		}
 		if st.StreamsSince != 0 || st.StreamsPass != nil {
 			st.StreamsSince, st.StreamsPass = 0, nil
-			return a.saveReplicaState(dir, st)
+			return a.saveStreamsState(dir, st)
 		}
 		return nil
 	}
@@ -226,7 +265,7 @@ func (a *Agent) resyncEvery() time.Duration {
 	return a.streamsEvery
 }
 
-// streamSync is one SyncStreams run, replicaMu held.
+// streamSync is one SyncStreams run, streamsMu held.
 type streamSync struct {
 	a       *Agent
 	dir     string
@@ -237,7 +276,21 @@ type streamSync struct {
 
 func (s *streamSync) save() error {
 	s.st.StreamsSince = s.cursor
-	return s.a.saveReplicaState(s.dir, s.st)
+	return s.a.saveStreamsState(s.dir, s.st)
+}
+
+// writeSince writes the cursor to streams.json. The section becoming whole
+// there (0 to above 0) is a change PHP applies, even when the pass that got
+// it there stored nothing.
+func (s *streamSync) writeSince() error {
+	was := streamsSince(s.dir)
+	if err := s.a.writeStreamsSince(s.dir, s.cursor); err != nil {
+		return err
+	}
+	if was <= 0 && streamsSince(s.dir) > 0 {
+		s.changed = true
+	}
+	return nil
 }
 
 // deltas asks for what changed past the cursor while MAIN has more; it
@@ -259,7 +312,7 @@ func (s *streamSync) deltas(ctx context.Context) (bool, error) {
 			if err := s.save(); err != nil {
 				return false, err
 			}
-			if err := s.a.writeStreamsSince(s.dir, s.cursor); err != nil {
+			if err := s.writeSince(); err != nil {
 				return false, err
 			}
 		}
@@ -292,15 +345,24 @@ func (s *streamSync) fullPass(ctx context.Context) error {
 		s.cursor = pass.Head
 	}
 	s.st.StreamsPass = nil
-	s.st.StreamsResyncAt = time.Now().Unix()
-	s.a.streamsResyncNow = false
+	s.walked()
 	if err := s.save(); err != nil {
 		return err
 	}
 	if !pass.Withheld {
-		return s.a.writeStreamsSince(s.dir, s.cursor)
+		return s.writeSince()
 	}
 	return nil
+}
+
+// walked notes a walk that went to its end: the next resync is due in full
+// time, and the records that failed their check, left out of this walk (so
+// MAIN resent what it holds), are named again in the next one (so MAIN
+// removes what it no longer holds).
+func (s *streamSync) walked() {
+	s.st.StreamsResyncAt = time.Now().Unix()
+	s.a.streamsResyncNow = false
+	s.a.streamsBad = nil
 }
 
 // resync walks the section hashes with the cursor unchanged.
@@ -308,8 +370,7 @@ func (s *streamSync) resync(ctx context.Context) error {
 	if err := s.walk(ctx, 0, func(*streamsReply, int64) error { return nil }); err != nil {
 		return err
 	}
-	s.st.StreamsResyncAt = time.Now().Unix()
-	s.a.streamsResyncNow = false
+	s.walked()
 	return s.save()
 }
 
@@ -497,8 +558,10 @@ func (a *Agent) openStream(sealed []byte, id int64) (*streamDoc, error) {
 }
 
 // recheckStreams verifies every stored stream record with the node's keys;
-// the streams whose record fails are left out of the next resync's hashes
-// (streamsBad), and that resync runs at the next sync. replicaMu is held.
+// the streams whose record fails are left out of the next walk's hashes
+// (streamsBad), and that resync runs at once. The config sync asks for it
+// at the agent's start and whenever the node's keys changed
+// (streamsRecheck); streamsMu is held.
 func (a *Agent) recheckStreams(dir string) {
 	var bad []int64
 	for _, id := range heldStreams(dir) {

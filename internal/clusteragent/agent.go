@@ -72,14 +72,20 @@ type Agent struct {
 	kickOnce           sync.Once
 	syncKick           chan struct{} // config.changed: sync now (replica.go)
 	applyKick          chan struct{} // the CONFIG flow changed: apply now
+	streamsKick        chan struct{} // a config sync ended: a streams sync now (streams.go)
 	applyMu            sync.Mutex    // one cluster:apply at a time
 	lastApply          time.Time
 	configSeen         atomic.Int64 // the CONFIG and STREAMS bits of the flows last published, +1 (0: none yet)
 	streamsSeen        atomic.Int32 // the STREAMS bit last published: 0 none yet, 1 off, 2 on
 	streamsFileMu      sync.Mutex   // streams.json against the flow turning off (streams.go)
+	stateFileMu        sync.Mutex   // replica/state.json, written by the config and streams syncs
+	// One streams sync at a time, on its own loop (RunStreams): never
+	// under replicaMu, so a long walk holds up no config sync.
+	streamsMu      sync.Mutex
+	streamsRecheck atomic.Bool // the node's keys changed: check the stored stream records
 	// The stream records that did not verify at the last check, left out
-	// of the next resync's hashes, and whether that resync is due now; the
-	// resync interval (replicaMu).
+	// of the next walk's hashes, and whether that resync is due now; the
+	// resync interval (streamsMu).
 	streamsBad       map[int64]bool
 	streamsResyncNow bool
 	streamsEvery     time.Duration
