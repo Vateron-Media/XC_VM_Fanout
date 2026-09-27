@@ -141,8 +141,10 @@ func (c *Client) urls() []string {
 	return append(good, bad...)
 }
 
-// reached notes whether a MAIN URL answered. err is the request's error;
-// a failure the caller's own context caused says nothing of the URL.
+// reached notes whether a MAIN URL answered. err is the request's error, or
+// ErrTransport for an answer that did not authenticate; a failure the
+// caller's own context caused says nothing of the URL. A URL that failed is
+// only tried after the others for URLRetry, never dropped.
 func (c *Client) reached(ctx context.Context, base string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -297,19 +299,28 @@ func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op st
 	var lastErr error = ErrTransport
 	for _, base := range c.urls() {
 		st, rh, rb, err := c.postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
-		c.reached(ctx, base, err)
 		if err != nil {
+			c.reached(ctx, base, err)
 			lastErr = err
 			continue
 		}
 		if st == http.StatusOK && strings.EqualFold(rh.Get("Content-Type"), octet) {
 			err := c.openReply(s, reqCtx, st, rh, rb, out)
-			if !errors.Is(err, ErrTransport) {
-				// The MAC verified and the BOX opened: MAIN answered here.
-				c.answered(base)
+			if errors.Is(err, ErrTransport) {
+				// An answer that does not authenticate is this URL's failure
+				// (ADR 0004, "MAIN endpoint changes (Phase 3, third
+				// increment)"): whoever answers there now is not MAIN.
+				c.reached(ctx, base, ErrTransport)
+				lastErr = err
+				continue
 			}
+			// The MAC verified and the BOX opened: MAIN answered here, and
+			// that is final even when the reply does not decode into out.
+			c.reached(ctx, base, nil)
+			c.answered(base)
 			return err
 		}
+		c.reached(ctx, base, nil)
 		if d := c.denial(st, rh, rb, nonce); d != nil {
 			if d.Reason != "HTTPS_REQUIRED" {
 				// Reached MAIN, but one that refuses ops over this URL is no
