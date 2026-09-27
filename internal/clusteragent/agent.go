@@ -10,6 +10,7 @@ import (
 	mrand "math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -186,7 +187,17 @@ func bootID() string {
 }
 
 func (a *Agent) identity() map[string]any {
-	return map[string]any{"instance_id": a.Client.State.InstanceID, "boot_id": bootID(), "agent_version": a.Version}
+	return map[string]any{"instance_id": a.Client.State.InstanceID, "boot_id": bootID(), "agent_version": a.Version, "arch": assetArch()}
+}
+
+// assetArch names this machine as the xc_agent release assets do
+// (xc_agent-linux-<arch>), so MAIN can offer the node the binary it pinned for
+// it rather than guess which one it can run.
+func assetArch() string {
+	if runtime.GOARCH == "arm" {
+		return "armv7"
+	}
+	return runtime.GOARCH
 }
 
 // fatal reports whether a refusal means the loop must stop.
