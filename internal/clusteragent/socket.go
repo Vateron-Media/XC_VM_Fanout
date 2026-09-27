@@ -24,7 +24,14 @@ import (
 // the event spool instead (events.go).
 
 // SocketOps are the MAIN ops the node's PHP may call through the socket.
-var SocketOps = map[string]bool{"recording_complete": true}
+var SocketOps = map[string]bool{
+	"recording_complete": true,
+	// The encoding queue is MAIN's table, so a node in mode 2 claims its own
+	// rows and reports what it started here (the panel's QueueSink).
+	"queue_enqueue": true,
+	"queue_claim":   true,
+	"queue_update":  true,
+}
 
 // MaxSocketBody caps a request from PHP.
 const MaxSocketBody = 1 << 20

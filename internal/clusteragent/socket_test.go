@@ -68,6 +68,9 @@ func TestSocketPassesOnlyAllowedOpsToMain(t *testing.T) {
 	if code, body := post("/v1/main/recording_complete", `{"recording_id":1}`); code != 200 || !strings.Contains(body, `"stream_id":42`) || gotPath != "/cluster/v1/recording_complete" {
 		t.Fatalf("allowed op: %d %s (MAIN saw %s)", code, body, gotPath)
 	}
+	if code, _ := post("/v1/main/queue_claim", `{"type":"movie","limit":5}`); code != 200 || gotPath != "/cluster/v1/queue_claim" {
+		t.Errorf("queue_claim: %d (MAIN saw %s)", code, gotPath)
+	}
 	for _, path := range []string{"/v1/main/token_refresh", "/v1/main/heartbeat", "/v1/other"} {
 		if code, _ := post(path, `{}`); code != 403 {
 			t.Errorf("%s: %d, want 403", path, code)
