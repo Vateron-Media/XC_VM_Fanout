@@ -53,6 +53,10 @@ type Executor func(ctx context.Context, cmd *Command, wire WireCommand) (ok bool
 // MaxResult caps a command's result sent back in its ack.
 const MaxResult = 64 << 10
 
+// TypeRotateNow is the one command the agent runs itself: the token it would
+// rotate is the agent's, and the node's PHP has no idea what it is.
+const TypeRotateNow = "token.rotate_now"
+
 // CommandsWait is how long MAIN holds a commands poll with nothing to send.
 var CommandsWait = 20 * time.Second
 
@@ -170,6 +174,13 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 	} else if refusal != nil {
 		id, result = cmd.CmdID, refusal
 		w.Seq = cmd.Seq
+	} else if cmd.Type == TypeRotateNow {
+		// The agent's own: the token lives here, not in the node's PHP, which
+		// would refuse the type. An operator asking for a rotation wants it
+		// before the refresh window would have come round.
+		id, ok, result = cmd.CmdID, true, []byte("rotating")
+		w.Seq = cmd.Seq
+		a.refreshLater(ctx)
 	} else {
 		id = cmd.CmdID
 		ok, result = run(ctx, cmd, w)
