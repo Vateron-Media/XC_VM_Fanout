@@ -315,7 +315,8 @@ func TestInteropIngestLaneRefusals(t *testing.T) {
 	if err := json.Unmarshal([]byte(runPHP("events.php", "state")), &state); err != nil || state.P0 < 1 {
 		t.Fatalf("MAIN's P0 cursor %d: %v", state.P0, err)
 	}
-	if logs.has("cluster: replica:") || logs.has("cluster: events p0") {
+	// Logged as an error, a refusal would read "MAIN refused (503 RATE_LIMITED)".
+	if logs.has("RATE_LIMITED") || logs.has("cluster: replica:") {
 		t.Fatalf("a busy refusal was logged as an error: %v", logs.lines)
 	}
 }

@@ -98,30 +98,20 @@ func (a *Agent) RunEvents(ctx context.Context, lane Lane) {
 		if n > 0 {
 			next = n
 		}
-		if served {
-			backoff = iv.served()
-		}
+		wait, busy := iv.next(served, err)
+		backoff = wait
 		if err != nil {
 			if fatal(err) || ctx.Err() != nil {
 				return
 			}
-			if d := laneRefusal(err); d != nil {
+			if busy {
 				// MAIN's permits for the lane are all held: busy, not
 				// failing. The in-flight batch goes again, before any other.
 				a.busyRefusals.Add(1)
-				if d.Lane == "p0" {
-					backoff = p0Wait(d)
-				} else {
-					backoff = iv.refused(err)
-				}
 				continue
 			}
 			if !errors.Is(err, ErrNoEpoch) {
 				a.logf("cluster: events %s: %v", lane.Name, err)
-			}
-			backoff = min(max(time.Second, lane.Interval*2), 30*time.Second)
-			if w, ok := busyWait(err); ok {
-				backoff = max(backoff, w) // MAIN is starting or busy: when it says
 			}
 		}
 	}

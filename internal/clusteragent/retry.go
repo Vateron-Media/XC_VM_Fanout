@@ -169,3 +169,30 @@ func (l *laneInterval) served() time.Duration {
 	l.cur = max(l.normal, l.cur/2)
 	return l.cur
 }
+
+// next is how long the lane waits before it sends again, after a send that
+// had a batch served (or not) and ended with err; busy reports a lane
+// refusal, which the caller counts and does not log. A p0 refusal waits
+// p0Wait; a bulk one stretches the interval. Any other failure keeps the
+// lanes' usual backoff (twice the normal interval, 1–30 s, or a busy or
+// starting MAIN's wait if longer) and leaves the interval as it is.
+func (l *laneInterval) next(served bool, err error) (wait time.Duration, busy bool) {
+	wait = l.cur
+	if served {
+		wait = l.served()
+	}
+	if err == nil {
+		return wait, false
+	}
+	if d := laneRefusal(err); d != nil {
+		if d.Lane == "p0" {
+			return p0Wait(d), true
+		}
+		return l.refused(err), true
+	}
+	wait = min(max(time.Second, l.normal*2), 30*time.Second)
+	if w, ok := busyWait(err); ok {
+		wait = max(wait, w) // MAIN is starting or busy: when it says
+	}
+	return wait, false
+}

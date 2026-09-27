@@ -2,6 +2,7 @@ package clusteragent
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,7 +19,7 @@ func laneBusy(lane string, ms int64, op string) func() map[string]any {
 	return func() map[string]any { return map[string]any{"retry_after_ms": ms, "op": op, "lane": lane} }
 }
 
-// logSink collects an agent's log lines.
+// logSink collects an agent's log lines as they are written.
 type logSink struct {
 	mu    sync.Mutex
 	lines []string
@@ -28,7 +29,7 @@ func (l *logSink) logf(t *testing.T) func(string, ...any) {
 	return func(format string, args ...any) {
 		t.Logf(format, args...)
 		l.mu.Lock()
-		l.lines = append(l.lines, format)
+		l.lines = append(l.lines, fmt.Sprintf(format, args...))
 		l.mu.Unlock()
 	}
 }
