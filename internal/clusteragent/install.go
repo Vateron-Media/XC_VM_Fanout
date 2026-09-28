@@ -156,8 +156,10 @@ func Install(path string, d InstallData) error {
 	// its server id and the panel key it was just given. Nothing is printed
 	// either way — MAIN's install flow compares this command's whole output to
 	// "OK" — and a refused lease is left to `xc_agent lease` and to MAIN's own
-	// `node.lease_refused` audit.
-	acceptLease(st, d.Lease)
+	// `node.lease_refused` audit. The install data carries no MAIN time but the
+	// first token's: minted by the same approval as the lease, its iat is the
+	// MAIN time the lease is judged at (this machine's clock is not asked).
+	acceptLease(st, d.Lease, leaseAnchor{MainNow: tok.Iat, Gen: tok.Gen})
 	st.PendingEphSk = nil
 	st.Enrolled = false
 	// A previous enrolment's (or MAIN's) URL sets are never dialled.

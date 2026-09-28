@@ -341,7 +341,7 @@ func (cl *codeClient) install(st *State, body []byte, h http.Header, boxPub []by
 	st.Epochs = []Epoch{{Epoch: 1, EphSk: st.PendingEphSk, TokenSealed: sealed}}
 	// After the identity above, as in Install: the approval's lease is for this
 	// node, this server and the key the code pinned.
-	acceptLease(st, doc.Lease)
+	acceptLease(st, doc.Lease, leaseAnchor{MainNow: (time.Now().UnixMilli() + cl.offsetMs) / 1000, Gen: tok.Gen})
 	st.PendingEphSk = nil
 	st.Enrolled = false
 	// A previous enrolment's (or MAIN's) URL sets are never dialled.

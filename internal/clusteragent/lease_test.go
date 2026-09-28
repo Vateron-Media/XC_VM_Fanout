@@ -37,11 +37,15 @@ func wireLease(panel ed25519.PrivateKey, doc map[string]any, announced int64) js
 	return raw
 }
 
+// onMain is the anchor a lease is judged at on arrival: MAIN's time as the
+// node estimates it, and the node's generation (its token's).
+func onMain(now int64, gen int64) leaseAnchor { return leaseAnchor{MainNow: now, Gen: gen} }
+
 func TestALeaseThatCameWithATokenIsKept(t *testing.T) {
 	f, st := newFake(t)
 	iat, exp := int64(1800000000), int64(1800000000+13*3600)
 
-	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 4, iat, exp), exp)) {
+	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 4, iat, exp), exp), onMain(iat+1, 4)) {
 		t.Fatalf("a lease from MAIN was refused: %s", st.LeaseRefused)
 	}
 	if st.Lease.Exp != exp || st.Lease.Iat != iat || st.Lease.Gen != 4 || st.Lease.ServerID != st.ServerID {
@@ -68,11 +72,11 @@ func TestNoLeaseAtAllIsNotARefusal(t *testing.T) {
 	// it holds and records nothing: "none sent" is not "one refused".
 	f, st := newFake(t)
 	exp := int64(1800000000 + 3600)
-	acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, 1800000000, exp), exp))
+	acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, 1800000000, exp), exp), onMain(1800000000, 1))
 	held := fmt.Sprintf("%+v", *st.Lease)
 
 	for _, absent := range []json.RawMessage{nil, {}, json.RawMessage("null")} {
-		if acceptLease(st, absent) {
+		if acceptLease(st, absent, onMain(1800000000, 1)) {
 			t.Fatal("something was stored for a lease that never arrived")
 		}
 		if st.LeaseRefused != "" || fmt.Sprintf("%+v", *st.Lease) != held {
@@ -104,25 +108,36 @@ func TestWhatANodeRefusesAndWhy(t *testing.T) {
 		name string
 		raw  json.RawMessage
 		want string
+		at   *leaseAnchor // default: MAIN at iat, generation 1
 	}{
-		{"not an object", json.RawMessage(`"a lease"`), "not a lease object"},
-		{"payload not base64", json.RawMessage(`{"payload":"!!!","sig":"","exp":1}`), "the payload is not base64"},
-		{"signature too short", json.RawMessage(fmt.Sprintf(`{"payload":%q,"sig":"AAAA","exp":1}`, base64.StdEncoding.EncodeToString([]byte("{}")))), "the signature is not 64 base64'd bytes"},
-		{"signed by a stranger", wireLease(stranger, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp), "not signed under `lea` by the panel key this node holds"},
-		{"signature tampered with", tamperedRaw, "not signed under `lea` by the panel key this node holds"},
-		{"another document type", wireLease(f.panel, other, exp), "signed under `lea` but not a lease document"},
-		{"a version this agent does not read", wireLease(f.panel, v2, exp), "a lease version this agent does not read"},
-		{"another node's", wireLease(f.panel, leaseDoc("11111111-1111-4111-a111-111111111111", st.ServerID, 1, iat, exp), exp), "another node's lease"},
-		{"another server's", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID+1, 1, iat, exp), exp), "another server's lease"},
-		{"no generation", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 0, iat, exp), exp), "a lease with no window"},
-		{"expiring before it starts", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, iat), iat), "a lease with no window"},
-		{"a window past 26 h", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, iat+MaxLeaseSec+1), iat+MaxLeaseSec+1), "a window longer than the 26 h a lease may hold"},
-		{"an exp that disagrees with itself", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp+60), "the exp announced beside the lease is not the one inside it"},
+		{"not an object", json.RawMessage(`"a lease"`), "not a lease object", nil},
+		{"payload not base64", json.RawMessage(`{"payload":"!!!","sig":"","exp":1}`), "the payload is not base64", nil},
+		{"signature too short", json.RawMessage(fmt.Sprintf(`{"payload":%q,"sig":"AAAA","exp":1}`, base64.StdEncoding.EncodeToString([]byte("{}")))), "the signature is not 64 base64'd bytes", nil},
+		{"signed by a stranger", wireLease(stranger, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp), "not signed under `lea` by the panel key this node holds", nil},
+		{"signature tampered with", tamperedRaw, "not signed under `lea` by the panel key this node holds", nil},
+		{"another document type", wireLease(f.panel, other, exp), "signed under `lea` but not a lease document", nil},
+		{"a version this agent does not read", wireLease(f.panel, v2, exp), "a lease version this agent does not read", nil},
+		{"another node's", wireLease(f.panel, leaseDoc("11111111-1111-4111-a111-111111111111", st.ServerID, 1, iat, exp), exp), "another node's lease", nil},
+		{"another server's", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID+1, 1, iat, exp), exp), "another server's lease", nil},
+		{"no generation", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 0, iat, exp), exp), "a lease with no window", nil},
+		{"expiring before it starts", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, iat), iat), "a lease with no window", nil},
+		{"a window past 26 h", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, iat+MaxLeaseSec+1), iat+MaxLeaseSec+1), "a window longer than the 26 h a lease may hold", nil},
+		{"an exp that disagrees with itself", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp+60), "the exp announced beside the lease is not the one inside it", nil},
+		// ADR-002: the lease's generation is the node's own, and
+		// iat - 120 <= main_time < exp on MAIN's time at receipt.
+		{"another generation's", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 2, iat, exp), exp), "a lease for another generation of this node", nil},
+		{"a node that knows no generation", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp), "a lease for another generation of this node", &leaseAnchor{MainNow: iat}},
+		{"issued past the skew ahead of MAIN", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat+LeaseSkewSec+1, exp), exp), "issued in the future on MAIN's clock", nil},
+		{"already expired on MAIN", wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp), "already expired on MAIN's clock", &leaseAnchor{MainNow: exp, Gen: 1}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			st.Lease, st.LeaseRefused = nil, ""
-			if acceptLease(st, c.raw) {
+			at := onMain(iat, 1)
+			if c.at != nil {
+				at = *c.at
+			}
+			if acceptLease(st, c.raw, at) {
 				t.Fatal("kept")
 			}
 			if st.Lease != nil {
@@ -142,7 +157,7 @@ func TestTheLongestWindowALeaseMayHoldIsKept(t *testing.T) {
 	f, st := newFake(t)
 	iat := int64(1800000000)
 	exp := iat + MaxLeaseSec
-	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp)) {
+	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp), onMain(iat, 1)) {
 		t.Fatalf("a 26 h lease was refused: %s", st.LeaseRefused)
 	}
 }
@@ -151,14 +166,14 @@ func TestTheNewerLeaseWinsAndAReplayDoesNot(t *testing.T) {
 	f, st := newFake(t)
 	iat := int64(1800000000)
 	long := wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 2, iat, iat+13*3600), iat+13*3600)
-	if !acceptLease(st, long) {
+	if !acceptLease(st, long, onMain(iat, 2)) {
 		t.Fatalf("first lease: %s", st.LeaseRefused)
 	}
 
 	// An operator lowers lb_partition_tolerance_h: the next lease is SHORTER and
 	// must still replace the one held — the node is meant to hold less.
 	shortExp := iat + 60 + 2*3600
-	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 2, iat+60, shortExp), shortExp)) {
+	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 2, iat+60, shortExp), shortExp), onMain(iat+60, 2)) {
 		t.Fatalf("a shorter, newer lease was refused: %s", st.LeaseRefused)
 	}
 	if st.Lease.Exp != shortExp {
@@ -167,17 +182,21 @@ func TestTheNewerLeaseWinsAndAReplayDoesNot(t *testing.T) {
 
 	// The same first lease presented again is a copy replayed at a later
 	// request, and never widens the window back.
-	if acceptLease(st, long) {
+	if acceptLease(st, long, onMain(iat+60, 2)) {
 		t.Fatal("a replayed lease replaced a newer one")
 	}
 	if st.Lease.Exp != shortExp || st.LeaseRefused != "older than the lease this node already holds" {
 		t.Fatalf("after the replay: %+v refused=%q", st.Lease, st.LeaseRefused)
 	}
 
-	// A generation that went backwards is the same replay under another name.
+	// A generation that went backwards is the same replay under another name,
+	// even presented beside a token of that older generation.
 	backExp := iat + 3600 + 13*3600
-	if acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat+3600, backExp), backExp)) {
+	if acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat+3600, backExp), backExp), onMain(iat+3600, 1)) {
 		t.Fatal("a lease from an older generation was kept")
+	}
+	if st.LeaseRefused != "older than the lease this node already holds" {
+		t.Fatalf("refused=%q", st.LeaseRefused)
 	}
 	if st.Lease.Exp != shortExp {
 		t.Fatalf("the older generation replaced the lease held: %+v", st.Lease)
@@ -261,7 +280,7 @@ func TestTheLeaseReportAnswersOnAnUnfinishedNode(t *testing.T) {
 	st.path = path
 	iat := int64(1800000000)
 	exp := iat + 7200
-	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 3, iat, exp), exp)) {
+	if !acceptLease(st, wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 3, iat, exp), exp), onMain(iat, 3)) {
 		t.Fatal(st.LeaseRefused)
 	}
 	if err := st.Save(); err != nil {
@@ -280,5 +299,29 @@ func TestTheLeaseReportAnswersOnAnUnfinishedNode(t *testing.T) {
 	out, _ = LeaseReport(path, time.Unix(exp+60, 0))
 	if !strings.Contains(out, "expired 1m0s ago") {
 		t.Fatalf("report %q", out)
+	}
+}
+
+// The window edges are the extension's (cluster_lease_verify): a lease is
+// kept from 120 s before its iat, on MAIN's time, up to but not at its exp.
+func TestALeaseIsJudgedOnMainsTimeAtReceipt(t *testing.T) {
+	f, st := newFake(t)
+	iat := int64(1800000000)
+	exp := iat + 3600
+	raw := wireLease(f.panel, leaseDoc(st.NodeUUID, st.ServerID, 1, iat, exp), exp)
+	for _, c := range []struct {
+		main int64
+		kept bool
+	}{
+		{iat - LeaseSkewSec - 1, false},
+		{iat - LeaseSkewSec, true},
+		{iat, true},
+		{exp - 1, true},
+		{exp, false},
+	} {
+		st.Lease, st.LeaseRefused = nil, ""
+		if got := acceptLease(st, raw, onMain(c.main, 1)); got != c.kept {
+			t.Errorf("MAIN at iat%+d: kept %v, want %v (%s)", c.main-iat, got, c.kept, st.LeaseRefused)
+		}
 	}
 }

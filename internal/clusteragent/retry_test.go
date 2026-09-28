@@ -2,6 +2,7 @@ package clusteragent
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -237,5 +238,95 @@ func TestStartingIsNeverFatal(t *testing.T) {
 	st := m.stamps["heartbeat"]
 	if gap := st[2] - st[1]; gap < 900 {
 		t.Fatalf("a heartbeat followed a STARTING after %d ms", gap)
+	}
+}
+
+// skewedMain is a MAIN whose clock runs ahead of the node's by ahead, and
+// which refuses a stamp more than 90 s off its clock as PHP's ClusterApi does:
+// a signed 401 CLOCK_SKEW naming the request, with main_time_ms.
+func skewedMain(t *testing.T, ahead time.Duration, deny func(f *fakeMain, w http.ResponseWriter, nonce []byte, mainMs int64)) (*Client, *[]int64) {
+	f, st := newFake(t)
+	var mu sync.Mutex
+	var stamps []int64
+	f.answer = func(w http.ResponseWriter, r *http.Request, reqCtx, nonce []byte) {
+		ts, _ := strconv.ParseInt(r.Header.Get(cc.HTs), 10, 64)
+		mu.Lock()
+		stamps = append(stamps, ts)
+		mu.Unlock()
+		mainMs := time.Now().Add(ahead).UnixMilli()
+		if d := ts - mainMs; d > 90000 || d < -90000 {
+			deny(f, w, nonce, mainMs)
+			return
+		}
+		f.box(w, reqCtx, map[string]any{"state": "active", "mode": 1})
+	}
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	st.MainURLs = []string{srv.URL + "/cluster/v1/"}
+	return NewClient(st, "xc_agent/test"), &stamps
+}
+
+// A node whose clock is off by more than MAIN's 90 s window takes MAIN's time
+// from the verified CLOCK_SKEW and is served on the very next request, instead
+// of being refused on every op until its token looked expired.
+func TestClockSkewResyncsTheClockAndRetriesOnce(t *testing.T) {
+	ahead := 10 * time.Minute
+	c, stamps := skewedMain(t, ahead, func(f *fakeMain, w http.ResponseWriter, nonce []byte, mainMs int64) {
+		f.refuse(w, 401, nonce, "CLOCK_SKEW", map[string]any{"main_time_ms": mainMs})
+	})
+	var r Reply
+	if err := c.Call(context.Background(), "heartbeat", map[string]any{}, &r, false); err != nil || r.State != "active" {
+		t.Fatalf("after CLOCK_SKEW: %v %+v", err, r)
+	}
+	if len(*stamps) != 2 {
+		t.Fatalf("%d requests, want 2 (the refused one and its retry)", len(*stamps))
+	}
+	if off := time.Duration(c.MainNowMs()-time.Now().UnixMilli()) * time.Millisecond; off < ahead-5*time.Second || off > ahead+5*time.Second {
+		t.Fatalf("offset %s after resync, want about %s", off, ahead)
+	}
+	// And it stays in sync: the next op goes through at once.
+	if err := c.Call(context.Background(), "heartbeat", map[string]any{}, nil, false); err != nil || len(*stamps) != 3 {
+		t.Fatalf("next op: %v after %d requests", err, len(*stamps))
+	}
+}
+
+// Only a verified CLOCK_SKEW moves the clock: one not signed by the panel, or
+// bound to another request's nonce, is a transport failure and changes
+// nothing. And a second CLOCK_SKEW in a row is returned, not retried again.
+func TestClockSkewIsTakenOnlyFromAVerifiedDenialAndOnce(t *testing.T) {
+	_, stranger, _ := ed25519.GenerateKey(nil)
+	for name, deny := range map[string]func(f *fakeMain, w http.ResponseWriter, nonce []byte, mainMs int64){
+		"signed by another key": func(f *fakeMain, w http.ResponseWriter, nonce []byte, mainMs int64) {
+			(&fakeMain{panel: stranger, uuid: f.uuid}).refuse(w, 401, nonce, "CLOCK_SKEW", map[string]any{"main_time_ms": mainMs})
+		},
+		"for another request": func(f *fakeMain, w http.ResponseWriter, _ []byte, mainMs int64) {
+			f.refuse(w, 401, make([]byte, 16), "CLOCK_SKEW", map[string]any{"main_time_ms": mainMs})
+		},
+	} {
+		c, stamps := skewedMain(t, time.Hour, deny)
+		err := c.Call(context.Background(), "heartbeat", map[string]any{}, nil, false)
+		var d *Denial
+		if err == nil || errors.As(err, &d) || !errors.Is(err, ErrTransport) {
+			t.Errorf("%s: %v", name, err)
+		}
+		if len(*stamps) != 1 {
+			t.Errorf("%s: %d requests, want 1", name, len(*stamps))
+		}
+		if off := c.MainNowMs() - time.Now().UnixMilli(); off > 5000 || off < -5000 {
+			t.Errorf("%s: the clock moved by %d ms", name, off)
+		}
+	}
+
+	// MAIN keeps refusing (its clock jumped again): the op fails after one retry.
+	c, stamps := skewedMain(t, time.Hour, func(f *fakeMain, w http.ResponseWriter, nonce []byte, mainMs int64) {
+		f.refuse(w, 401, nonce, "CLOCK_SKEW", map[string]any{"main_time_ms": mainMs - 3600_000})
+	})
+	err := c.Call(context.Background(), "heartbeat", map[string]any{}, nil, false)
+	var d *Denial
+	if !errors.As(err, &d) || d.Reason != "CLOCK_SKEW" || len(*stamps) != 2 {
+		t.Fatalf("two CLOCK_SKEWs in a row: %v after %d requests", err, len(*stamps))
+	}
+	if _, ok := skewClock(&Denial{Status: 401, Reason: "CLOCK_SKEW"}); ok {
+		t.Fatal("a CLOCK_SKEW without main_time_ms moved the clock")
 	}
 }

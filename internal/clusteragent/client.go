@@ -250,8 +250,8 @@ func (c *Client) CallP0(ctx context.Context, payload, out any) error {
 	return c.callVia(ctx, c.P0HTTP, s, "events", payload, out, false)
 }
 
-// A REPLAY that says when a request stamped anew will pass is retried once
-// (retry.go).
+// A REPLAY that says when a request stamped anew will pass, or a CLOCK_SKEW
+// that says MAIN's time, is retried once (retry.go).
 func (c *Client) call(ctx context.Context, s session, op string, payload, out any, signNode bool) error {
 	return c.callVia(ctx, nil, s, op, payload, out, signNode)
 }
@@ -480,19 +480,20 @@ func (c *Client) Refresh(ctx context.Context) (*cc.Token, error) {
 		return nil, err
 	}
 	c.State.AddEpoch(e)
+	c.mu.Lock()
+	tok := c.sessions[e.Epoch].tok
+	c.mu.Unlock()
 	c.State.mu.Lock()
 	c.State.PendingEphSk = nil
 	// The lease this token serves on. A resent token (MAIN re-sends the same one
 	// for the same ephemeral key) comes with a lease minted at that moment, so
-	// this runs on every reply, not only on a new epoch.
-	acceptLease(c.State, reply.Lease)
+	// this runs on every reply, not only on a new epoch. It is judged on MAIN's
+	// time as this reply just set it.
+	acceptLease(c.State, reply.Lease, leaseAnchor{MainNow: c.MainNowMs() / 1000, Gen: tok.Gen})
 	err = c.State.saveLocked()
 	c.State.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	tok := c.sessions[e.Epoch].tok
-	c.mu.Unlock()
 	return tok, nil
 }
