@@ -81,7 +81,8 @@ type State struct {
 	HeldCmds []HeldCmd `json:"held_cmds,omitempty"`
 	// Lease is MAIN's statement of how long this node may keep serving without
 	// reaching it, as it arrived beside a token (lease.go). Nil until MAIN sends
-	// one; nothing acts on it yet.
+	// one. The agent publishes it with its MAIN clock in lease_state.json, which
+	// the node's PHP judges (Core\Cluster\NodeLease).
 	Lease *Lease `json:"lease,omitempty"`
 	// LeaseRefused is why the last lease MAIN sent was not kept, or "" when the
 	// one held was the last one sent. It is written here rather than logged

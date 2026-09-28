@@ -1,10 +1,13 @@
 package clusteragent
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	cc "github.com/Vateron-Media/XC_VM_Fanout/internal/clustercrypto"
@@ -26,11 +29,11 @@ const LeaseSkewSec = 120
 // `cluster_lease_verify`, which resolves the panel key through the pin, or this
 // agent) judges the bytes MAIN signed rather than a re-encoding of them.
 //
-// Nothing reads it yet. This agent checks it on arrival against its own
-// estimate of MAIN's time and the generation of the token it came with, stores
-// it and reports it; the state machine that acts on it — and the
-// rollback-resistant MAIN-time anchor it has to be judged against later — is
-// the increment after (ADR 0004, Phase 9).
+// This agent checks it on arrival against its own estimate of MAIN's time and
+// the generation of the token it came with, stores it, reports it, and
+// publishes it with the MAIN clock it is judged against (mainclock.go) in
+// lease_state.json, where the node's PHP decides what the node may still serve
+// (Core\Cluster\NodeLease, ADR 0004 Phase 9).
 type Lease struct {
 	// Payload is the exact document MAIN signed, and Sig its 64-byte signature
 	// under the panel tag `lea`.
@@ -150,14 +153,163 @@ func acceptLease(st *State, raw json.RawMessage, at leaseAnchor) bool {
 	return true
 }
 
+// LeaseStateFile is the file beside the agent's state that the node's PHP
+// judges the lease by (Core\Cluster\NodeLease::FILE,
+// config/cluster/lease_state.json).
+const LeaseStateFile = "lease_state.json"
+
+// LeaseStateStaleSec is NodeLease::STALE_SEC: a lease_state.json older than
+// this, by this machine's clock, is not judged at all — the node serves.
+const LeaseStateStaleSec = 60
+
+// LeaseState is lease_state.json: the lease this node holds and MAIN's clock as
+// the agent vouches for it, for Core\Cluster\NodeLease. Facts, and no verdict:
+// the switch (lb_lease_fence) and the drain (lb_fence_drain_min) are panel
+// settings the agent does not read (ADR 0004, "The fence a lease's end draws").
+type LeaseState struct {
+	// Exp, Iat, Gen and ServerID are the held lease's, exp and iat in unix
+	// seconds on MAIN's clock; all 0 while the node holds none, which NodeLease
+	// reads as "MAIN has sent this node no lease".
+	Exp      int64  `json:"exp"`
+	Iat      int64  `json:"iat"`
+	Gen      uint64 `json:"gen"`
+	ServerID int64  `json:"server_id"`
+	// AnchorMs is MAIN's time, in unix ms, at the moment of writing, as the
+	// agent's MAIN clock has it (mainclock.go): MAIN's last authenticated
+	// statement plus CLOCK_MONOTONIC since, never this machine's wall clock.
+	// 0 until MAIN has been heard on this node: "no anchor".
+	AnchorMs int64 `json:"anchor_ms"`
+	// WroteAtMs is this machine's wall clock, in unix ms, at the same moment.
+	// NodeLease compares it with that clock only: it adds the time since the
+	// write to the anchor (never less than nothing, so a clock moved back adds
+	// nothing), and it serves on a file older than LeaseStateStaleSec (an
+	// agent that is not running), which a clock moved forward also looks like
+	// until the next write.
+	WroteAtMs int64 `json:"wrote_at_ms"`
+}
+
+// leaseState is the lease half of lease_state.json.
+func (s *State) leaseState() LeaseState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Lease == nil {
+		return LeaseState{}
+	}
+	return LeaseState{Exp: s.Lease.Exp, Iat: s.Lease.Iat, Gen: s.Lease.Gen, ServerID: s.Lease.ServerID}
+}
+
+// writeLeaseState puts doc in place atomically, 0640 like flows.json, for the
+// node's PHP (the agent's own user, as PHP-FPM is). With no fsync: it is
+// rewritten every heartbeat interval from what the agent holds, and a crash
+// that loses it leaves no file, or the one before, both of which serve.
+func writeLeaseState(path string, doc LeaseState) error {
+	b, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	return writeFile(path, b, fileWrite{perm: 0o640, noSync: true})
+}
+
+// readLeaseState reads a lease_state.json; ok is false without one.
+func readLeaseState(path string) (doc LeaseState, ok bool) {
+	b, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(b, &doc) != nil {
+		return LeaseState{}, false
+	}
+	return doc, true
+}
+
+// publishLease writes LeaseFile: the lease held, MAIN's clock now as the
+// agent vouches for it, and this machine's clock now.
+func (a *Agent) publishLease() {
+	if a.LeaseFile == "" {
+		return
+	}
+	doc := a.Client.State.leaseState()
+	doc.AnchorMs = a.Client.clock.nowMs()
+	doc.WroteAtMs = a.Client.now().UnixMilli()
+	err := writeLeaseState(a.LeaseFile, doc)
+	// Once per failure, not once per heartbeat interval.
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	if msg != a.leaseErr {
+		if err != nil {
+			a.logf("cluster: writing the lease state: %v", err)
+		}
+		a.leaseErr = msg
+	}
+}
+
+// kickLease has RunLeaseState write the file now: a heartbeat was answered, or
+// a token brought a lease.
+func (a *Agent) kickLease() {
+	if a.LeaseFile == "" {
+		return
+	}
+	select {
+	case a.leaseKicks() <- struct{}{}:
+	default:
+	}
+}
+
+func (a *Agent) leaseKicks() chan struct{} {
+	a.leaseOnce.Do(func() { a.leaseKick = make(chan struct{}, 1) })
+	return a.leaseKick
+}
+
+// RunLeaseState keeps LeaseFile for the node's PHP until ctx ends: rewritten
+// every heartbeat interval whether or not MAIN answers — NodeLease serves on a
+// file the agent stopped rewriting, so it must go on being refreshed exactly
+// while MAIN cannot be reached — and at once on kickLease. It also saves the
+// MAIN clock in the state every ClockSaveEvery, and when ctx ends, so a
+// restart resumes the clock rather than starting it again (mainclock.go).
+// Run starts it before anything else, ahead of the first hello, which may not
+// be answered for as long as MAIN is gone.
+func (a *Agent) RunLeaseState(ctx context.Context) {
+	if a.LeaseFile == "" {
+		return
+	}
+	kick := a.leaseKicks()
+	every := a.heartbeatEvery()
+	t := time.NewTicker(every)
+	defer t.Stop()
+	saved := time.Now()
+	for {
+		a.publishLease()
+		if time.Since(saved) >= ClockSaveEvery {
+			if err := a.Client.saveClock(); err != nil {
+				a.logf("cluster: saving MAIN's clock: %v", err)
+			}
+			saved = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			if err := a.Client.saveClock(); err != nil {
+				a.logf("cluster: saving MAIN's clock: %v", err)
+			}
+			return
+		case <-t.C:
+		case <-kick:
+		}
+		if want := a.heartbeatEvery(); want != every {
+			every = want
+			t.Reset(want)
+		}
+	}
+}
+
 // LeaseReport is `xc_agent lease`: what this node holds, for an operator at the
 // console of a node that cannot reach MAIN. It reads the state file directly,
 // so it answers on a node whose enrolment never finished, and it re-checks the
 // signature against the panel key in that same file.
 //
-// The remaining window is reported against this machine's clock, which is the
-// clock a lease exists to distrust — MAIN vouches for none of it — so the line
-// says so rather than implying an answer it cannot give.
+// The remaining window is reported twice. Against this machine's clock, which
+// is the clock a lease exists to distrust — MAIN vouches for none of it — so
+// the line says so rather than implying an answer it cannot give. And against
+// MAIN's clock as the agent last wrote it in lease_state.json, reckoned as the
+// node's PHP reckons it (Core\Cluster\NodeLease): the window the fence goes by.
 func LeaseReport(path string, now time.Time) (string, error) {
 	st, err := loadRaw(path)
 	if err != nil {
@@ -176,6 +328,29 @@ func LeaseReport(path string, now time.Time) (string, error) {
 	if left <= 0 {
 		window = fmt.Sprintf("expired %s ago by this machine's clock, which MAIN does not vouch for", (time.Duration(-left) * time.Second).String())
 	}
-	return fmt.Sprintf("lease: server %d, generation %d\nissued: %d  expires: %d (%d s window)\n%s\n%s\n",
-		l.ServerID, l.Gen, l.Iat, l.Exp, l.Exp-l.Iat, window, signed), nil
+	return fmt.Sprintf("lease: server %d, generation %d\nissued: %d  expires: %d (%d s window)\n%s\n%s\n%s\n",
+		l.ServerID, l.Gen, l.Iat, l.Exp, l.Exp-l.Iat, window, onMainClock(filepath.Join(filepath.Dir(path), LeaseStateFile), l.Exp, now), signed), nil
+}
+
+// onMainClock is the report's line on MAIN's clock: the lease's window as the
+// fence judges it, from the lease_state.json the agent writes.
+func onMainClock(path string, exp int64, now time.Time) string {
+	ls, ok := readLeaseState(path)
+	switch {
+	case !ok:
+		return "on MAIN's clock: no " + LeaseStateFile + " (the agent has not run since this was installed)"
+	case ls.AnchorMs <= 0:
+		return "on MAIN's clock: unknown, MAIN has never been heard on this node"
+	}
+	age := now.UnixMilli() - ls.WroteAtMs
+	left := exp - (ls.AnchorMs+max(0, age))/1000
+	line := fmt.Sprintf("%s left on MAIN's clock as the agent last vouched for it", (time.Duration(left) * time.Second).String())
+	if left <= 0 {
+		line = fmt.Sprintf("expired %s ago on MAIN's clock as the agent last vouched for it", (time.Duration(-left) * time.Second).String())
+	}
+	if age > LeaseStateStaleSec*1000 {
+		line += fmt.Sprintf(", but the agent last wrote %s %s ago and a file that old is not judged: the node serves",
+			LeaseStateFile, (time.Duration(age) * time.Millisecond).Round(time.Second).String())
+	}
+	return line
 }

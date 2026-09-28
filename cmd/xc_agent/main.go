@@ -7,7 +7,10 @@
 // says hello, heartbeats and rotates its token. Every heartbeat carries the
 // host sampled each second (Phase 3); with the node's TELEMETRY flow on, MAIN
 // takes the server's stats from it. The mode and flows MAIN sends are written
-// to flows.json beside the state for the node's PHP.
+// to flows.json beside the state for the node's PHP, and the lease the node
+// holds, with MAIN's clock as the agent vouches for it, to lease_state.json
+// every heartbeat interval, whether MAIN answers or not (the node's PHP fences
+// on it behind lb_lease_fence).
 //
 // With CONNECTIONS on, the agent holds the node's viewers (registry.snap,
 // rebuilt against the fanout and the PHP workers after a restart), admits new
@@ -222,7 +225,7 @@ func main() {
 	go sampler.Run(stopSampler)
 	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
 		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
-		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl,
+		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl, LeaseFile: filepath.Join(filepath.Dir(*statePath), clusteragent.LeaseStateFile),
 		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute),
 		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
 		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath)}

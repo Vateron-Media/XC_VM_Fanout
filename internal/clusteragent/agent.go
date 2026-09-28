@@ -28,6 +28,10 @@ type Agent struct {
 	// FlowsFile receives the node's mode and flow bits from MAIN's replies,
 	// for the LB's PHP (Core\Cluster\NodeFlows); "" writes nothing.
 	FlowsFile string
+	// LeaseFile receives the lease the node holds and MAIN's clock as the
+	// agent vouches for it, every heartbeat interval, for the LB's PHP
+	// (lease_state.json, Core\Cluster\NodeLease; lease.go); "" writes nothing.
+	LeaseFile string
 	// Exec runs MAIN's commands (commands.go); nil leaves the commands lane off.
 	Exec Executor
 	// SpoolDir is where the node's PHP spools events for MAIN (events.go);
@@ -114,6 +118,9 @@ type Agent struct {
 	// fallback URL only, and under which policy version (Run's loop only).
 	fallbackHelloAt  time.Time
 	fallbackHelloVer int
+	leaseOnce        sync.Once
+	leaseKick        chan struct{} // write lease_state.json now (lease.go)
+	leaseErr         string        // the last error writing it, logged once (RunLeaseState's loop only)
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -277,6 +284,7 @@ func (a *Agent) recover(ctx context.Context) error {
 		tok, err := a.Client.Rekey(ctx, a.identity())
 		if err == nil {
 			a.logf("cluster: re-keyed (epoch %d)", tok.Epoch)
+			a.kickLease() // the lease the new token came with
 			return nil
 		}
 		if fatal(err) {
@@ -357,10 +365,14 @@ func (a *Agent) publish(r *Reply) {
 }
 
 // Unpublish removes the flows file, so the LB's PHP falls back to the legacy
-// paths: called when MAIN stops the node.
+// paths, and the lease state, which describes a session MAIN has ended:
+// called when MAIN stops the node.
 func (a *Agent) Unpublish() {
 	if a.FlowsFile != "" {
 		os.Remove(a.FlowsFile)
+	}
+	if a.LeaseFile != "" {
+		os.Remove(a.LeaseFile)
 	}
 }
 
@@ -407,6 +419,7 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 		return nil, err
 	}
 	a.apply(&r)
+	a.kickLease()
 	return &r, nil
 }
 
@@ -417,6 +430,20 @@ func (a *Agent) Run(ctx context.Context) error {
 	interval := a.heartbeatEvery()
 	backoff := interval
 	a.stopCh = make(chan error, 1)
+	if a.LeaseFile != "" {
+		// First, and stopped and waited for on return (its last act saves
+		// MAIN's clock): the file must go on being rewritten while MAIN
+		// cannot be reached, which is also while the hello below fails.
+		lctx, stopLease := context.WithCancel(ctx)
+		var leaseDone sync.WaitGroup
+		leaseDone.Add(1)
+		defer leaseDone.Wait()
+		defer stopLease()
+		go func() {
+			defer leaseDone.Done()
+			a.RunLeaseState(lctx)
+		}()
+	}
 	if a.Exec != nil && a.run == nil {
 		a.run = a.localExec(a.Exec)
 	}
@@ -706,7 +733,9 @@ func (a *Agent) refreshLater(ctx context.Context) {
 			}
 			// The current token lasts to exp; a later heartbeat re-keys if it must.
 			a.logf("cluster: token refresh: %v", err)
+			return
 		}
+		a.kickLease() // the lease the token came with
 	}()
 }
 
@@ -798,6 +827,7 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 	}
 	a.lastBeatMs.Store(time.Now().UnixMilli())
 	a.publish(&r)
+	a.kickLease()
 	return &r, nil
 }
 

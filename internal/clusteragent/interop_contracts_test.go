@@ -569,3 +569,79 @@ func TestInteropDataPlane(t *testing.T) {
 		t.Fatalf("a tampered chunk: %d bytes passed on", len(body))
 	}
 }
+
+// TestInteropNodeLeaseJudgesTheAgentsFile: the lease MAIN's real LeaseService
+// signed, kept by the agent and anchored on MAIN's clock from a real reply, is
+// judged by the node's real Core\Cluster\NodeLease from the file the agent
+// writes — serving while MAIN's clock is short of the exp, draining past it and
+// fenced past the drain, as the agent's clock carries MAIN's time forward with
+// MAIN gone.
+func TestInteropNodeLeaseJudgesTheAgentsFile(t *testing.T) {
+	a, runPHP, ctx := interopNode(t)
+	runPHP("events.php", "flows", "0") // mode 1: a cluster node
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st := a.Client.State
+	if st.Lease == nil {
+		t.Fatalf("no lease: %q", st.LeaseRefused)
+	}
+	a.LeaseFile = filepath.Join(filepath.Dir(st.path), LeaseStateFile)
+	verdict := func(fence, drainMin int) (v struct {
+		State      string `json:"state"`
+		Exp        int64  `json:"exp"`
+		DrainUntil int64  `json:"drain_until"`
+		Anchor     int64  `json:"anchor"`
+		Gen        uint64 `json:"gen"`
+		Why        string `json:"why"`
+	}) {
+		t.Helper()
+		out := runPHP("lease.php", a.FlowsFile, a.LeaseFile, fmt.Sprint(fence), fmt.Sprint(drainMin))
+		if err := json.Unmarshal([]byte(out), &v); err != nil {
+			t.Fatalf("%s: %v", out, err)
+		}
+		return v
+	}
+
+	a.publishLease()
+	v := verdict(1, 10)
+	if v.State != "serving" || v.Why != "" || v.Exp != st.Lease.Exp || v.Gen != st.Lease.Gen {
+		t.Fatalf("a live lease: %+v, held %+v", v, st.Lease)
+	}
+	if d := v.Anchor - time.Now().Unix(); d < -5 || d > 5 {
+		t.Fatalf("PHP reckons MAIN's clock %d s off", d)
+	}
+	if v.DrainUntil != v.Exp+600 {
+		t.Fatalf("drain until %d for exp %d", v.DrainUntil, v.Exp)
+	}
+
+	// MAIN gone, and the time passing on the agent's monotonic clock only: the
+	// wall clock this machine keeps is not asked.
+	pass := func(to int64) {
+		t.Helper()
+		a.Client.clock.mu.Lock()
+		shift := (to - a.Client.clock.nowLocked(monotonicNs())) * int64(time.Millisecond)
+		a.Client.clock.mono = func() int64 { return monotonicNs() + shift }
+		a.Client.clock.mu.Unlock()
+		a.publishLease()
+	}
+	pass(st.Lease.Exp*1000 + 5_000)
+	if v := verdict(1, 10); v.State != "draining" {
+		t.Fatalf("5 s past the exp: %+v", v)
+	}
+	if v := verdict(0, 10); v.State != "serving" || v.Why != "the switch is off" {
+		t.Fatalf("switch off: %+v", v)
+	}
+	pass((st.Lease.Exp+600)*1000 + 5_000)
+	if v := verdict(1, 10); v.State != "fenced" {
+		t.Fatalf("past the drain: %+v", v)
+	}
+	// And a word from MAIN again puts its clock back where MAIN says it is.
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	a.publishLease()
+	if v := verdict(1, 10); v.State != "serving" {
+		t.Fatalf("MAIN heard again: %+v", v)
+	}
+}
