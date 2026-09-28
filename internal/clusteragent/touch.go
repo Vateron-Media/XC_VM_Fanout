@@ -129,17 +129,17 @@ func (r *Registry) touchesToP0() (int, error) {
 	if len(events) == 0 {
 		return 0, nil
 	}
-	if err := r.emit(events); err != nil {
+	err := r.emitThenLocked(events, func() {
+		for _, rec := range recs {
+			uuid, _ := rec["uuid"].(string)
+			if c := r.conns[uuid]; c != nil && norm(c["hls_last_read"]) == norm(rec["hls_last_read"]) {
+				r.sentP0Locked(uuid, rec)
+			}
+		}
+	})
+	if err != nil {
 		return 0, err
 	}
-	r.mu.Lock()
-	for _, rec := range recs {
-		uuid, _ := rec["uuid"].(string)
-		if c := r.conns[uuid]; c != nil && norm(c["hls_last_read"]) == norm(rec["hls_last_read"]) {
-			r.sentP0Locked(uuid, rec)
-		}
-	}
-	r.mu.Unlock()
 	return len(events), nil
 }
 

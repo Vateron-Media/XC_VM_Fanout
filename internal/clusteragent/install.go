@@ -27,7 +27,8 @@ import (
 //  3. install — MAIN's reply (epoch 1, sealed to the per-epoch key) is
 //     opened and checked before it is saved; then the agent can run.
 
-var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+// uuidRe is a node uuid alone (a node id with no `sid:` form).
+var uuidRe = regexp.MustCompile(`^` + cc.NodeUUIDPattern + `$`)
 
 // KeygenResult is what goes back to MAIN over SSH.
 type KeygenResult struct {

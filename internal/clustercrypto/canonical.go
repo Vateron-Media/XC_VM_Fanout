@@ -44,7 +44,11 @@ type Request struct {
 	Nonce           []byte
 }
 
-var nodeRe = regexp.MustCompile(`^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|sid:[1-9][0-9]{0,9})$`)
+// NodeUUIDPattern is a node uuid (lower-case 8-4-4-4-12 hex), unanchored so
+// it can be embedded: a node id is one of these or a `sid:<server id>`.
+const NodeUUIDPattern = `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`
+
+var nodeRe = regexp.MustCompile(`^(` + NodeUUIDPattern + `|sid:[1-9][0-9]{0,9})$`)
 
 // ValidNode reports whether s is a node id as X-XCVM-Node may carry it.
 func ValidNode(s string) bool { return nodeRe.MatchString(s) }

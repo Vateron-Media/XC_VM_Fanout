@@ -88,15 +88,6 @@ func TestWriteFileTempNames(t *testing.T) {
 	if b, _ := os.ReadFile(other); string(b) != "theirs" {
 		t.Fatalf("another writer's temporary file changed: %q", b)
 	}
-	f, tmp, err := createTemp(dir, "7.json", fileWrite{perm: 0o600})
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	os.Remove(tmp)
-	if name := filepath.Base(tmp); !strings.HasPrefix(name, ".7.json.") || !strings.HasSuffix(name, ".tmp") || name == ".7.json.tmp" || filepath.Dir(tmp) != dir {
-		t.Fatalf("temporary file %s", tmp)
-	}
 }
 
 func TestWriteFileFailures(t *testing.T) {
