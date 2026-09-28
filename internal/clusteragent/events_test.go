@@ -29,6 +29,7 @@ type eventsMain struct {
 	cursor   map[string]int64
 	applied  map[string][]string // event "d.n" values, in order
 	loseNext bool
+	refuse   int // the next calls fail (MAIN out of reach) without applying anything
 	calls    int
 }
 
@@ -45,6 +46,11 @@ func newEventsMain(t *testing.T) (*eventsMain, *Agent) {
 
 func (m *eventsMain) answer(w http.ResponseWriter, r *http.Request, reqCtx, nonce []byte) {
 	m.calls++
+	if m.refuse > 0 {
+		m.refuse--
+		http.Error(w, "gateway timeout", 504)
+		return
+	}
 	body, _ := io.ReadAll(r.Body)
 	plain, err := cc.Unbox(m.keys.EncUp, reqCtx, body)
 	if err != nil {
@@ -328,30 +334,45 @@ func TestP0CompactsPastItsSizeToTheLatestStatePerKey(t *testing.T) {
 		`{"type":"recording.state","t":2,"d":{"id":3,"status":2}}`,
 		`{"type":"node.state","t":2,"d":{"fields":{"certbot_ssl":"b"}}}`)
 	ls.lane.Compact = 1 << 30
-	if n, _ := ls.compact(); n != 0 {
+	if res, _ := ls.compactTail(nil); res.folded != 0 {
 		t.Fatal("compacted below its size")
 	}
 	ls.lane.Compact = 10
-	n, err := ls.compact()
-	if err != nil || n != 3 {
-		t.Fatalf("folded %d, %v", n, err)
+	res, err := ls.compactTail(nil)
+	if err != nil || res.folded != 3 {
+		t.Fatalf("folded %d, %v", res.folded, err)
 	}
 	files, _ := ls.spooled()
-	if len(files) != 1 || files[0].Name() != fmt.Sprintf("%019d-1-0000.ndjson", 1) {
+	if len(files) != 1 || !strings.HasPrefix(files[0].Name(), fmt.Sprintf("%019d-compact-", 1)) {
 		t.Fatalf("files %v", files)
-	}
-	evs, _, _ := readSpoolFile(filepath.Join(dir, files[0].Name()))
-	var got []string
-	for _, e := range evs {
-		got = append(got, string(e))
 	}
 	want := []string{
 		`{"d":{"fields":{"pid":2,"stream_status":2},"server_id":7,"stream_id":5},"t":2,"type":"stream.state"}`,
-		`{"d":{"x":1},"t":2,"type":"future.thing"}`,
-		`{"d":{"id":3,"status":2},"t":2,"type":"recording.state"}`,
+		`{"type":"future.thing","t":2,"d":{"x":1}}`,
+		`{"type":"recording.state","t":2,"d":{"id":3,"status":2}}`,
 		`{"d":{"fields":{"certbot_ssl":"b","sysctl":"s"}},"t":2,"type":"node.state"}`,
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+	if got := laneLines(t, ls); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("compacted:\n%s", strings.Join(got, "\n"))
 	}
+}
+
+// laneLines is every event the lane holds, in the order it sends them.
+func laneLines(t *testing.T, ls *laneSpool) []string {
+	t.Helper()
+	files, err := ls.spooled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, f := range files {
+		evs, _, err := readSpoolFile(filepath.Join(ls.dir, f.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range evs {
+			out = append(out, string(e))
+		}
+	}
+	return out
 }

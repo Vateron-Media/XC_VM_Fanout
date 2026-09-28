@@ -1,8 +1,6 @@
 package clusteragent
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,7 +16,7 @@ import (
 // MAIN into a spool, one file per write, renamed in when complete
 // (Core\Cluster\EventSpool):
 //
-//	spool/p0/<hrtime>-<pid>-<rand>.ndjson   stream state: gap-checked, never dropped
+//	spool/p0/<hrtime>-<pid>-<rand>.ndjson   state: gap-checked, never dropped (compacted, compact.go)
 //	spool/p1/<hrtime>-<pid>-<rand>.ndjson   logs: oldest dropped past the cap
 //
 // One loop per lane sends the oldest files as a batch to MAIN's `events` op,
@@ -27,6 +25,12 @@ import (
 // is written to <lane>.inflight, so after a crash or a lost reply the same
 // files go again under the same numbers and MAIN, which applies a batch and
 // its cursor together, does not apply them twice.
+//
+// A lane's bounds (P1's cap, P0's compaction, compact.go) apply
+// to the backlog behind the in-flight batch, and hold while that batch is
+// stuck (MAIN out of reach) and before MAIN's cursor is known: the in-flight
+// files themselves are never touched, so a resend is the same batch byte for
+// byte.
 
 // Lane is one event lane.
 type Lane struct {
@@ -36,7 +40,8 @@ type Lane struct {
 	// are dropped (reported to MAIN as a `skip`); 0 never drops.
 	Cap int64
 	// Compact is the size past which the lane's spool is collapsed to the
-	// latest state per key instead (P0, which is never dropped); 0 never.
+	// latest state per key instead (P0, which is never dropped, compact.go);
+	// 0 never.
 	Compact int64
 }
 
@@ -45,6 +50,10 @@ var Lanes = []Lane{
 	{Name: "p0", Interval: 200 * time.Millisecond, Compact: 128 << 20},
 	{Name: "p1", Interval: 5 * time.Second, Cap: 64 << 20},
 }
+
+// HousekeepEvery is the most often a lane's backlog is measured against its
+// bounds.
+var HousekeepEvery = time.Second
 
 // Batch limits: MAIN takes up to 5000 events and 8 MB per request.
 var (
@@ -69,6 +78,14 @@ type laneSpool struct {
 	lane  Lane
 	dir   string // spool/<lane>
 	state string // spool/<lane>.inflight
+	// checked is when the backlog was last measured (housekeep); compacted
+	// is its size after the last compaction, 0 once it fell below Compact.
+	// retryAt is when a compaction that failed is tried again, after
+	// failures in a row (compactTail).
+	checked   time.Time
+	compacted int64
+	retryAt   time.Time
+	failures  int
 }
 
 // cursor is MAIN's cursor for a lane from the latest hello; -1 until one arrives.
@@ -90,6 +107,16 @@ func (a *Agent) RunEvents(ctx context.Context, lane Lane) {
 		if next == 0 {
 			c := a.cursor(lane.Name)
 			if c < 0 {
+				// No hello yet (MAIN out of reach since the agent started):
+				// nothing is sent, but the backlog is still bounded. An
+				// in-flight record that cannot be read skips the pass: its
+				// batch's files would be taken for the tail and compacted,
+				// and MAIN may already hold them under their numbers.
+				if fl, err := ls.loadInflight(); err == nil {
+					ls.housekeep(fl, a.logf)
+				} else {
+					a.logf("cluster: events %s: %v", lane.Name, err)
+				}
 				continue
 			}
 			next = c + 1
@@ -124,18 +151,13 @@ func (a *Agent) shipOnce(ctx context.Context, ls *laneSpool, next int64) (int64,
 	if err != nil {
 		return next, false, err
 	}
+	if !ls.housekeep(fl, a.logf) {
+		// A compaction a crash interrupted could not be finished: sending
+		// now could send a file and its compaction both.
+		return next, false, errors.New("clusteragent: the lane's compaction is unfinished")
+	}
 	switch {
 	case fl == nil:
-		if ls.lane.Cap > 0 {
-			ls.enforceCap()
-		}
-		if ls.lane.Compact > 0 {
-			if n, err := ls.compact(); err != nil {
-				a.logf("cluster: events %s: compacting: %v", ls.lane.Name, err)
-			} else if n > 0 {
-				a.logf("cluster: events %s: backlog past %d MB collapsed (%d events folded)", ls.lane.Name, ls.lane.Compact>>20, n)
-			}
-		}
 		files, events, err := ls.collect()
 		if err != nil || len(events) == 0 {
 			return next, false, err
@@ -276,31 +298,71 @@ func (ls *laneSpool) read(files []string) ([]json.RawMessage, error) {
 }
 
 // readSpoolFile returns the file's events (one JSON object per line; a line
-// that is not one is skipped) and its size.
+// that is not one, or is longer than a batch, is skipped) and its size.
 func readSpoolFile(path string) ([]json.RawMessage, int, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, 0, err
-	}
 	var out []json.RawMessage
-	sc := bufio.NewScanner(bytes.NewReader(b))
-	sc.Buffer(make([]byte, 64<<10), MaxBatchBytes)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
+	n, err := eachLine(path, MaxBatchBytes, func(_ int64, line []byte) error {
 		var probe struct {
 			Type string          `json:"type"`
 			D    json.RawMessage `json:"d"`
 		}
-		if len(line) == 0 || json.Unmarshal(line, &probe) != nil || probe.Type == "" {
-			continue
+		if json.Unmarshal(line, &probe) == nil && probe.Type != "" {
+			out = append(out, append(json.RawMessage{}, line...))
 		}
-		out = append(out, append(json.RawMessage{}, line...))
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
-	return out, len(b), nil
+	return out, int(n), nil
 }
 
-// enforceCap drops the oldest files while the lane holds more than its cap.
-func (ls *laneSpool) enforceCap() {
+// housekeep bounds the backlog behind the in-flight batch fl (nil: none):
+// it first finishes a compaction a crash interrupted (false when it cannot,
+// and nothing may be collected), then, at most every HousekeepEvery, drops
+// P1's oldest files past its cap or compacts P0 (compact.go). The in-flight
+// batch's files are left as they are.
+func (ls *laneSpool) housekeep(fl *inflight, logf func(string, ...any)) bool {
+	if err := ls.recoverCompaction(); err != nil {
+		logf("cluster: events %s: finishing a compaction: %v", ls.lane.Name, err)
+		if _, statErr := os.Stat(ls.manifestPath()); statErr == nil {
+			return false
+		}
+	}
+	if (ls.lane.Cap == 0 && ls.lane.Compact == 0) || time.Since(ls.checked) < HousekeepEvery {
+		return true
+	}
+	ls.checked = time.Now()
+	exclude := map[string]bool{}
+	if fl != nil {
+		for _, f := range fl.Files {
+			exclude[filepath.Base(f)] = true
+		}
+	}
+	if ls.lane.Cap > 0 {
+		ls.enforceCap(exclude)
+	}
+	if ls.lane.Compact > 0 {
+		res, err := ls.compactTail(exclude)
+		switch {
+		case err != nil:
+			logf("cluster: events %s: compacting: %v", ls.lane.Name, err)
+			// Committed but not rolled forward: the lane holds until the
+			// next pass finishes it, or it would send a file and its
+			// compaction both.
+			if _, statErr := os.Stat(ls.manifestPath()); statErr == nil {
+				return false
+			}
+		case res.folded > 0:
+			logf("cluster: events %s: backlog past %d MB collapsed (%d events folded, %d MB left)", ls.lane.Name, ls.lane.Compact>>20, res.folded, res.size>>20)
+		}
+	}
+	return true
+}
+
+// enforceCap drops the oldest files (but those in exclude, the in-flight
+// batch's) while the lane holds more than its cap.
+func (ls *laneSpool) enforceCap(exclude map[string]bool) {
 	entries, err := ls.spooled()
 	if err != nil {
 		return
@@ -308,6 +370,9 @@ func (ls *laneSpool) enforceCap() {
 	var total int64
 	sizes := make([]int64, len(entries))
 	for i, e := range entries {
+		if exclude[e.Name()] {
+			continue
+		}
 		if info, err := e.Info(); err == nil {
 			sizes[i] = info.Size()
 			total += sizes[i]
@@ -315,6 +380,9 @@ func (ls *laneSpool) enforceCap() {
 	}
 	dropped := 0
 	for i := 0; total > ls.lane.Cap && i < len(entries); i++ {
+		if exclude[entries[i].Name()] {
+			continue
+		}
 		path := filepath.Join(ls.dir, entries[i].Name())
 		evs, _, _ := readSpoolFile(path)
 		if os.Remove(path) == nil {
@@ -325,11 +393,7 @@ func (ls *laneSpool) enforceCap() {
 	if dropped > 0 {
 		// Reported to MAIN as a `skip`, from a file that sorts before any PHP
 		// spool file, so it goes in the next batch and survives a restart.
-		line, _ := json.Marshal(map[string]any{"type": "skip", "t": time.Now().UnixMilli(), "d": map[string]int{"count": dropped}})
-		name := fmt.Sprintf("%019d-skip-%d.ndjson", 0, time.Now().UnixNano())
-		if err := os.WriteFile(filepath.Join(ls.dir, "."+name+".tmp"), append(line, '\n'), 0o640); err == nil {
-			os.Rename(filepath.Join(ls.dir, "."+name+".tmp"), filepath.Join(ls.dir, name))
-		}
+		writeSkip(ls.dir, dropped, fmt.Sprint(time.Now().UnixNano()))
 	}
 }
 
@@ -377,118 +441,4 @@ func (ls *laneSpool) finish(fl *inflight) {
 		os.Remove(filepath.Join(ls.dir, filepath.Base(f)))
 	}
 	os.Remove(ls.state)
-}
-
-// compact collapses a backlog past the lane's Compact size to the latest
-// state per key (the plan's p0_reset): P0 events describe state, so only the
-// last word on each stream row, worker, recording or movie matters, merged
-// where an event carries part of it. Events of other types are kept as they
-// are. The result replaces the oldest file, so it still goes first; the rest
-// are removed after. A crash between the two only repeats state, which MAIN
-// applies idempotently. Returns how many events were folded away.
-func (ls *laneSpool) compact() (int, error) {
-	entries, err := ls.spooled()
-	if err != nil || len(entries) < 2 {
-		return 0, err
-	}
-	var total int64
-	for _, e := range entries {
-		if info, err := e.Info(); err == nil {
-			total += info.Size()
-		}
-	}
-	if total <= ls.lane.Compact {
-		return 0, nil
-	}
-	type slot struct {
-		last int
-		ev   map[string]any
-	}
-	slots := map[string]*slot{}
-	var order []string
-	n := 0
-	for _, e := range entries {
-		evs, _, err := readSpoolFile(filepath.Join(ls.dir, e.Name()))
-		if err != nil {
-			return 0, err
-		}
-		for _, raw := range evs {
-			var ev map[string]any
-			if json.Unmarshal(raw, &ev) != nil {
-				continue
-			}
-			key, merge := compactKey(ev, n)
-			n++
-			if s, ok := slots[key]; ok {
-				if merge != "" {
-					ev = mergeInto(s.ev, ev, merge)
-				}
-				s.ev, s.last = ev, n
-			} else {
-				slots[key] = &slot{last: n, ev: ev}
-				order = append(order, key)
-			}
-		}
-	}
-	sort.SliceStable(order, func(i, j int) bool { return slots[order[i]].last < slots[order[j]].last })
-	var body []byte
-	for _, k := range order {
-		line, _ := json.Marshal(slots[k].ev)
-		body = append(append(body, line...), '\n')
-	}
-	first := filepath.Join(ls.dir, entries[0].Name())
-	tmp := filepath.Join(ls.dir, "."+entries[0].Name()+".compact.tmp")
-	if err := os.WriteFile(tmp, body, 0o640); err != nil {
-		return 0, err
-	}
-	if err := os.Rename(tmp, first); err != nil {
-		os.Remove(tmp)
-		return 0, err
-	}
-	for _, e := range entries[1:] {
-		os.Remove(filepath.Join(ls.dir, e.Name()))
-	}
-	return n - len(order), nil
-}
-
-// compactKey is what an event describes, and which part of it merges ("" to
-// replace): the latest event for a key carries the state.
-func compactKey(ev map[string]any, i int) (string, string) {
-	d, _ := ev["d"].(map[string]any)
-	id := func(k string) string { return fmt.Sprint(d[k]) }
-	switch ev["type"] {
-	case "stream.state":
-		if _, ok := d["ssid"]; ok {
-			return "state:r" + id("ssid"), "fields"
-		}
-		return "state:s" + id("stream_id") + ":" + id("server_id"), "fields"
-	case "stream.monitor":
-		return "monitor:" + id("stream_id"), ""
-	case "stream.worker":
-		return "worker:" + id("stream_id") + ":" + id("worker"), ""
-	case "recording.state":
-		return "recording:" + id("id"), ""
-	case "vod.analysis":
-		return "vod:" + id("stream_id"), "props"
-	case "node.state":
-		return "node", "fields"
-	}
-	return fmt.Sprintf("keep:%d", i), ""
-}
-
-// mergeInto lays the newer event's part over the older one's.
-func mergeInto(older, newer map[string]any, part string) map[string]any {
-	od, _ := older["d"].(map[string]any)
-	nd, _ := newer["d"].(map[string]any)
-	op, _ := od[part].(map[string]any)
-	np, _ := nd[part].(map[string]any)
-	merged := map[string]any{}
-	for k, v := range op {
-		merged[k] = v
-	}
-	for k, v := range np {
-		merged[k] = v
-	}
-	nd[part] = merged
-	return newer
 }

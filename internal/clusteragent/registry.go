@@ -51,6 +51,11 @@ import (
 // Every heartbeat carries the registry's Digest. When MAIN's store for the
 // node drifts from it, MAIN asks for the whole registry (conn_snapshot).
 //
+// While MAIN is out of reach these events wait in the P0 spool. Its
+// compaction (compact.go) folds a viewer's upserts that differ only in
+// hls_last_read into one and keeps every other change, remove and close in
+// order. P0 drops none of them.
+//
 // The HLS reaper (Reap): an HLS viewer has no worker to watch, only its
 // playlist requests. One that has made none for HLSReapAfter is ended here
 // (hls_end 1, a P0 conn.upsert), and MAIN closes it as it closes any ended
