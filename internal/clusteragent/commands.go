@@ -3,6 +3,7 @@ package clusteragent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -26,10 +27,14 @@ import (
 // node.root to root. A command that carries an artefact grant waits for its
 // download beside the loop first (artefact.go).
 
-// Command is a signed command document.
+// Command is a signed command document. Action is set for node.rpc and
+// node.root only, at the top level of the document (never among Args):
+// xcvm_core classes a command by its type and that action
+// (clustercrypto/testdata/cluster_commands.json, its registry).
 type Command struct {
 	V         int            `json:"v"`
 	Type      string         `json:"type"`
+	Action    string         `json:"action,omitempty"`
 	Exp       int64          `json:"exp"`
 	Iat       int64          `json:"iat"`
 	CmdID     string         `json:"cmd_id"`
@@ -140,13 +145,36 @@ func (c *Client) PollCommands(ctx context.Context, wait time.Duration) ([]WireCo
 	return reply.Commands, nil
 }
 
+// fate is what became of one command handleCommand was handed.
+type fate int
+
+const (
+	// cmdTaken: the command left the agent's queue on MAIN (the high-water
+	// went past it, or MAIN took its refusal).
+	cmdTaken fate = iota
+	// cmdStuck: MAIN will keep handing it out whatever the agent does (no
+	// cmd_id to ack it by, or an ack MAIN refused for good).
+	cmdStuck
+	// cmdUnacked: its refusal's ack failed for now (MAIN down, busy or
+	// restarting): ack it again on a later delivery.
+	cmdUnacked
+)
+
 // handleCommand verifies, runs and acknowledges one command, and raises the
-// high-water. A command that fails its checks is acknowledged as refused.
-func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) {
+// high-water. A command that fails its checks is acknowledged as refused, by
+// its cmd_id, and leaves the high-water where it was: its seq is only what
+// an unverified document claims, and one near 2^64 would otherwise stop
+// every later command for good (MAIN takes a refused command out of the
+// queue on its ack, so it is not handed out again).
+//
+// It reports what became of the command: one not taken is handed out again
+// on the next poll, at once (RunCommands).
+func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) fate {
 	c := a.Client
 	cmd, err := c.verifyCommand(w)
 	ok, result := false, []byte(nil)
 	var id string
+	var seq uint64 // the high-water to raise to: a verified command's only
 	if err != nil {
 		var probe struct {
 			CmdID string `json:"cmd_id"`
@@ -159,36 +187,35 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 		high := c.State.CmdSeq
 		c.State.mu.Unlock()
 		if probe.Seq <= high {
-			return // already handled: a redelivery
+			return cmdStuck // already handled: a redelivery
 		}
-		w.Seq = probe.Seq
 	} else if k, done := c.State.kept(cmd.CmdID); done {
 		// Run already from a LICENCE_INVALID denial (sealed.go): ack its
 		// result, never run it twice.
 		id, ok, result = cmd.CmdID, k.OK, k.Result
-		w.Seq = cmd.Seq
+		seq = cmd.Seq
 	} else if held, refusal := a.holdCommand(cmd, w); held {
 		// Its artefact downloads beside this loop (artefact.go): kept, with
 		// the high-water past it, and acked once it is handed on.
-		return
+		return cmdTaken
 	} else if refusal != nil {
 		id, result = cmd.CmdID, refusal
-		w.Seq = cmd.Seq
+		seq = cmd.Seq
 	} else if cmd.Type == TypeRotateNow {
 		// The agent's own: the token lives here, not in the node's PHP, which
 		// would refuse the type. An operator asking for a rotation wants it
 		// before the refresh window would have come round.
 		id, ok, result = cmd.CmdID, true, []byte("rotating")
-		w.Seq = cmd.Seq
+		seq = cmd.Seq
 		a.refreshLater(ctx)
 	} else {
 		id = cmd.CmdID
 		ok, result = run(ctx, cmd, w)
-		w.Seq = cmd.Seq
+		seq = cmd.Seq
 	}
 	c.State.mu.Lock()
-	if w.Seq > c.State.CmdSeq {
-		c.State.CmdSeq = w.Seq
+	if seq > c.State.CmdSeq {
+		c.State.CmdSeq = seq
 	}
 	serr := c.State.saveLocked()
 	c.State.mu.Unlock()
@@ -196,9 +223,28 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 		a.logf("cluster: saving command high-water: %v", serr)
 	}
 	if id == "" {
-		return
+		if seq > 0 {
+			return cmdTaken
+		}
+		return cmdStuck
 	}
-	a.ack(ctx, id, ok, result)
+	aerr := a.ack(ctx, id, ok, result)
+	if aerr == nil || seq > 0 {
+		return cmdTaken
+	}
+	a.logf("cluster: command %s: refusal not acked: %v", id, aerr)
+	if ackRefused(aerr) {
+		return cmdStuck
+	}
+	return cmdUnacked
+}
+
+// ackRefused is MAIN refusing an ack for good: a verified BAD_REQUEST (a
+// cmd_id it holds no command under for this node) or an UNKNOWN_OP. Any
+// other failure (no answer, a 5xx, a session to redo) may pass.
+func ackRefused(err error) bool {
+	var d *Denial
+	return errors.As(err, &d) && (d.Reason == "BAD_REQUEST" || d.Reason == "UNKNOWN_OP")
 }
 
 // ack sends a command's outcome, trying three times; it returns the last
@@ -210,10 +256,10 @@ func (a *Agent) ack(ctx context.Context, id string, ok bool, result []byte) erro
 			OK bool `json:"ok"`
 		}
 		err = a.Client.Call(ctx, "ack", map[string]any{"cmd_id": id, "ok": ok, "result": string(result)}, &r, false)
-		if err == nil || fatal(err) || ctx.Err() != nil {
+		if err == nil || fatal(err) || ackRefused(err) || ctx.Err() != nil {
 			return err
 		}
-		if !sleep(ctx, time.Duration(attempt+1)*time.Second) {
+		if attempt == 2 || !sleep(ctx, time.Duration(attempt+1)*time.Second) {
 			return err
 		}
 	}
@@ -221,8 +267,23 @@ func (a *Agent) ack(ctx context.Context, id string, ok bool, result []byte) erro
 }
 
 // RunCommands keeps a commands long-poll open until ctx ends.
+//
+// A refused command MAIN keeps handing out is remembered by its document and
+// skipped: for good when nothing the agent does will take it off the queue
+// (cmdStuck), until a later try when only its refusal's ack failed, MAIN
+// being down or busy for now (cmdUnacked: acked again then, backing off from
+// RefusalAckRetry to a minute). A poll that brings nothing the agent could
+// take pauses, up to CommandsStuck, before the next: MAIN answers at once
+// while such a row sits above the high-water, and the loop would otherwise
+// spin against it, one PHP worker a request, for as long as the row's own
+// exp says.
 func (a *Agent) RunCommands(ctx context.Context, run Executor) {
-	backoff := time.Second
+	backoff, stuck := time.Second, time.Duration(0)
+	type skipped struct {
+		until time.Time // zero: for good
+		tries int
+	}
+	skip := map[[sha256.Size]byte]skipped{}
 	for ctx.Err() == nil {
 		// Only a node whose COMMANDS flow is on holds a poll open on MAIN
 		// (each one holds a PHP worker there).
@@ -254,8 +315,48 @@ func (a *Agent) RunCommands(ctx context.Context, run Executor) {
 			continue
 		}
 		backoff = time.Second
+		taken := len(cmds) == 0 // an empty reply is a long-poll that ran out
 		for _, w := range cmds {
-			a.handleCommand(ctx, w, run)
+			key := sha256.Sum256([]byte(w.Doc))
+			sk, seen := skip[key]
+			if seen && (sk.until.IsZero() || time.Now().Before(sk.until)) {
+				continue
+			}
+			switch a.handleCommand(ctx, w, run) {
+			case cmdTaken:
+				delete(skip, key)
+				taken = true
+				continue
+			case cmdStuck:
+				sk = skipped{}
+			case cmdUnacked:
+				sk.until = time.Now().Add(min(RefusalAckRetry<<min(sk.tries, 10), time.Minute))
+				sk.tries++
+			}
+			if !seen && len(skip) >= maxSkipped {
+				clear(skip)
+			}
+			skip[key] = sk
+		}
+		if taken {
+			stuck = 0
+			continue
+		}
+		stuck = min(max(2*stuck, 250*time.Millisecond), CommandsStuck)
+		if !sleep(ctx, stuck) {
+			return
 		}
 	}
 }
+
+// CommandsStuck caps the pause between polls that bring only refused
+// commands MAIN keeps handing out (RunCommands): a genuine command queued
+// behind such a row waits at most this long.
+var CommandsStuck = 5 * time.Second
+
+// RefusalAckRetry is how long RunCommands first waits before acking again a
+// refusal whose ack failed for now; each failure doubles it, up to a minute.
+var RefusalAckRetry = 2 * time.Second
+
+// maxSkipped bounds RunCommands' memory of the refused commands it skips.
+const maxSkipped = 1024

@@ -151,12 +151,24 @@ func grantFor(id, name string, data []byte) map[string]any {
 	return map[string]any{"id": id, "name": name, "size": len(data), "sha256": hex.EncodeToString(sum[:]), "mtime": 1800000000, "ctime": 1800000000, "exp": time.Now().Unix() + 3600}
 }
 
-// command signs a command for this node as MAIN's CommandBus does; a grant
-// in args is served from data.
+// command signs a command for this node as MAIN's CommandBus does: the
+// action of a node.root or node.rpc is lifted out of args to the top level.
+// A grant in args is served from data.
 func (m *artefactMain) command(seq uint64, typ string, args map[string]any, data []byte) WireCommand {
 	id := cmdIDFor(seq)
-	doc, _ := json.Marshal(map[string]any{"v": 1, "type": typ, "exp": time.Now().Unix() + 3600, "iat": time.Now().Unix(), "cmd_id": id, "seq": seq,
-		"node_uuid": m.uuid, "gen": 1, "dedupe_key": nil, "args": args})
+	d := map[string]any{"v": 1, "type": typ, "exp": time.Now().Unix() + 3600, "iat": time.Now().Unix(), "cmd_id": id, "seq": seq,
+		"node_uuid": m.uuid, "gen": 1, "dedupe_key": nil}
+	if action, ok := args["action"]; ok && (typ == "node.root" || typ == "node.rpc") {
+		rest := map[string]any{}
+		for k, v := range args {
+			if k != "action" {
+				rest[k] = v
+			}
+		}
+		d["action"], args = action, rest
+	}
+	d["args"] = args
+	doc, _ := json.Marshal(d)
 	if g, ok := args["artefact"].(map[string]any); ok && data != nil {
 		m.mu.Lock()
 		m.files[id], m.sums[id] = data, g["sha256"].(string)
@@ -354,8 +366,8 @@ func TestArtefactGrantShape(t *testing.T) {
 		want bool
 	}{
 		{Command{Type: "artefact.fetch"}, true},
-		{Command{Type: "node.root", Args: map[string]any{"action": "agent_binary", "artefact": map[string]any{}}}, true},
-		{Command{Type: "node.root", Args: map[string]any{"action": "install_module"}}, false},
+		{Command{Type: "node.root", Action: "agent_binary", Args: map[string]any{"artefact": map[string]any{}}}, true},
+		{Command{Type: "node.root", Action: "install_module", Args: map[string]any{}}, false},
 		{Command{Type: "node.rpc", Args: map[string]any{"artefact": map[string]any{}}}, false},
 	} {
 		if carriesGrant(&c.cmd) != c.want {

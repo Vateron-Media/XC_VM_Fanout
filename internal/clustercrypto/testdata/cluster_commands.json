@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "tag": "cmd",
+  "envelope": [
+    "v",
+    "type",
+    "exp",
+    "iat",
+    "cmd_id",
+    "seq",
+    "node_uuid",
+    "gen",
+    "dedupe_key",
+    "args"
+  ],
+  "action_key": "action",
+  "max_ttl_sec": 86400,
+  "types": {
+    "conn.drop": {
+      "class": "R",
+      "args": [
+        "uuid",
+        "uuids",
+        "reason"
+      ]
+    },
+    "conn.drop_line": {
+      "class": "R",
+      "args": [
+        "line_id",
+        "reason"
+      ]
+    },
+    "conn.kill_worker": {
+      "class": "R",
+      "args": [
+        "pid",
+        "uuid",
+        "rtmp"
+      ]
+    },
+    "conn.close": {
+      "class": "R",
+      "args": [
+        "uuid",
+        "remove"
+      ]
+    },
+    "stream.stop": {
+      "class": "R",
+      "args": [
+        "stream_id"
+      ]
+    },
+    "vod.stop": {
+      "class": "R",
+      "args": [
+        "stream_id"
+      ]
+    },
+    "token.rotate_now": {
+      "class": "R",
+      "args": []
+    },
+    "node.quarantine": {
+      "class": "R",
+      "args": [
+        "reason"
+      ]
+    },
+    "node.fence": {
+      "class": "R",
+      "args": [
+        "reason",
+        "drain_min"
+      ]
+    },
+    "resync": {
+      "class": "R",
+      "args": [
+        "sections"
+      ]
+    },
+    "config.changed": {
+      "class": "R",
+      "args": [
+        "sections",
+        "etag"
+      ]
+    },
+    "conn.overlay": {
+      "class": "G"
+    },
+    "stream.start": {
+      "class": "G"
+    },
+    "stream.assign": {
+      "class": "G"
+    },
+    "vod.start": {
+      "class": "G"
+    },
+    "recording.start": {
+      "class": "G"
+    },
+    "queue.poke": {
+      "class": "G"
+    },
+    "node.rpc": {
+      "class": "G",
+      "action": true
+    },
+    "node.root": {
+      "class": "G",
+      "action": true,
+      "restrictive_actions": {
+        "fence": [
+          "reason",
+          "drain_min"
+        ]
+      }
+    },
+    "node.cache": {
+      "class": "G"
+    },
+    "node.unfence": {
+      "class": "G"
+    },
+    "policy.update": {
+      "class": "G"
+    },
+    "artefact.fetch": {
+      "class": "G"
+    }
+  }
+}
