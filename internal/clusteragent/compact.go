@@ -3,12 +3,13 @@ package clusteragent
 import (
 	"bufio"
 	"bytes"
+	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -370,7 +371,9 @@ func (ls *laneSpool) stage(tail []string) (*compactManifest, compaction, error) 
 	}
 
 	// Pass 2: write what stays, in order.
-	gen := fmt.Sprintf("%019d%04x", monotonicNs(), rand.Intn(0x10000))
+	var sfx [2]byte
+	_, _ = crand.Read(sfx[:]) // only keeps two compactions in one tick apart
+	gen := fmt.Sprintf("%019d%04x", monotonicNs(), binary.BigEndian.Uint16(sfx[:]))
 	cw := &chunkWriter{dir: staging, prefix: spoolPrefix(tail[0]), gen: gen}
 	var res compaction
 	n = 0
