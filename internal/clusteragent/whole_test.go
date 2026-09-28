@@ -314,6 +314,10 @@ func TestConfigChangedSyncsAtOnceAndAcks(t *testing.T) {
 	if f := (&Agent{Client: c}).features(); strings.Join(f, ",") != "hls_reaper" {
 		t.Fatalf("features without a replica %v", f)
 	}
+	// relay: the loopback relay proxy runs, so MAIN may switch DATAPLANE on.
+	if f := (&Agent{Client: c, RelayAddr: RelayProxyAddr, RelayKeyDir: t.TempDir()}).features(); strings.Join(f, ",") != "hls_reaper,relay" {
+		t.Fatalf("features with the relay proxy %v", f)
+	}
 	run := a.localExec(a.Exec)
 	for i := 0; i < 3; i++ { // coalesced: one sync pending
 		ok, res := run(context.Background(), &Command{Type: "config.changed", Args: map[string]any{"sections": []any{"servers"}}}, WireCommand{})

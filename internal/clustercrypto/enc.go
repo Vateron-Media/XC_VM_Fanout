@@ -3,12 +3,14 @@
 //
 // Three codebases must produce the same bytes: xcvm_core (the panel's
 // cryptographic root, Rust), the panel (PHP) and this agent. The wire formats
-// are fixed by two vector files, copied verbatim into testdata/:
+// are fixed by three vector files, copied verbatim into testdata/:
 //
 //   - cluster_vectors.json (owned by xcvm_core, ADR-002): XCVM-SEAL-v1,
 //     XCVM-BOX-v1, the token document and the panel signature domain;
 //   - cluster_canonical_vectors.json (owned by the panel, ADR 0004): the
-//     canonical request/response contexts and their MAC.
+//     canonical request/response contexts and their MAC;
+//   - cluster_dataplane_vectors.json (owned by the panel, ADR 0004): the
+//     relay and file tickets, X-XCVM-Relay-Auth and X-XCVM-File-Digest.
 //
 // Changing a formula here without new vectors from their owner is a protocol
 // break. The agent never holds the cluster root: it receives its session

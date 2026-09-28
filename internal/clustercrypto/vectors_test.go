@@ -300,7 +300,8 @@ func TestNodeSignatureDomain(t *testing.T) {
 // ClusterVectorsTest records the same digests, and xcvm_core's vectors.rs
 // those of the files it generates (cluster_vectors.json and
 // cluster_commands.json, its command registry), so whichever side changes
-// first fails until all are updated.
+// first fails until all are updated. cluster_dataplane_vectors.json is the
+// panel's own (tickets, relay auth, file digests), like the canonical file.
 //
 // Regenerating the vectors is a protocol change (ADR 0004): copy the files
 // here, update the digests in every test, raise proto and keep accepting N-1.
@@ -309,6 +310,7 @@ func TestVectorFilesAreThePanelsCopies(t *testing.T) {
 		"cluster_vectors.json":           "6cb3272fc1f97e2bc547105b8d5e42c77dcbf805e53d3eae78c89798d8f89645",
 		"cluster_canonical_vectors.json": "ee0fd4b297f02e2e1c1277a1433d1febe9c520414ce107addb524ff2b16799c3",
 		"cluster_commands.json":          "af0b7fd74136f3d9f66859b26749bb6d1955b81eb7e698938fd6d2d630f00802",
+		"cluster_dataplane_vectors.json": "05462ec7d32145f87feba616516511df61570e8f8b5d82fdaa5f564d6bac2206",
 	} {
 		b, err := os.ReadFile("testdata/" + name)
 		if err != nil {

@@ -1,14 +1,24 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -447,5 +457,115 @@ func TestInteropStreams(t *testing.T) {
 	sync("full again")
 	if stored() != "100" || streamsSince(a.ReplicaDir) != head() || streamsSince(a.ReplicaDir) <= cursor {
 		t.Fatalf("after the reset: cursor %d, head %d", streamsSince(a.ReplicaDir), head())
+	}
+}
+
+// TestInteropDataPlane: the relay half of the data plane end to end, against
+// the panel's real code (Phase 8). MAIN's streams op mints node 7's tickets
+// for stream 100 (relayed from MAIN, reading a file MAIN holds) into the
+// record; the agent keeps them apart from it; its loopback proxy signs each
+// upstream connect, which MAIN's RelayGuard admits once (a replay is
+// refused), and reads the file through MAIN's FileTicketServer chunk by
+// chunk, each checked against MAIN's digest, and refuses a tampered chunk.
+func TestInteropDataPlane(t *testing.T) {
+	a, runPHP, ctx := interopNode(t)
+	a.ReplicaDir = filepath.Join(t.TempDir(), "replica")
+	runPHP("events.php", "flows", fmt.Sprint(FlowStreams|16|FlowDataplane))
+	size := cc.FileChunk + 1234
+	path := runPHP("dataplane.php", "setup", fmt.Sprint(size))
+	want, err := os.ReadFile(path)
+	if err != nil || len(want) != size {
+		t.Fatalf("the file MAIN holds: %v", err)
+	}
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := a.SyncStreams(ctx); err != nil {
+		t.Fatalf("full pass: %v", err)
+	}
+	if a.tickets().relay(100) == "" {
+		t.Fatal("no relay ticket for stream 100")
+	}
+	// The ref the node's PHP puts in its URL (DataPlane::ref) is the one MAIN minted.
+	h := sha256.New()
+	h.Write([]byte("xcvm-file-ref-v1"))
+	h.Write(cc.U32(1))
+	h.Write(cc.U32(uint32(len(path))))
+	h.Write([]byte(path))
+	ref := hex.EncodeToString(h.Sum(nil))[:32]
+	if a.tickets().file(ref) == "" {
+		t.Fatalf("no file ticket for ref %s", ref)
+	}
+	// The record's file keeps its ETag: the tickets live apart.
+	rep, _ := os.ReadFile(streamFile(a, 100, ".rep"))
+	if doc, err := a.openStream(rep, 100); err != nil || storedStreamEtag(a.ReplicaDir, 100) != doc.Etag {
+		t.Fatalf("stream 100's record: %v", err)
+	}
+
+	var seen []http.Header
+	var tamper atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/admin/live":
+			seen = append(seen, r.Header.Clone())
+			if runPHP("dataplane.php", "relay", r.Header.Get("X-XCVM-Relay"), r.Header.Get("X-XCVM-Relay-Auth"), r.URL.RequestURI()) != "7" {
+				http.NotFound(w, r)
+				return
+			}
+			io.WriteString(w, "TS-FROM-MAIN")
+		case "/xfile":
+			var out struct {
+				Status int    `json:"status"`
+				Digest string `json:"digest"`
+				Body   []byte `json:"body"`
+			}
+			json.Unmarshal([]byte(runPHP("dataplane.php", "xfile", r.Header.Get("X-XCVM-File"), r.Header.Get("X-XCVM-File-Auth"), r.URL.RequestURI(), r.URL.Query().Get("o"), r.URL.Query().Get("n"))), &out)
+			if tamper.Load() && r.URL.Query().Get("o") != "0" && len(out.Body) > 0 {
+				out.Body[0] ^= 1
+			}
+			w.Header().Set("X-XCVM-File-Digest", out.Digest)
+			w.WriteHeader(out.Status)
+			w.Write(out.Body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	host, port, _ := net.SplitHostPort(u.Host)
+	p, _ := strconv.ParseInt(port, 10, 64)
+	proxy := a.NewRelayProxy("interop-loopback-key-0123")
+	proxy.servers = func() (*serverRoutes, error) {
+		return &serverRoutes{self: 7, mainSid: 1, byID: map[int64]serverRoute{1: {ip: host, port: p}, 7: {ip: "127.0.0.2", port: 1}}, nodes: map[int64]routeNode{}}, nil
+	}
+	get := func(path string) (int, []byte) {
+		rec := httptest.NewRecorder()
+		func() {
+			defer func() {
+				if v := recover(); v != nil && v != http.ErrAbortHandler {
+					panic(v)
+				}
+			}()
+			proxy.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		}()
+		return rec.Code, rec.Body.Bytes()
+	}
+
+	if code, body := get("/relay/interop-loopback-key-0123/100.ts"); code != 200 || string(body) != "TS-FROM-MAIN" {
+		t.Fatalf("relay: %d %q", code, body)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("%d connects", len(seen))
+	}
+	// A replay of the headers a sniffer copied: MAIN has spent the nonce.
+	if out := runPHP("dataplane.php", "relay", seen[0].Get("X-XCVM-Relay"), seen[0].Get("X-XCVM-Relay-Auth"), "/admin/live?stream=100&extension=ts"); out != "refused" {
+		t.Fatalf("a replayed relay auth: %s", out)
+	}
+	if code, body := get("/xfile/interop-loopback-key-0123/" + ref + ".mkv"); code != 200 || !bytes.Equal(body, want) {
+		t.Fatalf("xfile: %d, %d bytes", code, len(body))
+	}
+	tamper.Store(true)
+	if _, body := get("/xfile/interop-loopback-key-0123/" + ref + ".mkv"); len(body) != cc.FileChunk {
+		t.Fatalf("a tampered chunk: %d bytes passed on", len(body))
 	}
 }

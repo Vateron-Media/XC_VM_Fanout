@@ -39,7 +39,16 @@
 // is written by the panel's install flow over SSH: node uuid, server id, the
 // node's Ed25519 seed, the pinned panel key, MAIN's URLs and epoch 1.
 //
+// With DATAPLANE on (Phase 8), encoders and the fanout pull relays and other
+// servers' files from the loopback relay proxy (127.0.0.1:31290, keyed by
+// relay.key beside the state, published only while the proxy holds the port
+// and removed when it lets go; a port it cannot bind is retried with
+// backoff), which signs each upstream connect with the tickets MAIN sends in
+// the R2 streams section and checks each file chunk against its owner's
+// digest.
+//
 //	xc_agent [-state path] [-interval 2s]   run the control loop
+//	xc_agent run -role main                 MAIN: the loopback relay proxy alone
 //	xc_agent health [-state path]           fetch and verify MAIN's signed health
 //	xc_agent version
 //
@@ -91,6 +100,8 @@ func main() {
 	phpBin := fs.String("php", "/home/xc_vm/bin/php/bin/php", "run: the PHP that runs MAIN's commands")
 	console := fs.String("console", "/home/xc_vm/console.php", "run: the panel console (cluster:exec)")
 	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
+	relayAddr := fs.String("relay-addr", clusteragent.RelayProxyAddr, "run: the loopback relay proxy's address (DATAPLANE); empty = off")
+	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's: the loopback relay proxy alone)")
 	var urls multiFlag
 	fs.Var(&urls, "url", "probe: a MAIN cluster URL (repeatable)")
 	fs.Parse(args)
@@ -158,6 +169,23 @@ func main() {
 		fmt.Print(out)
 		return
 	case "run", "health":
+		if cmd == "run" && *role == "main" {
+			// MAIN has no node identity, tickets or flows: it runs the
+			// loopback listener alone, so the service layout is the same on
+			// every server, and it answers 503 until MAIN pulls anything
+			// through it (MAIN's own relays and file reads keep the legacy
+			// URLs; ADR 0004, Phase 8).
+			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+			log.Printf("xc_agent %s: role main, relay proxy on %s", version, *relayAddr)
+			if err := (&clusteragent.Agent{}).ServeRelayProxy(ctx, *relayAddr, filepath.Dir(*statePath)); err != nil {
+				log.Fatalf("xc_agent: relay proxy: %v", err)
+			}
+			return
+		}
+		if *role != "lb" && *role != "main" {
+			log.Fatalf("xc_agent: unknown role %q (lb, main)", *role)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, keygen, probe, install, enrol, lease, version)\n", cmd)
 		os.Exit(2)
@@ -196,7 +224,8 @@ func main() {
 		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
 		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl,
 		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute),
-		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute)}
+		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
+		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath)}
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
 	switch {

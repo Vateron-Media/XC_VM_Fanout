@@ -54,6 +54,10 @@ type Agent struct {
 	// Types lists the command types the node's PHP runs (TypesViaPHP),
 	// asked before each hello; nil says no artefact feature.
 	Types func(ctx context.Context) ([]string, error)
+	// RelayAddr is where the loopback relay proxy listens (relayproxy.go,
+	// RelayProxyAddr), with its key in RelayKeyDir; "" leaves it off.
+	RelayAddr   string
+	RelayKeyDir string
 
 	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
@@ -75,6 +79,8 @@ type Agent struct {
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 	nonceOnce          sync.Once    // the data plane's nonce window (dataplane.go)
 	nonces             *nonceCache
+	ticketsOnce        sync.Once // the data plane's tickets (tickets.go)
+	ticketStore        *ticketStore
 	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
 	replicaMu          sync.Mutex   // one replica sync or check at a time (replica.go)
 	replicaKeys        string       // the keys the stored records were last checked with (replicaMu)
@@ -145,6 +151,11 @@ var Features = []string{"hls_reaper"}
 // one whose node's PHP runs artefact.fetch FeatureArtefact (artefact.go).
 const FeatureConfigChanged = "config_changed"
 
+// FeatureRelay says the agent runs the loopback relay proxy (relayproxy.go),
+// so its node's DATAPLANE flow may be switched on (the panel's
+// ClusterAdmin::FEATURE_RELAY).
+const FeatureRelay = "relay"
+
 // FeatureHTTPS says MAIN has answered this node over HTTPS.
 const FeatureHTTPS = "https"
 
@@ -161,6 +172,11 @@ func (a *Agent) features() []string {
 	if a.ArtefactDir != "" && (a.Exec != nil || a.run != nil) && a.artefactOn.Load() {
 		// Only while the node's PHP runs artefact.fetch (artefact.go).
 		out = append(out, FeatureArtefact)
+	}
+	if a.RelayAddr != "" && a.RelayKeyDir != "" {
+		// The loopback relay proxy runs (relayproxy.go): MAIN lets an
+		// operator switch the node's DATAPLANE flow on only then.
+		out = append(out, FeatureRelay)
 	}
 	if a.Client != nil && a.Client.HTTPSAnswered() {
 		// MAIN has answered this node over HTTPS: it may be moved to
@@ -519,6 +535,22 @@ func (a *Agent) Run(ctx context.Context) error {
 		go func() {
 			if err := a.ServeSocket(sctx, a.SocketPath); err != nil {
 				a.logf("cluster: local socket: %v", err)
+			}
+		}()
+	}
+	if a.RelayAddr != "" && a.RelayKeyDir != "" {
+		// Always up: the DATAPLANE flow decides per request, so it turning
+		// on needs no restart. Stopped and waited for on return, so relay.key
+		// is withdrawn before the process exits.
+		pctx, stopRelay := context.WithCancel(ctx)
+		var relayDone sync.WaitGroup
+		relayDone.Add(1)
+		defer relayDone.Wait()
+		defer stopRelay()
+		go func() {
+			defer relayDone.Done()
+			if err := a.ServeRelayProxy(pctx, a.RelayAddr, a.RelayKeyDir); err != nil {
+				a.logf("cluster: relay proxy: %v", err)
 			}
 		}()
 	}
