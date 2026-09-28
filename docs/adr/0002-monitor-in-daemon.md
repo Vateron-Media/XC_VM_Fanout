@@ -1,6 +1,8 @@
 # ADR 0002 — Move the per-stream monitor into the daemon
 
-Status: **implemented** — M1–M5 landed, off by default (see Rollout).
+Status: **implemented** — M1–M5 landed. **Amended 2026-09-28:** supervision is **on by
+default** (setting `fanout_supervise`, migration 018), and the event drain is `GET /events` —
+see **Amendment (2026-09-28)** below. The original "off by default" status is superseded.
 
 Supersedes, in XC_VM's `docs/adr/0003-full-daemon-cutover.md`, its premise that per-stream
 process monitoring stays in PHP: §1 "Two things the daemon does NOT replace" keeps the
@@ -8,7 +10,41 @@ per-stream ffmpeg outside the daemon, and Phase F lists `MonitorCommand` health 
 readers of the on-disk HLS. (0003 has no line worded "PHP retains per-stream process
 monitoring".)
 
-Date: 2026-09-10
+Date: 2026-09-10 (amended 2026-09-28)
+
+## Amendment (2026-09-28) — on by default, `fanout_supervise`, `GET /events`
+
+**Decision (from the user):** keep the code as it is and bring this ADR in line with it.
+Where the sections below disagree with this amendment, this amendment wins; their original
+text is kept as the record.
+
+- **The setting is `fanout_supervise`, not `daemon_supervise`.** It is added by XC_VM's
+  migration `src/migrations/database/up/018_add_fanout_supervise.sql` as `tinyint(1)
+  DEFAULT '1'`, so every install that runs the migration supervises by default.
+  `Streaming\Fanout\FanoutConfig` writes it to the daemon's `config.json` as `supervise`,
+  reading a missing key as **on** (`$rSettings['fanout_supervise'] ?? true`). The panel's own
+  hand-over check, `StreamProcess::supervisionEnabled()`, requires the setting to be truthy
+  **and** `LicenseGate::fanoutUsable()`.
+- **Clearing it (`fanout_supervise = 0`) is the rollback.** The daemon then refuses new
+  hand-overs, the panel stops handing streams over, and `MonitorCommand` supervises them as
+  before. Streams the daemon already supervises stay with it until the panel takes them back
+  (`StreamProcess::startMonitor()` releases a still-supervised stream before starting the PHP
+  monitor).
+- **Supervision is enabled at boot; acceptance follows `config.json`.** `cmd/xc_fanout`
+  always calls `EnableSupervision()` — there is no per-node opt-in. Whether a *new* hand-over
+  (`PUT /monitor/<id>`) is accepted is `config.json`'s `supervise`, applied live on the
+  daemon's config poll (`Manager.superviseOn`); when it is false the `PUT` answers 501 and the
+  panel runs the stream itself. The daemon's built-in default (`defaults.CfgSupervise`) is
+  false, but the panel always writes the key.
+- **The event drain is `GET /events`**, not `GET /monitor/events`. It is the control-socket
+  feed `internal/server/events.go` serves (`GET /events?boot=<boot>&since=<seq>&wait=<sec>`) —
+  the same feed XC_VM ADR 0004's cluster agent (`xc_agent`) reads. No `/monitor/events` route
+  exists.
+- **`settings.fanout_enabled = 0` overrides everything.** It restores the pre-fanout path
+  (user decision recorded in XC_VM ADR 0003, amendment 2026-09-25): `FanoutMode::applyToNode()`
+  stops the daemon, and `LicenseGate::fanoutUsable()` — which `supervisionEnabled()` requires —
+  is false, so no stream is handed over and the PHP monitor supervises everything regardless
+  of `fanout_supervise`.
 
 ## Context
 
@@ -110,6 +146,10 @@ POST   /monitor/<id>/source   force a source switch (replaces the .force signal 
 GET    /monitor/events?since=<seq>   drain the event log (see below)
 ```
 
+> **Superseded (2026-09-28):** the event drain shipped as `GET /events` on the control
+> socket (`internal/server/events.go`), the feed XC_VM ADR 0004's cluster agent reads. There
+> is no `/monitor/events` route. See the amendment above.
+
 Events are drained by PHP and written to the DB there. The daemon *also* appends them to
 `LOGS_TMP_PATH/stream_log.log` in the panel's existing format (base64-encoded JSON, one per
 line) — `StreamProcess::streamLog` already writes exactly that file and a cron drains it,
@@ -147,6 +187,8 @@ watching this stream" check does not read a daemon pid as "no monitor".
 **Rollback.** The daemon is only asked to supervise a stream when PHP `PUT`s a spec for it.
 If PHP stops doing that, `MonitorCommand` runs exactly as it does today. The cutover is
 therefore per-stream and reversible without a daemon deploy.
+(As amended 2026-09-28: the switch that makes PHP stop is `fanout_supervise = 0`; a
+`fanout_enabled = 0` does it too, and also restores the whole pre-fanout path.)
 
 ## Phases
 
@@ -163,6 +205,12 @@ therefore per-stream and reversible without a daemon deploy.
 Each phase is independently shippable and independently revertible.
 
 ## Rollout
+
+> **Superseded (2026-09-28):** the opt-in described below is not what shipped. Supervision is
+> on by default via `fanout_supervise` (migration 018, default `1`); `EnableSupervision` is
+> always called at boot and hand-over acceptance follows `config.json`'s `supervise`;
+> clearing `fanout_supervise` is the rollback; `fanout_enabled = 0` overrides it. See the
+> amendment above. The original text follows.
 
 Nothing changes until an operator opts in, twice over:
 
