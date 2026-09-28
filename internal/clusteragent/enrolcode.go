@@ -1,7 +1,6 @@
 package clusteragent
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/hmac"
@@ -13,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,16 +95,7 @@ type codeClient struct {
 // pin fetches the health document and accepts its panel key only when it
 // matches the code's hash and signs the document.
 func (cl *codeClient) pin(ctx context.Context) (boxPub []byte, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cl.base+"health", nil)
-	if err != nil {
-		return nil, err
-	}
-	res, err := cl.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	_, h, body, err := getSigned(ctx, cl.http, cl.base+"health")
 	if err != nil {
 		return nil, err
 	}
@@ -120,19 +109,24 @@ func (cl *codeClient) pin(ctx context.Context) (boxPub []byte, err error) {
 	}
 	pub, _ := base64.StdEncoding.DecodeString(doc.PanelSignPub)
 	box, _ := base64.StdEncoding.DecodeString(doc.PanelBoxPub)
-	sig, _ := base64.RawURLEncoding.DecodeString(res.Header.Get(cc.HPanelSig))
 	if len(pub) != ed25519.PublicKeySize || !hmac.Equal(cc.SHA256(pub)[:16], cl.code.PanelFP) {
 		return nil, errors.New("clusteragent: MAIN's panel key does not match the code (wrong code, or not the MAIN that issued it)")
 	}
-	if !cc.VerifyPanel(pub, "hlt", body, sig) || len(box) != 32 {
+	if !panelSigned(pub, "hlt", h, body) || len(box) != 32 {
 		return nil, fmt.Errorf("%w: health from %s is not signed by the panel key", ErrTransport, cl.base)
 	}
 	cl.panelPub = pub
 	if doc.MainTimeMs > 0 {
-		cl.offsetMs = doc.MainTimeMs - time.Now().UnixMilli()
+		cl.setMainTime(doc.MainTimeMs)
 	}
 	return box, nil
 }
+
+// mainNowMs is MAIN's clock as last observed.
+func (cl *codeClient) mainNowMs() int64 { return time.Now().UnixMilli() + cl.offsetMs }
+
+// setMainTime takes MAIN's clock from a signed main_time_ms.
+func (cl *codeClient) setMainTime(mainMs int64) { cl.offsetMs = mainMs - time.Now().UnixMilli() }
 
 // call sends one code op and returns the verified reply body and its headers,
 // or a verified *Denial. A REPLAY that says when a request stamped anew will
@@ -140,7 +134,7 @@ func (cl *codeClient) pin(ctx context.Context) (boxPub []byte, err error) {
 func (cl *codeClient) call(ctx context.Context, op, contentType string, body func(reqCtx []byte) ([]byte, error), signKey ed25519.PrivateKey) ([]byte, http.Header, error) {
 	var rb []byte
 	var h http.Header
-	err := withReplay(ctx, func(mainMs int64) { cl.offsetMs = mainMs - time.Now().UnixMilli() }, func() error {
+	err := withReplay(ctx, cl.setMainTime, func() error {
 		var err error
 		rb, h, err = cl.callOnce(ctx, op, contentType, body, signKey)
 		return err
@@ -149,67 +143,28 @@ func (cl *codeClient) call(ctx context.Context, op, contentType string, body fun
 }
 
 func (cl *codeClient) callOnce(ctx context.Context, op, contentType string, body func(reqCtx []byte) ([]byte, error), signKey ed25519.PrivateKey) ([]byte, http.Header, error) {
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, nil, err
-	}
-	ts := uint64(time.Now().UnixMilli() + cl.offsetMs)
-	reqCtx, err := cc.RequestContext(cc.Request{
-		Proto: Proto, Agent: cl.agent, Method: "POST", Path: cc.PathPrefix + op, ContentType: contentType,
-		Node: cl.code.node(), Epoch: 0, TsMs: ts, Nonce: nonce,
-	})
+	r, err := newRequest(cl.agent, cl.code.node(), op, contentType, 0, cl.mainNowMs)
 	if err != nil {
 		return nil, nil, err
 	}
-	b, err := body(reqCtx)
+	b, err := body(r.ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cl.base+op, bytes.NewReader(b))
+	st, rh, rb, err := postWith(ctx, cl.http, cl.base+op, r.header(b, cl.req, signKey), b)
 	if err != nil {
 		return nil, nil, err
 	}
-	req.Header.Set(cc.HProto, strconv.Itoa(Proto))
-	req.Header.Set(cc.HAgent, cl.agent)
-	req.Header.Set(cc.HNode, cl.code.node())
-	req.Header.Set(cc.HEpoch, "0")
-	req.Header.Set(cc.HTs, strconv.FormatUint(ts, 10))
-	req.Header.Set(cc.HNonce, hex.EncodeToString(nonce))
-	req.Header.Set(cc.HSig, hex.EncodeToString(cc.MAC(cl.req, reqCtx, b)))
-	req.Header.Set("Content-Type", contentType)
-	if signKey != nil {
-		req.Header.Set(cc.HNodeSig, hex.EncodeToString(cc.SignNode(signKey, "request", append(append([]byte{}, reqCtx...), cc.SHA256(b)...))))
-	}
-	res, err := cl.http.Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer res.Body.Close()
-	rb, err := io.ReadAll(io.LimitReader(res.Body, MaxReply+1))
-	if err != nil || len(rb) > MaxReply {
-		return nil, nil, ErrTransport
-	}
-	if res.StatusCode == http.StatusOK {
-		rts, err1 := strconv.ParseUint(res.Header.Get(cc.HTs), 10, 64)
-		rn, err2 := hex.DecodeString(res.Header.Get(cc.HNonce))
-		mac, err3 := hex.DecodeString(res.Header.Get(cc.HSig))
-		if err1 != nil || err2 != nil || err3 != nil || len(rn) != 16 {
-			return nil, nil, ErrTransport
+	if st == http.StatusOK {
+		if _, err := replyContext(cl.res, r.ctx, st, rh, rb); err != nil {
+			return nil, nil, err
 		}
-		resCtx, err := cc.ResponseContext(reqCtx, 200, res.Header.Get("Content-Type"), rts, rn)
-		if err != nil || !cc.VerifyMAC(cl.res, resCtx, rb, mac) {
-			return nil, nil, ErrTransport
-		}
-		return rb, res.Header, nil
+		return rb, rh, nil
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(res.Header.Get(cc.HPanelSig))
-	var d Denial
-	if err == nil && cc.VerifyPanel(cl.panelPub, "den", rb, sig) && json.Unmarshal(rb, &d) == nil && d.Node == cl.code.node() && d.Nonce == hex.EncodeToString(nonce) {
-		d.Status = res.StatusCode
-		d.Doc = append(json.RawMessage{}, rb...)
-		return nil, nil, &d
+	if d := verifyDenial(cl.panelPub, cl.code.node(), st, rh, rb, r.nonce); d != nil {
+		return nil, nil, d
 	}
-	return nil, nil, fmt.Errorf("%w: HTTP %d from %s", ErrTransport, res.StatusCode, cl.base)
+	return nil, nil, fmt.Errorf("%w: HTTP %d from %s", ErrTransport, st, cl.base)
 }
 
 // ErrAlreadyEnrolled refuses to replace a node's working identity unless asked.
@@ -305,8 +260,7 @@ func EnrolByCode(ctx context.Context, path, codeText, agent string, replace bool
 // install checks the approval (panel-signed, this node, this server, epoch 1
 // sealed to the pending key) and completes the state, as Install does.
 func (cl *codeClient) install(st *State, body []byte, h http.Header, boxPub []byte) error {
-	sig, err := base64.RawURLEncoding.DecodeString(h.Get(cc.HPanelSig))
-	if err != nil || !cc.VerifyPanel(cl.panelPub, "pre", body, sig) {
+	if !panelSigned(cl.panelPub, "pre", h, body) {
 		return fmt.Errorf("%w: the approval is not signed by the panel", ErrTransport)
 	}
 	var doc struct {
@@ -341,7 +295,7 @@ func (cl *codeClient) install(st *State, body []byte, h http.Header, boxPub []by
 	st.Epochs = []Epoch{{Epoch: 1, EphSk: st.PendingEphSk, TokenSealed: sealed}}
 	// After the identity above, as in Install: the approval's lease is for this
 	// node, this server and the key the code pinned.
-	acceptLease(st, doc.Lease, leaseAnchor{MainNow: (time.Now().UnixMilli() + cl.offsetMs) / 1000, Gen: tok.Gen})
+	acceptLease(st, doc.Lease, leaseAnchor{MainNow: cl.mainNowMs() / 1000, Gen: tok.Gen})
 	st.PendingEphSk = nil
 	st.Enrolled = false
 	// A previous enrolment's (or MAIN's) URL sets are never dialled.

@@ -2,16 +2,13 @@ package clusteragent
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 
 	cc "github.com/Vateron-Media/XC_VM_Fanout/internal/clustercrypto"
@@ -60,22 +57,12 @@ func (c *Client) Challenge(ctx context.Context) (*Challenge, error) {
 }
 
 func (c *Client) challenge(ctx context.Context, base string) (*Challenge, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/challenge?cn="+url.QueryEscape(c.State.NodeUUID), nil)
+	status, h, body, err := getSigned(ctx, c.HTTP, strings.TrimRight(base, "/")+"/challenge?cn="+url.QueryEscape(c.State.NodeUUID))
 	if err != nil {
 		return nil, err
 	}
-	res, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-	if err != nil {
-		return nil, err
-	}
-	sig, err := base64.RawURLEncoding.DecodeString(res.Header.Get(cc.HPanelSig))
-	if res.StatusCode != http.StatusOK || err != nil || !cc.VerifyPanel(c.State.PanelSignPub, "hlt", body, sig) {
-		return nil, fmt.Errorf("%w: challenge (HTTP %d) from %s", ErrTransport, res.StatusCode, base)
+	if status != http.StatusOK || !panelSigned(c.State.PanelSignPub, "hlt", h, body) {
+		return nil, fmt.Errorf("%w: challenge (HTTP %d) from %s", ErrTransport, status, base)
 	}
 	var doc struct {
 		Typ        string  `json:"typ"`
@@ -142,7 +129,7 @@ func (c *Client) Rekey(ctx context.Context, identity map[string]any) (*cc.Token,
 	}
 	if ch.MainTimeMs > 0 {
 		// Only the request timestamp depends on it; MAIN checks the window.
-		c.offsetMs.Store(ch.MainTimeMs - c.now().UnixMilli())
+		c.setMainTime(ch.MainTimeMs)
 	}
 	if !ch.LicenceOK {
 		return nil, ErrUnlicensed
@@ -173,35 +160,21 @@ func (c *Client) rekeyOnce(ctx context.Context, boxPub []byte, ch *Challenge, id
 	if err != nil {
 		return nil, err
 	}
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	ts := uint64(c.MainNowMs())
-	reqCtx, err := cc.RequestContext(cc.Request{
-		Proto: Proto, Agent: c.Agent, Method: "POST", Path: cc.PathPrefix + "token_rekey", ContentType: octet,
-		Node: c.State.NodeUUID, Epoch: 0, TsMs: ts, Nonce: nonce,
-	})
+	r, err := newRequest(c.Agent, c.State.NodeUUID, "token_rekey", octet, 0, c.MainNowMs)
 	if err != nil {
 		return nil, err
 	}
-	body, err := cc.Seal(boxPub, "rekey", string(reqCtx), plain)
+	nonce := r.nonce
+	body, err := cc.Seal(boxPub, "rekey", string(r.ctx), plain)
 	if err != nil {
 		return nil, err
 	}
-	h := http.Header{}
-	h.Set(cc.HProto, strconv.Itoa(Proto))
-	h.Set(cc.HAgent, c.Agent)
-	h.Set(cc.HNode, c.State.NodeUUID)
-	h.Set(cc.HEpoch, "0")
-	h.Set(cc.HTs, strconv.FormatUint(ts, 10))
-	h.Set(cc.HNonce, hex.EncodeToString(nonce))
-	h.Set("Content-Type", octet)
-	h.Set(cc.HNodeSig, hex.EncodeToString(cc.SignNode(c.State.SignKey(), "request", append(append([]byte{}, reqCtx...), cc.SHA256(body)...))))
+	// Epoch 0 and no X-XCVM-Sig: there is no session, only the node key.
+	h := r.header(body, nil, c.State.SignKey())
 
 	var lastErr error = ErrTransport
 	for _, base := range c.urls() {
-		st, rh, rb, err := c.post(ctx, strings.TrimRight(base, "/")+"/token_rekey", h, body)
+		st, rh, rb, err := postWith(ctx, c.HTTP, strings.TrimRight(base, "/")+"/token_rekey", h, body)
 		if err != nil {
 			c.reached(ctx, base, err)
 			lastErr = err
@@ -234,8 +207,7 @@ func (c *Client) rekeyOnce(ctx context.Context, boxPub []byte, ch *Challenge, id
 
 // acceptRekey checks a re-key reply and makes its epoch the node's only one.
 func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Token, error) {
-	sig, err := base64.RawURLEncoding.DecodeString(h.Get(cc.HPanelSig))
-	if err != nil || !cc.VerifyPanel(c.State.PanelSignPub, "pre", body, sig) {
+	if !panelSigned(c.State.PanelSignPub, "pre", h, body) {
 		return nil, ErrTransport
 	}
 	var doc struct {
@@ -250,37 +222,9 @@ func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Toke
 	if json.Unmarshal(body, &doc) != nil || doc.Typ != "xcvm-rekey" || doc.Node != c.State.NodeUUID || doc.Nonce != hex.EncodeToString(nonce) {
 		return nil, ErrTransport
 	}
-	sealed, err := base64.StdEncoding.DecodeString(doc.TokenSealed)
-	if err != nil {
-		return nil, ErrTransport
-	}
-	e := Epoch{Epoch: doc.Epoch, EphSk: ephSk, TokenSealed: sealed}
-	if err := c.openEpoch(e); err != nil {
-		return nil, err
-	}
-	c.mu.Lock()
-	for n := range c.sessions {
-		if n != e.Epoch {
-			delete(c.sessions, n)
-		}
-	}
-	tok := c.sessions[e.Epoch].tok
-	c.mu.Unlock()
-	if doc.MainTimeMs > 0 {
-		c.offsetMs.Store(doc.MainTimeMs - c.now().UnixMilli())
-	}
-	c.State.mu.Lock()
-	c.State.Epochs = []Epoch{e}
-	c.State.PendingEphSk = nil
 	// A re-key is how a node whose tokens all expired comes back; the lease that
 	// arrives with the new token is the one it serves on from here.
-	acceptLease(c.State, doc.Lease, leaseAnchor{MainNow: c.MainNowMs() / 1000, Gen: tok.Gen})
-	err = c.State.saveLocked()
-	c.State.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	return tok, nil
+	return c.takeToken(doc.TokenSealed, doc.Epoch, ephSk, doc.Lease, true, doc.MainTimeMs)
 }
 
 // retryAfterMs is a denial's retry_after_ms, or 0.
