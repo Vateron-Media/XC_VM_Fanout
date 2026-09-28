@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"sync"
 	"time"
@@ -260,8 +259,6 @@ func (a *Agent) setFanoutLive(on bool) {
 	}
 }
 
-var dropUUID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-
 // localExec runs the commands the agent can serve itself, within its own
 // process: `conn.drop {uuid}` against the fanout's control socket (a daemon
 // viewer, well under the plan's 1 s), and `conn.close {uuid, remove}` on the
@@ -288,7 +285,7 @@ func (a *Agent) localExec(next Executor) Executor {
 			return next(ctx, cmd, w)
 		}
 		uuid, _ := cmd.Args["uuid"].(string)
-		if !dropUUID.MatchString(uuid) {
+		if !connUUID.MatchString(uuid) {
 			return false, []byte("refused: bad uuid")
 		}
 		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)

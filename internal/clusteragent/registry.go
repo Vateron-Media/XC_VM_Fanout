@@ -76,6 +76,8 @@ var HLSReapAfter = 30 * time.Second
 // FlowConnections is the CONNECTIONS flow bit: the registry holds the node's viewers.
 const FlowConnections = 64
 
+// connUUID is a connection uuid: a registry key, and the uuid a conn.close or
+// conn.drop command names.
 var connUUID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 type Registry struct {
@@ -139,25 +141,23 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 	p2 := touchOnly && r.P2 != nil && r.P2()
 	send := !p2 && (old == nil || !touchOnly || r.now().Sub(r.sentAt[uuid]) >= TouchEvery)
 	r.mu.Unlock()
+	var events []map[string]any
 	if send {
-		if err := r.emit([]map[string]any{{"type": "conn.upsert", "d": map[string]any{"record": rec}}}); err != nil {
-			return err
+		events = []map[string]any{{"type": "conn.upsert", "d": map[string]any{"record": rec}}}
+	}
+	return r.emitThenLocked(events, func() {
+		if old == nil || norm(old["hls_last_read"]) != norm(rec["hls_last_read"]) {
+			r.readAt[uuid] = r.now()
+			if p2 {
+				r.pending[uuid] = intOf(rec["hls_last_read"])
+			}
 		}
-	}
-	r.mu.Lock()
-	if old == nil || norm(old["hls_last_read"]) != norm(rec["hls_last_read"]) {
-		r.readAt[uuid] = r.now()
-		if p2 {
-			r.pending[uuid] = intOf(rec["hls_last_read"])
+		r.conns[uuid] = rec
+		r.dirty = true
+		if send {
+			r.sentP0Locked(uuid, rec)
 		}
-	}
-	r.conns[uuid] = rec
-	r.dirty = true
-	if send {
-		r.sentP0Locked(uuid, rec)
-	}
-	r.mu.Unlock()
-	return nil
+	})
 }
 
 // sentP0Locked notes a P0 conn.upsert of the whole record: it carried the
@@ -216,19 +216,18 @@ func (r *Registry) Reap(after time.Duration) int {
 	n := 0
 	for _, rec := range stale {
 		uuid, _ := rec["uuid"].(string)
-		if err := r.emit([]map[string]any{{"type": "conn.upsert", "d": map[string]any{"record": rec}}}); err != nil {
+		err := r.emitThenLocked([]map[string]any{{"type": "conn.upsert", "d": map[string]any{"record": rec}}}, func() {
+			// Unless a request re-opened it meanwhile.
+			if c := r.conns[uuid]; c != nil && num(c["hls_end"]) == 0 && norm(c["hls_last_read"]) == norm(rec["hls_last_read"]) {
+				r.conns[uuid] = rec
+				r.sentP0Locked(uuid, rec)
+				r.dirty = true
+				n++
+			}
+		})
+		if err != nil {
 			r.logf("cluster: ending HLS viewer %s: %v", uuid, err)
-			continue
 		}
-		r.mu.Lock()
-		// Unless a request re-opened it meanwhile.
-		if c := r.conns[uuid]; c != nil && num(c["hls_end"]) == 0 && norm(c["hls_last_read"]) == norm(rec["hls_last_read"]) {
-			r.conns[uuid] = rec
-			r.sentP0Locked(uuid, rec)
-			r.dirty = true
-			n++
-		}
-		r.mu.Unlock()
 	}
 	return n
 }
@@ -255,12 +254,7 @@ func (r *Registry) Touch(uuid string, lastRead any) (map[string]any, error) {
 func (r *Registry) Find(match map[string]any) map[string]any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	keys := make([]string, 0, len(r.conns))
-	for k := range r.conns {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range r.sortedKeysLocked() {
 		ok := true
 		for col, want := range match {
 			if fmt.Sprint(r.conns[k][col]) != fmt.Sprint(want) {
@@ -318,31 +312,43 @@ func (r *Registry) closeWhere(uuids []string, pass func(map[string]any) bool) (i
 	if len(events) == 0 {
 		return 0, nil
 	}
-	if err := r.emit(events); err != nil {
+	err := r.emitThenLocked(events, func() {
+		for _, uuid := range gone {
+			delete(r.conns, uuid)
+			r.forgetLocked(uuid)
+		}
+		r.dirty = true
+	})
+	if err != nil {
 		return 0, err
 	}
-	r.mu.Lock()
-	for _, uuid := range gone {
-		delete(r.conns, uuid)
-		r.forgetLocked(uuid)
-	}
-	r.dirty = true
-	r.mu.Unlock()
 	return len(gone), nil
 }
 
 // Delete removes a connection and tells MAIN.
 func (r *Registry) Delete(uuid string) error {
-	if err := r.emit([]map[string]any{{"type": "conn.remove", "d": map[string]any{"uuid": uuid}}}); err != nil {
-		return err
+	return r.emitThenLocked([]map[string]any{{"type": "conn.remove", "d": map[string]any{"uuid": uuid}}}, func() {
+		if _, had := r.conns[uuid]; had {
+			delete(r.conns, uuid)
+			r.dirty = true
+		}
+		r.forgetLocked(uuid)
+	})
+}
+
+// emitThenLocked spools events for MAIN first, with r.mu not held, and only
+// once they are spooled applies the change to the registry (apply runs under
+// r.mu): a failure leaves the registry as it was. No events: nothing is
+// spooled and apply runs.
+func (r *Registry) emitThenLocked(events []map[string]any, apply func()) error {
+	if len(events) > 0 {
+		if err := r.emit(events); err != nil {
+			return err
+		}
 	}
 	r.mu.Lock()
-	if _, had := r.conns[uuid]; had {
-		delete(r.conns, uuid)
-		r.dirty = true
-	}
-	r.forgetLocked(uuid)
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	apply()
 	return nil
 }
 
@@ -434,16 +440,22 @@ func intOf(v any) int64 {
 func (r *Registry) Records() []map[string]any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	keys := make([]string, 0, len(r.conns))
-	for k := range r.conns {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := r.sortedKeysLocked()
 	out := make([]map[string]any, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, clone(r.conns[k]))
 	}
 	return out
+}
+
+// sortedKeysLocked returns the registry's uuids in order.
+func (r *Registry) sortedKeysLocked() []string {
+	keys := make([]string, 0, len(r.conns))
+	for k := range r.conns {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // Seed loads records as they are, with no event: MAIN's store already holds

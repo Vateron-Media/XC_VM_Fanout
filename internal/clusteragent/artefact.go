@@ -122,7 +122,6 @@ type HeldCmd struct {
 
 var (
 	grantNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	grantHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	cmdIDRe     = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	moduleRe    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 	moduleVerRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$`)
@@ -192,7 +191,7 @@ func parseGrant(cmdID, doc string) (*Grant, string, error) {
 	case !cmdIDRe.MatchString(cmdID), !validArtefactID(g.ID),
 		json.Unmarshal(f["name"], &g.Name) != nil, !grantNameRe.MatchString(g.Name),
 		!sizeOK, g.Size < 1,
-		json.Unmarshal(f["sha256"], &g.SHA256) != nil, !grantHashRe.MatchString(g.SHA256),
+		json.Unmarshal(f["sha256"], &g.SHA256) != nil, !etagRe.MatchString(g.SHA256),
 		!expOK:
 		return nil, id, errMalformedGrant
 	}

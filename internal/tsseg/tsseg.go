@@ -47,6 +47,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/atomicfile"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tspes"
 )
 
@@ -197,9 +198,8 @@ type Segmenter struct {
 	pmtPkts []byte
 
 	// open segment
-	f        *os.File
+	f        *atomicfile.File // written as <segment>.tmp, renamed in by finalize
 	w        *bufio.Writer
-	tmpPath  string
 	segBytes int
 	segOpen  bool
 	startPCR int64
@@ -544,14 +544,12 @@ func (s *Segmenter) spliced(pts int64, hasPTS bool, pcr int64, hasPCR bool) bool
 }
 
 func (s *Segmenter) open() {
-	path := fmt.Sprintf(s.cfg.SegPattern, s.seq)
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := atomicfile.Create(fmt.Sprintf(s.cfg.SegPattern, s.seq), segWrite)
 	if err != nil {
 		s.cfg.Logf("segment %d: %v", s.seq, err)
 		return
 	}
-	s.f, s.w, s.tmpPath = f, bufio.NewWriterSize(f, writeBuf), tmp
+	s.f, s.w = f, bufio.NewWriterSize(f, writeBuf)
 	s.segBytes, s.segOpen = 0, true
 	s.startPCR, s.startPTS = s.lastPCR, s.lastPTS
 	// PSI first, so the file decodes from its first byte.
@@ -578,8 +576,7 @@ func (s *Segmenter) write(pkt []byte) {
 // abandon discards the open segment; the next keyframe opens a fresh one.
 func (s *Segmenter) abandon() {
 	if s.f != nil {
-		_ = s.f.Close()
-		_ = os.Remove(s.tmpPath)
+		s.f.Abort()
 	}
 	s.f, s.w, s.segOpen = nil, nil, false
 }
@@ -612,17 +609,14 @@ func (s *Segmenter) finalize() {
 	}
 
 	err := s.w.Flush()
-	if cerr := s.f.Close(); err == nil {
-		err = cerr
-	}
-	path := fmt.Sprintf(s.cfg.SegPattern, s.seq)
 	if err == nil {
-		err = os.Rename(s.tmpPath, path)
+		err = s.f.Commit() // a failed one removes the temporary file
+	} else {
+		s.f.Abort()
 	}
 	s.f, s.w, s.segOpen = nil, nil, false
 	if err != nil {
 		s.cfg.Logf("segment %d: %v", s.seq, err)
-		_ = os.Remove(s.tmpPath)
 		return
 	}
 
@@ -707,17 +701,14 @@ func (s *Segmenter) sweep() {
 	}
 }
 
-// writeAtomic writes through a temporary file and renames it into place, so a
-// reader never sees a half-written playlist — and never sees it missing, which
-// the archive worker would read as the stream having stopped.
+// segWrite is how a segment is written: <segment>.tmp (the name sweep knows),
+// 0666 less the umask as os.Create, and no fsync, which the hot path never had.
+var segWrite = atomicfile.Options{Perm: 0o666, Temp: atomicfile.Suffix, NoSync: true}
+
+// writeAtomic writes through a temporary file (<playlist>.tmp, 0644 less the
+// umask, no fsync) and renames it into place, so a reader never sees a
+// half-written playlist — and never sees it missing, which the archive worker
+// would read as the stream having stopped.
 func writeAtomic(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicfile.Write(path, data, atomicfile.Options{Perm: 0o644, Temp: atomicfile.Suffix, NoSync: true})
 }

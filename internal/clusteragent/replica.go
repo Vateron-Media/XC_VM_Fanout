@@ -64,6 +64,8 @@ var ReplicaMaxDeltas = 1000
 
 const replicaPurpose = "replica"
 
+// etagRe is a lower-case hex SHA-256: a replica or stream ETag, and an
+// artefact grant's sha256.
 var etagRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // WholeSections are the sections MAIN sends whole, as named in `have`.
@@ -343,13 +345,8 @@ func (a *Agent) storeSection(dir, deltas, etag, sealedB64 string, seq int64) err
 	if err != nil {
 		return err
 	}
-	var doc struct {
-		Section string `json:"section"`
-		Node    string `json:"node"`
-		Etag    string `json:"etag"`
-		Seq     int64  `json:"seq"`
-	}
-	if err := json.Unmarshal(payload, &doc); err != nil || doc.Section != "blocklist" || doc.Node != a.Client.State.NodeUUID || doc.Etag != etag || doc.Seq != seq {
+	var doc blkSection
+	if err := json.Unmarshal(payload, &doc); err != nil || !doc.is(a.Client.State.NodeUUID, etag) || doc.Seq != seq {
 		return errors.New("clusteragent: config: the blocklist section is not this node's, or not the one announced")
 	}
 	if err := writeFileAtomic(filepath.Join(dir, "blocklist.rep"), sealed); err != nil {
@@ -505,30 +502,94 @@ func (a *Agent) recheckLocked(dir string) {
 	a.streamsRecheck.Store(true)
 }
 
-// verifyBlocklist opens the stored blocklist section and its deltas.
+// verifyBlocklist opens the stored blocklist section and its deltas, as
+// materialise takes them.
 func (a *Agent) verifyBlocklist(dir, etag string) error {
+	_, err := a.openBlocklist(dir, etag)
+	return err
+}
+
+// blkSection is the payload of the blocklist's whole section (a `rep` record).
+type blkSection struct {
+	Section string          `json:"section"`
+	Node    string          `json:"node"`
+	Etag    string          `json:"etag"`
+	Seq     int64           `json:"seq"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// is reports whether the section is the blocklist for node with the ETag etag.
+func (d *blkSection) is(node, etag string) bool {
+	return d.Section == "blocklist" && d.Node == node && d.Etag == etag
+}
+
+// blkDelta is the payload of a blocklist delta (a `blk` record).
+type blkDelta struct {
+	Seq    int64    `json:"seq"`
+	Add    []string `json:"add"`
+	Remove []string `json:"remove"`
+}
+
+// storedBlocklist is the stored blocklist as openBlocklist took it.
+type storedBlocklist struct {
+	seq    int64                      // the section's
+	data   map[string]json.RawMessage // the section's data, never nil
+	ips    []string                   // its data's ip
+	deltas []blkDelta                 // in seq order
+}
+
+// openBlocklist opens the stored blocklist, the one set of checks both the
+// start-up recheck and materialise make: blocklist.rep opens for this node,
+// verifies under the panel key (tag rep) and names section "blocklist", this
+// node and the ETag held (etag), with a list of strings as its data's ip;
+// each blocklist.d/*.blk, in name order, opens and verifies (tag blk) with a
+// seq above the one before it (the section's first).
+func (a *Agent) openBlocklist(dir, etag string) (*storedBlocklist, error) {
 	sealed, err := os.ReadFile(filepath.Join(dir, "blocklist.rep"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	payload, err := a.Client.OpenRecord(sealed, "rep")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var doc wholeDoc
-	if err := json.Unmarshal(payload, &doc); err != nil || doc.Section != "blocklist" || doc.Node != a.Client.State.NodeUUID || doc.Etag != etag {
-		return errors.New("clusteragent: replica: the stored blocklist is not this node's")
+	var doc struct {
+		blkSection
+		Gen *int64 `json:"gen"` // an integer if there, as for a whole section (wholeDoc)
 	}
+	if err := json.Unmarshal(payload, &doc); err != nil || !doc.is(a.Client.State.NodeUUID, etag) {
+		return nil, errors.New("clusteragent: replica: the stored blocklist is not this node's")
+	}
+	bl := &storedBlocklist{seq: doc.Seq}
+	if len(doc.Data) > 0 && json.Unmarshal(doc.Data, &bl.data) != nil {
+		return nil, errors.New("clusteragent: replica: the section's data is not an object")
+	}
+	if bl.data == nil {
+		bl.data = map[string]json.RawMessage{}
+	}
+	if raw, ok := bl.data["ip"]; ok {
+		if err := json.Unmarshal(raw, &bl.ips); err != nil {
+			return nil, errors.New("clusteragent: replica: the section's ip list")
+		}
+	}
+	seq := doc.Seq
 	for _, name := range ReplicaDeltas(dir) {
 		b, err := os.ReadFile(filepath.Join(dir, "blocklist.d", name))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if _, err := a.Client.OpenRecord(b, "blk"); err != nil {
-			return err
+		p, err := a.Client.OpenRecord(b, "blk")
+		if err != nil {
+			return nil, err
 		}
+		var d blkDelta
+		if err := json.Unmarshal(p, &d); err != nil || d.Seq <= seq {
+			return nil, errors.New("clusteragent: replica: a stored delta is out of order")
+		}
+		bl.deltas = append(bl.deltas, d)
+		seq = d.Seq
 	}
-	return nil
+	return bl, nil
 }
 
 func (a *Agent) storeDelta(deltas, sealedB64 string, after, seq int64) error {
@@ -540,11 +601,7 @@ func (a *Agent) storeDelta(deltas, sealedB64 string, after, seq int64) error {
 	if err != nil {
 		return err
 	}
-	var doc struct {
-		Seq    int64    `json:"seq"`
-		Add    []string `json:"add"`
-		Remove []string `json:"remove"`
-	}
+	var doc blkDelta
 	if err := json.Unmarshal(payload, &doc); err != nil || doc.Seq != seq || seq <= after {
 		return errors.New("clusteragent: config: the blocklist delta is not the one announced")
 	}
@@ -552,55 +609,19 @@ func (a *Agent) storeDelta(deltas, sealedB64 string, after, seq int64) error {
 }
 
 // materialise writes blocklist.json: the stored section with its deltas
-// applied in seq order, each opened and verified again.
+// applied in seq order, each opened and verified again (openBlocklist), the
+// section against the ETag held.
 func (a *Agent) materialise(dir string, st ReplicaState) error {
-	sealed, err := os.ReadFile(filepath.Join(dir, "blocklist.rep"))
+	bl, err := a.openBlocklist(dir, st.BlocklistEtag)
 	if err != nil {
 		return err
 	}
-	payload, err := a.Client.OpenRecord(sealed, "rep")
-	if err != nil {
-		return err
-	}
-	var doc struct {
-		Node string                     `json:"node"`
-		Seq  int64                      `json:"seq"`
-		Data map[string]json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(payload, &doc); err != nil || doc.Node != a.Client.State.NodeUUID {
-		return errors.New("clusteragent: replica: the stored section is not this node's")
-	}
-	if doc.Data == nil {
-		doc.Data = map[string]json.RawMessage{}
-	}
-	var ips []string
-	if raw, ok := doc.Data["ip"]; ok {
-		if err := json.Unmarshal(raw, &ips); err != nil {
-			return errors.New("clusteragent: replica: the section's ip list")
-		}
-	}
-	set := make(map[string]bool, len(ips))
-	for _, ip := range ips {
+	set := make(map[string]bool, len(bl.ips))
+	for _, ip := range bl.ips {
 		set[ip] = true
 	}
-	seq := doc.Seq
-	for _, name := range ReplicaDeltas(dir) {
-		b, err := os.ReadFile(filepath.Join(dir, "blocklist.d", name))
-		if err != nil {
-			return err
-		}
-		p, err := a.Client.OpenRecord(b, "blk")
-		if err != nil {
-			return err
-		}
-		var d struct {
-			Seq    int64    `json:"seq"`
-			Add    []string `json:"add"`
-			Remove []string `json:"remove"`
-		}
-		if err := json.Unmarshal(p, &d); err != nil || d.Seq <= seq {
-			return errors.New("clusteragent: replica: a stored delta is out of order")
-		}
+	seq := bl.seq
+	for _, d := range bl.deltas {
 		for _, ip := range d.Remove {
 			delete(set, ip)
 		}
@@ -609,14 +630,14 @@ func (a *Agent) materialise(dir string, st ReplicaState) error {
 		}
 		seq = d.Seq
 	}
-	ips = ips[:0]
+	ips := bl.ips[:0] // a section with no ip list and nothing added keeps it null
 	for ip := range set {
 		ips = append(ips, ip)
 	}
 	sort.Strings(ips)
 	ipJSON, _ := json.Marshal(ips)
-	doc.Data["ip"] = ipJSON
-	out, err := json.Marshal(map[string]any{"seq": seq, "etag": st.BlocklistEtag, "data": doc.Data})
+	bl.data["ip"] = ipJSON
+	out, err := json.Marshal(map[string]any{"seq": seq, "etag": st.BlocklistEtag, "data": bl.data})
 	if err != nil {
 		return err
 	}

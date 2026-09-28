@@ -28,6 +28,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/atomicfile"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 )
 
@@ -238,15 +239,8 @@ func Save(path string, v Values) error {
 		return err
 	}
 	b = append(b, '\n')
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	// <path>.tmp, 0644 less the umask, no fsync: as it always was.
+	return atomicfile.Write(path, b, atomicfile.Options{Perm: 0o644, Temp: atomicfile.Suffix, NoSync: true})
 }
 
 // clamp keeps every value inside a sane operating range so a typo in the panel
