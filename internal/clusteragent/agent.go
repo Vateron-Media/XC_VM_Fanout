@@ -54,6 +54,10 @@ type Agent struct {
 	// Types lists the command types the node's PHP runs (TypesViaPHP),
 	// asked before each hello; nil says no artefact feature.
 	Types func(ctx context.Context) ([]string, error)
+	// RelayAddr is where the loopback relay proxy listens (relayproxy.go,
+	// RelayProxyAddr), with its key in RelayKeyDir; "" leaves it off.
+	RelayAddr   string
+	RelayKeyDir string
 
 	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
@@ -75,6 +79,8 @@ type Agent struct {
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 	nonceOnce          sync.Once    // the data plane's nonce window (dataplane.go)
 	nonces             *nonceCache
+	ticketsOnce        sync.Once // the data plane's tickets (tickets.go)
+	ticketStore        *ticketStore
 	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
 	replicaMu          sync.Mutex   // one replica sync or check at a time (replica.go)
 	replicaKeys        string       // the keys the stored records were last checked with (replicaMu)
@@ -519,6 +525,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		go func() {
 			if err := a.ServeSocket(sctx, a.SocketPath); err != nil {
 				a.logf("cluster: local socket: %v", err)
+			}
+		}()
+	}
+	if a.RelayAddr != "" && a.RelayKeyDir != "" {
+		// Always up: the DATAPLANE flow decides per request, so it turning
+		// on needs no restart.
+		pctx, stopRelay := context.WithCancel(ctx)
+		defer stopRelay()
+		go func() {
+			if err := a.ServeRelayProxy(pctx, a.RelayAddr, a.RelayKeyDir); err != nil {
+				a.logf("cluster: relay proxy: %v", err)
 			}
 		}()
 	}

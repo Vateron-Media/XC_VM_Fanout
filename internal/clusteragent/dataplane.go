@@ -18,7 +18,7 @@ import (
 // node's PHP over the local socket while it serves a relay or file request:
 //
 //	POST /v1/nonce        {nonce}                              -> {fresh}
-//	POST /v1/file_digest  {tid, owner_sid, size, sha256}        -> {header}
+//	POST /v1/file_digest  {tid, owner_sid, size, sha256[, offset, total]} -> {header}
 //
 // Both are the node's own: no call to MAIN, nothing stored on disk.
 //
@@ -135,32 +135,24 @@ func (a *Agent) serveNonce(w http.ResponseWriter, r *http.Request) {
 	replyJSON(w, map[string]any{"fresh": a.nonces.fresh(strings.ToLower(body.Nonce))})
 }
 
-// fileDigestDoc is the document the owner signs, with its fields in the order
-// the panel's FileDigest sorts them (ksort): a byte of difference and the
-// fetcher's verification fails.
-type fileDigestDoc struct {
-	Iat      int64  `json:"iat"`
-	OwnerSid int64  `json:"owner_sid"`
-	Sha256   string `json:"sha256"`
-	Size     int64  `json:"size"`
-	Tid      string `json:"tid"`
-	Typ      string `json:"typ"`
-	V        int    `json:"v"`
-}
-
 func (a *Agent) serveFileDigest(w http.ResponseWriter, r *http.Request) {
-	// An iat the caller sends (older PHP does) is read and not used.
+	// An iat the caller sends (older PHP does) is read and not used. Offset
+	// and total come together: a chunk of /xfile's (both), or a whole file
+	// (neither).
 	var body struct {
 		Tid      string `json:"tid"`
 		OwnerSid int64  `json:"owner_sid"`
 		Size     int64  `json:"size"`
 		Sha256   string `json:"sha256"`
+		Offset   *int64 `json:"offset"`
+		Total    *int64 `json:"total"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
 	sum := strings.ToLower(body.Sha256)
-	if _, err := hex.DecodeString(sum); err != nil || len(sum) != 64 || body.Size < 0 || body.OwnerSid <= 0 || body.Tid == "" || len(body.Tid) > 64 {
+	if _, err := hex.DecodeString(sum); err != nil || len(sum) != 64 || body.Size < 0 || body.OwnerSid <= 0 || body.Tid == "" || len(body.Tid) > 64 ||
+		(body.Offset == nil) != (body.Total == nil) || (body.Offset != nil && (*body.Offset < 0 || *body.Total < *body.Offset+body.Size)) {
 		http.Error(w, "bad digest fields", http.StatusBadRequest)
 		return
 	}
@@ -179,9 +171,9 @@ func (a *Agent) serveFileDigest(w http.ResponseWriter, r *http.Request) {
 	// node's own clock is the one nothing vouches for), as this agent last
 	// measured it; the caller's clock is not asked.
 	iat := a.Client.MainNowMs() / 1000
-	doc, err := json.Marshal(fileDigestDoc{Iat: iat, OwnerSid: body.OwnerSid, Sha256: sum, Size: body.Size, Tid: body.Tid, Typ: "xcvm-file-digest", V: 1})
+	doc, err := cc.FileDigestDoc(body.Tid, body.OwnerSid, body.Size, sum, iat, body.Offset, body.Total)
 	if err != nil {
-		http.Error(w, "doc", http.StatusInternalServerError)
+		http.Error(w, "doc", http.StatusBadRequest)
 		return
 	}
 	sig := cc.SignNode(a.Client.State.SignKey(), "digest", doc)

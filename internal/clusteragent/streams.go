@@ -39,8 +39,10 @@ import (
 //     at least `from`, at most MaxStreamHashes, taken from the files as
 //     stored at that moment.
 //
-// One record of a reply that does not verify rejects the whole reply. The
-// section follows the STREAMS flow (8): while it is off the cursor is 0 and
+// With the DATAPLANE flow on, a record's `tickets` slot and the delta's
+// ticket refresh go to replica/tickets.json (tickets.go), never into a
+// record's file or ETag. One record of a reply that does not verify rejects
+// the whole reply. The section follows the STREAMS flow (8): while it is off the cursor is 0 and
 // every file is kept. No record, its data or a diff of it is ever logged:
 // only stream ids.
 
@@ -79,6 +81,9 @@ type streamEntry struct {
 }
 
 type streamsReply struct {
+	// Tickets, on a delta that asked for them: the epoch's relay and file
+	// tickets (tickets.go).
+	Tickets  *ticketsReply `json:"tickets"`
 	Ver      int64         `json:"ver"`
 	Head     int64         `json:"head"`
 	More     bool          `json:"more"`
@@ -98,13 +103,16 @@ type streamResync struct {
 type streamsRequest struct {
 	Since  int64         `json:"since"`
 	Resync *streamResync `json:"resync,omitempty"`
+	// Tickets asks a delta for the epoch's tickets while DATAPLANE is on.
+	Tickets *ticketsAsk `json:"tickets,omitempty"`
 }
 
 // checkedStream is a record of a reply that opened and verified.
 type checkedStream struct {
-	id     int64
-	sealed []byte
-	json   []byte
+	id      int64
+	sealed  []byte
+	json    []byte
+	tickets json.RawMessage // the record's `tickets` slot, kept apart (tickets.go)
 }
 
 func streamsDir(dir string) string { return filepath.Join(dir, "streams") }
@@ -302,7 +310,7 @@ func (s *streamSync) writeSince() error {
 // reports whether MAIN answered `full`.
 func (s *streamSync) deltas(ctx context.Context) (bool, error) {
 	for round := 0; round < 1000; round++ {
-		r, err := s.a.streamsCall(ctx, streamsRequest{Since: s.cursor})
+		r, err := s.a.streamsCall(ctx, streamsRequest{Since: s.cursor, Tickets: s.a.ticketsAsk()})
 		if err != nil {
 			return false, err
 		}
@@ -310,6 +318,12 @@ func (s *streamSync) deltas(ctx context.Context) (bool, error) {
 			return true, nil
 		}
 		if err := s.apply(r); err != nil {
+			return false, err
+		}
+		// The ticket refresh rides the delta: it moves no cursor and no
+		// record, and asks again at once while MAIN has more.
+		moreTickets, err := s.a.ticketsTake(r.Tickets)
+		if err != nil {
 			return false, err
 		}
 		if r.Ver != s.cursor {
@@ -321,7 +335,7 @@ func (s *streamSync) deltas(ctx context.Context) (bool, error) {
 				return false, err
 			}
 		}
-		if !r.More {
+		if !r.More && !moreTickets {
 			return false, nil
 		}
 	}
@@ -513,6 +527,21 @@ func (s *streamSync) apply(r *streamsReply) error {
 	if err := os.MkdirAll(sd, 0o700); err != nil {
 		return err
 	}
+	// The tickets first, kept apart from the records (tickets.go): a record
+	// stored replaces its stream's, a removal drops them.
+	if ts := s.a.tickets(); ts != nil {
+		m := map[int64]streamTickets{}
+		for _, c := range ok {
+			t, _ := s.a.parseTickets(c.id, c.tickets)
+			m[c.id] = t
+		}
+		for _, id := range r.Removed {
+			m[id] = streamTickets{}
+		}
+		if err := ts.setStreams(m); err != nil {
+			return fmt.Errorf("clusteragent: streams: writing the tickets: %w", err)
+		}
+	}
 	for _, c := range ok {
 		name := filepath.Join(sd, strconv.FormatInt(c.id, 10))
 		if err := writeFileMode(name+".rep", c.sealed, 0o600); err != nil {
@@ -561,7 +590,11 @@ func (a *Agent) checkStream(e streamEntry) (checkedStream, error) {
 		return checkedStream{}, bad
 	}
 	out := append([]byte(`{"etag":"`+doc.Etag+`","ver":`+strconv.FormatInt(*doc.Ver, 10)+`,"data":`), doc.Data...)
-	return checkedStream{id: e.ID, sealed: sealed, json: append(out, '}')}, nil
+	var slot struct {
+		Tickets json.RawMessage `json:"tickets"`
+	}
+	json.Unmarshal(doc.Data, &slot)
+	return checkedStream{id: e.ID, sealed: sealed, json: append(out, '}'), tickets: slot.Tickets}, nil
 }
 
 // openStream opens a stream record and checks that it is this node's
