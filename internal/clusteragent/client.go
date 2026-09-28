@@ -85,7 +85,10 @@ type Client struct {
 	// offsetAtMs is the local unix ms offsetMs was last taken at; 0 while
 	// MAIN's time has not been observed (status.go).
 	offsetAtMs atomic.Int64
-	now        func() time.Time
+	// clock is MAIN's clock as the node can vouch for it, which a lease is
+	// judged against (mainclock.go, lease.go's lease_state.json).
+	clock mainClock
+	now   func() time.Time
 	// failed holds the MAIN URLs that could not be reached (connect, TLS or
 	// timeout), each until it is tried first again (URLRetry).
 	failed map[string]time.Time
@@ -184,6 +187,9 @@ func NewClient(st *State, agent string) *Client {
 	for _, e := range st.Epochs {
 		c.openEpoch(e)
 	}
+	st.mu.Lock()
+	c.clock.resume(st.MainSeenMs, st.MainAnchor)
+	st.mu.Unlock()
 	return c
 }
 
@@ -264,11 +270,34 @@ func (c *Client) callVia(ctx context.Context, hc *http.Client, s session, op str
 	return withReplay(ctx, c.setMainTime, func() error { return c.callOnce(ctx, hc, s, op, plain, out, signNode) })
 }
 
-// setMainTime takes MAIN's clock from an authenticated main_time_ms.
+// setMainTime takes MAIN's clock from an authenticated main_time_ms: a MAC'd
+// reply, a verified denial or a panel-signed re-key document. It sets the
+// offset requests are stamped with and anchors the clock a lease is judged
+// against (mainclock.go).
 func (c *Client) setMainTime(mainMs int64) {
+	c.setOffset(mainMs)
+	c.clock.heard(mainMs)
+}
+
+// setOffset takes MAIN's clock for stamping requests only: from a document
+// bound to no request (the re-key challenge), which a copy replays.
+func (c *Client) setOffset(mainMs int64) {
 	now := c.now().UnixMilli()
 	c.offsetMs.Store(mainMs - now)
 	c.offsetAtMs.Store(now)
+}
+
+// saveClock keeps the MAIN clock in the state, so a restart resumes it
+// (mainclock.go). The caller saves at most every ClockSaveEvery.
+func (c *Client) saveClock() error {
+	seen, mark := c.clock.mark()
+	if mark == nil {
+		return nil
+	}
+	c.State.mu.Lock()
+	defer c.State.mu.Unlock()
+	c.State.MainSeenMs, c.State.MainAnchor = seen, mark
+	return c.State.saveLocked()
 }
 
 func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op string, plain []byte, out any, signNode bool) error {

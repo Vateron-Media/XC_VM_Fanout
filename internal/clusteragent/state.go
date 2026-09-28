@@ -89,6 +89,12 @@ type State struct {
 	// design) and because an operator reads it after the fact, on a node that
 	// may have been restarted since.
 	LeaseRefused string `json:"lease_refused,omitempty"`
+	// MainSeenMs is the highest MAIN time an authenticated statement carried,
+	// and MainAnchor MAIN's clock as the agent held it, both saved at most every
+	// ClockSaveEvery so a restart resumes the clock a lease is judged against
+	// rather than starting it again (mainclock.go).
+	MainSeenMs int64      `json:"main_seen_ms,omitempty"`
+	MainAnchor *ClockMark `json:"main_anchor,omitempty"`
 
 	path string
 	mu   sync.Mutex

@@ -129,7 +129,9 @@ func (c *Client) Rekey(ctx context.Context, identity map[string]any) (*cc.Token,
 	}
 	if ch.MainTimeMs > 0 {
 		// Only the request timestamp depends on it; MAIN checks the window.
-		c.setMainTime(ch.MainTimeMs)
+		// A challenge answers no request of this node's, so an old copy
+		// replays: it stamps requests and never anchors the lease's clock.
+		c.setOffset(ch.MainTimeMs)
 	}
 	if !ch.LicenceOK {
 		return nil, ErrUnlicensed
