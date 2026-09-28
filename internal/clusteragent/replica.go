@@ -171,38 +171,7 @@ func writeFileAtomic(path string, b []byte) error { return writeFileMode(path, b
 // writeFileMode writes path atomically (temp file, fsync, rename) with mode
 // perm, whatever the umask or a stale temp file.
 func writeFileMode(path string, b []byte, perm os.FileMode) error {
-	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp")
-	os.Remove(tmp)
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp)
-	if err := f.Chmod(perm); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	// The rename itself durable, so files written in turn (a .rep before
-	// its .json) reach the disk in that order.
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		d.Sync()
-		d.Close()
-	}
-	return nil
+	return writeFile(path, b, fileWrite{perm: perm, exact: true, fixedTemp: true})
 }
 
 // SyncReplica asks MAIN for what changed since the replica's state and stores

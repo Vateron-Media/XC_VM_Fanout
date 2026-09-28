@@ -42,7 +42,7 @@ switch ($argv[1]) {
 		break;
 	case 'seed':
 		AgentClient::useSocket($argv[2]);
-		echo json_encode(AgentConnections::seed(\XcVm\Cli\Commands\ClusterSeedConnectionsCommand::stored(7)));
+		echo json_encode(AgentConnections::seed(\XcVm\Core\Cluster\StoredConnections::ofServer(7, false)));
 		break;
 	case 'close':
 		echo \XcVm\Domain\Cluster\CommandBus::enqueue($rCrypto, 7, 'conn.close', ['uuid' => 'v1', 'remove' => $argv[2] === '1']);

@@ -327,12 +327,7 @@ func (a *Agent) publish(r *Reply) {
 		os.Chtimes(a.FlowsFile, now, now)
 		return
 	}
-	tmp := a.FlowsFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o640); err != nil {
-		a.logf("cluster: writing flows: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, a.FlowsFile); err != nil {
+	if err := writeFile(a.FlowsFile, b, fileWrite{perm: 0o640}); err != nil {
 		a.logf("cluster: writing flows: %v", err)
 		return
 	}

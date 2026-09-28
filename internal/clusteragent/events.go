@@ -416,23 +416,7 @@ func (ls *laneSpool) loadInflight() (*inflight, error) {
 // saveInflight persists the batch before it is sent (written aside, synced, renamed in).
 func (ls *laneSpool) saveInflight(fl *inflight) error {
 	b, _ := json.Marshal(fl)
-	tmp := ls.state + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, ls.state)
+	return writeFile(ls.state, b, fileWrite{perm: 0o640})
 }
 
 // finish deletes an applied batch's files, then its in-flight record.
