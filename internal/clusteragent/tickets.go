@@ -23,8 +23,12 @@ import (
 //     {"tickets": {"epoch", "streams": {"<id>": TICKETS}, "next", "withheld"}}.
 //
 // The record's ETag is taken with the slot empty and no ticket bumps a
-// version, so a refresh changes no file PHP compares: the tickets live
-// apart, in replica/tickets.json (0600), never in streams/<id>.json's hash.
+// version, so a refresh changes no file PHP compares. The tickets the proxy
+// uses live apart, in replica/tickets.json (0600), refreshed on the delta
+// path. A record's own copy stays in its `data` as MAIN signed it, so
+// streams/<id>.json (0600) holds the tickets that came with the record,
+// never refreshed there and read by nothing: its ETag, which PHP and the
+// resync compare, is taken without them.
 // Each ticket is verified before it is kept: the panel's signature, its
 // lifetime, and that it names this node (child or fetcher) at the token's
 // generation. A ticket is never logged.
@@ -98,14 +102,40 @@ func (a *Agent) tickets() *ticketStore {
 }
 
 // index rebuilds the ref index (mu held for writing, or not yet shared).
+// Streams that read the same file each hold a ticket for its ref, refreshed
+// at different times; the index names the one whose ticket expires last (on
+// a tie, the lowest stream id), whatever order the map is walked in, so a
+// read never picks a stale ticket while a fresher one is held.
 func (s *ticketStore) index() {
 	s.files = map[string]int64{}
+	best := map[string]int64{} // ref -> exp of the indexed ticket
 	for id, t := range s.f.Streams {
 		n, _ := strconv.ParseInt(id, 10, 64)
-		for ref := range t.Files {
-			s.files[ref] = n
+		for ref, wire := range t.Files {
+			exp := ticketExp(wire)
+			held, ok := s.files[ref]
+			if !ok || exp > best[ref] || exp == best[ref] && n < held {
+				s.files[ref], best[ref] = n, exp
+			}
 		}
 	}
+}
+
+// ticketExp is a stored ticket's `exp`, read without checking its signature
+// (each was verified before it was kept, and is again before it is used);
+// 0 when it does not read.
+func ticketExp(wire string) int64 {
+	doc, _, ok := cc.SplitSigned(wire, cc.TicketMaxWire)
+	if !ok {
+		return 0
+	}
+	var t struct {
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(doc, &t) != nil {
+		return 0
+	}
+	return t.Exp
 }
 
 // save writes tickets.json (mu held).

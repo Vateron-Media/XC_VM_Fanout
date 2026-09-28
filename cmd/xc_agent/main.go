@@ -41,9 +41,11 @@
 //
 // With DATAPLANE on (Phase 8), encoders and the fanout pull relays and other
 // servers' files from the loopback relay proxy (127.0.0.1:31290, keyed by
-// relay.key beside the state), which signs each upstream connect with the
-// tickets MAIN sends in the R2 streams section and checks each file chunk
-// against its owner's digest.
+// relay.key beside the state, published only while the proxy holds the port
+// and removed when it lets go; a port it cannot bind is retried with
+// backoff), which signs each upstream connect with the tickets MAIN sends in
+// the R2 streams section and checks each file chunk against its owner's
+// digest.
 //
 //	xc_agent [-state path] [-interval 2s]   run the control loop
 //	xc_agent run -role main                 MAIN: the loopback relay proxy alone

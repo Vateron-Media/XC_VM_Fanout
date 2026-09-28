@@ -151,6 +151,11 @@ var Features = []string{"hls_reaper"}
 // one whose node's PHP runs artefact.fetch FeatureArtefact (artefact.go).
 const FeatureConfigChanged = "config_changed"
 
+// FeatureRelay says the agent runs the loopback relay proxy (relayproxy.go),
+// so its node's DATAPLANE flow may be switched on (the panel's
+// ClusterAdmin::FEATURE_RELAY).
+const FeatureRelay = "relay"
+
 // FeatureHTTPS says MAIN has answered this node over HTTPS.
 const FeatureHTTPS = "https"
 
@@ -167,6 +172,11 @@ func (a *Agent) features() []string {
 	if a.ArtefactDir != "" && (a.Exec != nil || a.run != nil) && a.artefactOn.Load() {
 		// Only while the node's PHP runs artefact.fetch (artefact.go).
 		out = append(out, FeatureArtefact)
+	}
+	if a.RelayAddr != "" && a.RelayKeyDir != "" {
+		// The loopback relay proxy runs (relayproxy.go): MAIN lets an
+		// operator switch the node's DATAPLANE flow on only then.
+		out = append(out, FeatureRelay)
 	}
 	if a.Client != nil && a.Client.HTTPSAnswered() {
 		// MAIN has answered this node over HTTPS: it may be moved to
@@ -530,10 +540,15 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	if a.RelayAddr != "" && a.RelayKeyDir != "" {
 		// Always up: the DATAPLANE flow decides per request, so it turning
-		// on needs no restart.
+		// on needs no restart. Stopped and waited for on return, so relay.key
+		// is withdrawn before the process exits.
 		pctx, stopRelay := context.WithCancel(ctx)
+		var relayDone sync.WaitGroup
+		relayDone.Add(1)
+		defer relayDone.Wait()
 		defer stopRelay()
 		go func() {
+			defer relayDone.Done()
 			if err := a.ServeRelayProxy(pctx, a.RelayAddr, a.RelayKeyDir); err != nil {
 				a.logf("cluster: relay proxy: %v", err)
 			}

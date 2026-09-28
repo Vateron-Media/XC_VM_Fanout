@@ -40,8 +40,10 @@ import (
 //     stored at that moment.
 //
 // With the DATAPLANE flow on, a record's `tickets` slot and the delta's
-// ticket refresh go to replica/tickets.json (tickets.go), never into a
-// record's file or ETag. One record of a reply that does not verify rejects
+// ticket refresh go to replica/tickets.json (tickets.go), which the relay
+// proxy reads. The slot also stays in the record's `data`, as MAIN signed
+// it, so streams/<id>.json carries the tickets of the record's last push
+// (never refreshed there, read by nothing); they are never in its ETag. One record of a reply that does not verify rejects
 // the whole reply. The section follows the STREAMS flow (8): while it is off the cursor is 0 and
 // every file is kept. No record, its data or a diff of it is ever logged:
 // only stream ids.

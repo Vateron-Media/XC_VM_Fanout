@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -36,11 +37,16 @@ import (
 //	       X-XCVM-File-Auth   the same proof over the file ticket
 //	       <- X-XCVM-File-Digest, checked before a byte of the chunk is passed on
 //
-// `k` is the loopback key (relay.key beside the state, 0600): the node's PHP
-// puts it in the URLs it builds, and a request without it is refused, so a
-// local user who reads an encoder's command line holds a key that unlocks
-// this listener only, and no ticket. The URLs never name a ticket, so a
-// refresh reaches the next connect with no encoder restart.
+// `k` is the loopback key: the node's PHP puts it in the URLs it builds, and
+// a request without it is refused, so a local user who reads an encoder's
+// command line holds a key that unlocks this listener only, and no ticket.
+// The URLs never name a ticket, so a refresh reaches the next connect with no
+// encoder restart. The key is kept in .relay.key (0600) and published as
+// relay.key, which PHP reads, only while this process holds the port: it is
+// written once the listener is bound and removed when it lets go, so the key
+// never sits beside a port another local user could bind (PHP also checks
+// that the listener's uid is relay.key's owner; DataPlane::loopback). A port
+// that cannot be bound is retried with backoff, and logged, until it can.
 //
 // Where the parent or owner is comes from the servers section the agent
 // stores (replica/servers.json): its private address when both it and this
@@ -57,8 +63,31 @@ import (
 const RelayProxyAddr = "127.0.0.1:31290"
 
 // RelayKeyFile is the loopback key's name beside the state (the panel's
-// DataPlane::KEY_FILE).
+// DataPlane::KEY_FILE): published only while the proxy holds its port.
 const RelayKeyFile = "relay.key"
+
+// RelayKeyStore is where the key is kept across restarts, so the URLs the
+// running encoders hold outlive an agent restart; PHP never reads it.
+const RelayKeyStore = ".relay.key"
+
+// RelayBindRetryMin and RelayBindRetryMax bound the wait between attempts to
+// bind the proxy's port; RelayBindLogEvery is how often a failure that goes
+// on is logged again.
+var (
+	RelayBindRetryMin = time.Second
+	RelayBindRetryMax = 30 * time.Second
+	RelayBindLogEvery = 20
+)
+
+// ChunkRetries is how many times one /xfile chunk is asked for when the owner
+// answers 429 or 503 (its rate limit, or busy); ChunkRetryMin and
+// ChunkRetryMax bound the wait between tries (a Retry-After within them is
+// taken).
+var (
+	ChunkRetries  = 5
+	ChunkRetryMin = 250 * time.Millisecond
+	ChunkRetryMax = 4 * time.Second
+)
 
 // RelayUpstreamTimeout bounds a connect and the wait for the upstream's
 // headers; a relay's body then streams for as long as it lasts.
@@ -98,12 +127,23 @@ type routeNode struct {
 	state string
 }
 
-// LoadRelayKey reads the loopback key beside the state, making one the first
-// time (32 random bytes, base64url).
+// LoadRelayKey reads the loopback key kept beside the state (RelayKeyStore),
+// making one the first time (32 random bytes, base64url). A key an older
+// agent kept in relay.key itself is taken over, so the encoders' URLs survive
+// the upgrade. It publishes nothing: see publishRelayKey.
 func LoadRelayKey(dir string) (string, error) {
-	path := filepath.Join(dir, RelayKeyFile)
-	if b, err := os.ReadFile(path); err == nil {
+	store := filepath.Join(dir, RelayKeyStore)
+	for _, path := range []string{store, filepath.Join(dir, RelayKeyFile)} {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
 		if k := strings.TrimSpace(string(b)); len(k) >= 22 && len(k) <= 64 && validKey(k) {
+			if path != store {
+				if err := writeFileMode(store, []byte(k+"\n"), 0o600); err != nil {
+					return "", err
+				}
+			}
 			return k, nil
 		}
 	}
@@ -112,10 +152,24 @@ func LoadRelayKey(dir string) (string, error) {
 		return "", err
 	}
 	k := base64.RawURLEncoding.EncodeToString(raw)
-	if err := writeFileMode(path, []byte(k+"\n"), 0o600); err != nil {
+	if err := writeFileMode(store, []byte(k+"\n"), 0o600); err != nil {
 		return "", err
 	}
 	return k, nil
+}
+
+// publishRelayKey writes relay.key (0600) for the node's PHP: only once this
+// process holds the proxy's port.
+func publishRelayKey(dir, k string) error {
+	return writeFileMode(filepath.Join(dir, RelayKeyFile), []byte(k+"\n"), 0o600)
+}
+
+// withdrawRelayKey removes relay.key: the port is no longer this process's,
+// and PHP then builds no loopback URL.
+func withdrawRelayKey(dir string) {
+	if err := os.Remove(filepath.Join(dir, RelayKeyFile)); err != nil && !os.IsNotExist(err) {
+		log.Printf("cluster: relay proxy: removing %s: %v", RelayKeyFile, err)
+	}
 }
 
 func validKey(k string) bool {
@@ -141,23 +195,74 @@ func (a *Agent) NewRelayProxy(k string) *RelayProxy {
 	}}
 }
 
-// ServeRelayProxy listens on addr until ctx ends.
+// ServeRelayProxy listens on addr until ctx ends. The key is published
+// (relay.key) only while the listener is bound, and withdrawn before it is
+// closed. A bind that fails (the port taken, by anyone) is retried with
+// backoff, from RelayBindRetryMin up to RelayBindRetryMax, and logged at the
+// first failure and every RelayBindLogEvery after: the node's data-plane
+// URLs stay unavailable meanwhile. It returns nil once ctx ends, and an error
+// only when the key cannot be kept or published.
 func (a *Agent) ServeRelayProxy(ctx context.Context, addr, keyDir string) error {
 	k, err := LoadRelayKey(keyDir)
 	if err != nil {
 		return err
 	}
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+	// One left behind by a crash: nothing is ours until the port is.
+	withdrawRelayKey(keyDir)
+	handler := a.NewRelayProxy(k)
+	delay, failures := RelayBindRetryMin, 0
+	wait := func() bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, RelayBindRetryMax)
+		return true
 	}
-	srv := &http.Server{Handler: a.NewRelayProxy(k), ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		<-ctx.Done()
-		srv.Close()
-	}()
-	if err := srv.Serve(l); !errors.Is(err, http.ErrServerClosed) {
-		return err
+	for ctx.Err() == nil {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			failures++
+			if failures == 1 || failures%max(1, RelayBindLogEvery) == 0 {
+				a.logf("cluster: relay proxy: cannot listen on %s (%d attempts): %v; data-plane URLs on this node stay unavailable until it can", addr, failures, err)
+			}
+			if !wait() {
+				return nil
+			}
+			continue
+		}
+		if failures > 0 {
+			a.logf("cluster: relay proxy: listening on %s after %d failed attempts", addr, failures)
+		}
+		delay, failures = RelayBindRetryMin, 0
+		if err := publishRelayKey(keyDir, k); err != nil {
+			l.Close()
+			withdrawRelayKey(keyDir)
+			return err
+		}
+		srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+		served := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				// The key goes first: PHP stops building URLs to a port that
+				// is about to be free for anyone to bind.
+				withdrawRelayKey(keyDir)
+				srv.Close()
+			case <-served:
+			}
+		}()
+		err = srv.Serve(l)
+		close(served)
+		withdrawRelayKey(keyDir)
+		if ctx.Err() != nil {
+			return nil
+		}
+		a.logf("cluster: relay proxy: the listener on %s stopped: %v; listening again", addr, err)
+		if !wait() {
+			return nil
+		}
 	}
 	return nil
 }
@@ -286,7 +391,7 @@ func (p *RelayProxy) xfile(w http.ResponseWriter, r *http.Request, ref string) {
 		http.Error(w, "range", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
-	c := &chunkReader{p: p, ctx: r.Context(), base: base, wire: wire, tid: t.Tid, owner: owner, panelPub: panelPub, nodePub: nodePub}
+	c := &chunkReader{p: p, ctx: r.Context(), base: base, ref: ref, wire: wire, tid: t.Tid, owner: owner, panelPub: panelPub, nodePub: nodePub}
 	// The chunk holding the start tells the file's size; a suffix range
 	// needs the size first.
 	first := int64(0)
@@ -358,24 +463,82 @@ func (p *RelayProxy) xfile(w http.ResponseWriter, r *http.Request, ref string) {
 
 // chunkReader fetches and checks the chunks of one file.
 type chunkReader struct {
-	p                 *RelayProxy
-	ctx               context.Context
-	base, wire, tid   string
-	owner             int64
-	panelPub, nodePub []byte
-	total             int64 // -1 until the first chunk
-	seen              bool
+	p                    *RelayProxy
+	ctx                  context.Context
+	base, ref, wire, tid string
+	owner                int64
+	panelPub, nodePub    []byte
+	total                int64 // -1 until the first chunk
+	seen                 bool
 }
 
 // fetch reads the chunk at off and checks it; nothing of a chunk that does
-// not verify is returned.
+// not verify is returned. An owner answering 429 or 503 (its rate limit, or
+// busy) is asked again, at most ChunkRetries times in all, waiting from
+// ChunkRetryMin up to ChunkRetryMax (or its Retry-After within them).
 func (c *chunkReader) fetch(off int64) ([]byte, error) {
+	delay := ChunkRetryMin
+	for try := 1; ; try++ {
+		body, after, err := c.fetchOnce(off)
+		if err == nil || after < 0 || try >= ChunkRetries {
+			return body, err
+		}
+		wait := min(max(delay, after), ChunkRetryMax)
+		select {
+		case <-c.ctx.Done():
+			return nil, c.ctx.Err()
+		case <-time.After(wait):
+		}
+		delay = min(delay*2, ChunkRetryMax)
+	}
+}
+
+// ticket re-reads the file ticket for this chunk: a transfer outlives the
+// ticket it started with (a refresh replaces it, an expiry or a revocation
+// ends it), so each chunk is asked for with the ticket the store holds now,
+// verified now, and naming the same owner.
+func (c *chunkReader) ticket() error {
+	a := c.p.a
+	wire := a.tickets().file(c.ref)
+	t, ok := a.verifiedTicket("fil", wire)
+	if wire == "" || !ok {
+		return errors.New("the file ticket is no longer valid")
+	}
+	owner, _ := t.Int("owner_sid")
+	if ref, _ := t.String("ref"); owner != c.owner || ref != c.ref {
+		return errors.New("the file ticket names another file")
+	}
+	c.wire, c.tid = wire, t.Tid
+	return nil
+}
+
+// fetchOnce asks for the chunk at off once. after is how long to wait
+// before asking again when the owner was busy (429, 503; 0: no Retry-After),
+// or -1 when asking again would not help.
+func (c *chunkReader) fetchOnce(off int64) (body []byte, after time.Duration, err error) {
+	if err := c.ticket(); err != nil {
+		return nil, -1, err
+	}
 	target := "/xfile?o=" + strconv.FormatInt(off, 10) + "&n=" + strconv.Itoa(cc.FileChunk)
 	resp, err := c.p.upstream(c.ctx, c.base, target, "X-XCVM-File", "X-XCVM-File-Auth", c.wire)
 	if err != nil {
-		return nil, err
+		return nil, -1, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		after = 0
+		if s, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && s > 0 {
+			after = time.Duration(s) * time.Second
+		}
+		return nil, after, fmt.Errorf("the owner answered %d", resp.StatusCode)
+	}
+	body, err = c.check(off, resp)
+	return body, -1, err
+}
+
+// check verifies one chunk's response.
+func (c *chunkReader) check(off int64, resp *http.Response) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("the owner answered %d", resp.StatusCode)
 	}
