@@ -1,6 +1,8 @@
 # ADR 0001 — One TS cache, HLS cut on demand
 
-Status: **accepted** (2026-08-29) — implementation in progress.
+Status: **accepted** (2026-08-29) — Plan items 1–3 done (config tuning, HLS cut from the ring
+with `internal/hlsseg` removed, Phase 2b unified buffer); item 4, Phase 3 (on-demand ingest),
+is not done.
 
 ## Context
 

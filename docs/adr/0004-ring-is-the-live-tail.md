@@ -36,8 +36,10 @@ At scale this is the dominant steady-state cost on a watched node:
   permanently busy even with `GOGC=50` and the soft memlimit holding RSS.
 - **Memory bandwidth.** Each source byte on a watched stream is memcpy'd
   **twice** after the socket read: once into `b`, once into the ring. The whole
-  premise of the native remux (ADR 0002) is that copying a channel should cost a
-  goroutine, not a process; this doubles the copy for no benefit.
+  premise of the native remux (no ADR records it; see
+  [09, "The native remuxer"](../en/09-encoder-supervision.md#the-native-remuxer)) is that
+  copying a channel should cost a goroutine, not a process; this doubles the copy for no
+  benefit.
 - **Slow-viewer amplification.** `SubscriberQueue = 256` × ~12 KB ≈ **~3 MB
   pinned per slow viewer** before it is dropped.
 
