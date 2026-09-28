@@ -106,6 +106,9 @@ func (a *Agent) takeSealed(ctx context.Context, d *Denial) {
 	}
 	a.sealedMu.Lock()
 	defer a.sealedMu.Unlock()
+	// A LICENCE_INVALID is MAIN refusing the session: a licence fence among
+	// these commands is taken (fence.go).
+	a.setFenced(true)
 	c := a.Client
 	cmds, err := c.openSealedCommands(d.CommandsSealed)
 	if err != nil {

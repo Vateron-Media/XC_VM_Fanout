@@ -548,7 +548,7 @@ func loadCommandRegistry(t *testing.T) commandRegistry {
 // action MAIN signs at the top level reaches the executor.
 func TestEveryRegistryTypeIsHandledOrForwarded(t *testing.T) {
 	reg := loadCommandRegistry(t)
-	for _, typ := range []string{TypeRotateNow, TypeArtefactFetch, "node.root", "conn.close", "conn.drop", "config.changed"} {
+	for _, typ := range []string{TypeRotateNow, TypeArtefactFetch, "node.root", "conn.close", "conn.drop", "config.changed", TypeFence, TypeUnfence, TypeQuarantine, TypeResync, TypePolicy} {
 		if _, ok := reg.Types[typ]; !ok {
 			t.Errorf("the agent dispatches on %q, which the extension does not sign", typ)
 		}
@@ -560,11 +560,13 @@ func TestEveryRegistryTypeIsHandledOrForwarded(t *testing.T) {
 	m, a, ex, _ := newArtefactAgent(t)
 	a.artefactOn.Store(false)
 	// No fanout socket, connection registry or replica here: all but the
-	// agent's own token.rotate_now (TestRotateNowIsTheAgentsOwn) go to PHP.
+	// agent's own (token.rotate_now, TestRotateNowIsTheAgentsOwn, and the
+	// control commands, TestTheAgentsControlCommandsNeverReachPHP) go to PHP.
 	run := a.localExec(ex.run)
+	own := map[string]bool{TypeRotateNow: true, TypeFence: true, TypeUnfence: true, TypeQuarantine: true, TypeResync: true, TypePolicy: true}
 	types := make([]string, 0, len(reg.Types))
 	for typ := range reg.Types {
-		if typ != TypeRotateNow {
+		if !own[typ] {
 			types = append(types, typ)
 		}
 	}

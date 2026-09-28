@@ -7,7 +7,10 @@
 // says hello, heartbeats and rotates its token. Every heartbeat carries the
 // host sampled each second (Phase 3); with the node's TELEMETRY flow on, MAIN
 // takes the server's stats from it. The mode and flows MAIN sends are written
-// to flows.json beside the state for the node's PHP.
+// to flows.json beside the state for the node's PHP, and the lease the node
+// holds, with MAIN's clock as the agent vouches for it, to lease_state.json
+// every heartbeat interval, whether MAIN answers or not (the node's PHP fences
+// on it behind lb_lease_fence).
 //
 // With CONNECTIONS on, the agent holds the node's viewers (registry.snap,
 // rebuilt against the fanout and the PHP workers after a restart), admits new
@@ -99,6 +102,7 @@ func main() {
 	force := fs.Bool("force", false, "enrol: replace an identity that already holds tokens")
 	phpBin := fs.String("php", "/home/xc_vm/bin/php/bin/php", "run: the PHP that runs MAIN's commands")
 	console := fs.String("console", "/home/xc_vm/console.php", "run: the panel console (cluster:exec)")
+	signalsDir := fs.String("signals", "/home/xc_vm/signals", "run: the node's SIGNALS_PATH, where a fence past its drain drops the viewers it holds; empty = off")
 	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
 	relayAddr := fs.String("relay-addr", clusteragent.RelayProxyAddr, "run: the loopback relay proxy's address (DATAPLANE); empty = off")
 	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's: the loopback relay proxy alone)")
@@ -222,10 +226,11 @@ func main() {
 	go sampler.Run(stopSampler)
 	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
 		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
-		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl,
+		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl, LeaseFile: filepath.Join(filepath.Dir(*statePath), clusteragent.LeaseStateFile),
 		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute),
 		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
-		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath)}
+		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
+		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir}
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
 	switch {

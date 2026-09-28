@@ -20,6 +20,7 @@ import (
 //	/v1/conn/...         the connection registry (registry.go)
 //	POST /v1/nonce       a parent's one-shot nonce window (dataplane.go)
 //	POST /v1/file_digest an owner's signature over what it served (dataplane.go)
+//	GET  /v1/status      the agent's own standing with MAIN (status.go)
 //
 // Only the ops in SocketOps pass. The socket is xc_vm's alone (0660, in the
 // agent's state directory); everything that is only a report goes through
@@ -97,6 +98,10 @@ func (a *Agent) ServeSocket(ctx context.Context, path string) error {
 func (a *Agent) socketHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		arrived := time.Now()
+		if r.URL.Path == "/v1/status" {
+			a.serveStatus(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/v1/conn/") {
 			if a.Registry == nil {
 				http.Error(w, "no registry", http.StatusServiceUnavailable)

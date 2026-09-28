@@ -28,6 +28,10 @@ type Agent struct {
 	// FlowsFile receives the node's mode and flow bits from MAIN's replies,
 	// for the LB's PHP (Core\Cluster\NodeFlows); "" writes nothing.
 	FlowsFile string
+	// LeaseFile receives the lease the node holds and MAIN's clock as the
+	// agent vouches for it, every heartbeat interval, for the LB's PHP
+	// (lease_state.json, Core\Cluster\NodeLease; lease.go); "" writes nothing.
+	LeaseFile string
 	// Exec runs MAIN's commands (commands.go); nil leaves the commands lane off.
 	Exec Executor
 	// SpoolDir is where the node's PHP spools events for MAIN (events.go);
@@ -51,6 +55,12 @@ type Agent struct {
 	// ArtefactDir is where the agent downloads the artefacts MAIN grants
 	// (config/cluster/artefacts, artefact.go); "" fetches none.
 	ArtefactDir string
+	// FenceFile receives the fence MAIN commanded, for the node's PHP
+	// (Core\Cluster\NodeLease, fence.go); "" writes nothing.
+	FenceFile string
+	// SignalsDir is the node's SIGNALS_PATH, where a fence past its drain
+	// writes one drop entry per viewer (fence.go); "" writes none.
+	SignalsDir string
 	// Types lists the command types the node's PHP runs (TypesViaPHP),
 	// asked before each hello; nil says no artefact feature.
 	Types func(ctx context.Context) ([]string, error)
@@ -67,6 +77,8 @@ type Agent struct {
 	fanoutLive         atomic.Bool  // the fanout's /events feed is being followed
 	snapshotting       atomic.Bool  // a conn_snapshot is being sent
 	state              atomic.Value // string: the node state in MAIN's latest reply
+	mode               atomic.Int64 // the node mode in MAIN's latest reply
+	lastBeatMs         atomic.Int64 // local unix ms of the last heartbeat MAIN answered (status.go)
 	admits             admitCache   // conn_admit's admitting answers (admission.go)
 	p2Touch            atomic.Bool  // HLS touches go on the P2 lane (touch.go)
 	helloing           atomic.Bool  // a hello is being retried in the background
@@ -112,6 +124,16 @@ type Agent struct {
 	// fallback URL only, and under which policy version (Run's loop only).
 	fallbackHelloAt  time.Time
 	fallbackHelloVer int
+	leaseOnce        sync.Once
+	leaseKick        chan struct{} // write lease_state.json now (lease.go)
+	leaseErr         string        // the last error writing it, logged once (RunLeaseState's loop only)
+	// The viewers a fence past its drain has dropped (fence.go).
+	drops fenceDrops
+	// replicaResync: the next config sync fetches every section from
+	// scratch; streamsResyncWanted: the next streams sync walks the hashes
+	// (a resync command, fence.go).
+	replicaResync       atomic.Bool
+	streamsResyncWanted atomic.Bool
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -275,6 +297,7 @@ func (a *Agent) recover(ctx context.Context) error {
 		tok, err := a.Client.Rekey(ctx, a.identity())
 		if err == nil {
 			a.logf("cluster: re-keyed (epoch %d)", tok.Epoch)
+			a.kickLease() // the lease the new token came with
 			return nil
 		}
 		if fatal(err) {
@@ -311,7 +334,9 @@ func (a *Agent) publish(r *Reply) {
 	}
 	a.pubMu.Lock()
 	defer a.pubMu.Unlock()
+	a.followState(r.State)
 	a.flows.Store(int64(r.Flows))
+	a.mode.Store(int64(r.Mode))
 	// With STREAMS off, streams.json says 0 before flows.json says so.
 	a.streamsFlow(r.Flows)
 	a.state.Store(r.State)
@@ -354,10 +379,14 @@ func (a *Agent) publish(r *Reply) {
 }
 
 // Unpublish removes the flows file, so the LB's PHP falls back to the legacy
-// paths: called when MAIN stops the node.
+// paths, and the lease state, which describes a session MAIN has ended:
+// called when MAIN stops the node.
 func (a *Agent) Unpublish() {
 	if a.FlowsFile != "" {
 		os.Remove(a.FlowsFile)
+	}
+	if a.LeaseFile != "" {
+		os.Remove(a.LeaseFile)
 	}
 }
 
@@ -404,6 +433,7 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 		return nil, err
 	}
 	a.apply(&r)
+	a.kickLease()
 	return &r, nil
 }
 
@@ -414,6 +444,20 @@ func (a *Agent) Run(ctx context.Context) error {
 	interval := a.heartbeatEvery()
 	backoff := interval
 	a.stopCh = make(chan error, 1)
+	if a.LeaseFile != "" {
+		// First, and stopped and waited for on return (its last act saves
+		// MAIN's clock): the file must go on being rewritten while MAIN
+		// cannot be reached, which is also while the hello below fails.
+		lctx, stopLease := context.WithCancel(ctx)
+		var leaseDone sync.WaitGroup
+		leaseDone.Add(1)
+		defer leaseDone.Wait()
+		defer stopLease()
+		go func() {
+			defer leaseDone.Done()
+			a.RunLeaseState(lctx)
+		}()
+	}
 	if a.Exec != nil && a.run == nil {
 		a.run = a.localExec(a.Exec)
 	}
@@ -429,6 +473,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	var policyDone sync.WaitGroup
 	defer policyDone.Wait()
+	fctx, stopFence := context.WithCancel(ctx)
+	defer stopFence()
+	policyDone.Add(1)
+	go func() {
+		defer policyDone.Done()
+		a.RunFence(fctx)
+	}()
 	pctx, stopPolicy := context.WithCancel(ctx)
 	defer stopPolicy()
 	policyDone.Add(1)
@@ -632,6 +683,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			continue
 		}
 		a.setFenced(false)
+		a.licenceBack()
 		a.httpsFailing.Store(false)
 		if a.hasUnackedSealed() && a.acking.CompareAndSwap(false, true) {
 			go func() {
@@ -703,7 +755,9 @@ func (a *Agent) refreshLater(ctx context.Context) {
 			}
 			// The current token lasts to exp; a later heartbeat re-keys if it must.
 			a.logf("cluster: token refresh: %v", err)
+			return
 		}
+		a.kickLease() // the lease the token came with
 	}()
 }
 
@@ -793,7 +847,9 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 	if err := a.Client.Call(ctx, "heartbeat", payload, &r, false); err != nil {
 		return nil, err
 	}
+	a.lastBeatMs.Store(time.Now().UnixMilli())
 	a.publish(&r)
+	a.kickLease()
 	return &r, nil
 }
 

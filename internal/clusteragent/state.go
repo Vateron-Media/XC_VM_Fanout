@@ -81,7 +81,8 @@ type State struct {
 	HeldCmds []HeldCmd `json:"held_cmds,omitempty"`
 	// Lease is MAIN's statement of how long this node may keep serving without
 	// reaching it, as it arrived beside a token (lease.go). Nil until MAIN sends
-	// one; nothing acts on it yet.
+	// one. The agent publishes it with its MAIN clock in lease_state.json, which
+	// the node's PHP judges (Core\Cluster\NodeLease).
 	Lease *Lease `json:"lease,omitempty"`
 	// LeaseRefused is why the last lease MAIN sent was not kept, or "" when the
 	// one held was the last one sent. It is written here rather than logged
@@ -89,6 +90,19 @@ type State struct {
 	// design) and because an operator reads it after the fact, on a node that
 	// may have been restarted since.
 	LeaseRefused string `json:"lease_refused,omitempty"`
+	// MainSeenMs is the highest MAIN time an authenticated statement carried,
+	// and MainAnchor MAIN's clock as the agent held it, both saved at most every
+	// ClockSaveEvery so a restart resumes the clock a lease is judged against
+	// rather than starting it again (mainclock.go).
+	MainSeenMs int64      `json:"main_seen_ms,omitempty"`
+	MainAnchor *ClockMark `json:"main_anchor,omitempty"`
+	// Fence is the fence MAIN commanded (node.fence), until node.unfence
+	// lifts it or, for a licence fence, MAIN accepts the session again
+	// (fence.go).
+	Fence *Fence `json:"fence,omitempty"`
+	// Quarantine is why MAIN quarantined this node (node.quarantine), until
+	// a reply says it is active again; "" when it is not.
+	Quarantine string `json:"quarantine,omitempty"`
 
 	path string
 	mu   sync.Mutex
