@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -100,6 +102,79 @@ func TestEventsPublishAViewersLastClose(t *testing.T) {
 	}
 	st.removeConn("abc") // unknown now: nothing more
 	if out, _ := m.events.since(m.events.boot, 1); out != nil {
+		t.Fatalf("%+v", out)
+	}
+}
+
+// The ring wraps in place: once full, each event replaces the oldest, and a
+// consumer anywhere in it gets exactly the events after its seq; one behind
+// it, ahead of it, or from another boot gets a reset.
+func TestEventsRingWrapsKeepingItsSemantics(t *testing.T) {
+	old := EventsRing
+	EventsRing = 3
+	defer func() { EventsRing = old }()
+	l := newEventLog()
+	for i := 1; i <= 10; i++ {
+		l.connClosed("4", "u"+strconv.Itoa(i))
+	}
+	l.observe(map[string]monitorStateView{"4": view(true, true, 9, 0)}) // seq 11
+	seqs := func(out *eventsReply) (s []uint64) {
+		for _, e := range out.Events {
+			s = append(s, e.Seq)
+		}
+		return s
+	}
+	for since, want := range map[uint64][]uint64{8: {9, 10, 11}, 9: {10, 11}, 10: {11}} {
+		out, wake := l.since(l.boot, since)
+		if out == nil || wake != nil || out.Reset || out.Seq != 11 || len(out.Events) != len(want) {
+			t.Fatalf("since %d: %+v", since, out)
+		}
+		for i, s := range seqs(out) {
+			if s != want[i] {
+				t.Fatalf("since %d: seqs %v, want %v", since, seqs(out), want)
+			}
+		}
+	}
+	if out, _ := l.since(l.boot, 9); out.Events[0].Type != "conn_close" || out.Events[0].UUID != "u10" || out.Events[1].Type != "monitor" {
+		t.Fatalf("wrong events %+v", out.Events)
+	}
+	if out, wake := l.since(l.boot, 11); out != nil || wake == nil {
+		t.Fatal("a consumer at the head should wait")
+	}
+	for name, c := range map[string]struct {
+		boot  string
+		since uint64
+	}{"behind the ring": {l.boot, 7}, "ahead": {l.boot, 12}, "other boot": {"feedface", 10}, "new": {"", 0}} {
+		out, _ := l.since(c.boot, c.since)
+		if out == nil || !out.Reset || out.Seq != 11 || len(out.Events) != 1 || out.Events[0].State.PID != 9 {
+			t.Errorf("%s: %+v", name, out)
+		}
+	}
+}
+
+// Publishing into a full ring costs O(1): it used to copy the whole ring
+// (4096 events, about 256 KB) on every conn_close and every transition.
+func TestEventsAFullRingDoesNotCopyItself(t *testing.T) {
+	l := newEventLog()
+	for i := 0; i < EventsRing; i++ {
+		l.connClosed("1", "fill")
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	const n = 2000
+	for i := 0; i < n; i++ {
+		l.connClosed("1", "x")
+	}
+	runtime.ReadMemStats(&after)
+	// A wake channel per event, not a ring: the old copy was n × 256 KB.
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
+		t.Fatalf("%d events into a full ring allocated %d bytes", n, grew)
+	}
+	if l.n != EventsRing {
+		t.Fatalf("ring holds %d, want %d", l.n, EventsRing)
+	}
+	if out, _ := l.since(l.boot, l.seq-1); out == nil || len(out.Events) != 1 || out.Events[0].Seq != l.seq {
 		t.Fatalf("%+v", out)
 	}
 }

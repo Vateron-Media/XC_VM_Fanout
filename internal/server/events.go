@@ -51,10 +51,15 @@ type monitorEvent struct {
 }
 
 type eventLog struct {
-	mu     sync.Mutex
-	boot   string
-	seq    uint64
+	mu   sync.Mutex
+	boot string
+	seq  uint64
+	// ring is a circular buffer of the last EventsRing events, oldest at
+	// head, n of them held. Its seqs are consecutive (every seq is pushed), so
+	// a consumer's place in it is arithmetic, and a push never copies it.
 	ring   []monitorEvent
+	head   int
+	n      int
 	wake   chan struct{} // closed and replaced on every append
 	last   map[string]string
 	latest map[string]monitorStateView
@@ -99,7 +104,7 @@ func (l *eventLog) observe(states map[string]monitorStateView) {
 		l.last[id] = fp
 		l.seq++
 		sv := v
-		l.ring = append(l.ring, monitorEvent{Seq: l.seq, Type: "monitor", Stream: id, State: &sv})
+		l.push(monitorEvent{Seq: l.seq, Type: "monitor", Stream: id, State: &sv})
 		changed = true
 	}
 	for id := range l.last {
@@ -107,9 +112,6 @@ func (l *eventLog) observe(states map[string]monitorStateView) {
 			delete(l.last, id) // no longer supervised: PHP's reconcile releases it
 			delete(l.latest, id)
 		}
-	}
-	if over := len(l.ring) - EventsRing; over > 0 {
-		l.ring = append([]monitorEvent(nil), l.ring[over:]...)
 	}
 	if changed {
 		close(l.wake)
@@ -122,13 +124,29 @@ func (l *eventLog) connClosed(stream, uuid string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.seq++
-	l.ring = append(l.ring, monitorEvent{Seq: l.seq, Type: "conn_close", Stream: stream, UUID: uuid})
-	if over := len(l.ring) - EventsRing; over > 0 {
-		l.ring = append([]monitorEvent(nil), l.ring[over:]...)
-	}
+	l.push(monitorEvent{Seq: l.seq, Type: "conn_close", Stream: stream, UUID: uuid})
 	close(l.wake)
 	l.wake = make(chan struct{})
 }
+
+// push adds e as the newest event, overwriting the oldest once the ring is
+// full: O(1), where trimming a slice copied the whole ring on every event.
+// The ring is sized from EventsRing at the first push. The caller holds mu.
+func (l *eventLog) push(e monitorEvent) {
+	if l.ring == nil {
+		l.ring = make([]monitorEvent, max(1, EventsRing))
+	}
+	if l.n < len(l.ring) {
+		l.ring[(l.head+l.n)%len(l.ring)] = e
+		l.n++
+		return
+	}
+	l.ring[l.head] = e // the oldest goes, and with it its state
+	l.head = (l.head + 1) % len(l.ring)
+}
+
+// at is the i-th event held, oldest first. The caller holds mu.
+func (l *eventLog) at(i int) monitorEvent { return l.ring[(l.head+i)%len(l.ring)] }
 
 type eventsReply struct {
 	Boot   string         `json:"boot"`
@@ -143,8 +161,8 @@ func (l *eventLog) since(boot string, seq uint64) (*eventsReply, <-chan struct{}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	oldest := l.seq + 1
-	if len(l.ring) > 0 {
-		oldest = l.ring[0].Seq
+	if l.n > 0 {
+		oldest = l.at(0).Seq
 	}
 	if boot != l.boot || seq > l.seq || seq+1 < oldest {
 		out := &eventsReply{Boot: l.boot, Seq: l.seq, Reset: true, Events: []monitorEvent{}}
@@ -157,11 +175,12 @@ func (l *eventLog) since(boot string, seq uint64) (*eventsReply, <-chan struct{}
 	if seq == l.seq {
 		return nil, l.wake
 	}
-	out := &eventsReply{Boot: l.boot, Seq: l.seq, Events: []monitorEvent{}}
-	for _, e := range l.ring {
-		if e.Seq > seq {
-			out.Events = append(out.Events, e)
-		}
+	// oldest-1 <= seq < l.seq here, and the seqs held are consecutive: the
+	// last l.seq-seq events are the ones after seq.
+	k := int(l.seq - seq)
+	out := &eventsReply{Boot: l.boot, Seq: l.seq, Events: make([]monitorEvent, 0, k)}
+	for i := l.n - k; i < l.n; i++ {
+		out.Events = append(out.Events, l.at(i))
 	}
 	return out, nil
 }

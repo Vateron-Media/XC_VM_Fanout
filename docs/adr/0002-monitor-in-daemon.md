@@ -2,8 +2,11 @@
 
 Status: **implemented** — M1–M5 landed, off by default (see Rollout).
 
-Supersedes the "PHP retains per-stream process monitoring" line in XC_VM's
-`docs/adr/0003-full-daemon-cutover.md`.
+Supersedes, in XC_VM's `docs/adr/0003-full-daemon-cutover.md`, its premise that per-stream
+process monitoring stays in PHP: §1 "Two things the daemon does NOT replace" keeps the
+per-stream ffmpeg outside the daemon, and Phase F lists `MonitorCommand` health among the
+readers of the on-disk HLS. (0003 has no line worded "PHP retains per-stream process
+monitoring".)
 
 Date: 2026-09-10
 
@@ -38,7 +41,8 @@ The obvious version of this change — "give the daemon a MySQL connection and p
 `StreamProcess.php` to Go" — **is not available**, and this is the central finding.
 
 XC_VM's database credentials live in `config.enc` (AES-256-GCM). The key is derived from
-`install_id` and the whole thing is handled inside the compiled `XC_VM` C extension.
+`install_id` and the whole thing is handled inside the compiled `xcvm_core` extension (the `XC_VM` class;
+written in Rust since the original C extension was retired).
 `src/Core/Config/ConfigReader.php` states it outright:
 
 > Учётные данные БД и Redis расширение никогда не возвращает в PHP;
@@ -49,7 +53,7 @@ once `config.enc` exists. For the daemon to reach MySQL it would have to either
 
 - reimplement the vendor's protected key derivation — adversarial to a deliberate security
   control, and it would break on any extension update; or
-- link the C extension — which ends `CGO_ENABLED=0`, and with it the single static binary
+- link the extension's native library — which ends `CGO_ENABLED=0`, and with it the single static binary
   per architecture that is the daemon's defining property and its whole install story.
 
 Neither is acceptable. **The daemon does not get a database connection.**
@@ -135,8 +139,10 @@ AND its command line to carry the panel-supplied `adopt_match`, because pids are
 thing standing between a crash and dead channels.
 
 `monitor_pid` in `streams_servers` changes meaning — it becomes the daemon's pid for every
-supervised stream, so anything reconciling on it needs updating. That is the one piece of
-panel bookkeeping this work does not yet touch.
+supervised stream, so anything reconciling on it needs updating. The panel now does:
+`StreamProcess::superviseStream()` writes the daemon's pid there at the hand-over, the
+supervision reconcile (`StreamProcess::supervisedRowUpdate()`) keeps it, and the "is anything
+watching this stream" check does not read a daemon pid as "no monitor".
 
 **Rollback.** The daemon is only asked to supervise a stream when PHP `PUT`s a spec for it.
 If PHP stops doing that, `MonitorCommand` runs exactly as it does today. The cutover is

@@ -264,6 +264,7 @@ func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Toke
 			delete(c.sessions, n)
 		}
 	}
+	tok := c.sessions[e.Epoch].tok
 	c.mu.Unlock()
 	if doc.MainTimeMs > 0 {
 		c.offsetMs.Store(doc.MainTimeMs - c.now().UnixMilli())
@@ -273,15 +274,12 @@ func (c *Client) acceptRekey(h http.Header, body, nonce, ephSk []byte) (*cc.Toke
 	c.State.PendingEphSk = nil
 	// A re-key is how a node whose tokens all expired comes back; the lease that
 	// arrives with the new token is the one it serves on from here.
-	acceptLease(c.State, doc.Lease)
+	acceptLease(c.State, doc.Lease, leaseAnchor{MainNow: c.MainNowMs() / 1000, Gen: tok.Gen})
 	err = c.State.saveLocked()
 	c.State.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	tok := c.sessions[e.Epoch].tok
-	c.mu.Unlock()
 	return tok, nil
 }
 

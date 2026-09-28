@@ -14,6 +14,11 @@ import (
 // "Lease"): `exp - iat` may be 26 h exactly, never more.
 const MaxLeaseSec = 26 * 3600
 
+// LeaseSkewSec is how far a lease's iat may be ahead of MAIN's time as the
+// node estimates it: the extension's `iat - 120 <= main_time`
+// (cluster_lease_verify, the token's own nbf skew).
+const LeaseSkewSec = 120
+
 // Lease is the lease MAIN signed for this node — its statement of how long the
 // node may keep serving viewers once it can no longer reach MAIN. It is kept
 // exactly as it arrived, the signed bytes and the signature, so whatever comes
@@ -21,10 +26,11 @@ const MaxLeaseSec = 26 * 3600
 // `cluster_lease_verify`, which resolves the panel key through the pin, or this
 // agent) judges the bytes MAIN signed rather than a re-encoding of them.
 //
-// Nothing reads it yet. This agent stores it and reports it; the state machine
-// that acts on it — and the MAIN-time anchor it has to be judged against, which
-// this agent does not yet hold in any form worth trusting — is the increment
-// after (ADR 0004, Phase 9).
+// Nothing reads it yet. This agent checks it on arrival against its own
+// estimate of MAIN's time and the generation of the token it came with, stores
+// it and reports it; the state machine that acts on it — and the
+// rollback-resistant MAIN-time anchor it has to be judged against later — is
+// the increment after (ADR 0004, Phase 9).
 type Lease struct {
 	// Payload is the exact document MAIN signed, and Sig its 64-byte signature
 	// under the panel tag `lea`.
@@ -39,8 +45,23 @@ type Lease struct {
 	ServerID int64  `json:"server_id"`
 }
 
+// leaseAnchor is what a lease is judged against when it arrives: MAIN's time
+// as the node estimates it at receipt (unix seconds), and the node's
+// generation, the one in the token the lease came with.
+type leaseAnchor struct {
+	MainNow int64
+	Gen     int64
+}
+
 // acceptLease verifies a lease that arrived beside a token and records it on
 // st. The caller holds st's lock (or owns st outright) and saves afterwards.
+//
+// The checks are the extension's `cluster_lease_verify` (ADR-002, "Lease"):
+// the panel signature under `lea`, typ, v = 1, this node's uuid,
+// `exp - iat <= 26 h` and `iat - 120 <= main_time < exp` on at.MainNow; plus
+// what that call leaves to its caller: this server, and the generation, which
+// must be the node's own (at.Gen) — a lease is issued for, and fenced by, one
+// generation (ADR-002, "Leases are checked against the generation only").
 //
 // It returns false and records nothing when MAIN sent no lease at all, which is
 // ordinary: MAIN sends the token without one whenever the extension refuses to
@@ -52,7 +73,7 @@ type Lease struct {
 // raw is a json.RawMessage on purpose: the lease rides in the same reply as the
 // token, and a lease whose base64 is broken must cost the node its lease, not
 // its session. Nothing here fails the surrounding decode.
-func acceptLease(st *State, raw json.RawMessage) bool {
+func acceptLease(st *State, raw json.RawMessage, at leaseAnchor) bool {
 	refuse := func(why string) bool {
 		st.LeaseRefused = why
 		return false
@@ -102,10 +123,16 @@ func acceptLease(st *State, raw json.RawMessage) bool {
 		return refuse("another server's lease")
 	case doc.Gen == 0 || doc.Iat <= 0 || doc.Exp <= doc.Iat:
 		return refuse("a lease with no window")
+	case at.Gen <= 0 || doc.Gen != uint64(at.Gen):
+		return refuse("a lease for another generation of this node")
 	case doc.Exp-doc.Iat > MaxLeaseSec:
 		// The extension caps this itself, so a document past the cap was not
 		// written by one, whoever signed it.
 		return refuse("a window longer than the 26 h a lease may hold")
+	case at.MainNow < doc.Iat-LeaseSkewSec:
+		return refuse("issued in the future on MAIN's clock")
+	case at.MainNow >= doc.Exp:
+		return refuse("already expired on MAIN's clock")
 	case w.Exp != doc.Exp:
 		return refuse("the exp announced beside the lease is not the one inside it")
 	}

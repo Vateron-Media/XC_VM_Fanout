@@ -24,6 +24,17 @@ import (
 //     again, without raising its backoff. A 429 RATE_LIMITED is token_rekey's
 //     once-a-minute slot, handled by recover.
 //
+// And a refusal that says the node's clock is wrong:
+//
+//   - 401 CLOCK_SKEW: the request's stamp was more than 90 s off MAIN's clock
+//     (Canonical::withinWindow). The denial carries main_time_ms and is
+//     verified like every other (panel-signed, naming this node and this
+//     request's nonce), so the agent takes MAIN's clock from it, as from a
+//     REPLAY, and sends the op once more at once, stamped anew. Without that
+//     the offset only ever came from a MAC'd reply, which a skewed node never
+//     gets: every op was refused until the token looked expired and a re-key's
+//     challenge carried the time.
+//
 // And from MAIN's front controller (ADR 0004, "The cluster pools (Phase 2,
 // second increment)"):
 //
@@ -47,14 +58,30 @@ func replayWait(d *Denial) (time.Duration, bool) {
 	return min(w, ReplayWaitMax), true
 }
 
+// skewClock is MAIN's clock from a CLOCK_SKEW refusal; ok is false for any
+// other refusal, or one that does not say MAIN's time.
+func skewClock(d *Denial) (mainMs int64, ok bool) {
+	if d == nil || d.Status != 401 || d.Reason != "CLOCK_SKEW" || d.MainTimeMs <= 0 {
+		return 0, false
+	}
+	return d.MainTimeMs, true
+}
+
 // withReplay runs send, and runs it once more when MAIN refused it with a
 // REPLAY that carries retry_after_ms, after taking MAIN's clock from the
-// denial (setClock) and waiting. send must build a fresh request each time.
+// denial (setClock) and waiting, or with a CLOCK_SKEW, after taking MAIN's
+// clock from it. send must build a fresh request each time. err is only ever
+// a *Denial once the reply verified (Client.denial): its signature and its
+// binding to this node and this request's nonce.
 func withReplay(ctx context.Context, setClock func(mainMs int64), send func() error) error {
 	err := send()
 	var d *Denial
 	if !errors.As(err, &d) {
 		return err
+	}
+	if ms, ok := skewClock(d); ok && setClock != nil {
+		setClock(ms)
+		return send()
 	}
 	w, ok := replayWait(d)
 	if !ok {

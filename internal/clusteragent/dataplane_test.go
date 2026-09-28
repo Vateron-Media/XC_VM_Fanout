@@ -68,9 +68,14 @@ func TestNonceWindowRefusesRatherThanGrow(t *testing.T) {
 func TestFileDigestIsSignedWithTheNodeKey(t *testing.T) {
 	_, st := newFake(t)
 	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
+	// MAIN's clock, as the agent measured it: 1800000000, while this node's
+	// runs 50 s behind. The digest is stamped on MAIN's clock.
+	a.Client.now = func() time.Time { return time.Unix(1800000000-50, 0) }
+	a.Client.setMainTime(1800000000 * 1000)
 
 	rec := httptest.NewRecorder()
-	body := `{"tid":"tid_0123456789","owner_sid":5,"size":1234,"sha256":"` + strings.Repeat("ab", 32) + `","iat":1800000000}`
+	// The caller's own iat (PHP's time()) is not what gets signed.
+	body := `{"tid":"tid_0123456789","owner_sid":3,"size":1234,"sha256":"` + strings.Repeat("ab", 32) + `","iat":1700000000}`
 	a.dataPlaneHandler(rec, httptest.NewRequest(http.MethodPost, "/v1/file_digest", strings.NewReader(body)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("file_digest: %d %s", rec.Code, rec.Body.String())
@@ -94,7 +99,7 @@ func TestFileDigestIsSignedWithTheNodeKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The panel's document, key for key and in its order.
-	want := `{"iat":1800000000,"owner_sid":5,"sha256":"` + strings.Repeat("ab", 32) + `","size":1234,"tid":"tid_0123456789","typ":"xcvm-file-digest","v":1}`
+	want := `{"iat":1800000000,"owner_sid":3,"sha256":"` + strings.Repeat("ab", 32) + `","size":1234,"tid":"tid_0123456789","typ":"xcvm-file-digest","v":1}`
 	if string(doc) != want {
 		t.Fatalf("document\n got %s\nwant %s", doc, want)
 	}
@@ -112,17 +117,22 @@ func TestDataPlaneRefusesWhatItCannotSign(t *testing.T) {
 	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
 
 	for name, body := range map[string]string{
-		"no sha256": `{"tid":"t0123456789","owner_sid":5,"size":1}`,
-		"short sha": `{"tid":"t0123456789","owner_sid":5,"size":1,"sha256":"ab"}`,
+		"no sha256": `{"tid":"t0123456789","owner_sid":3,"size":1}`,
+		"short sha": `{"tid":"t0123456789","owner_sid":3,"size":1,"sha256":"ab"}`,
 		"no owner":  `{"tid":"t0123456789","owner_sid":0,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `"}`,
-		"no ticket": `{"tid":"","owner_sid":5,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `"}`,
-		"bad size":  `{"tid":"t0123456789","owner_sid":5,"size":-1,"sha256":"` + strings.Repeat("ab", 32) + `"}`,
+		"no ticket": `{"tid":"","owner_sid":3,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `"}`,
+		"bad size":  `{"tid":"t0123456789","owner_sid":3,"size":-1,"sha256":"` + strings.Repeat("ab", 32) + `"}`,
 		"not json":  `nope`,
+		// The node signs digests as itself only (it is server 3).
+		"another owner": `{"tid":"t0123456789","owner_sid":5,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `"}`,
 	} {
 		rec := httptest.NewRecorder()
 		a.dataPlaneHandler(rec, httptest.NewRequest(http.MethodPost, "/v1/file_digest", strings.NewReader(body)))
 		if rec.Code == http.StatusOK {
 			t.Errorf("%s: signed anyway", name)
+		}
+		if name == "another owner" && rec.Code != http.StatusForbidden {
+			t.Errorf("%s: %d, want 403", name, rec.Code)
 		}
 	}
 

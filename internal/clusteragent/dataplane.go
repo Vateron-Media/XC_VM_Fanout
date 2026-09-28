@@ -18,7 +18,7 @@ import (
 // node's PHP over the local socket while it serves a relay or file request:
 //
 //	POST /v1/nonce        {nonce}                              -> {fresh}
-//	POST /v1/file_digest  {tid, owner_sid, size, sha256, iat?}  -> {header}
+//	POST /v1/file_digest  {tid, owner_sid, size, sha256}        -> {header}
 //
 // Both are the node's own: no call to MAIN, nothing stored on disk.
 //
@@ -27,7 +27,10 @@ import (
 //     parent has only its agent, so the window lives here.
 //   - The owner of a file vouches for what it served with its node key, which
 //     the agent holds and the node's PHP does not (Core\Cluster\Crypto\
-//     FileDigest verifies the same document on the fetcher's side).
+//     FileDigest verifies the same document on the fetcher's side). It
+//     vouches as this node only: owner_sid must be the node's own server id,
+//     and iat is the agent's own reading of MAIN's clock (a caller's iat is
+//     not signed).
 
 // NonceWindow is how long a spent nonce is remembered: longer than the request
 // window a signature is accepted in, so nothing replays inside it.
@@ -146,12 +149,12 @@ type fileDigestDoc struct {
 }
 
 func (a *Agent) serveFileDigest(w http.ResponseWriter, r *http.Request) {
+	// An iat the caller sends (older PHP does) is read and not used.
 	var body struct {
 		Tid      string `json:"tid"`
 		OwnerSid int64  `json:"owner_sid"`
 		Size     int64  `json:"size"`
 		Sha256   string `json:"sha256"`
-		Iat      int64  `json:"iat"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
@@ -165,10 +168,17 @@ func (a *Agent) serveFileDigest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no node key", http.StatusServiceUnavailable)
 		return
 	}
-	iat := body.Iat
-	if iat <= 0 {
-		iat = time.Now().Unix()
+	// The node key speaks for this node alone: a digest naming another owner
+	// would let whoever reaches this socket vouch, in this node's name, for a
+	// file another node serves.
+	if body.OwnerSid != a.Client.State.ServerID {
+		http.Error(w, "owner_sid is not this node", http.StatusForbidden)
+		return
 	}
+	// Stamped on MAIN's clock, which every node's times are judged on (the
+	// node's own clock is the one nothing vouches for), as this agent last
+	// measured it; the caller's clock is not asked.
+	iat := a.Client.MainNowMs() / 1000
 	doc, err := json.Marshal(fileDigestDoc{Iat: iat, OwnerSid: body.OwnerSid, Sha256: sum, Size: body.Size, Tid: body.Tid, Typ: "xcvm-file-digest", V: 1})
 	if err != nil {
 		http.Error(w, "doc", http.StatusInternalServerError)
