@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 )
@@ -136,36 +135,7 @@ func (s *State) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(s.path)
-	f, err := os.CreateTemp(dir, ".state-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return err
-	}
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
-	}
-	return nil
+	return writeFile(s.path, b, fileWrite{perm: 0o600, exact: true})
 }
 
 // SignKey is the node's Ed25519 key.

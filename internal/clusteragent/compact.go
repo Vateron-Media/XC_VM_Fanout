@@ -541,14 +541,7 @@ func (ls *laneSpool) commit(m *compactManifest) error {
 	if err != nil {
 		return err
 	}
-	path := ls.manifestPath()
-	if err := writeSynced(path+".tmp", b); err != nil {
-		return err
-	}
-	if err := os.Rename(path+".tmp", path); err != nil {
-		return err
-	}
-	return syncDir(filepath.Dir(path))
+	return writeFile(ls.manifestPath(), b, fileWrite{perm: 0o640, mustSyncDir: true})
 }
 
 // rollForward replaces the tail by its compaction: the replaced files go,
@@ -646,27 +639,7 @@ func writeSkip(dir string, count int, tag string) error {
 	}
 	line, _ := json.Marshal(map[string]any{"type": "skip", "t": time.Now().UnixMilli(), "d": map[string]int{"count": count}})
 	name := fmt.Sprintf("%019d-skip-%s.ndjson", 0, tag)
-	tmp := filepath.Join(dir, "."+name+".tmp")
-	if err := os.WriteFile(tmp, append(line, '\n'), 0o640); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(dir, name))
-}
-
-func writeSynced(path string, b []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
+	return writeFile(filepath.Join(dir, name), append(line, '\n'), fileWrite{perm: 0o640})
 }
 
 // syncDir makes the renames in a directory durable. A variable, as is

@@ -1,18 +1,14 @@
 package clusteragent
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
+	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -269,35 +265,20 @@ func (c *Client) callVia(ctx context.Context, hc *http.Client, s session, op str
 func (c *Client) setMainTime(mainMs int64) { c.offsetMs.Store(mainMs - c.now().UnixMilli()) }
 
 func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op string, plain []byte, out any, signNode bool) error {
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return err
-	}
-	ts := uint64(c.MainNowMs())
-	path := cc.PathPrefix + op
-	reqCtx, err := cc.RequestContext(cc.Request{
-		Proto: Proto, Agent: c.Agent, Method: "POST", Path: path, ContentType: octet,
-		Node: c.State.NodeUUID, Epoch: s.epoch, TsMs: ts, Nonce: nonce,
-	})
+	r, err := newRequest(c.Agent, c.State.NodeUUID, op, octet, s.epoch, c.MainNowMs)
 	if err != nil {
 		return err
 	}
+	reqCtx, nonce := r.ctx, r.nonce
 	body, err := cc.Box(s.keys.EncUp, reqCtx, plain)
 	if err != nil {
 		return err
 	}
-	h := http.Header{}
-	h.Set(cc.HProto, strconv.Itoa(Proto))
-	h.Set(cc.HAgent, c.Agent)
-	h.Set(cc.HNode, c.State.NodeUUID)
-	h.Set(cc.HEpoch, strconv.FormatUint(s.epoch, 10))
-	h.Set(cc.HTs, strconv.FormatUint(ts, 10))
-	h.Set(cc.HNonce, hex.EncodeToString(nonce))
-	h.Set(cc.HSig, hex.EncodeToString(cc.MAC(s.keys.MacUp, reqCtx, body)))
-	h.Set("Content-Type", octet)
+	var signKey ed25519.PrivateKey
 	if signNode {
-		h.Set(cc.HNodeSig, hex.EncodeToString(cc.SignNode(c.State.SignKey(), "request", append(append([]byte{}, reqCtx...), cc.SHA256(body)...))))
+		signKey = c.State.SignKey()
 	}
+	h := r.header(body, s.keys.MacUp, signKey)
 
 	if hc == nil {
 		hc = c.HTTP
@@ -307,7 +288,7 @@ func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op st
 	}
 	var lastErr error = ErrTransport
 	for _, base := range c.urls() {
-		st, rh, rb, err := c.postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
+		st, rh, rb, err := postWith(ctx, hc, strings.TrimRight(base, "/")+"/"+op, h, body)
 		if err != nil {
 			c.reached(ctx, base, err)
 			lastErr = err
@@ -346,38 +327,10 @@ func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op st
 	return lastErr
 }
 
-func (c *Client) post(ctx context.Context, url string, h http.Header, body []byte) (int, http.Header, []byte, error) {
-	return c.postWith(ctx, c.HTTP, url, h, body)
-}
-
-func (c *Client) postWith(ctx context.Context, hc *http.Client, url string, h http.Header, body []byte) (int, http.Header, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	req.Header = h.Clone()
-	res, err := hc.Do(req)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	defer res.Body.Close()
-	rb, err := io.ReadAll(io.LimitReader(res.Body, MaxReply+1))
-	if err != nil || len(rb) > MaxReply {
-		return 0, nil, nil, ErrTransport
-	}
-	return res.StatusCode, res.Header, rb, nil
-}
-
 func (c *Client) openReply(s session, reqCtx []byte, status int, h http.Header, body []byte, out any) error {
-	ts, err1 := strconv.ParseUint(h.Get(cc.HTs), 10, 64)
-	nonce, err2 := hex.DecodeString(h.Get(cc.HNonce))
-	mac, err3 := hex.DecodeString(h.Get(cc.HSig))
-	if err1 != nil || err2 != nil || err3 != nil || len(nonce) != 16 {
-		return ErrTransport
-	}
-	resCtx, err := cc.ResponseContext(reqCtx, uint32(status), h.Get("Content-Type"), ts, nonce)
-	if err != nil || !cc.VerifyMAC(s.keys.MacDown, resCtx, body, mac) {
-		return ErrTransport
+	resCtx, err := replyContext(s.keys.MacDown, reqCtx, status, h, body)
+	if err != nil {
+		return err
 	}
 	plain, err := cc.Unbox(s.keys.EncDown, resCtx, body)
 	if err != nil {
@@ -397,36 +350,16 @@ func (c *Client) openReply(s session, reqCtx []byte, status int, h http.Header, 
 
 // denial returns a verified refusal about this request, or nil.
 func (c *Client) denial(status int, h http.Header, body, nonce []byte) *Denial {
-	sig, err := base64.RawURLEncoding.DecodeString(h.Get(cc.HPanelSig))
-	if err != nil || !cc.VerifyPanel(c.State.PanelSignPub, "den", body, sig) {
-		return nil
-	}
-	var d Denial
-	if json.Unmarshal(body, &d) != nil || d.Node != c.State.NodeUUID || d.Nonce != hex.EncodeToString(nonce) {
-		return nil
-	}
-	d.Status = status
-	d.Doc = append(json.RawMessage{}, body...)
-	return &d
+	return verifyDenial(c.State.PanelSignPub, c.State.NodeUUID, status, h, body, nonce)
 }
 
 // Health fetches and verifies MAIN's signed health document from one URL.
 func (c *Client) Health(ctx context.Context, base string) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/health", nil)
+	_, h, body, err := getSigned(ctx, c.HTTP, strings.TrimRight(base, "/")+"/health")
 	if err != nil {
 		return nil, err
 	}
-	res, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-	if err != nil {
-		return nil, err
-	}
-	sig, err := base64.RawURLEncoding.DecodeString(res.Header.Get(cc.HPanelSig))
-	if err != nil || !cc.VerifyPanel(c.State.PanelSignPub, "hlt", body, sig) {
+	if !panelSigned(c.State.PanelSignPub, "hlt", h, body) {
 		return nil, ErrTransport
 	}
 	var doc map[string]any
@@ -471,25 +404,49 @@ func (c *Client) Refresh(ctx context.Context) (*cc.Token, error) {
 	if err := c.call(ctx, s, "token_refresh", map[string]string{"eph_pub": base64.StdEncoding.EncodeToString(ephPub)}, &reply, true); err != nil {
 		return nil, err
 	}
-	sealed, err := base64.StdEncoding.DecodeString(reply.TokenSealed)
+	// The lease this token serves on. A resent token (MAIN re-sends the same one
+	// for the same ephemeral key) comes with a lease minted at that moment, so
+	// it is taken on every reply, not only on a new epoch. It is judged on
+	// MAIN's time as this reply just set it.
+	return c.takeToken(reply.TokenSealed, reply.Epoch, ephSk, reply.Lease, false, 0)
+}
+
+// takeToken opens the token MAIN sent for epoch (base64, sealed to ephSk),
+// stores it and takes the lease it came with, on MAIN's time. A refresh adds
+// the epoch to those held (State.AddEpoch keeps the two newest); a re-key
+// (only) makes it the node's only one, taking MAIN's clock from mainTimeMs
+// first when the reply says it.
+func (c *Client) takeToken(tokenSealed string, epoch uint64, ephSk []byte, lease json.RawMessage, only bool, mainTimeMs int64) (*cc.Token, error) {
+	sealed, err := base64.StdEncoding.DecodeString(tokenSealed)
 	if err != nil {
 		return nil, ErrTransport
 	}
-	e := Epoch{Epoch: reply.Epoch, EphSk: ephSk, TokenSealed: sealed}
+	e := Epoch{Epoch: epoch, EphSk: ephSk, TokenSealed: sealed}
 	if err := c.openEpoch(e); err != nil {
 		return nil, err
 	}
-	c.State.AddEpoch(e)
+	if !only {
+		c.State.AddEpoch(e)
+	}
 	c.mu.Lock()
+	if only {
+		for n := range c.sessions {
+			if n != e.Epoch {
+				delete(c.sessions, n)
+			}
+		}
+	}
 	tok := c.sessions[e.Epoch].tok
 	c.mu.Unlock()
+	if mainTimeMs > 0 {
+		c.setMainTime(mainTimeMs)
+	}
 	c.State.mu.Lock()
+	if only {
+		c.State.Epochs = []Epoch{e}
+	}
 	c.State.PendingEphSk = nil
-	// The lease this token serves on. A resent token (MAIN re-sends the same one
-	// for the same ephemeral key) comes with a lease minted at that moment, so
-	// this runs on every reply, not only on a new epoch. It is judged on MAIN's
-	// time as this reply just set it.
-	acceptLease(c.State, reply.Lease, leaseAnchor{MainNow: c.MainNowMs() / 1000, Gen: tok.Gen})
+	acceptLease(c.State, lease, leaseAnchor{MainNow: c.MainNowMs() / 1000, Gen: tok.Gen})
 	err = c.State.saveLocked()
 	c.State.mu.Unlock()
 	if err != nil {

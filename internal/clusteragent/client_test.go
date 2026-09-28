@@ -35,9 +35,21 @@ func newFake(t *testing.T) (*fakeMain, *State) {
 	uuid := "0f8fad5b-d9cb-469f-a165-70867728950e"
 	secret := make([]byte, 32)
 	secret[0] = 7
+	ephSk, sealed := mintToken(t, panel, uuid, 1, secret)
+	st := NewState(filepath.Join(t.TempDir(), "state.json"))
+	st.NodeUUID, st.ServerID, st.NodeSignSeed = uuid, 3, make([]byte, 32)
+	st.PanelSignPub = panel.Public().(ed25519.PublicKey)
+	st.Epochs = []Epoch{{Epoch: 1, EphSk: ephSk, TokenSealed: sealed}}
+	return &fakeMain{panel: panel, keys: cc.DeriveSession(secret), uuid: uuid}, st
+}
+
+// mintToken mints epoch's token for node uuid on server 3, as xcvm_core does
+// (doc signed "tok", sealed to a fresh epoch key), and returns that key.
+func mintToken(t *testing.T, panel ed25519.PrivateKey, uuid string, epoch uint64, secret []byte) (ephSk, sealed []byte) {
+	t.Helper()
 	now := time.Now().Unix()
 	doc, _ := json.Marshal(map[string]any{
-		"v": 1, "typ": "xcvm-token", "node_uuid": uuid, "server_id": 3, "gen": 1, "epoch": 1,
+		"v": 1, "typ": "xcvm-token", "node_uuid": uuid, "server_id": 3, "gen": 1, "epoch": epoch,
 		"iat": now, "nbf": now - 120, "exp": now + 4500, "kid": "00000000", "rotation_min": 60,
 		"grace_min": 15, "refresh_at": now + 1800, "token": hex.EncodeToString(secret),
 	})
@@ -48,11 +60,7 @@ func newFake(t *testing.T) (*fakeMain, *State) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := NewState(filepath.Join(t.TempDir(), "state.json"))
-	st.NodeUUID, st.ServerID, st.NodeSignSeed = uuid, 3, make([]byte, 32)
-	st.PanelSignPub = panel.Public().(ed25519.PublicKey)
-	st.Epochs = []Epoch{{Epoch: 1, EphSk: ephSk, TokenSealed: sealed}}
-	return &fakeMain{panel: panel, keys: cc.DeriveSession(secret), uuid: uuid}, st
+	return ephSk, sealed
 }
 
 func (f *fakeMain) ServeHTTP(w http.ResponseWriter, r *http.Request) {

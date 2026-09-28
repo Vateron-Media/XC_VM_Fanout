@@ -471,7 +471,7 @@ func (r *Registry) Seed(records []map[string]any, reset bool) int {
 	return n
 }
 
-// Save writes the snapshot when something changed (written aside, renamed in).
+// Save writes the snapshot when something changed (written aside, synced, renamed in).
 func (r *Registry) Save() error {
 	r.mu.Lock()
 	if !r.dirty {
@@ -484,11 +484,7 @@ func (r *Registry) Save() error {
 	if err != nil {
 		return err
 	}
-	tmp := r.snap + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o640); err != nil {
-		return err
-	}
-	return os.Rename(tmp, r.snap)
+	return writeFile(r.snap, b, fileWrite{perm: 0o640})
 }
 
 func sameBut(a, b map[string]any, except string) bool {
@@ -550,11 +546,7 @@ func spoolP0(dir string, events []map[string]any) error {
 		return err
 	}
 	name := fmt.Sprintf("%019d-agent-%04x.ndjson", monotonicNs(), rand.Intn(0x10000))
-	tmp := filepath.Join(p0, "."+name+".tmp")
-	if err := os.WriteFile(tmp, body, 0o640); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(p0, name))
+	return writeFile(filepath.Join(p0, name), body, fileWrite{perm: 0o640, noSync: true})
 }
 
 // connHandler serves /v1/conn on the local socket.
