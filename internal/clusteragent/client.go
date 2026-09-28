@@ -82,7 +82,10 @@ type Client struct {
 	mu       sync.Mutex
 	sessions map[uint64]session
 	offsetMs atomic.Int64 // MAIN time − local time, from authenticated replies
-	now      func() time.Time
+	// offsetAtMs is the local unix ms offsetMs was last taken at; 0 while
+	// MAIN's time has not been observed (status.go).
+	offsetAtMs atomic.Int64
+	now        func() time.Time
 	// failed holds the MAIN URLs that could not be reached (connect, TLS or
 	// timeout), each until it is tried first again (URLRetry).
 	failed map[string]time.Time
@@ -262,7 +265,11 @@ func (c *Client) callVia(ctx context.Context, hc *http.Client, s session, op str
 }
 
 // setMainTime takes MAIN's clock from an authenticated main_time_ms.
-func (c *Client) setMainTime(mainMs int64) { c.offsetMs.Store(mainMs - c.now().UnixMilli()) }
+func (c *Client) setMainTime(mainMs int64) {
+	now := c.now().UnixMilli()
+	c.offsetMs.Store(mainMs - now)
+	c.offsetAtMs.Store(now)
+}
 
 func (c *Client) callOnce(ctx context.Context, hc *http.Client, s session, op string, plain []byte, out any, signNode bool) error {
 	r, err := newRequest(c.Agent, c.State.NodeUUID, op, octet, s.epoch, c.MainNowMs)

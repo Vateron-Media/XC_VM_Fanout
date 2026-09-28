@@ -67,6 +67,8 @@ type Agent struct {
 	fanoutLive         atomic.Bool  // the fanout's /events feed is being followed
 	snapshotting       atomic.Bool  // a conn_snapshot is being sent
 	state              atomic.Value // string: the node state in MAIN's latest reply
+	mode               atomic.Int64 // the node mode in MAIN's latest reply
+	lastBeatMs         atomic.Int64 // local unix ms of the last heartbeat MAIN answered (status.go)
 	admits             admitCache   // conn_admit's admitting answers (admission.go)
 	p2Touch            atomic.Bool  // HLS touches go on the P2 lane (touch.go)
 	helloing           atomic.Bool  // a hello is being retried in the background
@@ -312,6 +314,7 @@ func (a *Agent) publish(r *Reply) {
 	a.pubMu.Lock()
 	defer a.pubMu.Unlock()
 	a.flows.Store(int64(r.Flows))
+	a.mode.Store(int64(r.Mode))
 	// With STREAMS off, streams.json says 0 before flows.json says so.
 	a.streamsFlow(r.Flows)
 	a.state.Store(r.State)
@@ -793,6 +796,7 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 	if err := a.Client.Call(ctx, "heartbeat", payload, &r, false); err != nil {
 		return nil, err
 	}
+	a.lastBeatMs.Store(time.Now().UnixMilli())
 	a.publish(&r)
 	return &r, nil
 }
