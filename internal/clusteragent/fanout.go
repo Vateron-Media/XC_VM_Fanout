@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
@@ -49,13 +50,36 @@ type fanoutReply struct {
 	Events []fanoutEvent `json:"events"`
 }
 
+// FanoutIdleConn is how long a kept-alive connection to the fanout's control
+// socket may sit unused before the agent closes it: under the daemon's own
+// idle timeout, so the agent is the side that closes.
+var FanoutIdleConn = 30 * time.Second
+
+// fanoutClients holds one client per control socket path, for the life of the
+// process. A client of its own per call left each call's kept-alive
+// connection open behind a transport nobody used again: an fd and a goroutine
+// on both sides per GET /connections or conn.drop, never closed.
+var fanoutClients sync.Map // socket path → *http.Client
+
+// fanoutClient is the socket's client, shared by every call to it. It has no
+// overall timeout: each request carries its own deadline (fanoutPoll's is
+// the long-poll's).
 func fanoutClient(sock string) *http.Client {
-	return &http.Client{
-		Timeout: FanoutWait + 10*time.Second,
-		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
-		}},
+	if hc, ok := fanoutClients.Load(sock); ok {
+		return hc.(*http.Client)
 	}
+	hc, _ := fanoutClients.LoadOrStore(sock, &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+			},
+			// The /events long-poll, a /connections read and a conn.drop may
+			// overlap; more than that is not kept.
+			MaxIdleConnsPerHost: 4,
+			IdleConnTimeout:     FanoutIdleConn,
+		},
+	})
+	return hc.(*http.Client)
 }
 
 // RunFanoutEvents follows the fanout's feed until ctx ends.
@@ -99,6 +123,8 @@ func (a *Agent) RunFanoutEvents(ctx context.Context) {
 
 func fanoutPoll(ctx context.Context, hc *http.Client, boot string, seq uint64) (*fanoutReply, error) {
 	q := url.Values{"boot": {boot}, "since": {strconv.FormatUint(seq, 10)}, "wait": {strconv.Itoa(int(FanoutWait / time.Second))}}
+	ctx, cancel := context.WithTimeout(ctx, FanoutWait+10*time.Second)
+	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://fanout/events?"+q.Encode(), nil)
 	res, err := hc.Do(req)
 	if err != nil {

@@ -298,3 +298,52 @@ func TestAgentEndsDaemonViewersTheFanoutReportsGone(t *testing.T) {
 		t.Fatalf("err %v, events %s", err, s.types())
 	}
 }
+
+// Every call to the fanout's control socket goes over one kept-alive
+// connection. A client of its own per call left each call's connection open
+// behind a transport nobody used again: 400 calls held about 800 fds and as
+// many goroutines, on the agent's side and the daemon's.
+func TestFanoutCallsShareOneConnection(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "xf")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "c.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conns atomic.Int32
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodDelete {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.Write([]byte(`[{"uuid":"live1","stream_id":4,"since_ms":1}]`))
+		}),
+		ConnState: func(_ net.Conn, s http.ConnState) {
+			if s == http.StateNew {
+				conns.Add(1)
+			}
+		},
+	}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+
+	if fanoutClient(sock) != fanoutClient(sock) {
+		t.Fatal("a second client for the same socket")
+	}
+	a := &Agent{Logf: t.Logf, FanoutCtl: sock}
+	run := a.localExec(func(context.Context, *Command, WireCommand) (bool, []byte) { return false, []byte("php") })
+	for i := 0; i < 200; i++ {
+		live, err := fanoutConnections(sock)
+		if err != nil || live["live1"].StreamID != "4" {
+			t.Fatalf("call %d: %v %v", i, live, err)
+		}
+		if ok, res := run(context.Background(), &Command{Type: "conn.drop", Args: map[string]any{"uuid": "live1"}}, WireCommand{}); !ok || string(res) != `{"result":true}` {
+			t.Fatalf("drop %d: %v %s", i, ok, res)
+		}
+	}
+	if n := conns.Load(); n != 1 {
+		t.Fatalf("400 sequential calls opened %d connections, want 1", n)
+	}
+}

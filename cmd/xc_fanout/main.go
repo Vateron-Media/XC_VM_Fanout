@@ -388,6 +388,12 @@ func serveUnix(path string, h http.Handler) (*http.Server, func()) {
 	return srv, cleanup
 }
 
+// unixIdleTimeout is how long a unix-socket connection may sit idle between
+// requests: longer than the agent's own idle close (clusteragent.
+// FanoutIdleConn) and nginx's upstream keepalive, so a client normally closes
+// first and this only reaps what a client abandoned.
+var unixIdleTimeout = 2 * time.Minute
+
 // listenUnix binds path and serves h on it, returning the server and a cleanup
 // that removes the socket file.
 //
@@ -414,7 +420,12 @@ func listenUnix(path string, h http.Handler) (*http.Server, func(), error) {
 	_ = os.Chmod(path, 0o660)
 	owned := &ownedListener{Listener: ln}
 
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: defaults.HTTPReadHeaderTimeout}
+	// IdleTimeout closes a kept-alive connection no request came on for that
+	// long. It runs only between requests, so neither a live-TS response nor
+	// the agent's /events long-poll is cut by it; without it every connection
+	// a client left idle (and never closed) held an fd and a goroutine here
+	// for the daemon's life.
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: defaults.HTTPReadHeaderTimeout, IdleTimeout: unixIdleTimeout}
 	go func() {
 		if err := srv.Serve(owned); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve %s: %v", path, err)
