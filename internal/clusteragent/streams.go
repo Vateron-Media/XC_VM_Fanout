@@ -263,6 +263,9 @@ func (a *Agent) SyncStreams(ctx context.Context) error {
 	if s.st.StreamsPass != nil || s.cursor == 0 {
 		return s.fullPass(ctx)
 	}
+	if a.streamsResyncWanted.Swap(false) {
+		a.streamsResyncNow = true // a resync command (fence.go)
+	}
 	if a.streamsResyncNow || time.Now().Unix() >= s.st.StreamsResyncAt+int64(a.resyncEvery()/time.Second) {
 		return s.resync(ctx)
 	}

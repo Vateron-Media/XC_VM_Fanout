@@ -189,6 +189,10 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 	if dir == "" {
 		return false, nil
 	}
+	if a.quarantined() {
+		// MAIN serves no replica to a quarantined node (fence.go).
+		return false, nil
+	}
 	a.replicaMu.Lock()
 	defer a.replicaMu.Unlock()
 	deltas := filepath.Join(dir, "blocklist.d")
@@ -198,7 +202,8 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 	// First at the agent's start, then whenever the node's keys changed
 	// (an enrolment, a re-enrolment, a new panel key): records that no
 	// longer verify are asked for again.
-	if keys := a.replicaKeyPrint(); keys != a.replicaKeys {
+	full := a.replicaResync.Swap(false)
+	if keys := a.replicaKeyPrint(); keys != a.replicaKeys || full {
 		a.recheckLocked(dir)
 		a.replicaKeys = keys
 	}
@@ -221,12 +226,18 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 	for round := 0; round < 100; round++ {
 		since := st.BlocklistSeq
 		now := time.Now().Unix()
-		if n, _ := os.ReadDir(deltas); len(n) >= ReplicaMaxDeltas || now-st.FullAt >= int64(ReplicaFullEvery/time.Second) {
+		if n, _ := os.ReadDir(deltas); len(n) >= ReplicaMaxDeltas || now-st.FullAt >= int64(ReplicaFullEvery/time.Second) || (full && round == 0) {
 			since = 0
 		}
 		have := map[string]string{"blocklist": st.BlocklistEtag}
 		for _, name := range WholeSections {
 			have[name] = st.etag(name)
+		}
+		if full && round == 0 {
+			// A resync: MAIN sends every section, whatever the node holds.
+			for name := range have {
+				have[name] = ""
+			}
 		}
 		var raw json.RawMessage
 		if err := a.Client.Call(ctx, "config", map[string]any{"blocklist_since": since, "have": have}, &raw, false); err != nil {

@@ -102,6 +102,7 @@ func main() {
 	force := fs.Bool("force", false, "enrol: replace an identity that already holds tokens")
 	phpBin := fs.String("php", "/home/xc_vm/bin/php/bin/php", "run: the PHP that runs MAIN's commands")
 	console := fs.String("console", "/home/xc_vm/console.php", "run: the panel console (cluster:exec)")
+	signalsDir := fs.String("signals", "/home/xc_vm/signals", "run: the node's SIGNALS_PATH, where a fence past its drain drops the viewers it holds; empty = off")
 	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
 	relayAddr := fs.String("relay-addr", clusteragent.RelayProxyAddr, "run: the loopback relay proxy's address (DATAPLANE); empty = off")
 	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's: the loopback relay proxy alone)")
@@ -228,7 +229,8 @@ func main() {
 		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl, LeaseFile: filepath.Join(filepath.Dir(*statePath), clusteragent.LeaseStateFile),
 		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute),
 		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
-		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath)}
+		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
+		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir}
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
 	switch {

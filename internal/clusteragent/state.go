@@ -96,6 +96,13 @@ type State struct {
 	// rather than starting it again (mainclock.go).
 	MainSeenMs int64      `json:"main_seen_ms,omitempty"`
 	MainAnchor *ClockMark `json:"main_anchor,omitempty"`
+	// Fence is the fence MAIN commanded (node.fence), until node.unfence
+	// lifts it or, for a licence fence, MAIN accepts the session again
+	// (fence.go).
+	Fence *Fence `json:"fence,omitempty"`
+	// Quarantine is why MAIN quarantined this node (node.quarantine), until
+	// a reply says it is active again; "" when it is not.
+	Quarantine string `json:"quarantine,omitempty"`
 
 	path string
 	mu   sync.Mutex

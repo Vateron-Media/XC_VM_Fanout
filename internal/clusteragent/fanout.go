@@ -260,12 +260,15 @@ func (a *Agent) setFanoutLive(on bool) {
 }
 
 // localExec runs the commands the agent can serve itself, within its own
-// process: `conn.drop {uuid}` against the fanout's control socket (a daemon
+// process: its control commands (fence.go), `conn.drop {uuid}` against the fanout's control socket (a daemon
 // viewer, well under the plan's 1 s), and `conn.close {uuid, remove}` on the
 // connection registry (a close MAIN decided). Anything else, or a fanout it cannot
 // reach, goes to next (the node's PHP, cluster:exec).
 func (a *Agent) localExec(next Executor) Executor {
 	return func(ctx context.Context, cmd *Command, w WireCommand) (bool, []byte) {
+		if handled, ok, result := a.controlExec(ctx, cmd); handled {
+			return ok, result
+		}
 		if cmd.Type == "config.changed" && a.ReplicaDir != "" {
 			// Another node's key changed hands: fetch the replica now, and
 			// ack without waiting for the sync.

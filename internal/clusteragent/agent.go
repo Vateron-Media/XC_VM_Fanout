@@ -55,6 +55,12 @@ type Agent struct {
 	// ArtefactDir is where the agent downloads the artefacts MAIN grants
 	// (config/cluster/artefacts, artefact.go); "" fetches none.
 	ArtefactDir string
+	// FenceFile receives the fence MAIN commanded, for the node's PHP
+	// (Core\Cluster\NodeLease, fence.go); "" writes nothing.
+	FenceFile string
+	// SignalsDir is the node's SIGNALS_PATH, where a fence past its drain
+	// writes one drop entry per viewer (fence.go); "" writes none.
+	SignalsDir string
 	// Types lists the command types the node's PHP runs (TypesViaPHP),
 	// asked before each hello; nil says no artefact feature.
 	Types func(ctx context.Context) ([]string, error)
@@ -121,6 +127,13 @@ type Agent struct {
 	leaseOnce        sync.Once
 	leaseKick        chan struct{} // write lease_state.json now (lease.go)
 	leaseErr         string        // the last error writing it, logged once (RunLeaseState's loop only)
+	// The viewers a fence past its drain has dropped (fence.go).
+	drops fenceDrops
+	// replicaResync: the next config sync fetches every section from
+	// scratch; streamsResyncWanted: the next streams sync walks the hashes
+	// (a resync command, fence.go).
+	replicaResync       atomic.Bool
+	streamsResyncWanted atomic.Bool
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -321,6 +334,7 @@ func (a *Agent) publish(r *Reply) {
 	}
 	a.pubMu.Lock()
 	defer a.pubMu.Unlock()
+	a.followState(r.State)
 	a.flows.Store(int64(r.Flows))
 	a.mode.Store(int64(r.Mode))
 	// With STREAMS off, streams.json says 0 before flows.json says so.
@@ -459,6 +473,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	var policyDone sync.WaitGroup
 	defer policyDone.Wait()
+	fctx, stopFence := context.WithCancel(ctx)
+	defer stopFence()
+	policyDone.Add(1)
+	go func() {
+		defer policyDone.Done()
+		a.RunFence(fctx)
+	}()
 	pctx, stopPolicy := context.WithCancel(ctx)
 	defer stopPolicy()
 	policyDone.Add(1)
@@ -662,6 +683,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			continue
 		}
 		a.setFenced(false)
+		a.licenceBack()
 		a.httpsFailing.Store(false)
 		if a.hasUnackedSealed() && a.acking.CompareAndSwap(false, true) {
 			go func() {
