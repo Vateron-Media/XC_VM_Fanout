@@ -139,6 +139,30 @@ func (a *Agent) followMainIdentity() error {
 	return nil
 }
 
+// MainDigestN1File is where MAIN's agent reports the owners whose chunk
+// digest named no request (DigestN1Report), beside its key state: MAIN's
+// agent sends no heartbeat, so MAIN's PHP reads this instead of digest_n1.
+const MainDigestN1File = "main_digest_n1.json"
+
+// MainDigestN1Every is how often an unchanged report is written again, so
+// MAIN's PHP can tell a running agent's report from a stopped one's.
+var MainDigestN1Every = 10 * time.Minute
+
+// writeMainDigestN1 writes MAIN's report when it changed, or when the last
+// write is MainDigestN1Every old: {"owners": [...], "at_ms": <unix ms>}.
+func (a *Agent) writeMainDigestN1(last *string, lastAt *time.Time, now time.Time) {
+	owners, _ := json.Marshal(a.DigestN1Report(now))
+	if string(owners) == *last && now.Sub(*lastAt) < MainDigestN1Every {
+		return
+	}
+	doc, _ := json.Marshal(map[string]any{"owners": json.RawMessage(owners), "at_ms": now.UnixMilli()})
+	if err := writeFile(filepath.Join(filepath.Dir(a.MainIdentityPath), MainDigestN1File), doc, fileWrite{perm: 0o644}); err != nil {
+		a.logf("cluster: %s: %v", MainDigestN1File, err)
+		return
+	}
+	*last, *lastAt = string(owners), now
+}
+
 // RunMain serves the loopback proxy as MAIN until ctx ends, or until MAIN's
 // identity changes (an error: the supervisor restarts the agent on the new
 // one).
@@ -148,6 +172,8 @@ func (a *Agent) RunMain(ctx context.Context) error {
 	go func() {
 		t := time.NewTicker(MainIdentityEvery)
 		defer t.Stop()
+		var reported string
+		var reportedAt time.Time
 		for {
 			select {
 			case <-ctx.Done():
@@ -158,6 +184,7 @@ func (a *Agent) RunMain(ctx context.Context) error {
 				cancel(err)
 				return
 			}
+			a.writeMainDigestN1(&reported, &reportedAt, time.Now())
 		}
 	}()
 	err := a.ServeRelayProxy(ctx, a.RelayAddr, a.RelayKeyDir)
