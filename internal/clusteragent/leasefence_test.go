@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -186,7 +187,7 @@ func TestACommandedFenceDropsTheFanoutsOwnViewersToo(t *testing.T) {
 	sock, f := newFakeFanoutConns(t, "v1", "daemon9")
 	_, a, _ := fenceAgent(t)
 	a.FanoutCtl = sock
-	a.controlExec(t.Context(), controlCmd(TypeFence, map[string]any{"reason": "admin", "drain_min": float64(0)}))
+	a.controlExec(context.Background(), controlCmd(TypeFence, map[string]any{"reason": "admin", "drain_min": float64(0)}))
 	if a.fenceTick(time.Now()) != FenceFenced {
 		t.Fatal("not fenced")
 	}
