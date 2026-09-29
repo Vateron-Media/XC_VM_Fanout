@@ -2,6 +2,7 @@ package clustercrypto
 
 import (
 	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -48,6 +49,7 @@ type dataplaneVectors struct {
 		Iat         int64  `json:"iat"`
 		Body        string `json:"body"`
 		Sha256      string `json:"sha256"`
+		Nonce       string `json:"nonce"`
 		Doc         string `json:"doc"`
 		NodeHeader  string `json:"node_header"`
 		PanelHeader string `json:"panel_header"`
@@ -171,7 +173,7 @@ func TestRelayAuthVectors(t *testing.T) {
 func TestFileDigestVectors(t *testing.T) {
 	v := loadDataplane(t)
 	d := v.FileDigest
-	doc, err := FileDigestDoc(d.Tid, d.OwnerSid, int64(len(d.Body)), d.Sha256, d.Iat, &d.Offset, &d.Total)
+	doc, err := FileDigestDoc(d.Tid, d.OwnerSid, int64(len(d.Body)), d.Sha256, d.Iat, &d.Offset, &d.Total, d.Nonce)
 	if err != nil || string(doc) != d.Doc {
 		t.Fatalf("doc %s %v", doc, err)
 	}
@@ -201,5 +203,57 @@ func TestFileDigestVectors(t *testing.T) {
 	tampered[0] ^= 1
 	if got.ChunkMatches(d.Offset, tampered) {
 		t.Fatal("a tampered chunk matched")
+	}
+	// It answers file_auth's request, whenever it is judged, and no other.
+	if d.Nonce != hex.EncodeToString(v.FileAuth.Nonce) || got.Nonce != d.Nonce {
+		t.Fatalf("the digest names %s, file_auth's nonce is %x", got.Nonce, v.FileAuth.Nonce)
+	}
+	if !got.Answers(v.FileAuth.Nonce, d.Iat*1000+86400000) {
+		t.Fatal("the digest does not answer its own request")
+	}
+	other := append([]byte{}, v.FileAuth.Nonce...)
+	other[15] ^= 1
+	if got.Answers(other, d.Iat*1000) {
+		t.Fatal("the digest answers another request")
+	}
+}
+
+// An owner from before the nonce signs a chunk's digest without one: it
+// answers any request, but only while its iat is inside the request window.
+// A nonce is a chunk's only, and 32 lowercase hex.
+func TestFileDigestNonce(t *testing.T) {
+	v := loadDataplane(t)
+	d := v.FileDigest
+	sk := ed25519.NewKeyFromSeed(v.NodeSeed)
+	legacy, err := FileDigestDoc(d.Tid, d.OwnerSid, int64(len(d.Body)), d.Sha256, d.Iat, &d.Offset, &d.Total, "")
+	if err != nil || strings.Contains(string(legacy), "nonce") {
+		t.Fatalf("a digest without a nonce: %s %v", legacy, err)
+	}
+	got, ok := VerifyFileDigest(JoinSigned(legacy, SignNode(sk, "digest", legacy)), d.Tid, nil, v.NodePub)
+	if !ok {
+		t.Fatal("a digest without a nonce does not verify")
+	}
+	for skewMs, want := range map[int64]bool{0: true, RelayWindowMs: true, -RelayWindowMs: true, RelayWindowMs + 2000: false, -RelayWindowMs - 2000: false} {
+		if got.Answers(v.FileAuth.Nonce, d.Iat*1000+skewMs) != want {
+			t.Errorf("without a nonce, judged %d ms after its iat: want %v", skewMs, want)
+		}
+	}
+	for name, nonce := range map[string]string{"upper case": "0123456789ABCDEF0123456789abcdef", "short": "0123456789abcdef", "not hex": "0123456789abcdef0123456789abcdeg"} {
+		if _, err := FileDigestDoc(d.Tid, d.OwnerSid, 1, d.Sha256, d.Iat, &d.Offset, &d.Total, nonce); err == nil {
+			t.Errorf("a nonce %s was signed", name)
+		}
+	}
+	if _, err := FileDigestDoc(d.Tid, d.OwnerSid, 1, d.Sha256, d.Iat, nil, nil, d.Nonce); err == nil {
+		t.Error("a nonce on a whole file was signed")
+	}
+	for name, doc := range map[string]string{
+		"a nonce on a whole file":  `{"iat":1,"nonce":"` + d.Nonce + `","owner_sid":3,"sha256":"` + d.Sha256 + `","size":1,"tid":"` + d.Tid + `","typ":"xcvm-file-digest","v":1}`,
+		"a nonce that is a number": `{"iat":1,"nonce":5,"offset":0,"owner_sid":3,"sha256":"` + d.Sha256 + `","size":1,"tid":"` + d.Tid + `","total":1,"typ":"xcvm-file-digest","v":1}`,
+		"a null nonce":             `{"iat":1,"nonce":null,"offset":0,"owner_sid":3,"sha256":"` + d.Sha256 + `","size":1,"tid":"` + d.Tid + `","total":1,"typ":"xcvm-file-digest","v":1}`,
+		"a malformed nonce":        `{"iat":1,"nonce":"xyz","offset":0,"owner_sid":3,"sha256":"` + d.Sha256 + `","size":1,"tid":"` + d.Tid + `","total":1,"typ":"xcvm-file-digest","v":1}`,
+	} {
+		if _, ok := VerifyFileDigest(JoinSigned([]byte(doc), SignNode(sk, "digest", []byte(doc))), d.Tid, nil, v.NodePub); ok {
+			t.Errorf("%s verified", name)
+		}
 	}
 }

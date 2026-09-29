@@ -112,6 +112,35 @@ func TestFileDigestIsSignedWithTheNodeKey(t *testing.T) {
 	}
 }
 
+// A chunk's digest names the nonce of the request it answers, as the
+// owner's PHP passes it; one without (older PHP) is signed as before.
+func TestAChunksDigestNamesTheRequestsNonce(t *testing.T) {
+	_, st := newFake(t)
+	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
+	a.Client.now = func() time.Time { return time.Unix(1800000000, 0) }
+	for nonce, want := range map[string]string{
+		strings.Repeat("cd", 16): `{"iat":1800000000,"nonce":"` + strings.Repeat("cd", 16) + `","offset":0,"owner_sid":3,"sha256":"` + strings.Repeat("ab", 32) + `","size":1,"tid":"t0123456789","total":1,"typ":"xcvm-file-digest","v":1}`,
+		"":                       `{"iat":1800000000,"offset":0,"owner_sid":3,"sha256":"` + strings.Repeat("ab", 32) + `","size":1,"tid":"t0123456789","total":1,"typ":"xcvm-file-digest","v":1}`,
+	} {
+		body := `{"tid":"t0123456789","owner_sid":3,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `","offset":0,"total":1`
+		if nonce != "" {
+			body += `,"nonce":"` + nonce + `"`
+		}
+		rec := httptest.NewRecorder()
+		a.dataPlaneHandler(rec, httptest.NewRequest(http.MethodPost, "/v1/file_digest", strings.NewReader(body+"}")))
+		var out struct {
+			Header string `json:"header"`
+		}
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &out) != nil {
+			t.Fatalf("nonce %q: %d %s", nonce, rec.Code, rec.Body.String())
+		}
+		doc, _ := base64.RawURLEncoding.DecodeString(strings.Split(out.Header, ".")[0])
+		if string(doc) != want {
+			t.Errorf("nonce %q: document\n got %s\nwant %s", nonce, doc, want)
+		}
+	}
+}
+
 func TestDataPlaneRefusesWhatItCannotSign(t *testing.T) {
 	_, st := newFake(t)
 	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
@@ -125,6 +154,10 @@ func TestDataPlaneRefusesWhatItCannotSign(t *testing.T) {
 		"not json":  `nope`,
 		// The node signs digests as itself only (it is server 3).
 		"another owner": `{"tid":"t0123456789","owner_sid":5,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `"}`,
+		// A nonce names the request a chunk answers: a chunk's only, 32 lowercase hex.
+		"a nonce on a whole file": `{"tid":"t0123456789","owner_sid":3,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `","nonce":"` + strings.Repeat("cd", 16) + `"}`,
+		"a short nonce":           `{"tid":"t0123456789","owner_sid":3,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `","offset":0,"total":1,"nonce":"cdcd"}`,
+		"an upper-case nonce":     `{"tid":"t0123456789","owner_sid":3,"size":1,"sha256":"` + strings.Repeat("ab", 32) + `","offset":0,"total":1,"nonce":"` + strings.Repeat("CD", 16) + `"}`,
 	} {
 		rec := httptest.NewRecorder()
 		a.dataPlaneHandler(rec, httptest.NewRequest(http.MethodPost, "/v1/file_digest", strings.NewReader(body)))

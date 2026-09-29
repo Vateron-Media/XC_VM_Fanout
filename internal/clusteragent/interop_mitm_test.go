@@ -164,8 +164,8 @@ func TestInteropMITM(t *testing.T) {
 // (ADR 0004, Phase 8, fourth increment). A relay whose target, ticket or
 // proof the wire changed is refused, as is a proof or a whole request sent
 // again; a file chunk changed, cut, moved or answered with another chunk's
-// bytes or digest is never passed on, and what was passed on before it is the
-// file's own bytes.
+// bytes or digest, or with its own earlier answer, is never passed on, and
+// what was passed on before it is the file's own bytes.
 func TestInteropMITMDataPlane(t *testing.T) {
 	rig := interopDataPlane(t)
 	p := mitm.New(rig.parent(t, nil, nil))
@@ -255,6 +255,14 @@ func TestInteropMITMDataPlane(t *testing.T) {
 				e.RawQuery = strings.Replace(e.RawQuery, "o="+queryOf(*e, "o"), "o=0", 1)
 			}
 		}, nil},
+		// The digest names the request's File-Auth nonce, so the owner's
+		// earlier answer for the same chunk under the same ticket is not
+		// taken for a new request (ADR 0004, "The MITM harness").
+		"an old answer for the same chunk": {func(e *mitm.Exchange) {
+			if later(e) {
+				mitm.Answer(second)(e)
+			}
+		}, nil},
 	} {
 		p.Set(a[0], a[1])
 		// Refused: an error before any byte, or the file's own bytes up to
@@ -271,22 +279,6 @@ func TestInteropMITMDataPlane(t *testing.T) {
 	if r := replay(t, context.Background(), p, second, nil); r.Upstream == 200 {
 		t.Error("a chunk request sent again was served")
 	}
-
-	// A limit, pinned so that closing it is a decision (ADR 0004, "The MITM
-	// harness"): a chunk's digest names the ticket, the offset, the size,
-	// the hash and the total, not the request, so an old answer for the same
-	// chunk under the same ticket is taken. It is the file's own bytes at that
-	// offset; a file rewritten in place within one ticket's life could be read
-	// mixed.
-	p.Set(func(e *mitm.Exchange) {
-		if later(e) {
-			mitm.Answer(second)(e)
-		}
-	}, nil)
-	if !whole() {
-		t.Error("an old answer for the same chunk is refused now: update ADR 0004's limit and this test")
-	}
-	p.Clear()
 }
 
 // queryOf is the query parameter name of e's request.

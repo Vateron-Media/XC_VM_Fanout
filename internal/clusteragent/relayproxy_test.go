@@ -201,13 +201,17 @@ func TestTicketsAreKeptOnlyForThisNodeAndGeneration(t *testing.T) {
 }
 
 // fakeOwner is a fake file owner: it serves /xfile in chunks, each with a digest
-// signed by its node key, as the panel's FileTicketServer does.
+// signed by its node key and naming the request's File-Auth nonce, as the
+// panel's FileTicketServer does. legacy signs no nonce, as an owner from
+// before it; age moves the digest's iat back.
 type fakeOwner struct {
 	t      *testing.T
 	key    ed25519.PrivateKey
 	data   []byte
 	tamper func(off int64, b []byte) []byte
 	asks   []int64
+	legacy bool
+	age    time.Duration
 }
 
 func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +231,11 @@ func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	end := min(total, off+n)
 	chunk := append([]byte{}, o.data[off:end]...)
 	sum := sha256.Sum256(chunk)
-	d, _ := cc.FileDigestDoc(doc.Tid, 5, int64(len(chunk)), hex.EncodeToString(sum[:]), time.Now().Unix(), &off, &total)
+	nonce := ""
+	if parts := strings.Split(r.Header.Get("X-XCVM-File-Auth"), "."); len(parts) == 3 && !o.legacy {
+		nonce = parts[1]
+	}
+	d, _ := cc.FileDigestDoc(doc.Tid, 5, int64(len(chunk)), hex.EncodeToString(sum[:]), time.Now().Add(-o.age).Unix(), &off, &total, nonce)
 	if o.tamper != nil {
 		chunk = o.tamper(off, chunk)
 	}
@@ -320,6 +328,62 @@ func TestXfileRefusesATamperedBody(t *testing.T) {
 	res = fx2.get(path2, "Range", fmt.Sprintf("bytes=%d-", cc.FileChunk))
 	if res.StatusCode != http.StatusBadGateway {
 		t.Fatalf("a chunk served for another offset: %d", res.StatusCode)
+	}
+}
+
+// An owner's earlier answer for the same chunk under the same ticket, played
+// to a new request, names the earlier request's nonce and is refused; an
+// owner from before the nonce is taken only while its digest's iat is inside
+// the request window.
+func TestXfileRefusesAnOldAnswerForTheSameChunk(t *testing.T) {
+	fx, o, path := xfileFixture(t, cc.FileChunk+1000)
+	var mu sync.Mutex
+	var held *httptest.ResponseRecorder
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("o") != "0" {
+			o.ServeHTTP(w, r)
+			return
+		}
+		// The first chunk: the owner's first answer, every time.
+		mu.Lock()
+		defer mu.Unlock()
+		if held == nil {
+			held = httptest.NewRecorder()
+			o.ServeHTTP(held, r)
+		}
+		for k, v := range held.Header() {
+			w.Header()[k] = v
+		}
+		w.Write(held.Body.Bytes())
+	}))
+	defer srv.Close()
+	fx.route(5, srv)
+	read := func() (int, []byte) {
+		res := fx.get(path)
+		body, _ := io.ReadAll(res.Body)
+		return res.StatusCode, body
+	}
+	if code, body := read(); code != 200 || !bytes.Equal(body, o.data) {
+		t.Fatalf("the first read: %d, %d bytes", code, len(body))
+	}
+	if code, _ := read(); code != http.StatusBadGateway {
+		t.Fatalf("an old answer for the same chunk: %d", code)
+	}
+
+	for name, tc := range map[string]struct {
+		age  time.Duration
+		want int
+	}{
+		"a fresh digest":           {0, 200},
+		"a digest a minute old":    {time.Minute, 200},
+		"a digest past the window": {2 * time.Minute, http.StatusBadGateway},
+		"a digest from the future": {-2 * time.Minute, http.StatusBadGateway},
+	} {
+		fx, o, path := xfileFixture(t, 1000)
+		o.legacy, o.age = true, tc.age
+		if res := fx.get(path); res.StatusCode != tc.want {
+			t.Errorf("an owner without the nonce, %s: %d, want %d", name, res.StatusCode, tc.want)
+		}
 	}
 }
 

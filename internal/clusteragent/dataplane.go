@@ -18,7 +18,7 @@ import (
 // node's PHP over the local socket while it serves a relay or file request:
 //
 //	POST /v1/nonce        {nonce}                              -> {fresh}
-//	POST /v1/file_digest  {tid, owner_sid, size, sha256[, offset, total]} -> {header}
+//	POST /v1/file_digest  {tid, owner_sid, size, sha256[, offset, total[, nonce]]} -> {header}
 //
 // Both are the node's own: no call to MAIN, nothing stored on disk.
 //
@@ -138,7 +138,9 @@ func (a *Agent) serveNonce(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) serveFileDigest(w http.ResponseWriter, r *http.Request) {
 	// An iat the caller sends (older PHP does) is read and not used. Offset
 	// and total come together: a chunk of /xfile's (both), or a whole file
-	// (neither).
+	// (neither). A chunk's nonce, the answered request's File-Auth one as
+	// 32 hex, is signed in so the fetcher takes this answer for that request
+	// alone; older PHP sends none.
 	var body struct {
 		Tid      string `json:"tid"`
 		OwnerSid int64  `json:"owner_sid"`
@@ -146,13 +148,15 @@ func (a *Agent) serveFileDigest(w http.ResponseWriter, r *http.Request) {
 		Sha256   string `json:"sha256"`
 		Offset   *int64 `json:"offset"`
 		Total    *int64 `json:"total"`
+		Nonce    string `json:"nonce"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
 	sum := strings.ToLower(body.Sha256)
 	if _, err := hex.DecodeString(sum); err != nil || len(sum) != 64 || body.Size < 0 || body.OwnerSid <= 0 || body.Tid == "" || len(body.Tid) > 64 ||
-		(body.Offset == nil) != (body.Total == nil) || (body.Offset != nil && (*body.Offset < 0 || *body.Total < *body.Offset+body.Size)) {
+		(body.Offset == nil) != (body.Total == nil) || (body.Offset != nil && (*body.Offset < 0 || *body.Total < *body.Offset+body.Size)) ||
+		(body.Nonce != "" && (body.Offset == nil || len(body.Nonce) != 32 || !isLowerHex(body.Nonce))) {
 		http.Error(w, "bad digest fields", http.StatusBadRequest)
 		return
 	}
@@ -171,11 +175,21 @@ func (a *Agent) serveFileDigest(w http.ResponseWriter, r *http.Request) {
 	// node's own clock is the one nothing vouches for), as this agent last
 	// measured it; the caller's clock is not asked.
 	iat := a.Client.MainNowMs() / 1000
-	doc, err := cc.FileDigestDoc(body.Tid, body.OwnerSid, body.Size, sum, iat, body.Offset, body.Total)
+	doc, err := cc.FileDigestDoc(body.Tid, body.OwnerSid, body.Size, sum, iat, body.Offset, body.Total, body.Nonce)
 	if err != nil {
 		http.Error(w, "doc", http.StatusBadRequest)
 		return
 	}
 	sig := cc.SignNode(a.Client.State.SignKey(), "digest", doc)
 	replyJSON(w, map[string]any{"header": base64.RawURLEncoding.EncodeToString(doc) + "." + base64.RawURLEncoding.EncodeToString(sig)})
+}
+
+// isLowerHex reports whether s is lowercase hex, as the panel sends it.
+func isLowerHex(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
