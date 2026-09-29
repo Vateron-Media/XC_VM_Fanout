@@ -130,8 +130,12 @@ type Agent struct {
 	leaseOnce        sync.Once
 	leaseKick        chan struct{} // write lease_state.json now (lease.go)
 	leaseErr         string        // the last error writing it, logged once (RunLeaseState's loop only)
-	// The viewers a fence past its drain has dropped (fence.go).
-	drops fenceDrops
+	// The viewers a fence past its drain has dropped (fence.go): from the
+	// registry, and those the fanout lists; and the fanout's viewers a
+	// lease past its drain has dropped (leasefence.go).
+	drops       fenceDrops
+	fanoutDrops fenceDrops
+	leaseDrops  fenceDrops
 	// replicaResync: the next config sync fetches every section from
 	// scratch; streamsResyncWanted: the next streams sync walks the hashes
 	// (a resync command, fence.go).

@@ -216,6 +216,11 @@ func (a *Agent) fenceTick(now time.Time) string {
 	}
 	if state == FenceFenced {
 		a.dropFenced()
+		if a.FanoutCtl != "" {
+			// The fanout's viewers the registry does not hold (its
+			// CONNECTIONS flow off): the fanout lists them itself.
+			a.dropFanoutViewers(&a.fanoutDrops, "commanded")
+		}
 	}
 	return state
 }
@@ -275,12 +280,15 @@ func (a *Agent) dropFenced() {
 var FenceEvery = time.Second
 
 // RunFence keeps the fence published until ctx ends, whether MAIN answers
-// or not.
+// or not, and drops the fanout's viewers under a lease past its drain
+// (leasefence.go).
 func (a *Agent) RunFence(ctx context.Context) {
 	t := time.NewTicker(FenceEvery)
 	defer t.Stop()
 	for {
-		a.fenceTick(time.Now())
+		if a.fenceTick(time.Now()) == "" {
+			a.leaseFenceTick()
+		}
 		select {
 		case <-ctx.Done():
 			return
