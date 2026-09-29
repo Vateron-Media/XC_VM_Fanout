@@ -271,3 +271,26 @@ func TestInstallEmptiesTheKnownGoodSets(t *testing.T) {
 		t.Fatalf("known_good_urls %s", b)
 	}
 }
+
+func TestAHeartbeatCarriesTheNodesOwnClock(t *testing.T) {
+	m, c := newReplayMain(t)
+	c.State.Enrolled = true
+	a := &Agent{Client: c, Logf: t.Logf}
+	ctx := context.Background()
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// This node's clock runs ten minutes ahead of MAIN's.
+	at := time.Now().Add(10 * time.Minute)
+	c.now = func() time.Time { return at }
+	c.offsetMs.Store(-600000)
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.bodies["heartbeat"][0]["local_ms"]; got != float64(at.UnixMilli()) {
+		t.Fatalf("local_ms %v, want the node's clock %d", got, at.UnixMilli())
+	}
+	if got := m.stamps["heartbeat"][0]; got != at.UnixMilli()-600000 {
+		t.Fatalf("stamped %d, want MAIN's time %d", got, at.UnixMilli()-600000)
+	}
+}

@@ -850,7 +850,9 @@ func (a *Agent) stop(err error) {
 // Heartbeat sends one heartbeat and publishes the reply's mode and flows. A
 // node whose CONNECTIONS flow is on adds its registry's digest.
 func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
-	payload := map[string]any{"root_ready": RootReady(a.Client.State), "policy_ver": a.Client.State.policyVer()}
+	// local_ms is the node's own clock. Its requests are stamped with MAIN's
+	// time, so MAIN takes the node's clock offset (time_offset) from this.
+	payload := map[string]any{"root_ready": RootReady(a.Client.State), "policy_ver": a.Client.State.policyVer(), "local_ms": a.Client.now().UnixMilli()}
 	if a.Telemetry != nil {
 		payload["telemetry"] = a.Telemetry()
 	}
