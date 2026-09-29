@@ -77,6 +77,10 @@ if ($rNew) {
 		$rDb->exec(interopTable($rPanel, $rTable));
 	}
 	$rDb->exec("INSERT INTO `servers` (`id`, `status`, `server_name`, `http_broadcast_port`, `total_clients`) VALUES (7, 0, 'LB 7', 8080, 1000)");
+	// xc_cluster_sim's other nodes (XCVM_INTEROP_SERVERS, e.g. "8,9").
+	foreach (array_filter(array_map('intval', explode(',', (string) getenv('XCVM_INTEROP_SERVERS')))) as $rSid) {
+		$rDb->exec("INSERT INTO `servers` (`id`, `status`, `server_name`, `http_broadcast_port`, `total_clients`) VALUES ($rSid, 0, 'LB $rSid', 8080, 1000)");
+	}
 	// The crontab section: enabled rows whose role fits the node's mode.
 	$rDb->exec("INSERT INTO `crontab` (`filename`, `time`, `enabled`, `role`) VALUES ('cache', '* * * * *', 1, 'all'), ('users', '*/5 * * * *', 1, 'legacy'), ('epg', '0 */6 * * *', 1, 'main'), ('servers', '* * * * *', 0, 'all')");
 	$rDb->exec('INSERT INTO `streams_servers` (`server_stream_id`, `stream_id`, `server_id`, `pid`) VALUES (70, 100, 7, 0)');
@@ -125,6 +129,13 @@ if (method_exists(\XcVm\Core\Config\OpensslExtra::class, 'usePrevFile')) {
 SettingsManager::set($rSettings);
 $rMain = ['server_ip' => '127.0.0.1', 'http_broadcast_port' => (int) getenv('XCVM_INTEROP_PORT'), 'enable_https' => 1, 'domain_name' => 'main.invalid', 'https_broadcast_port' => 1];
 $rCrypto = new \XcVm\Tests\Support\FakeClusterCrypto();
+// xc_cluster_sim: while <db>.unlicensed exists MAIN's licence is gone. No
+// token and no lease is issued, and sessions go on (graceful revocation).
+if (is_file($rDbFile . '.unlicensed')) {
+	$rCrypto->rLicensed = false;
+	$rCrypto->rRefuseIssue = 'LICENCE';
+	$rCrypto->rRefuseLease = 'LICENCE';
+}
 if (class_exists(\XcVm\Domain\Cluster\ConnectionDigest::class)) {
 	// Every heartbeat's digest is checked, and snapshots are staged next to the DB.
 	\XcVm\Domain\Cluster\ConnectionDigest::useState(dirname($rDbFile) . '/digest/', 0);

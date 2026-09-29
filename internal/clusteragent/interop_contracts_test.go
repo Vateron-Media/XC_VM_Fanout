@@ -38,6 +38,22 @@ func interopNode(t *testing.T) (*Agent, func(script string, args ...string) stri
 // with extra environment (settings the harness reads from it).
 func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) string, context.Context, func(extra ...string)) {
 	t.Helper()
+	rig := interopMain(t)
+	return rig.enrol(t, 7), rig.runPHP, rig.ctx, rig.restart
+}
+
+// interopRig is MAIN's real PHP ClusterApi (XCVM_PANEL_DIR) under php -S,
+// with the harness in testdata/panel and its database in dir.
+type interopRig struct {
+	dir     string
+	runPHP  func(script string, args ...string) string
+	restart func(extra ...string)
+	ctx     context.Context
+}
+
+// interopMain starts MAIN; env is added to the harness's environment.
+func interopMain(t *testing.T, env ...string) *interopRig {
+	t.Helper()
 	panel := os.Getenv("XCVM_PANEL_DIR")
 	if panel == "" {
 		t.Skip("XCVM_PANEL_DIR not set")
@@ -49,7 +65,7 @@ func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) s
 	dir := t.TempDir()
 	harness, _ := filepath.Abs("testdata/panel")
 	port := freePort(t)
-	env := append(os.Environ(), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+filepath.Join(dir, "main.sqlite"), fmt.Sprintf("XCVM_INTEROP_PORT=%d", port))
+	env = append(append(os.Environ(), env...), "XCVM_PANEL_DIR="+panel, "XCVM_INTEROP_DB="+filepath.Join(dir, "main.sqlite"), fmt.Sprintf("XCVM_INTEROP_PORT=%d", port))
 	runPHP := func(script string, args ...string) string {
 		cmd := exec.Command(php, append([]string{filepath.Join(harness, script)}, args...)...)
 		cmd.Env = env
@@ -59,7 +75,6 @@ func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) s
 		}
 		return strings.TrimSpace(string(out))
 	}
-	code := runPHP("enrol_code.php")
 	var srv *exec.Cmd
 	dumpRouterLog(t, filepath.Join(dir, "main.sqlite"))
 	restart := func(extra ...string) {
@@ -81,12 +96,24 @@ func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) s
 	t.Cleanup(func() { EnrolPoll = old })
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
+	return &interopRig{dir: dir, runPHP: runPHP, restart: restart, ctx: ctx}
+}
+
+// enrol enrols an agent for server sid by code and returns it with a spool,
+// a registry and a local socket, none of them running yet.
+func (rig *interopRig) enrol(t *testing.T, sid int) *Agent {
+	t.Helper()
+	dir := filepath.Join(rig.dir, fmt.Sprintf("node-%d", sid))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	code := rig.runPHP("enrol_code.php", strconv.Itoa(sid))
 	statePath := filepath.Join(dir, "agent.json")
 	sasCh, done := make(chan string, 1), make(chan error, 1)
 	go func() {
-		done <- EnrolByCode(ctx, statePath, code, "xc_agent/interop", false, func(s string) { sasCh <- s })
+		done <- EnrolByCode(rig.ctx, statePath, code, "xc_agent/interop", false, func(s string) { sasCh <- s })
 	}()
-	runPHP("approve.php", <-sasCh)
+	rig.runPHP("approve.php", <-sasCh, strconv.Itoa(sid))
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +125,7 @@ func interopNodeEnv(t *testing.T) (*Agent, func(script string, args ...string) s
 		FlowsFile: filepath.Join(dir, "flows.json"), SpoolDir: spool, SocketPath: filepath.Join(sockDir, "a.sock")}
 	a.Registry = NewRegistry(filepath.Join(dir, "registry.snap"), func(ev []map[string]any) error { return spoolP0(spool, ev) }, t.Logf)
 	a.Registry.Admit = a.admit
-	return a, runPHP, ctx, restart
+	return a
 }
 
 func serveSocket(t *testing.T, ctx context.Context, a *Agent) {
