@@ -91,7 +91,9 @@ func newMainFixture(t *testing.T) *mainFixture {
 func (fx *mainFixture) identity(sid, gen int64, on bool) {
 	fx.t.Helper()
 	b, _ := json.Marshal(MainIdentity{V: 1, ServerID: sid, NodeUUID: mainUUID, Gen: gen, PanelSignPub: fx.panel.Public().(ed25519.PublicKey), Dataplane: on})
-	if err := os.WriteFile(filepath.Join(fx.dir, MainIdentityFile), b, 0o600); err != nil {
+	// Renamed in, as MAIN's MainDataPlane writes it: an agent re-reading it
+	// meanwhile never sees it half written.
+	if err := writeFile(filepath.Join(fx.dir, MainIdentityFile), b, fileWrite{perm: 0o600}); err != nil {
 		fx.t.Fatal(err)
 	}
 }
@@ -206,7 +208,9 @@ func TestRunMainEndsWhenTheIdentityChanges(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	fx.identity(1, 4, true)
 	b, _ := os.ReadFile(filepath.Join(fx.dir, MainIdentityFile))
-	os.WriteFile(filepath.Join(fx.dir, MainIdentityFile), bytes.Replace(b, []byte(mainUUID), []byte("8f8fad5b-d9cb-469f-a165-70867728950e"), 1), 0o600)
+	if err := writeFile(filepath.Join(fx.dir, MainIdentityFile), bytes.Replace(b, []byte(mainUUID), []byte("8f8fad5b-d9cb-469f-a165-70867728950e"), 1), fileWrite{perm: 0o600}); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), "identity changed") {
