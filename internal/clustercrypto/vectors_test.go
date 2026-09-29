@@ -309,7 +309,7 @@ func TestVectorFilesAreThePanelsCopies(t *testing.T) {
 	for name, want := range map[string]string{
 		"cluster_vectors.json":           "6cb3272fc1f97e2bc547105b8d5e42c77dcbf805e53d3eae78c89798d8f89645",
 		"cluster_canonical_vectors.json": "ee0fd4b297f02e2e1c1277a1433d1febe9c520414ce107addb524ff2b16799c3",
-		"cluster_commands.json":          "af0b7fd74136f3d9f66859b26749bb6d1955b81eb7e698938fd6d2d630f00802",
+		"cluster_commands.json":          "e091471a6087c75cc85f1a7ce7e7f89b59b3e1bea50bbae6505b93f82b69fa62",
 		"cluster_dataplane_vectors.json": "7016c21b9600dedc1745f4644772ff53e899ae8f83a14c27357c95172e7498b0",
 	} {
 		b, err := os.ReadFile("testdata/" + name)

@@ -88,6 +88,23 @@
         "etag"
       ]
     },
+    "node.purge": {
+      "class": "R",
+      "args": [
+        "jobs"
+      ],
+      "job_types": [
+        "delete_con",
+        "drop_con",
+        "delete_vod",
+        "delete_vods"
+      ],
+      "job_keys": [
+        "type",
+        "id",
+        "uuid"
+      ]
+    },
     "conn.overlay": {
       "class": "G"
     },

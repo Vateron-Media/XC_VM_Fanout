@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -218,6 +219,46 @@ func TestRunMainEndsWhenTheIdentityChanges(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("RunMain kept running on a changed identity")
+	}
+}
+
+// MAIN's agent sends no heartbeat, so it writes its digest_n1 report beside
+// its key state: when the owners change, and again every MainDigestN1Every.
+func TestMainReportsTheOwnersWhoseDigestNamedNoRequest(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{MainIdentityPath: filepath.Join(dir, MainIdentityFile), Logf: t.Logf}
+	path := filepath.Join(dir, MainDigestN1File)
+	owners := func() string {
+		t.Helper()
+		var doc struct {
+			Owners []int64 `json:"owners"`
+		}
+		b, err := os.ReadFile(path)
+		if err != nil || json.Unmarshal(b, &doc) != nil {
+			t.Fatalf("%s: %v %s", MainDigestN1File, err, b)
+		}
+		return fmt.Sprint(doc.Owners)
+	}
+	var last string
+	var lastAt time.Time
+	now := time.Now()
+	a.writeMainDigestN1(&last, &lastAt, now)
+	if got := owners(); got != "[]" {
+		t.Fatalf("no owner yet: %s", got)
+	}
+	a.takeDigestN1(9)
+	a.writeMainDigestN1(&last, &lastAt, now.Add(time.Second))
+	if got := owners(); got != "[9]" {
+		t.Fatalf("owners %s, want [9]", got)
+	}
+	os.Remove(path)
+	a.writeMainDigestN1(&last, &lastAt, now.Add(2*time.Second))
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("rewritten although nothing changed")
+	}
+	a.writeMainDigestN1(&last, &lastAt, now.Add(time.Second+MainDigestN1Every))
+	if got := owners(); got != "[9]" {
+		t.Fatalf("not written again after MainDigestN1Every: %s", got)
 	}
 }
 

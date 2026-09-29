@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +161,42 @@ func TestRegistryOverTheSocket(t *testing.T) {
 	}
 }
 
+func TestRegistryCountsEachStreamsOpenViewers(t *testing.T) {
+	r, _, _ := newTestRegistry(t)
+	a := &Agent{Registry: r, Logf: t.Logf}
+	h := a.socketHandler()
+	do := func(body string) (int, map[string]any) {
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, httptest.NewRequest("POST", "/v1/conn/counts", bytes.NewBufferString(body)))
+		var out map[string]any
+		json.Unmarshal(rw.Body.Bytes(), &out)
+		return rw.Code, out
+	}
+	for uuid, doc := range map[string]string{
+		"a1": `{"stream_id":100,"hls_end":0}`,
+		"a2": `{"stream_id":100,"hls_end":0}`,
+		"a3": `{"stream_id":100,"hls_end":1}`, // an HLS viewer that ended
+		"b1": `{"stream_id":"200","hls_end":0}`,
+		"c1": `{"stream_id":300,"hls_end":0}`, // not asked for
+	} {
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, httptest.NewRequest("PUT", "/v1/conn/"+uuid, bytes.NewBufferString(doc)))
+		if rw.Code != 200 {
+			t.Fatalf("put %s: %d", uuid, rw.Code)
+		}
+	}
+	code, out := do(`{"stream_ids":[100,200,400]}`)
+	if want := map[string]any{"100": float64(2), "200": float64(1), "400": float64(0)}; code != 200 || !reflect.DeepEqual(out["counts"], want) {
+		t.Fatalf("counts %d %v, want %v", code, out, want)
+	}
+	many := strings.Repeat("1,", MaxCountStreams) + "1"
+	for _, bad := range []string{`{}`, `{"stream_ids":[]}`, `{"stream_ids":["100"]}`, `{"stream_ids":[1.5]}`, `{"stream_ids":[-1]}`, `{"stream_ids":[` + many + `]}`} {
+		if code, _ := do(bad); code != http.StatusBadRequest {
+			t.Fatalf("%.40s: %d", bad, code)
+		}
+	}
+}
+
 func TestConnCloseCommandAppliesMainsClose(t *testing.T) {
 	r, _, _ := newTestRegistry(t)
 	r.Put("u1", rec(7, "1.2.3.4", 1, 1))
@@ -256,6 +293,9 @@ func TestInteropConnections(t *testing.T) {
 
 	var node map[string]any
 	json.Unmarshal([]byte(runPHP("conn.php", "node", a.FlowsFile, spool, a.SocketPath)), &node)
+	if counts, _ := node["counts"].(map[string]any); counts["100"] != float64(1) || counts["101"] != float64(0) {
+		t.Fatalf("PHP's counts through the agent: %v", node["counts"])
+	}
 	if node["open"] != true || node["found_ip"] != "10.0.0.9" || node["updated"] != true || node["beat"] != float64(1800000100) || node["accepted"] != "10.0.0.9" {
 		t.Fatalf("node side: %v", node)
 	}

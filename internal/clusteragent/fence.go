@@ -78,7 +78,7 @@ const (
 var Restrictive = map[string]bool{
 	"conn.drop": true, "conn.drop_line": true, "conn.kill_worker": true, "conn.close": true,
 	"stream.stop": true, "vod.stop": true, TypeRotateNow: true, TypeQuarantine: true,
-	TypeFence: true, TypeResync: true, "config.changed": true,
+	TypeFence: true, TypeResync: true, "config.changed": true, "node.purge": true,
 }
 
 var fenceReason = regexp.MustCompile(`^[a-z0-9_.-]{1,32}$`)

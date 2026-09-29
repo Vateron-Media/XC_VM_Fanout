@@ -41,6 +41,19 @@ func (rig *interopRig) licence(t *testing.T, on bool) {
 	}
 }
 
+// clock runs MAIN's clock d ahead of this machine's from now on (0 puts it
+// back): the harness fixes MAIN's ClusterClock at the time plus d for each
+// request, so tokens and leases are issued, and stamps checked, in that time.
+func (rig *interopRig) clock(t *testing.T, d time.Duration) {
+	t.Helper()
+	flag := filepath.Join(rig.dir, "main.sqlite.clock")
+	if d == 0 {
+		os.Remove(flag)
+	} else if err := os.WriteFile(flag, []byte(strconv.FormatInt(d.Milliseconds(), 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // runFleet runs every agent's loop until the test ends.
 func runFleet(t *testing.T, rig *interopRig, agents []*Agent) {
 	ctx, cancel := context.WithCancel(rig.ctx)
@@ -81,6 +94,9 @@ func TestInteropSimARelicensedFleetGetsItsLeasesBack(t *testing.T) {
 		t.Fatalf("an unlicensed MAIN issued tokens: epochs %v, were %v", got, before)
 	}
 
+	// MAIN's clock is this machine's: a lease issued once the licence is back
+	// has an iat of at least back, and the enrolment's lease, a second or more
+	// before it, never has (a second's slack let the last node's pass).
 	back := time.Now().Unix()
 	rig.licence(t, true)
 	// Well under a minute even on a loaded machine: one php -S serves the fleet.
@@ -90,7 +106,7 @@ func TestInteropSimARelicensedFleetGetsItsLeasesBack(t *testing.T) {
 		for _, a := range agents {
 			st := a.Client.State
 			st.mu.Lock()
-			if st.Lease != nil && st.Lease.Iat >= back-1 {
+			if st.Lease != nil && st.Lease.Iat >= back {
 				fresh++
 			}
 			st.mu.Unlock()
@@ -106,6 +122,56 @@ func TestInteropSimARelicensedFleetGetsItsLeasesBack(t *testing.T) {
 	for i, e := range epochs() {
 		if e <= before[i] {
 			t.Fatalf("node %d still on epoch %d", 7+i, e)
+		}
+	}
+}
+
+// MAIN's clock two hours ahead, past every token's expiry: each node takes
+// MAIN's time from the CLOCK_SKEW refusal, re-keys, and holds a token and a
+// lease issued at MAIN's new time.
+func TestInteropSimAFleetFollowsMainsClockPastItsTokens(t *testing.T) {
+	rig, agents := newClusterSim(t, 3)
+	for _, a := range agents {
+		a.Interval = 200 * time.Millisecond
+	}
+	runFleet(t, rig, agents)
+	// leased waits until every node is enrolled and holds a lease issued at
+	// or after iat.
+	leased := func(iat int64, what string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			n := 0
+			for _, a := range agents {
+				st := a.Client.State
+				st.mu.Lock()
+				if st.Enrolled && st.Lease != nil && st.Lease.Iat >= iat {
+					n++
+				}
+				st.mu.Unlock()
+			}
+			if n == len(agents) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%d of %d nodes hold a lease %s after 30 s", n, len(agents), what)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	leased(0, "once enrolled")
+	var before []uint64
+	for _, a := range agents {
+		tok, _ := a.Client.Current()
+		before = append(before, tok.Epoch)
+	}
+
+	ahead := 2 * time.Hour
+	rig.clock(t, ahead)
+	leased(time.Now().Add(ahead).Unix()-1, "issued at MAIN's new time")
+	for i, a := range agents {
+		if tok, _ := a.Client.Current(); tok.Epoch <= before[i] {
+			t.Fatalf("node %d still on epoch %d: its expired token was not replaced", 7+i, tok.Epoch)
 		}
 	}
 }

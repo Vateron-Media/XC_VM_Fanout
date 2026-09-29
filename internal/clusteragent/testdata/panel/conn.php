@@ -27,6 +27,7 @@ switch ($argv[1]) {
 		$rOut['updated'] = ConnectionTracker::updateLive($rSet, $rFound, ['pid' => 4242]);
 		$rOut['beat'] = ConnectionTracker::heartbeat($rSet, 'v1', 1800000100)['hls_last_read'] ?? null;
 		$rOut['accepted'] = ConnectionTracker::acceptedIP($rSet, 7);
+		$rOut['counts'] = AgentConnections::counts([100, 101]);
 		$rOut['local_rows'] = 0; // nothing was written to a store here: MAIN's comes from the events
 		echo json_encode($rOut);
 		break;
