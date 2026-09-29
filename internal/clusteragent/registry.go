@@ -269,6 +269,29 @@ func (r *Registry) Find(match map[string]any) map[string]any {
 	return nil
 }
 
+// MaxCountStreams is how many streams one POST /v1/conn/counts may ask for.
+const MaxCountStreams = 10000
+
+// Counts returns how many open viewers (hls_end 0, as Find matches them)
+// each stream asked for has, 0 for one it holds none of.
+func (r *Registry) Counts(streamIDs []string) map[string]int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]int, len(streamIDs))
+	for _, id := range streamIDs {
+		out[id] = 0
+	}
+	for _, c := range r.conns {
+		if fmt.Sprint(c["hls_end"]) != "0" {
+			continue
+		}
+		if n, ok := out[fmt.Sprint(c["stream_id"])]; ok {
+			out[fmt.Sprint(c["stream_id"])] = n + 1
+		}
+	}
+	return out
+}
+
 // Oldest returns a line's oldest open connection (by date_start).
 func (r *Registry) Oldest(userID any) map[string]any {
 	r.mu.Lock()
@@ -595,6 +618,25 @@ func (r *Registry) connHandler(w http.ResponseWriter, req *http.Request) {
 		reply(r.Find(match), nil)
 	case req.Method == http.MethodPost && path == "oldest":
 		reply(r.Oldest(body["user_id"]), nil)
+	case req.Method == http.MethodPost && path == "counts":
+		// Every stream's viewers in one call (the on-demand daemon's pass),
+		// where find answers one stream at a time.
+		raw, _ := body["stream_ids"].([]any)
+		if len(raw) == 0 || len(raw) > MaxCountStreams {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		ids := make([]string, 0, len(raw))
+		for _, v := range raw {
+			f, ok := v.(float64)
+			if !ok || f < 0 || f != float64(int64(f)) {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			ids = append(ids, strconv.FormatInt(int64(f), 10))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"counts": r.Counts(ids)})
 	case req.Method == http.MethodPost && path == "seed":
 		raw, _ := body["records"].([]any)
 		records := make([]map[string]any, 0, len(raw))
