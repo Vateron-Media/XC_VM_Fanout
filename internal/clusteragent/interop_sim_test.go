@@ -54,6 +54,31 @@ func (rig *interopRig) clock(t *testing.T, d time.Duration) {
 	}
 }
 
+// waitLeases waits until every node has completed its enrolment and holds a
+// lease issued at iat or later, failing the test past within.
+func waitLeases(t *testing.T, agents []*Agent, iat int64, within time.Duration, what string) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		n := 0
+		for _, a := range agents {
+			st := a.Client.State
+			st.mu.Lock()
+			if st.Enrolled && st.Lease != nil && st.Lease.Iat >= iat {
+				n++
+			}
+			st.mu.Unlock()
+		}
+		if n == len(agents) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d nodes hold a lease %s, after %s", n, len(agents), what, within)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // runFleet runs every agent's loop until the test ends.
 func runFleet(t *testing.T, rig *interopRig, agents []*Agent) {
 	ctx, cancel := context.WithCancel(rig.ctx)
@@ -100,25 +125,7 @@ func TestInteropSimARelicensedFleetGetsItsLeasesBack(t *testing.T) {
 	back := time.Now().Unix()
 	rig.licence(t, true)
 	// Well under a minute even on a loaded machine: one php -S serves the fleet.
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		fresh := 0
-		for _, a := range agents {
-			st := a.Client.State
-			st.mu.Lock()
-			if st.Lease != nil && st.Lease.Iat >= back {
-				fresh++
-			}
-			st.mu.Unlock()
-		}
-		if fresh == len(agents) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d of %d nodes hold a fresh lease 20 s after the licence came back", fresh, len(agents))
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	waitLeases(t, agents, back, 20*time.Second, "fresh, after the licence came back")
 	for i, e := range epochs() {
 		if e <= before[i] {
 			t.Fatalf("node %d still on epoch %d", 7+i, e)
@@ -135,31 +142,7 @@ func TestInteropSimAFleetFollowsMainsClockPastItsTokens(t *testing.T) {
 		a.Interval = 200 * time.Millisecond
 	}
 	runFleet(t, rig, agents)
-	// leased waits until every node is enrolled and holds a lease issued at
-	// or after iat.
-	leased := func(iat int64, what string) {
-		t.Helper()
-		deadline := time.Now().Add(30 * time.Second)
-		for {
-			n := 0
-			for _, a := range agents {
-				st := a.Client.State
-				st.mu.Lock()
-				if st.Enrolled && st.Lease != nil && st.Lease.Iat >= iat {
-					n++
-				}
-				st.mu.Unlock()
-			}
-			if n == len(agents) {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("%d of %d nodes hold a lease %s after 30 s", n, len(agents), what)
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}
-	leased(0, "once enrolled")
+	waitLeases(t, agents, 0, 30*time.Second, "once enrolled")
 	var before []uint64
 	for _, a := range agents {
 		tok, _ := a.Client.Current()
@@ -168,7 +151,7 @@ func TestInteropSimAFleetFollowsMainsClockPastItsTokens(t *testing.T) {
 
 	ahead := 2 * time.Hour
 	rig.clock(t, ahead)
-	leased(time.Now().Add(ahead).Unix()-1, "issued at MAIN's new time")
+	waitLeases(t, agents, time.Now().Add(ahead).Unix()-1, 30*time.Second, "issued at MAIN's new time")
 	for i, a := range agents {
 		if tok, _ := a.Client.Current(); tok.Epoch <= before[i] {
 			t.Fatalf("node %d still on epoch %d: its expired token was not replaced", 7+i, tok.Epoch)
