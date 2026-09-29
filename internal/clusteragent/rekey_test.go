@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -155,6 +156,46 @@ func (m *rekeyMain) rekey(w http.ResponseWriter, r *http.Request) {
 	sealed, _ := cc.Seal(ephPub, "token", m.uuid, tb)
 	tag, out := m.reply(map[string]any{"v": 1, "typ": "xcvm-rekey", "node": m.uuid, "req_nonce": hex.EncodeToString(nonce), "token_sealed": base64.StdEncoding.EncodeToString(sealed), "epoch": epoch, "main_time_ms": time.Now().UnixMilli()})
 	m.signed(w, 200, tag, out)
+}
+
+// A node whose token ran out while MAIN's licence was gone asks again every
+// RekeyPoll, not on the doubling backoff, so a re-licensed MAIN re-keys it,
+// and hands it a lease with the token, within one poll (ADR 0004,
+// "Re-licensing a fleet").
+func TestAnUnlicensedRekeyIsAskedAgainEveryPoll(t *testing.T) {
+	old := RekeyPoll
+	RekeyPoll = 50 * time.Millisecond
+	defer func() { RekeyPoll = old }()
+	m, st, _ := newRekeyMain(t)
+	m.licensed = false
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var waits []time.Duration
+	a := &Agent{Client: NewClient(st, "xc_agent/test"), Version: "t", Interval: 20 * time.Millisecond,
+		Telemetry: func() map[string]any { cancel(); return nil }, // the first heartbeat after the re-key
+		Logf: func(format string, args ...any) {
+			t.Logf(format, args...)
+			if strings.HasPrefix(format, "cluster: re-key: ") {
+				if waits = append(waits, args[1].(time.Duration)); len(waits) == 3 {
+					m.mu.Lock()
+					m.licensed = true
+					m.mu.Unlock()
+				}
+			}
+		}}
+	if err := a.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(waits) != 3 || m.rekeys != 1 {
+		t.Fatalf("waits %v, re-keys %d: want 3 polls, then one re-key", waits, m.rekeys)
+	}
+	for _, w := range waits {
+		if w != RekeyPoll {
+			t.Fatalf("an unlicensed re-key waited %s, not RekeyPoll", w)
+		}
+	}
 }
 
 func TestRekeyTrustsOnlyASignedAnswerToThisRequest(t *testing.T) {
