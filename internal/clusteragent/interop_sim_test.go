@@ -81,6 +81,9 @@ func TestInteropSimARelicensedFleetGetsItsLeasesBack(t *testing.T) {
 		t.Fatalf("an unlicensed MAIN issued tokens: epochs %v, were %v", got, before)
 	}
 
+	// MAIN's clock is this machine's: a lease issued once the licence is back
+	// has an iat of at least back, and the enrolment's lease, a second or more
+	// before it, never has (a second's slack let the last node's pass).
 	back := time.Now().Unix()
 	rig.licence(t, true)
 	// Well under a minute even on a loaded machine: one php -S serves the fleet.
@@ -90,7 +93,7 @@ func TestInteropSimARelicensedFleetGetsItsLeasesBack(t *testing.T) {
 		for _, a := range agents {
 			st := a.Client.State
 			st.mu.Lock()
-			if st.Lease != nil && st.Lease.Iat >= back-1 {
+			if st.Lease != nil && st.Lease.Iat >= back {
 				fresh++
 			}
 			st.mu.Unlock()
