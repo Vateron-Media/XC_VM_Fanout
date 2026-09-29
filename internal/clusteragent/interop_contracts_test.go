@@ -468,6 +468,46 @@ func TestInteropStreams(t *testing.T) {
 // refused), and reads the file through MAIN's FileTicketServer chunk by
 // chunk, each checked against MAIN's digest, and refuses a tampered chunk.
 func TestInteropDataPlane(t *testing.T) {
+	rig := interopDataPlane(t)
+	var seen []http.Header
+	var tamper atomic.Bool
+	get := rig.proxyTo(t, rig.parent(t, func(r *http.Request) { seen = append(seen, r.Header.Clone()) }, func(r *http.Request, body []byte) {
+		if tamper.Load() && r.URL.Query().Get("o") != "0" && len(body) > 0 {
+			body[0] ^= 1
+		}
+	}))
+
+	if code, body := get("/relay/interop-loopback-key-0123/100.ts"); code != 200 || string(body) != "TS-FROM-MAIN" {
+		t.Fatalf("relay: %d %q", code, body)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("%d connects", len(seen))
+	}
+	// A replay of the headers a sniffer copied: MAIN has spent the nonce.
+	if out := rig.runPHP("dataplane.php", "relay", seen[0].Get("X-XCVM-Relay"), seen[0].Get("X-XCVM-Relay-Auth"), "/admin/live?stream=100&extension=ts"); out != "refused" {
+		t.Fatalf("a replayed relay auth: %s", out)
+	}
+	if code, body := get("/xfile/interop-loopback-key-0123/" + rig.ref + ".mkv"); code != 200 || !bytes.Equal(body, rig.want) {
+		t.Fatalf("xfile: %d, %d bytes", code, len(body))
+	}
+	tamper.Store(true)
+	if _, body := get("/xfile/interop-loopback-key-0123/" + rig.ref + ".mkv"); len(body) != cc.FileChunk {
+		t.Fatalf("a tampered chunk: %d bytes passed on", len(body))
+	}
+}
+
+// dataPlaneRig is an enrolled agent holding MAIN's tickets for stream 100's
+// relay and for a file MAIN owns (want, under ref), with runPHP for the
+// harness's scripts.
+type dataPlaneRig struct {
+	a      *Agent
+	runPHP func(script string, args ...string) string
+	ref    string
+	want   []byte
+}
+
+func interopDataPlane(t *testing.T) *dataPlaneRig {
+	t.Helper()
 	a, runPHP, ctx := interopNode(t)
 	a.ReplicaDir = filepath.Join(t.TempDir(), "replica")
 	runPHP("events.php", "flows", fmt.Sprint(FlowStreams|16|FlowDataplane))
@@ -501,14 +541,22 @@ func TestInteropDataPlane(t *testing.T) {
 	if doc, err := a.openStream(rep, 100); err != nil || storedStreamEtag(a.ReplicaDir, 100) != doc.Etag {
 		t.Fatalf("stream 100's record: %v", err)
 	}
+	return &dataPlaneRig{a: a, runPHP: runPHP, ref: ref, want: want}
+}
 
-	var seen []http.Header
-	var tamper atomic.Bool
+// parent is MAIN as a parent and owner: /admin/live through MAIN's real
+// RelayGuard, /xfile through its real FileTicketServer. onRelay sees each
+// connect; onChunk may change a chunk before it is sent. It returns the
+// parent's URL.
+func (rig *dataPlaneRig) parent(t *testing.T, onRelay func(r *http.Request), onChunk func(r *http.Request, body []byte)) string {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/admin/live":
-			seen = append(seen, r.Header.Clone())
-			if runPHP("dataplane.php", "relay", r.Header.Get("X-XCVM-Relay"), r.Header.Get("X-XCVM-Relay-Auth"), r.URL.RequestURI()) != "7" {
+			if onRelay != nil {
+				onRelay(r)
+			}
+			if rig.runPHP("dataplane.php", "relay", r.Header.Get("X-XCVM-Relay"), r.Header.Get("X-XCVM-Relay-Auth"), r.URL.RequestURI()) != "7" {
 				http.NotFound(w, r)
 				return
 			}
@@ -519,9 +567,9 @@ func TestInteropDataPlane(t *testing.T) {
 				Digest string `json:"digest"`
 				Body   []byte `json:"body"`
 			}
-			json.Unmarshal([]byte(runPHP("dataplane.php", "xfile", r.Header.Get("X-XCVM-File"), r.Header.Get("X-XCVM-File-Auth"), r.URL.RequestURI(), r.URL.Query().Get("o"), r.URL.Query().Get("n"))), &out)
-			if tamper.Load() && r.URL.Query().Get("o") != "0" && len(out.Body) > 0 {
-				out.Body[0] ^= 1
+			json.Unmarshal([]byte(rig.runPHP("dataplane.php", "xfile", r.Header.Get("X-XCVM-File"), r.Header.Get("X-XCVM-File-Auth"), r.URL.RequestURI(), r.URL.Query().Get("o"), r.URL.Query().Get("n"))), &out)
+			if onChunk != nil {
+				onChunk(r, out.Body)
 			}
 			w.Header().Set("X-XCVM-File-Digest", out.Digest)
 			w.WriteHeader(out.Status)
@@ -530,15 +578,22 @@ func TestInteropDataPlane(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer srv.Close()
-	u, _ := url.Parse(srv.URL)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// proxyTo is the agent's loopback relay proxy with MAIN's route at base: a
+// GET through it returns the status and what it passed on.
+func (rig *dataPlaneRig) proxyTo(t *testing.T, base string) func(path string) (int, []byte) {
+	t.Helper()
+	u, _ := url.Parse(base)
 	host, port, _ := net.SplitHostPort(u.Host)
 	p, _ := strconv.ParseInt(port, 10, 64)
-	proxy := a.NewRelayProxy("interop-loopback-key-0123")
+	proxy := rig.a.NewRelayProxy("interop-loopback-key-0123")
 	proxy.servers = func() (*serverRoutes, error) {
 		return &serverRoutes{self: 7, mainSid: 1, byID: map[int64]serverRoute{1: {ip: host, port: p}, 7: {ip: "127.0.0.2", port: 1}}, nodes: map[int64]routeNode{}}, nil
 	}
-	get := func(path string) (int, []byte) {
+	return func(path string) (int, []byte) {
 		rec := httptest.NewRecorder()
 		func() {
 			defer func() {
@@ -549,24 +604,6 @@ func TestInteropDataPlane(t *testing.T) {
 			proxy.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		}()
 		return rec.Code, rec.Body.Bytes()
-	}
-
-	if code, body := get("/relay/interop-loopback-key-0123/100.ts"); code != 200 || string(body) != "TS-FROM-MAIN" {
-		t.Fatalf("relay: %d %q", code, body)
-	}
-	if len(seen) != 1 {
-		t.Fatalf("%d connects", len(seen))
-	}
-	// A replay of the headers a sniffer copied: MAIN has spent the nonce.
-	if out := runPHP("dataplane.php", "relay", seen[0].Get("X-XCVM-Relay"), seen[0].Get("X-XCVM-Relay-Auth"), "/admin/live?stream=100&extension=ts"); out != "refused" {
-		t.Fatalf("a replayed relay auth: %s", out)
-	}
-	if code, body := get("/xfile/interop-loopback-key-0123/" + ref + ".mkv"); code != 200 || !bytes.Equal(body, want) {
-		t.Fatalf("xfile: %d, %d bytes", code, len(body))
-	}
-	tamper.Store(true)
-	if _, body := get("/xfile/interop-loopback-key-0123/" + ref + ".mkv"); len(body) != cc.FileChunk {
-		t.Fatalf("a tampered chunk: %d bytes passed on", len(body))
 	}
 }
 
