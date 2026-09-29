@@ -369,6 +369,26 @@ func TestInteropWithPanel(t *testing.T) {
 		if _, err := c.OpenRecord(sealedBlk, "rep"); err == nil {
 			t.Fatal("a blk record verified as rep")
 		}
+		// Bouquets too large for one reply come in parts, from a panel that stages them.
+		if src, _ := os.ReadFile(filepath.Join(panel, "src/Domain/Cluster/ReplicaBuilder.php")); strings.Contains(string(src), "PART_BYTES") {
+			cmd := exec.Command(php, filepath.Join(harness, "bouquet.php"))
+			cmd.Env = env
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("bouquet.php: %v\n%s", err, out)
+			}
+			if err := a.SyncReplica(ctx); err != nil {
+				t.Fatalf("replica in parts: %v", err)
+			}
+			now := LoadReplicaState(a.ReplicaDir)
+			after := now.etag("bouquets")
+			b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "bouquets.json"))
+			if after == held.etag("bouquets") || len(b) < 4<<20 || !strings.Contains(string(b), `"bouquet_name":"Everything"`) || !strings.Contains(string(b), `"etag":"`+after+`"`) {
+				t.Fatalf("bouquets in parts: ETag %s (was %s), %d bytes", after, held.etag("bouquets"), len(b))
+			}
+			if left, _ := filepath.Glob(filepath.Join(dir, "xfer", "*")); len(left) != 0 {
+				t.Fatalf("MAIN kept its stage after the last part: %v", left)
+			}
+		}
 	}
 
 	// A second attempt within the minute is refused, signed and about this request.

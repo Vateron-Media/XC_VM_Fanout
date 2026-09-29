@@ -120,6 +120,50 @@ type wholeReply struct {
 	// TooLarge: the section's sealed record would pass MAIN's bound (4 MiB
 	// of base64), so MAIN sends only its ETag; the copy held is dropped.
 	TooLarge bool `json:"too_large"`
+	// Parts: MAIN staged that record for this node, to be fetched in this
+	// many parts (fetchParts), because the poll said "parts".
+	Parts int `json:"parts"`
+}
+
+// MaxWholeParts caps the parts a section is fetched in (MAIN's MAX_PARTS,
+// 32 of 4 MiB).
+const MaxWholeParts = 32
+
+// fetchParts fetches a section MAIN staged for this node in parts, each a
+// `config {part: {section, etag, n}}` of its own, and joins their data into
+// the sealed record's base64, which is then opened as any section sent
+// whole. MAIN's `gone` (the stage is not there any more), a part that is not
+// the one asked for, or a failed call is an error.
+func (a *Agent) fetchParts(ctx context.Context, name, etag string, parts int) (string, error) {
+	if parts < 1 || parts > MaxWholeParts || !etagRe.MatchString(etag) {
+		return "", fmt.Errorf("clusteragent: config: bad %s section", name)
+	}
+	var out strings.Builder
+	for n := 0; n < parts; n++ {
+		var r struct {
+			Part struct {
+				Section string `json:"section"`
+				Etag    string `json:"etag"`
+				N       int    `json:"n"`
+				Parts   int    `json:"parts"`
+				Data    string `json:"data"`
+				Gone    bool   `json:"gone"`
+			} `json:"part"`
+		}
+		ask := map[string]any{"section": name, "etag": etag, "n": n}
+		if err := a.Client.Call(ctx, "config", map[string]any{"part": ask}, &r, false); err != nil {
+			return "", err
+		}
+		p := r.Part
+		if p.Gone {
+			return "", fmt.Errorf("clusteragent: config: MAIN no longer holds the %s section's parts", name)
+		}
+		if p.Section != name || p.Etag != etag || p.N != n || p.Parts != parts || p.Data == "" {
+			return "", fmt.Errorf("clusteragent: config: bad %s section part", name)
+		}
+		out.WriteString(p.Data)
+	}
+	return out.String(), nil
 }
 
 type configReply struct {
@@ -240,7 +284,7 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 			}
 		}
 		var raw json.RawMessage
-		if err := a.Client.Call(ctx, "config", map[string]any{"blocklist_since": since, "have": have}, &raw, false); err != nil {
+		if err := a.Client.Call(ctx, "config", map[string]any{"blocklist_since": since, "have": have, "parts": true}, &raw, false); err != nil {
 			// A 503 DB among them: keep every file and ETag held.
 			return false, err
 		}
@@ -252,7 +296,20 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 		var firstErr error
 		for _, name := range WholeSections {
 			w, ok, err := wholePart(parts, name)
-			if err == nil && ok && w.TooLarge {
+			if err == nil && ok && w.TooLarge && w.Parts > 0 {
+				var sealed string
+				if sealed, err = a.fetchParts(ctx, name, w.Etag, w.Parts); err == nil {
+					err = a.storeWhole(dir, name, &wholeReply{Etag: w.Etag, Sealed: sealed})
+				}
+				if err == nil {
+					st.setEtag(name, w.Etag)
+					wholeChanged = true
+				} else if a.dropWhole(dir, name, w.Etag) == nil {
+					// No copy older than MAIN's, and the ETag held stays as it
+					// was: the next poll asks for the section, and its parts, anew.
+					wholeChanged = true
+				}
+			} else if err == nil && ok && w.TooLarge {
 				err = a.dropWhole(dir, name, w.Etag)
 				if err == nil {
 					st.setEtag(name, w.Etag)

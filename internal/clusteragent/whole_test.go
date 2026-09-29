@@ -522,3 +522,67 @@ func TestCatalogueSectionsAndTooLarge(t *testing.T) {
 		t.Fatal("bouquets not stored again")
 	}
 }
+
+// A section too large for one reply, which MAIN staged because the poll said
+// "parts": fetched part by part, joined, and stored as any section sent
+// whole. A stage MAIN no longer holds, or a part other than the one asked
+// for, drops the copy held and keeps its ETag, so the next poll asks again.
+func TestASectionTooLargeIsFetchedInParts(t *testing.T) {
+	m, a := newReplicaMain(t)
+	ctx := context.Background()
+	bouquets := map[string]any{"bouquets": []any{map[string]any{"id": 1, "bouquet_name": "News", "bouquet_order": 1}}}
+	sealed := m.wholeSection(t, "bouquets", m.uuid, etagOf("b1"), bouquets)["sealed"].(string)
+	half := len(sealed) / 2
+	staged := func(etag string, parts int) {
+		m.whole = append(m.whole, map[string]any{"bouquets": map[string]any{"too_large": true, "etag": etag, "parts": parts}})
+	}
+	part := func(etag string, n int, data string) map[string]any {
+		return map[string]any{"section": "bouquets", "etag": etag, "n": n, "parts": 2, "data": data}
+	}
+
+	staged(etagOf("b1"), 2)
+	m.partQ = append(m.partQ, part(etagOf("b1"), 0, sealed[:half]), part(etagOf("b1"), 1, sealed[half:]))
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if m.asked[0]["parts"] != true {
+		t.Fatalf("the poll does not say parts: %v", m.asked[0])
+	}
+	for n, want := range []float64{0, 1} {
+		ask, _ := m.asked[1+n]["part"].(map[string]any)
+		if ask["section"] != "bouquets" || ask["etag"] != etagOf("b1") || ask["n"] != want {
+			t.Fatalf("part %d asked as %v", n, m.asked[1+n])
+		}
+	}
+	if got := readJSON(t, filepath.Join(a.ReplicaDir, "bouquets.json")); got["etag"] != etagOf("b1") {
+		t.Fatalf("stored %v", got)
+	}
+	if st := LoadReplicaState(a.ReplicaDir); st.WholeEtags["bouquets"] != etagOf("b1") {
+		t.Fatalf("state %v", st.WholeEtags)
+	}
+
+	// MAIN no longer holds the stage: the copy held goes, its ETag stays.
+	staged(etagOf("b2"), 2)
+	m.partQ = append(m.partQ, map[string]any{"section": "bouquets", "etag": etagOf("b2"), "gone": true})
+	if err := a.SyncReplica(ctx); err == nil {
+		t.Fatal("a stage MAIN no longer holds taken")
+	}
+	if _, err := os.Stat(filepath.Join(a.ReplicaDir, "bouquets.json")); !os.IsNotExist(err) {
+		t.Fatal("the older copy kept")
+	}
+	if st := LoadReplicaState(a.ReplicaDir); st.WholeEtags["bouquets"] != etagOf("b1") {
+		t.Fatalf("the ETag moved on a failed fetch: %v", st.WholeEtags)
+	}
+
+	// A part other than the one asked for, or more parts than MAIN stages: refused.
+	staged(etagOf("b1"), 2)
+	m.partQ = append(m.partQ, part(etagOf("b1"), 1, sealed[half:]))
+	if err := a.SyncReplica(ctx); err == nil {
+		t.Fatal("a part out of order taken")
+	}
+	asked := len(m.asked)
+	staged(etagOf("b1"), MaxWholeParts+1)
+	if err := a.SyncReplica(ctx); err == nil || len(m.asked) != asked+1 {
+		t.Fatalf("%d parts asked for: %v", MaxWholeParts+1, err)
+	}
+}
