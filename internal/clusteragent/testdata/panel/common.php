@@ -128,6 +128,11 @@ if (method_exists(\XcVm\Core\Config\OpensslExtra::class, 'usePrevFile')) {
 }
 SettingsManager::set($rSettings);
 $rMain = ['server_ip' => '127.0.0.1', 'http_broadcast_port' => (int) getenv('XCVM_INTEROP_PORT'), 'enable_https' => 1, 'domain_name' => 'main.invalid', 'https_broadcast_port' => 1];
+// xc_cluster_sim: <db>.clock holds how far MAIN's clock runs ahead of this
+// machine's, in ms. Each request fixes MAIN's clock there while it exists.
+if (is_file($rDbFile . '.clock')) {
+	\XcVm\Domain\Cluster\ClusterClock::fix((int) round(microtime(true) * 1000) + (int) file_get_contents($rDbFile . '.clock'));
+}
 $rCrypto = new \XcVm\Tests\Support\FakeClusterCrypto();
 // xc_cluster_sim: while <db>.unlicensed exists MAIN's licence is gone. No
 // token and no lease is issued, and sessions go on (graceful revocation).
