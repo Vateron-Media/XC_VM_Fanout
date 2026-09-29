@@ -14,13 +14,16 @@ import (
 // (the panel's Core\Cluster\Crypto\FileDigest).
 //
 //	doc    = JSON {"v":1, "typ":"xcvm-file-digest", "tid", "owner_sid", "size", "sha256", "iat"
-//	               [, "offset", "total"]} (sorted keys)
+//	               [, "offset", "total" [, "nonce"]]} (sorted keys)
 //	header = b64url(doc) "." b64url(sig)
 //
 // MAIN signs as the panel (tag dig), a load balancer with its node key
 // (purpose digest). /xfile serves a file in chunks of at most FileChunk
 // bytes, each with a digest of its own naming its offset and the file's
-// total size.
+// total size, and the request it answers: nonce is the hex of the nonce in
+// that request's X-XCVM-File-Auth. An owner from before nonce signs none; its
+// digest is taken only while its iat is within the request window
+// (FileDigest.Answers).
 
 // FileDigestMaxHeader is the longest header accepted, in bytes.
 const FileDigestMaxHeader = 2048
@@ -30,7 +33,10 @@ const FileChunk = 4 << 20
 
 var errInvalid = errors.New("clustercrypto: invalid file digest fields")
 
-var sha256HexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var (
+	sha256HexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	nonceHexRe  = regexp.MustCompile(`^[0-9a-f]{32}$`)
+)
 
 // FileDigest is a verified digest document.
 type FileDigest struct {
@@ -41,15 +47,18 @@ type FileDigest struct {
 	Iat      int64  `json:"iat"`
 	Offset   *int64 `json:"offset"`
 	Total    *int64 `json:"total"`
+	Nonce    string `json:"nonce"`
 }
 
 // FileDigestDoc is the document a node signs, its fields in the order the
 // panel's FileDigest sorts them (ksort): a byte of difference and the
 // fetcher's verification fails. Offset and Total are both set (a chunk) or
-// both nil (a whole file).
-func FileDigestDoc(tid string, ownerSid, size int64, sha256Hex string, iat int64, offset, total *int64) ([]byte, error) {
+// both nil (a whole file); nonceHex, the answered request's File-Auth nonce,
+// is a chunk's only ("": none, as an owner from before it signed).
+func FileDigestDoc(tid string, ownerSid, size int64, sha256Hex string, iat int64, offset, total *int64, nonceHex string) ([]byte, error) {
 	type chunkDoc struct {
 		Iat      int64  `json:"iat"`
+		Nonce    string `json:"nonce,omitempty"`
 		Offset   int64  `json:"offset"`
 		OwnerSid int64  `json:"owner_sid"`
 		Sha256   string `json:"sha256"`
@@ -69,12 +78,12 @@ func FileDigestDoc(tid string, ownerSid, size int64, sha256Hex string, iat int64
 		V        int    `json:"v"`
 	}
 	if !sha256HexRe.MatchString(sha256Hex) || size < 0 || ownerSid <= 0 || (offset == nil) != (total == nil) ||
-		(offset != nil && (*offset < 0 || *total < *offset+size)) {
+		(offset != nil && (*offset < 0 || *total < *offset+size)) || (nonceHex != "" && (offset == nil || !nonceHexRe.MatchString(nonceHex))) {
 		return nil, errInvalid
 	}
 	var v any = wholeDoc{Iat: iat, OwnerSid: ownerSid, Sha256: sha256Hex, Size: size, Tid: tid, Typ: "xcvm-file-digest", V: 1}
 	if offset != nil {
-		v = chunkDoc{Iat: iat, Offset: *offset, OwnerSid: ownerSid, Sha256: sha256Hex, Size: size, Tid: tid, Total: *total, Typ: "xcvm-file-digest", V: 1}
+		v = chunkDoc{Iat: iat, Nonce: nonceHex, Offset: *offset, OwnerSid: ownerSid, Sha256: sha256Hex, Size: size, Tid: tid, Total: *total, Typ: "xcvm-file-digest", V: 1}
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -134,7 +143,27 @@ func VerifyFileDigest(header, tid string, panelPub, nodePub []byte) (*FileDigest
 			return nil, false
 		}
 	}
+	if _, has := raw["nonce"]; has && (!hasOff || !nonceHexRe.MatchString(d.Nonce)) {
+		return nil, false
+	}
 	return &d, true
+}
+
+// Answers reports whether the verified digest answers the request that
+// carried nonce (16 bytes, the X-XCVM-File-Auth one), judged at nowMs on
+// MAIN's clock: it names that nonce, or, from an owner that names none, its
+// iat is within the request window (RelayWindowMs, and a second for iat's
+// rounding). So an old answer for the same chunk passes for a new request only
+// from an owner from before the nonce, and only inside the window.
+func (d *FileDigest) Answers(nonce []byte, nowMs int64) bool {
+	if d.Nonce != "" {
+		return subtle.ConstantTimeCompare([]byte(d.Nonce), []byte(hex.EncodeToString(nonce))) == 1
+	}
+	if d.Iat < 0 || d.Iat > 1<<40 {
+		return false
+	}
+	skew := d.Iat*1000 - nowMs
+	return skew <= RelayWindowMs+1000 && -skew <= RelayWindowMs+1000
 }
 
 // ChunkMatches reports whether a received chunk is the one the verified

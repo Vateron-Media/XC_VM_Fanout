@@ -35,7 +35,8 @@ import (
 //	    -> GET <owner>/xfile?o=<offset>&n=<FileChunk>, chunk by chunk
 //	       X-XCVM-File        the file ticket naming ref
 //	       X-XCVM-File-Auth   the same proof over the file ticket
-//	       <- X-XCVM-File-Digest, checked before a byte of the chunk is passed on
+//	       <- X-XCVM-File-Digest, checked before a byte of the chunk is passed on;
+//	          it names the File-Auth nonce, so an old answer is not taken for this one
 //
 // `k` is the loopback key: the node's PHP puts it in the URLs it builds, and
 // a request without it is refused, so a local user who reads an encoder's
@@ -396,7 +397,7 @@ func (p *RelayProxy) relay(w http.ResponseWriter, r *http.Request, id int64, pre
 	if prebuffer {
 		target += "&prebuffer=1"
 	}
-	resp, err := p.upstream(r.Context(), base, target, "X-XCVM-Relay", "X-XCVM-Relay-Auth", wire)
+	resp, _, err := p.upstream(r.Context(), base, target, "X-XCVM-Relay", "X-XCVM-Relay-Auth", wire)
 	if err != nil {
 		a.logf("cluster: relay: stream %d from server %d: %v", id, parent, err)
 		http.Error(w, "upstream", http.StatusBadGateway)
@@ -415,24 +416,26 @@ func (p *RelayProxy) relay(w http.ResponseWriter, r *http.Request, id int64, pre
 	flushCopy(w, resp.Body)
 }
 
-// upstream sends one signed GET to base+target.
-func (p *RelayProxy) upstream(ctx context.Context, base, target, ticketHeader, authHeader, wire string) (*http.Response, error) {
-	nonce := make([]byte, 16)
+// upstream sends one signed GET to base+target; nonce is the proof's, which
+// a file chunk's digest must name.
+func (p *RelayProxy) upstream(ctx context.Context, base, target, ticketHeader, authHeader, wire string) (resp *http.Response, nonce []byte, err error) {
+	nonce = make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	auth, err := cc.RelayAuthHeader(p.a.Client.State.SignKey(), wire, http.MethodGet, target, p.a.Client.MainNowMs(), nonce)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+target, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set(ticketHeader, wire)
 	req.Header.Set(authHeader, auth)
 	req.Header.Set("User-Agent", "xc_agent/relay")
-	return p.client.Do(req)
+	resp, err = p.client.Do(req)
+	return resp, nonce, err
 }
 
 // xfile reads a file another server owns, chunk by chunk, each checked
@@ -594,7 +597,7 @@ func (c *chunkReader) fetchOnce(off int64) (body []byte, after time.Duration, er
 		return nil, -1, err
 	}
 	target := "/xfile?o=" + strconv.FormatInt(off, 10) + "&n=" + strconv.Itoa(cc.FileChunk)
-	resp, err := c.p.upstream(c.ctx, c.base, target, "X-XCVM-File", "X-XCVM-File-Auth", c.wire)
+	resp, nonce, err := c.p.upstream(c.ctx, c.base, target, "X-XCVM-File", "X-XCVM-File-Auth", c.wire)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -607,18 +610,21 @@ func (c *chunkReader) fetchOnce(off int64) (body []byte, after time.Duration, er
 		}
 		return nil, after, fmt.Errorf("the owner answered %d", resp.StatusCode)
 	}
-	body, err = c.check(off, resp)
+	body, err = c.check(off, nonce, resp)
 	return body, -1, err
 }
 
-// check verifies one chunk's response.
-func (c *chunkReader) check(off int64, resp *http.Response) ([]byte, error) {
+// check verifies one chunk's response to the request that carried nonce.
+func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("the owner answered %d", resp.StatusCode)
 	}
 	d, ok := cc.VerifyFileDigest(resp.Header.Get("X-XCVM-File-Digest"), c.tid, c.panelPub, c.nodePub)
 	if !ok || d.OwnerSid != c.owner || d.Offset == nil || d.Total == nil {
 		return nil, errors.New("the chunk's digest does not verify")
+	}
+	if !d.Answers(nonce, c.p.a.Client.MainNowMs()) {
+		return nil, errors.New("the chunk's digest answers another request")
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, cc.FileChunk+1))
 	if err != nil {
