@@ -128,6 +128,10 @@ if (method_exists(\XcVm\Core\Config\OpensslExtra::class, 'usePrevFile')) {
 }
 SettingsManager::set($rSettings);
 $rMain = ['server_ip' => '127.0.0.1', 'http_broadcast_port' => (int) getenv('XCVM_INTEROP_PORT'), 'enable_https' => 1, 'domain_name' => 'main.invalid', 'https_broadcast_port' => 1];
+if (method_exists(\XcVm\Domain\Cluster\ReplicaBuilder::class, 'useXferDir')) {
+	// A section staged for its parts: beside the DB, never a shared tmp/.
+	\XcVm\Domain\Cluster\ReplicaBuilder::useXferDir(dirname($rDbFile) . '/xfer/');
+}
 // xc_cluster_sim: <db>.clock holds how far MAIN's clock runs ahead of this
 // machine's, in ms. Each request fixes MAIN's clock there while it exists.
 if (is_file($rDbFile . '.clock')) {

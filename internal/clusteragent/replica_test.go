@@ -27,6 +27,7 @@ type replicaMain struct {
 	next     []map[string]any
 	settings []map[string]any // sent with the next replies, one each
 	whole    []map[string]any // whole sections by name, merged into the next replies, one each
+	partQ    []map[string]any // the next `config {part}` replies' part, one each
 	deny     string           // refuse the next request with this 503 reason
 	asked    []map[string]any
 }
@@ -56,7 +57,13 @@ func (m *replicaMain) answer(w http.ResponseWriter, r *http.Request, reqCtx, non
 		return
 	}
 	out := map[string]any{"blocklist": map[string]any{"seq": 0, "more": false}}
-	if len(m.next) > 0 {
+	if _, ok := req["part"]; ok {
+		out = map[string]any{}
+		if len(m.partQ) > 0 {
+			out["part"] = m.partQ[0]
+			m.partQ = m.partQ[1:]
+		}
+	} else if len(m.next) > 0 {
 		out = map[string]any{"blocklist": m.next[0]}
 		m.next = m.next[1:]
 	}
