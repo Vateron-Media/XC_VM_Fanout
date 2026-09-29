@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -626,6 +627,9 @@ func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response) ([]byt
 	if !d.Answers(nonce, c.p.a.Client.MainNowMs()) {
 		return nil, errors.New("the chunk's digest answers another request")
 	}
+	if d.Nonce == "" && !c.p.a.takeDigestN1(c.owner) {
+		return nil, errors.New("the chunk's digest names no request, which lb_digest_nonce_required refuses")
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, cc.FileChunk+1))
 	if err != nil {
 		return nil, err
@@ -643,6 +647,45 @@ func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response) ([]byt
 	}
 	c.total, c.seen = *d.Total, true
 	return body, nil
+}
+
+// DigestN1Window is how long the heartbeat names an owner whose chunk digest
+// named no request.
+const DigestN1Window = 24 * time.Hour
+
+// takeDigestN1 decides on a chunk digest that names no request, which only an
+// owner from before the nonce sends (ADR 0004, "Binding a chunk's digest to
+// its request"): refused while lb_digest_nonce_required is on, else noted for
+// the heartbeat (DigestN1Report).
+func (a *Agent) takeDigestN1(owner int64) bool {
+	if v, _ := settingInt(a.replicaSettings()["lb_digest_nonce_required"]); v == 1 {
+		return false
+	}
+	a.digestN1Mu.Lock()
+	defer a.digestN1Mu.Unlock()
+	if a.digestN1 == nil {
+		a.digestN1 = map[int64]time.Time{}
+	}
+	a.digestN1[owner] = time.Now()
+	return true
+}
+
+// DigestN1Report is what every heartbeat sends as digest_n1: the owners, in
+// order, whose chunk digest named no request within DigestN1Window, [] for
+// none. MAIN tells from it when the fallback can be refused.
+func (a *Agent) DigestN1Report(now time.Time) []int64 {
+	a.digestN1Mu.Lock()
+	defer a.digestN1Mu.Unlock()
+	owners := []int64{}
+	for sid, at := range a.digestN1 {
+		if now.Sub(at) < DigestN1Window {
+			owners = append(owners, sid)
+		} else {
+			delete(a.digestN1, sid)
+		}
+	}
+	sort.Slice(owners, func(i, j int) bool { return owners[i] < owners[j] })
+	return owners
 }
 
 // byteRange is one Range header's single range.

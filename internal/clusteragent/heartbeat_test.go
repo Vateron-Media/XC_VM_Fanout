@@ -95,6 +95,37 @@ func TestATokenRefreshDoesNotHoldTheHeartbeats(t *testing.T) {
 	}
 }
 
+// A refresh MAIN refuses for want of a licence is asked again on the next
+// tick, with no backoff, so the first one after the licence returns brings a
+// token and its lease (ADR 0004, "Re-licensing a fleet").
+func TestARefreshRefusedForTheLicenceIsAskedAgainEachTick(t *testing.T) {
+	f, st := newFake(t)
+	var mu sync.Mutex
+	refreshes := 0
+	f.answer = func(w http.ResponseWriter, r *http.Request, reqCtx, nonce []byte) {
+		if strings.HasSuffix(r.URL.Path, "/token_refresh") {
+			mu.Lock()
+			refreshes++
+			mu.Unlock()
+			f.refuse(w, 403, nonce, "LICENCE_INVALID", nil)
+			return
+		}
+		f.box(w, reqCtx, map[string]any{"state": "active", "mode": 1})
+	}
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	st.MainURLs, st.Enrolled = []string{srv.URL + "/cluster/v1/"}, true
+	a := &Agent{Client: NewClient(st, "xc_agent/test"), Interval: 100 * time.Millisecond, Logf: t.Logf}
+	s, _ := a.Client.current()
+	s.tok.RefreshAt = 0 // due from the start
+	runFor(t, a, 1500*time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if refreshes < 3 {
+		t.Fatalf("a refused refresh was asked %d times in 15 ticks", refreshes)
+	}
+}
+
 func TestAnUnreachableURLGoesLast(t *testing.T) {
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	dead := "http://" + l.Addr().String() + "/cluster/v1/"

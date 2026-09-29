@@ -102,7 +102,9 @@ type Agent struct {
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 	nonceOnce          sync.Once    // the data plane's nonce window (dataplane.go)
 	nonces             *nonceCache
-	ticketsOnce        sync.Once // the data plane's tickets (tickets.go)
+	digestN1Mu         sync.Mutex
+	digestN1           map[int64]time.Time // owners whose chunk digest named no request (relayproxy.go)
+	ticketsOnce        sync.Once           // the data plane's tickets (tickets.go)
 	ticketStore        *ticketStore
 	busyRefusals       atomic.Int64 // ingest lane refusals: MAIN busy, not failing (retry.go)
 	replicaMu          sync.Mutex   // one replica sync or check at a time (replica.go)
@@ -858,6 +860,7 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 	if relay := a.RelayReport(time.Now()); relay != nil {
 		payload["relay"] = relay
 	}
+	payload["digest_n1"] = a.DigestN1Report(time.Now())
 	if a.Registry != nil && a.flows.Load()&FlowConnections != 0 {
 		payload["conn_digest"] = a.Registry.Digest()
 	}
