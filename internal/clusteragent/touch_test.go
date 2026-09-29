@@ -234,3 +234,14 @@ func TestPendingTouchesLeaveWithTheRecord(t *testing.T) {
 		t.Fatal("a resetting seed kept a touch")
 	}
 }
+
+// sendTouches sends every touch due, a batch after another, as the P2 lane
+// does.
+func (a *Agent) sendTouches(ctx context.Context) error {
+	for {
+		served, err := a.sendTouchBatch(ctx)
+		if err != nil || !served {
+			return err
+		}
+	}
+}

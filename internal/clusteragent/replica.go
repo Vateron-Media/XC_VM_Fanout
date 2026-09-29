@@ -503,24 +503,6 @@ func (a *Agent) openWhole(sealed []byte, name, etag string) (*wholeDoc, error) {
 	return &doc, nil
 }
 
-// recheckReplica opens and verifies every stored record with the node's
-// current keys. syncReplica runs it at the agent's start and whenever those
-// keys changed (an enrolment, a re-enrolment, a new panel key), off the
-// heartbeat loop: it waits for a running sync and its apply. A whole section
-// whose record fails gets its held ETag reset, and a blocklist that fails
-// its ETag and seq, so the next config call fetches them again: MAIN would
-// otherwise answer unchanged while PHP refuses the stored records.
-func (a *Agent) recheckReplica() {
-	dir := a.ReplicaDir
-	if dir == "" {
-		return
-	}
-	a.replicaMu.Lock()
-	defer a.replicaMu.Unlock()
-	a.recheckLocked(dir)
-	a.replicaKeys = a.replicaKeyPrint()
-}
-
 // replicaKeyPrint names the keys the stored records verify under: the
 // node's uuid and box key, and the pinned panel key.
 func (a *Agent) replicaKeyPrint() string {
@@ -535,7 +517,13 @@ func (a *Agent) replicaKeyPrint() string {
 	return string(h.Sum(nil))
 }
 
-// recheckLocked is recheckReplica with replicaMu held.
+// recheckLocked opens and verifies every stored record with the node's
+// current keys, with replicaMu held. syncReplica runs it at the agent's start
+// and whenever those keys changed (an enrolment, a re-enrolment, a new panel
+// key). A whole section whose record fails gets its held ETag reset, and a
+// blocklist that fails its ETag and seq, so the next config call fetches them
+// again: MAIN would otherwise answer unchanged while PHP refuses the stored
+// records.
 func (a *Agent) recheckLocked(dir string) {
 	st := LoadReplicaState(dir)
 	changed := false

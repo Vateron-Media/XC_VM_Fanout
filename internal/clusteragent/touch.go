@@ -225,17 +225,6 @@ func (a *Agent) RunTouches(ctx context.Context) {
 	}
 }
 
-// sendTouches sends every touch due, a batch after another, one request at
-// a time.
-func (a *Agent) sendTouches(ctx context.Context) error {
-	for {
-		served, err := a.sendTouchBatch(ctx)
-		if err != nil || !served {
-			return err
-		}
-	}
-}
-
 // sendTouchBatch sends one batch of the touches due, at most MaxBatchEvents
 // events and MaxBatchBytes, and reports whether MAIN served one.
 func (a *Agent) sendTouchBatch(ctx context.Context) (bool, error) {
