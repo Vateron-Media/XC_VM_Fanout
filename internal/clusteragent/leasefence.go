@@ -38,27 +38,36 @@ const (
 	LeaseFenceDrainMinMax     = 60
 )
 
-// leaseFenceSettings reads lb_lease_fence and lb_fence_drain_min from the
-// replica's settings section; ok is false without one.
-func (a *Agent) leaseFenceSettings() (on bool, drainMin int64, ok bool) {
+// replicaSettings is the replica's settings section, nil without one.
+func (a *Agent) replicaSettings() map[string]any {
 	if a.ReplicaDir == "" {
-		return false, 0, false
+		return nil
 	}
 	b, err := os.ReadFile(filepath.Join(a.ReplicaDir, "settings.json"))
 	if err != nil {
-		return false, 0, false
+		return nil
 	}
 	var doc struct {
 		Data map[string]any `json:"data"`
 	}
-	if json.Unmarshal(b, &doc) != nil || doc.Data == nil {
+	if json.Unmarshal(b, &doc) != nil {
+		return nil
+	}
+	return doc.Data
+}
+
+// leaseFenceSettings reads lb_lease_fence and lb_fence_drain_min from the
+// replica's settings section; ok is false without one.
+func (a *Agent) leaseFenceSettings() (on bool, drainMin int64, ok bool) {
+	data := a.replicaSettings()
+	if data == nil {
 		return false, 0, false
 	}
 	drainMin = LeaseFenceDrainMinDefault
-	if v, ok := settingInt(doc.Data["lb_fence_drain_min"]); ok && v >= 0 && v <= LeaseFenceDrainMinMax {
+	if v, ok := settingInt(data["lb_fence_drain_min"]); ok && v >= 0 && v <= LeaseFenceDrainMinMax {
 		drainMin = v
 	}
-	v, _ := settingInt(doc.Data["lb_lease_fence"])
+	v, _ := settingInt(data["lb_lease_fence"])
 	return v == 1, drainMin, true
 }
 

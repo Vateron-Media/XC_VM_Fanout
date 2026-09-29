@@ -387,6 +387,45 @@ func TestXfileRefusesAnOldAnswerForTheSameChunk(t *testing.T) {
 	}
 }
 
+// An owner from before the nonce is named in the heartbeat's digest_n1 for a
+// day, and with lb_digest_nonce_required on its digest is refused, while an
+// owner that names the request is still read.
+func TestXfileReportsAnOwnerWithoutTheNonceAndCanRefuseIt(t *testing.T) {
+	fx, o, path := xfileFixture(t, 1000)
+	if got := fx.a.DigestN1Report(time.Now()); fmt.Sprint(got) != "[]" {
+		t.Fatalf("before any read: %v", got)
+	}
+	o.legacy = true
+	if res := fx.get(path); res.StatusCode != 200 {
+		t.Fatalf("an owner without the nonce: %d", res.StatusCode)
+	}
+	if got := fx.a.DigestN1Report(time.Now()); fmt.Sprint(got) != "[5]" {
+		t.Fatalf("digest_n1 %v, want the owner", got)
+	}
+	if got := fx.a.DigestN1Report(time.Now().Add(DigestN1Window)); fmt.Sprint(got) != "[]" {
+		t.Fatalf("digest_n1 a day later: %v", got)
+	}
+
+	required := func(fx *relayFixture) {
+		os.MkdirAll(fx.a.ReplicaDir, 0o750)
+		if err := os.WriteFile(filepath.Join(fx.a.ReplicaDir, "settings.json"), []byte(`{"data":{"lb_digest_nonce_required":"1"}}`), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	required(fx)
+	if res := fx.get(path); res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("an owner without the nonce, the setting on: %d", res.StatusCode)
+	}
+	if got := fx.a.DigestN1Report(time.Now()); fmt.Sprint(got) != "[]" {
+		t.Fatalf("a refused digest was reported: %v", got)
+	}
+	fx, _, path = xfileFixture(t, 1000)
+	required(fx)
+	if res := fx.get(path); res.StatusCode != 200 {
+		t.Fatalf("an owner with the nonce, the setting on: %d", res.StatusCode)
+	}
+}
+
 // A digest signed by another key than the owner's (a node the list does not
 // have active, or anyone else) is refused.
 func TestXfileRefusesADigestFromAnotherKeyOrAnInactiveOwner(t *testing.T) {
@@ -763,5 +802,15 @@ func TestHeartbeatCarriesTheRelayReport(t *testing.T) {
 	a.relayBind.up()
 	if got, _ := json.Marshal(beat()["relay"]); string(got) != `{"bound":true}` {
 		t.Fatalf("relay %s", got)
+	}
+	// digest_n1 goes out always, [] for none, so MAIN tells none from an agent
+	// that does not say.
+	if got, _ := json.Marshal(beat()["digest_n1"]); string(got) != `[]` {
+		t.Fatalf("digest_n1 %s", got)
+	}
+	a.takeDigestN1(7)
+	a.takeDigestN1(5)
+	if got, _ := json.Marshal(beat()["digest_n1"]); string(got) != `[5,7]` {
+		t.Fatalf("digest_n1 %s", got)
 	}
 }
