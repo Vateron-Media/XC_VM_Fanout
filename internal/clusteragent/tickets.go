@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	cc "github.com/Vateron-Media/XC_VM_Fanout/internal/clustercrypto"
 )
@@ -67,7 +68,16 @@ type ticketStore struct {
 	path  string
 	f     ticketFile
 	files map[string]int64 // ref -> stream id
+	// Following a file another process writes (TicketsFollowFile): what it
+	// was when last read, and when it was last looked at.
+	follow    bool
+	modAt     time.Time
+	size      int64
+	checkedAt time.Time
 }
+
+// TicketsFollowEvery is how often a followed tickets.json is looked at.
+var TicketsFollowEvery = time.Second
 
 type ticketsAsk struct {
 	Epoch int64 `json:"epoch"`
@@ -88,17 +98,47 @@ func (a *Agent) tickets() *ticketStore {
 		return nil
 	}
 	a.ticketsOnce.Do(func() {
-		s := &ticketStore{path: filepath.Join(a.ReplicaDir, "tickets.json")}
+		s := &ticketStore{path: filepath.Join(a.ReplicaDir, "tickets.json"), follow: a.TicketsFollowFile}
+		s.load()
+		a.ticketStore = s
+	})
+	if a.ticketStore.follow {
+		a.ticketStore.refollow()
+	}
+	return a.ticketStore
+}
+
+// load reads tickets.json (mu held for writing, or not yet shared).
+func (s *ticketStore) load() {
+	s.f = ticketFile{}
+	if fi, err := os.Stat(s.path); err == nil {
+		s.modAt, s.size = fi.ModTime(), fi.Size()
 		if b, err := os.ReadFile(s.path); err == nil {
 			json.Unmarshal(b, &s.f)
 		}
-		if s.f.Streams == nil {
-			s.f.Streams = map[string]streamTickets{}
-		}
-		s.index()
-		a.ticketStore = s
-	})
-	return a.ticketStore
+	} else {
+		s.modAt, s.size = time.Time{}, -1
+	}
+	if s.f.Streams == nil {
+		s.f.Streams = map[string]streamTickets{}
+	}
+	s.index()
+}
+
+// refollow reads a followed tickets.json again when it changed, looking at
+// most every TicketsFollowEvery.
+func (s *ticketStore) refollow() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Since(s.checkedAt) < TicketsFollowEvery {
+		return
+	}
+	s.checkedAt = time.Now()
+	fi, err := os.Stat(s.path)
+	if err == nil && fi.ModTime().Equal(s.modAt) && fi.Size() == s.size || err != nil && s.size == -1 {
+		return
+	}
+	s.load()
 }
 
 // index rebuilds the ref index (mu held for writing, or not yet shared).
@@ -168,6 +208,9 @@ func (a *Agent) verifiedTicket(tag, wire string) (*cc.Ticket, bool) {
 	}
 	if tok, has := a.Client.Current(); has && tok.Gen != 0 && int64(tok.Gen) != g {
 		return nil, false
+	}
+	if self := a.selfGen.Load(); self != 0 && self != g {
+		return nil, false // MAIN's: the generation main.json names
 	}
 	return t, true
 }

@@ -71,6 +71,14 @@ type Agent struct {
 	// relayBind is whether the relay proxy holds its port, for MAIN
 	// (heartbeat `relay`) and the local status (relayproxy.go).
 	relayBind relayBindState
+	// MainIdentityPath is MAIN's main.json (mainrole.go); "" on a node.
+	MainIdentityPath string
+	// TicketsFollowFile re-reads replica/tickets.json when it changes: on
+	// MAIN, whose PHP writes it (mainrole.go). A node's agent writes its own.
+	TicketsFollowFile bool
+	// selfGen is the generation tickets must name when there is no token to
+	// take it from (MAIN's, from main.json); 0 on a node.
+	selfGen atomic.Int64
 
 	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
