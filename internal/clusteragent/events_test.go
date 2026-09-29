@@ -311,9 +311,16 @@ func TestInteropEvents(t *testing.T) {
 	if strings.Contains(fmt.Sprint(got.Logs[0]["source"]), "pw") || fmt.Sprint(got.Logs[0]["server_id"]) != "7" {
 		t.Fatalf("log row %v", got.Logs[0])
 	}
+	// MAIN holds the events once it answered; the agent drops its spool file
+	// after reading that answer, a moment later.
 	for _, lane := range []string{"p0", "p1"} {
-		if files, _ := laneFor(a, lane).spooled(); len(files) != 0 {
-			t.Fatalf("%s: spool not drained", lane)
+		for i := 0; ; i++ {
+			if files, _ := laneFor(a, lane).spooled(); len(files) == 0 {
+				break
+			} else if i == 100 {
+				t.Fatalf("%s: spool not drained: %v", lane, files)
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }
