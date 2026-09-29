@@ -21,7 +21,8 @@ import (
 //	  "token": {"epoch": 9, "gen": 2, "nbf": …, "exp": …, "refresh_at": …} | null,
 //	  "lease": {"gen": 2, "iat": …, "exp": …} | null, "lease_refused": "",
 //	  "lanes": [{"name": "p0", "files": 0, "bytes": 0, "oldest_ms": 0, "inflight": 0, "cursor": 41}, …],
-//	  "busy_refusals": 0
+//	  "busy_refusals": 0,
+//	  "relay": {"bound": true} | {"bound": false, "since_ms": …, "failures": 3, "error": "…"} | null
 //	}
 //
 // Times are unix ms on this machine's clock except where a field says MAIN's:
@@ -66,6 +67,10 @@ func (a *Agent) Status(now time.Time) map[string]any {
 		"lease":             nil,
 		"lease_refused":     "",
 		"lanes":             []LaneStatus{},
+		"relay":             nil,
+	}
+	if relay := a.RelayReport(now); relay != nil {
+		doc["relay"] = relay
 	}
 	if s, ok := a.state.Load().(string); ok {
 		doc["state"] = s

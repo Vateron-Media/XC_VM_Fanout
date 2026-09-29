@@ -47,6 +47,9 @@ func TestInteropWithPanel(t *testing.T) {
 		MainPort  json.Number `json:"main_port"`
 		Audit     *string     `json:"audit"`
 		Features  *string     `json:"features"`
+		// RelayDownSince is nil while the relay proxy holds its port.
+		RelayDownSince *json.Number `json:"relay_down_since"`
+		RelayError     *string      `json:"relay_error"`
 	}) {
 		t.Helper()
 		cmd := exec.Command(php, filepath.Join(harness, "node.php"))
@@ -163,6 +166,26 @@ func TestInteropWithPanel(t *testing.T) {
 	if row := mainNode(); row.Audit == nil || !strings.Contains(*row.Audit, `"allowed_ips_admin":3`) || !strings.Contains(*row.Audit, `"sql_connects":2`) || !strings.Contains(*row.Audit, `"connects_since":1790000000`) {
 		t.Fatalf("MAIN kept audit %v", row.Audit)
 	}
+	// A relay proxy that cannot bind its port: MAIN keeps it with the error,
+	// then clears it once the port is the agent's.
+	a.RelayAddr, a.RelayKeyDir = RelayProxyAddr, t.TempDir()
+	a.relayBind.down(time.Now().Add(-time.Minute), 3, errors.New("listen tcp 127.0.0.1:31290: bind: address already in use"))
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatalf("heartbeat with relay down: %v", err)
+	}
+	if row := mainNode(); row.RelayDownSince == nil || row.RelayError == nil || !strings.Contains(*row.RelayError, "address already in use") {
+		t.Fatalf("MAIN kept relay_down_since %v, relay_error %v", row.RelayDownSince, row.RelayError)
+	} else if since, _ := row.RelayDownSince.Int64(); since > time.Now().Unix()-50 || since < time.Now().Unix()-70 {
+		t.Fatalf("relay_down_since %d, want about a minute ago", since)
+	}
+	a.relayBind.up()
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatalf("heartbeat with relay bound: %v", err)
+	}
+	if row := mainNode(); row.RelayDownSince != nil || row.RelayError != nil {
+		t.Fatalf("MAIN still keeps relay_down_since %v, relay_error %v", row.RelayDownSince, row.RelayError)
+	}
+	a.RelayAddr, a.RelayKeyDir = "", ""
 	var hb Reply
 	if err := c.Call(ctx, "heartbeat", map[string]any{"telemetry": map[string]int{"cpu": 1}}, &hb, false); err != nil {
 		t.Fatalf("heartbeat: %v", err)

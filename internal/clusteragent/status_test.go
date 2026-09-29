@@ -3,6 +3,7 @@ package clusteragent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -37,6 +38,9 @@ func TestStatusBeforeMainAnswered(t *testing.T) {
 	if lanes := doc["lanes"].([]LaneStatus); len(lanes) != 0 {
 		t.Errorf("no spool, got lanes %v", lanes)
 	}
+	if doc["relay"] != nil {
+		t.Errorf("no relay proxy, got relay %v", doc["relay"])
+	}
 }
 
 func TestStatusReportsClockLeaseAndLanes(t *testing.T) {
@@ -51,6 +55,8 @@ func TestStatusReportsClockLeaseAndLanes(t *testing.T) {
 	a.cursorP0.Store(42)
 	st.Lease = &Lease{Gen: 1, Iat: 100, Exp: 200, ServerID: 3}
 	st.LeaseRefused = "older than the lease this node already holds"
+	a.RelayAddr, a.RelayKeyDir = RelayProxyAddr, t.TempDir()
+	a.relayBind.down(time.UnixMilli(1_800_000_000_000), 4, errors.New("listen tcp 127.0.0.1:31290: bind: address already in use"))
 
 	p0 := filepath.Join(spool, "p0")
 	os.MkdirAll(p0, 0o755)
@@ -81,6 +87,9 @@ func TestStatusReportsClockLeaseAndLanes(t *testing.T) {
 	}
 	if p := lanes[1]; p.Files != 0 || p.OldestMs != 0 || p.Cursor != -1 {
 		t.Errorf("p1 %+v", p)
+	}
+	if r := doc["relay"].(map[string]any); r["bound"] != false || r["since_ms"] != int64(1_800_000_000_000) || r["failures"] != 4 || !strings.Contains(r["error"].(string), "address already in use") {
+		t.Errorf("relay %v", r)
 	}
 }
 

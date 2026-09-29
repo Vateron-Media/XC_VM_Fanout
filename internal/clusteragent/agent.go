@@ -68,6 +68,9 @@ type Agent struct {
 	// RelayProxyAddr), with its key in RelayKeyDir; "" leaves it off.
 	RelayAddr   string
 	RelayKeyDir string
+	// relayBind is whether the relay proxy holds its port, for MAIN
+	// (heartbeat `relay`) and the local status (relayproxy.go).
+	relayBind relayBindState
 
 	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
@@ -839,6 +842,9 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 	}
 	if audit := a.readAudit(); audit != nil {
 		payload["audit"] = audit
+	}
+	if relay := a.RelayReport(time.Now()); relay != nil {
+		payload["relay"] = relay
 	}
 	if a.Registry != nil && a.flows.Load()&FlowConnections != 0 {
 		payload["conn_digest"] = a.Registry.Digest()
