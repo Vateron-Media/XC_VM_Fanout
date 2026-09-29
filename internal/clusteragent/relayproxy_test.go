@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -617,5 +618,86 @@ func TestTheFileIndexPicksTheLatestTicketPerRef(t *testing.T) {
 	}
 	if ticketExp("not a ticket") != 0 || ticketExp(late) != fx.now+7200 {
 		t.Fatal("ticketExp")
+	}
+}
+
+// MAIN hears when the relay proxy cannot hold its port (heartbeat `relay`,
+// ADR 0004, Phase 9's eighth increment): down since the first failure in a
+// row, with the count and the last error, then bound once it can.
+func TestRelayReportTellsWhetherTheProxyHoldsItsPort(t *testing.T) {
+	defer func(a, b time.Duration) { RelayBindRetryMin, RelayBindRetryMax = a, b }(RelayBindRetryMin, RelayBindRetryMax)
+	RelayBindRetryMin, RelayBindRetryMax = 10*time.Millisecond, 40*time.Millisecond
+	squatter, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, dir := squatter.Addr().String(), t.TempDir()
+	if r := (&Agent{}).RelayReport(time.Now()); r != nil {
+		t.Fatalf("a proxy that is off reports %v", r)
+	}
+	a := &Agent{Logf: func(string, ...any) {}, RelayAddr: addr, RelayKeyDir: dir}
+	if r := a.RelayReport(time.Now()); r != nil {
+		t.Fatalf("before its first attempt the proxy reports %v", r)
+	}
+	start := time.Now().UnixMilli()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.ServeRelayProxy(ctx, addr, dir) }()
+
+	waitFor(t, "two failed binds", func() bool {
+		r := a.RelayReport(time.Now())
+		return r != nil && r["failures"].(int) >= 2
+	})
+	r := a.RelayReport(time.Now())
+	if r["bound"] != false || r["since_ms"].(int64) < start || !strings.Contains(r["error"].(string), "address already in use") {
+		t.Fatalf("report %v", r)
+	}
+	since := r["since_ms"]
+	waitFor(t, "a third failed bind", func() bool { return a.RelayReport(time.Now())["failures"].(int) >= 3 })
+	if got := a.RelayReport(time.Now())["since_ms"]; got != since {
+		t.Fatalf("since moved from %v to %v while the port stayed taken", since, got)
+	}
+
+	squatter.Close()
+	waitFor(t, "bound once the port frees", func() bool { return a.RelayReport(time.Now())["bound"] == true })
+	if r := a.RelayReport(time.Now()); len(r) != 1 {
+		t.Fatalf("a bound proxy reports %v", r)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrintableKeepsPrintableASCIIWithinTheCap(t *testing.T) {
+	if got := printable("listen tcp\x00 127.0.0.1:31290:\n bind: é address", 30); got != "listen tcp 127.0.0.1:31290: bi" {
+		t.Fatalf("%q", got)
+	}
+}
+
+// Every heartbeat carries the relay report while the proxy has one, and
+// none while it is off or has not tried yet.
+func TestHeartbeatCarriesTheRelayReport(t *testing.T) {
+	m, cl := newReplayMain(t)
+	a := &Agent{Client: cl, Logf: t.Logf, RelayAddr: RelayProxyAddr, RelayKeyDir: t.TempDir()}
+	beat := func() map[string]any {
+		t.Helper()
+		if _, err := a.Heartbeat(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		b := m.bodies["heartbeat"]
+		return b[len(b)-1]
+	}
+	if _, ok := beat()["relay"]; ok {
+		t.Fatal("sent a relay report before the proxy tried its port")
+	}
+	a.relayBind.down(time.UnixMilli(1_800_000_000_000), 2, errors.New("bind: address already in use"))
+	got, _ := json.Marshal(beat()["relay"])
+	if string(got) != `{"bound":false,"error":"bind: address already in use","failures":2,"since_ms":1800000000000}` {
+		t.Fatalf("relay %s", got)
+	}
+	a.relayBind.up()
+	if got, _ := json.Marshal(beat()["relay"]); string(got) != `{"bound":true}` {
+		t.Fatalf("relay %s", got)
 	}
 }

@@ -68,6 +68,9 @@ type Agent struct {
 	// RelayProxyAddr), with its key in RelayKeyDir; "" leaves it off.
 	RelayAddr   string
 	RelayKeyDir string
+	// relayBind is whether the relay proxy holds its port, for MAIN
+	// (heartbeat `relay`) and the local status (relayproxy.go).
+	relayBind relayBindState
 
 	pubMu     sync.Mutex // one reply published at a time (hellos run beside the heartbeats)
 	flowsSeen string
@@ -127,8 +130,12 @@ type Agent struct {
 	leaseOnce        sync.Once
 	leaseKick        chan struct{} // write lease_state.json now (lease.go)
 	leaseErr         string        // the last error writing it, logged once (RunLeaseState's loop only)
-	// The viewers a fence past its drain has dropped (fence.go).
-	drops fenceDrops
+	// The viewers a fence past its drain has dropped (fence.go): from the
+	// registry, and those the fanout lists; and the fanout's viewers a
+	// lease past its drain has dropped (leasefence.go).
+	drops       fenceDrops
+	fanoutDrops fenceDrops
+	leaseDrops  fenceDrops
 	// replicaResync: the next config sync fetches every section from
 	// scratch; streamsResyncWanted: the next streams sync walks the hashes
 	// (a resync command, fence.go).
@@ -839,6 +846,9 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 	}
 	if audit := a.readAudit(); audit != nil {
 		payload["audit"] = audit
+	}
+	if relay := a.RelayReport(time.Now()); relay != nil {
+		payload["relay"] = relay
 	}
 	if a.Registry != nil && a.flows.Load()&FlowConnections != 0 {
 		payload["conn_digest"] = a.Registry.Digest()

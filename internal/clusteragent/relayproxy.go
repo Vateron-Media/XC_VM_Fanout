@@ -195,13 +195,84 @@ func (a *Agent) NewRelayProxy(k string) *RelayProxy {
 	}}
 }
 
+// RelayErrorMax caps the bind error a relay report carries, in bytes.
+const RelayErrorMax = 200
+
+// relayBindState is whether the relay proxy holds its port: unknown until
+// its first attempt, then bound, or down since its first failed attempt in a
+// row with how many failed and the last error.
+type relayBindState struct {
+	mu        sync.Mutex
+	known     bool
+	bound     bool
+	downSince time.Time
+	failures  int
+	err       string
+}
+
+func (s *relayBindState) up() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.known, s.bound, s.downSince, s.failures, s.err = true, true, time.Time{}, 0, ""
+}
+
+func (s *relayBindState) down(now time.Time, failures int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.known || s.bound {
+		s.downSince = now
+	}
+	s.known, s.bound, s.failures = true, false, failures
+	s.err = ""
+	if err != nil {
+		s.err = printable(err.Error(), RelayErrorMax)
+	}
+}
+
+// printable keeps the printable ASCII of s, at most n bytes of it.
+func printable(s string, n int) string {
+	b := make([]byte, 0, min(len(s), n))
+	for i := 0; i < len(s) && len(b) < n; i++ {
+		if s[i] >= 0x20 && s[i] < 0x7f {
+			b = append(b, s[i])
+		}
+	}
+	return string(b)
+}
+
+// RelayReport is what the heartbeat tells MAIN of the relay proxy's port
+// (`relay`, ADR 0004, Phase 9's eighth increment), and GET /v1/status shows:
+//
+//	{"bound": true}
+//	{"bound": false, "since_ms": <local unix ms of the first failure in a row>,
+//	 "failures": <attempts since>, "error": "<the last one>"}
+//
+// nil while the proxy is off (no RelayAddr) or has not tried yet: MAIN keeps
+// what it had.
+func (a *Agent) RelayReport(now time.Time) map[string]any {
+	if a.RelayAddr == "" || a.RelayKeyDir == "" {
+		return nil
+	}
+	s := &a.relayBind
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.known {
+		return nil
+	}
+	if s.bound {
+		return map[string]any{"bound": true}
+	}
+	return map[string]any{"bound": false, "since_ms": s.downSince.UnixMilli(), "failures": s.failures, "error": s.err}
+}
+
 // ServeRelayProxy listens on addr until ctx ends. The key is published
 // (relay.key) only while the listener is bound, and withdrawn before it is
 // closed. A bind that fails (the port taken, by anyone) is retried with
 // backoff, from RelayBindRetryMin up to RelayBindRetryMax, and logged at the
 // first failure and every RelayBindLogEvery after: the node's data-plane
-// URLs stay unavailable meanwhile. It returns nil once ctx ends, and an error
-// only when the key cannot be kept or published.
+// URLs stay unavailable meanwhile, and every heartbeat tells MAIN so
+// (RelayReport). It returns nil once ctx ends, and an error only when the key
+// cannot be kept or published.
 func (a *Agent) ServeRelayProxy(ctx context.Context, addr, keyDir string) error {
 	k, err := LoadRelayKey(keyDir)
 	if err != nil {
@@ -224,6 +295,7 @@ func (a *Agent) ServeRelayProxy(ctx context.Context, addr, keyDir string) error 
 		l, err := net.Listen("tcp", addr)
 		if err != nil {
 			failures++
+			a.relayBind.down(time.Now(), failures, err)
 			if failures == 1 || failures%max(1, RelayBindLogEvery) == 0 {
 				a.logf("cluster: relay proxy: cannot listen on %s (%d attempts): %v; data-plane URLs on this node stay unavailable until it can", addr, failures, err)
 			}
@@ -236,6 +308,7 @@ func (a *Agent) ServeRelayProxy(ctx context.Context, addr, keyDir string) error 
 			a.logf("cluster: relay proxy: listening on %s after %d failed attempts", addr, failures)
 		}
 		delay, failures = RelayBindRetryMin, 0
+		a.relayBind.up()
 		if err := publishRelayKey(keyDir, k); err != nil {
 			l.Close()
 			withdrawRelayKey(keyDir)
@@ -260,6 +333,7 @@ func (a *Agent) ServeRelayProxy(ctx context.Context, addr, keyDir string) error 
 			return nil
 		}
 		a.logf("cluster: relay proxy: the listener on %s stopped: %v; listening again", addr, err)
+		a.relayBind.down(time.Now(), 0, err) // no failed bind yet: the listener stopped
 		if !wait() {
 			return nil
 		}

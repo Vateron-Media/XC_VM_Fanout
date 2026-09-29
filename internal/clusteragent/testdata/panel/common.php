@@ -66,6 +66,9 @@ if ($rNew) {
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `audit` text DEFAULT NULL');
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `main_port` int DEFAULT NULL');
 	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `arch` varchar(8) DEFAULT NULL');
+	// Migration 054: whether the node's agent holds its relay proxy's port.
+	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `relay_down_since` int DEFAULT NULL');
+	$rDb->exec('ALTER TABLE `cluster_nodes` ADD COLUMN `relay_error` varchar(255) DEFAULT NULL');
 	// The tables the panel's code under test reads, from its own install
 	// schema. The replica's servers and node sections read every column.
 	foreach (['servers', 'crontab', 'streams_servers', 'streams', 'recordings', 'settings', 'cluster_stream_ver', 'streams_types', 'profiles', 'streams_options', 'streams_arguments', 'bouquets', 'streams_categories'] as $rTable) {
