@@ -542,6 +542,22 @@ func loadCommandRegistry(t *testing.T) commandRegistry {
 	return reg
 }
 
+// The agent's restrictive set (what a quarantined node still runs) is the
+// extension's: every type its registry classes R, and no other.
+func TestRestrictiveIsTheRegistrys(t *testing.T) {
+	reg := loadCommandRegistry(t)
+	for typ, e := range reg.Types {
+		if (e.Class == "R") != Restrictive[typ] {
+			t.Errorf("%s: class %s, Restrictive %v", typ, e.Class, Restrictive[typ])
+		}
+	}
+	for typ := range Restrictive {
+		if _, ok := reg.Types[typ]; !ok {
+			t.Errorf("%s is not a type the extension signs", typ)
+		}
+	}
+}
+
 // Every type the extension signs is one the agent runs itself or hands to
 // the node's PHP (cluster:exec) unchanged, and acks: none is dropped. The
 // types the agent dispatches on by name are all in the registry, and the
