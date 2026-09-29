@@ -51,7 +51,7 @@
 // digest.
 //
 //	xc_agent [-state path] [-interval 2s]   run the control loop
-//	xc_agent run -role main                 MAIN: the loopback relay proxy alone
+//	xc_agent run -role main -state …/main_agent.json   MAIN: the loopback relay proxy, as MAIN (main.json beside it)
 //	xc_agent health [-state path]           fetch and verify MAIN's signed health
 //	xc_agent version
 //
@@ -105,7 +105,7 @@ func main() {
 	signalsDir := fs.String("signals", "/home/xc_vm/signals", "run: the node's SIGNALS_PATH, where a fence past its drain drops the viewers it holds; empty = off")
 	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
 	relayAddr := fs.String("relay-addr", clusteragent.RelayProxyAddr, "run: the loopback relay proxy's address (DATAPLANE); empty = off")
-	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's: the loopback relay proxy alone)")
+	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's data-plane client: the loopback relay proxy with MAIN's key, -state main_agent.json)")
 	var urls multiFlag
 	fs.Var(&urls, "url", "probe: a MAIN cluster URL (repeatable)")
 	fs.Parse(args)
@@ -174,14 +174,26 @@ func main() {
 		return
 	case "run", "health":
 		if cmd == "run" && *role == "main" {
-			// MAIN has no node identity, tickets or flows: it runs the
-			// loopback listener alone, so the service layout is the same on
-			// every server, and it answers 503 until MAIN pulls anything
-			// through it (MAIN's own relays and file reads keep the legacy
-			// URLs; ADR 0004, Phase 8).
+			// MAIN's data-plane client (ADR 0004, Phase 9's eighth increment):
+			// the loopback proxy with MAIN's own key (-state main_agent.json,
+			// from `xc_agent keygen`) and main.json beside it, both written by
+			// `cluster:main-dataplane on`. Without them the listener runs
+			// alone and answers 503, as before: MAIN's reads keep the legacy
+			// URLs.
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
-			log.Printf("xc_agent %s: role main, relay proxy on %s", version, *relayAddr)
+			if _, err := os.Stat(*statePath); err == nil {
+				a, err := clusteragent.NewMainAgent(*statePath, *relayAddr, log.Printf)
+				if err != nil {
+					log.Fatalf("xc_agent: role main: %v", err)
+				}
+				log.Printf("xc_agent %s: role main, MAIN's data plane on %s", version, *relayAddr)
+				if err := a.RunMain(ctx); err != nil {
+					log.Fatalf("xc_agent: role main: %v", err)
+				}
+				return
+			}
+			log.Printf("xc_agent %s: role main, relay proxy on %s (no MAIN identity: it answers 503)", version, *relayAddr)
 			if err := (&clusteragent.Agent{}).ServeRelayProxy(ctx, *relayAddr, filepath.Dir(*statePath)); err != nil {
 				log.Fatalf("xc_agent: relay proxy: %v", err)
 			}
