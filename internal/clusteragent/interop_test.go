@@ -50,6 +50,7 @@ func TestInteropWithPanel(t *testing.T) {
 		// RelayDownSince is nil while the relay proxy holds its port.
 		RelayDownSince *json.Number `json:"relay_down_since"`
 		RelayError     *string      `json:"relay_error"`
+		DigestN1       *string      `json:"digest_n1"`
 	}) {
 		t.Helper()
 		cmd := exec.Command(php, filepath.Join(harness, "node.php"))
@@ -184,6 +185,17 @@ func TestInteropWithPanel(t *testing.T) {
 	}
 	if row := mainNode(); row.RelayDownSince != nil || row.RelayError != nil {
 		t.Fatalf("MAIN still keeps relay_down_since %v, relay_error %v", row.RelayDownSince, row.RelayError)
+	}
+	// The owners whose chunk digest named no request: none yet, then one.
+	if row := mainNode(); row.DigestN1 == nil || *row.DigestN1 != "[]" {
+		t.Fatalf("MAIN kept digest_n1 %v, want []", row.DigestN1)
+	}
+	a.takeDigestN1(9)
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatalf("heartbeat with an N-1 owner: %v", err)
+	}
+	if row := mainNode(); row.DigestN1 == nil || *row.DigestN1 != "[9]" {
+		t.Fatalf("MAIN kept digest_n1 %v, want [9]", row.DigestN1)
 	}
 	a.RelayAddr, a.RelayKeyDir = "", ""
 	var hb Reply
