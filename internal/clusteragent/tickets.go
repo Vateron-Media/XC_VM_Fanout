@@ -268,15 +268,6 @@ func (s *ticketStore) setStreams(m map[int64]streamTickets) error {
 	return s.save()
 }
 
-// drop removes the tickets of streams taken off the node.
-func (s *ticketStore) drop(ids []int64) error {
-	m := map[int64]streamTickets{}
-	for _, id := range ids {
-		m[id] = streamTickets{}
-	}
-	return s.setStreams(m)
-}
-
 // relay is the relay ticket held for a stream.
 func (s *ticketStore) relay(id int64) string {
 	if s == nil {

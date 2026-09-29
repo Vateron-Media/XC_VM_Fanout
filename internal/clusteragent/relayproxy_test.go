@@ -814,3 +814,12 @@ func TestHeartbeatCarriesTheRelayReport(t *testing.T) {
 		t.Fatalf("digest_n1 %s", got)
 	}
 }
+
+// drop removes the tickets of streams taken off the node.
+func (s *ticketStore) drop(ids []int64) error {
+	m := map[int64]streamTickets{}
+	for _, id := range ids {
+		m[id] = streamTickets{}
+	}
+	return s.setStreams(m)
+}

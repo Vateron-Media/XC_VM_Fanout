@@ -98,15 +98,6 @@ func VerifyMAC(key, context, body, mac []byte) bool {
 	return len(mac) == 32 && hmac.Equal(MAC(key, context, body), mac)
 }
 
-// WithinWindow reports whether ts is within ±90 s of now.
-func WithinWindow(tsMs, nowMs int64) bool {
-	d := tsMs - nowMs
-	if d < 0 {
-		d = -d
-	}
-	return d <= WindowMs
-}
-
 // CanonicalQuery matches the panel's Canonical::query(): split on '&', skip
 // empty parts, '+' is a space, percent-decode (PHP rawurldecode: a malformed
 // escape stays literal), re-encode per RFC 3986 (PHP rawurlencode), and sort by

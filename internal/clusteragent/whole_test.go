@@ -586,3 +586,15 @@ func TestASectionTooLargeIsFetchedInParts(t *testing.T) {
 		t.Fatalf("%d parts asked for: %v", MaxWholeParts+1, err)
 	}
 }
+
+// recheckReplica is syncReplica's recheck alone.
+func (a *Agent) recheckReplica() {
+	dir := a.ReplicaDir
+	if dir == "" {
+		return
+	}
+	a.replicaMu.Lock()
+	defer a.replicaMu.Unlock()
+	a.recheckLocked(dir)
+	a.replicaKeys = a.replicaKeyPrint()
+}
