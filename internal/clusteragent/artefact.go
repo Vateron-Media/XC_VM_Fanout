@@ -658,13 +658,22 @@ func (a *Agent) sweepArtefacts() {
 	}
 }
 
+// FeatureTypedStarts: the node's PHP runs stream.start and vod.start, so
+// MAIN sends a start typed rather than as node.rpc (XC_VM's ClusterRoute).
+const FeatureTypedStarts = "typed_starts"
+
 // checkTypes asks the node's PHP which command types it runs, and says
-// FeatureArtefact at the next hello only while artefact.fetch is one.
+// FeatureTypedStarts at the next hello while stream.start is one, and
+// FeatureArtefact while artefact.fetch is.
 func (a *Agent) checkTypes(ctx context.Context) {
-	if a.ArtefactDir == "" || a.Types == nil {
+	if a.Types == nil {
 		return
 	}
 	types, err := a.Types(ctx)
+	a.typedStarts.Store(err == nil && slices.Contains(types, "stream.start"))
+	if a.ArtefactDir == "" {
+		return
+	}
 	on := err == nil && slices.Contains(types, TypeArtefactFetch)
 	if a.artefactOn.Swap(on) != on || (!on && !a.typesSeen.Swap(true)) {
 		if on {
