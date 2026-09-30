@@ -103,6 +103,8 @@ if ($rNew) {
 	$rDb->exec("INSERT INTO `settings` (`id`, `server_name`, `seg_time`, `api_pass`, `live_streaming_pass`, `cloudflare`) VALUES (1, 'Interop', 6, 'secret', 'InteropStreamPass', 0)");
 	$rDb->exec('CREATE TABLE `rtmp_ips` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `ip` varchar(255), `password` varchar(128), `push` int, `pull` int)');
 	$rDb->exec('CREATE TABLE `streams_logs` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `stream_id` int, `server_id` int, `action` text, `source` text, `date` int)');
+	// The resellers' DNS the servers section carries for verify_host (XC_VM #236).
+	$rDb->exec('CREATE TABLE `users` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `reseller_dns` text, `status` int DEFAULT 1)');
 }
 DatabaseFactory::set($rDb);
 $rSettings = ['cluster_api_enabled' => 1, 'lb_token_rotation_min' => (int) (getenv('XCVM_INTEROP_ROTATION') ?: 60), 'lb_new_node_mode' => 'legacy'];
