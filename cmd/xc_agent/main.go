@@ -112,7 +112,10 @@ func main() {
 
 	switch cmd {
 	case "version":
+		// The first line is the version (what an install checks); the
+		// second names what run.sh may ask of this agent.
 		fmt.Println(version)
+		fmt.Println("features: " + clusteragent.FeatureReached)
 		return
 	case "keygen":
 		res, err := clusteragent.Keygen(*statePath, *uuid)

@@ -197,6 +197,53 @@ func TestRotateNowIsTheAgentsOwn(t *testing.T) {
 	}
 }
 
+// An operator's token.rotate_now refreshes before its ack, which says how it
+// went: MAIN's refusal here, rather than a "rotating" that promised nothing.
+// It asks whatever backoff a failed scheduled refresh left.
+func TestRotateNowAcksTheRefreshsOutcome(t *testing.T) {
+	f, st := newFake(t)
+	var mu sync.Mutex
+	var acks []map[string]any
+	refreshes := 0
+	f.answer = func(w http.ResponseWriter, r *http.Request, reqCtx, nonce []byte) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/token_refresh"):
+			mu.Lock()
+			refreshes++
+			mu.Unlock()
+			f.refuse(w, 403, nonce, "LICENCE_INVALID", nil)
+		case strings.HasSuffix(r.URL.Path, "/ack"):
+			req := f.opened(r, reqCtx)
+			mu.Lock()
+			acks = append(acks, req)
+			mu.Unlock()
+			f.box(w, reqCtx, map[string]any{"ok": true})
+		default:
+			f.box(w, reqCtx, map[string]any{"state": "active", "mode": 1})
+		}
+	}
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	st.MainURLs, st.Enrolled = []string{srv.URL + "/cluster/v1/"}, true
+	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
+	a.refreshNotBefore.Store(time.Now().Add(time.Hour).UnixNano()) // a failed refresh's backoff
+	now := time.Now().Unix()
+	doc, _ := json.Marshal(map[string]any{"v": 1, "type": TypeRotateNow, "exp": now + 600, "iat": now, "cmd_id": strings.Repeat("c", 32), "seq": 1,
+		"node_uuid": f.uuid, "gen": 1, "dedupe_key": nil, "args": map[string]any{}})
+	w := WireCommand{Doc: string(doc), Sig: base64.RawURLEncoding.EncodeToString(ed25519.Sign(f.panel, cc.PanelSigInput("cmd", doc))), Seq: 1}
+
+	a.handleCommand(context.Background(), w, func(context.Context, *Command, WireCommand) (bool, []byte) { return true, nil })
+
+	mu.Lock()
+	defer mu.Unlock()
+	if refreshes != 1 {
+		t.Fatalf("%d refresh(es) asked, want 1 despite the backoff", refreshes)
+	}
+	if len(acks) != 1 || acks[0]["ok"] != false || !strings.Contains(acks[0]["result"].(string), "LICENCE_INVALID") {
+		t.Fatalf("acks %v, want one failure naming MAIN's refusal", acks)
+	}
+}
+
 func TestRootReadyFollowsRootsPin(t *testing.T) {
 	_, st := newFake(t)
 	old := RootPinDir

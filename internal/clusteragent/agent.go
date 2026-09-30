@@ -94,6 +94,9 @@ type Agent struct {
 	p2Touch            atomic.Bool  // HLS touches go on the P2 lane (touch.go)
 	helloing           atomic.Bool  // a hello is being retried in the background
 	refreshing         atomic.Bool  // a token refresh runs in the background
+	refreshFails       atomic.Int32 // refreshes refused or failed in a row, for the backoff
+	refreshNotBefore   atomic.Int64 // local unix ns before which no scheduled refresh is asked
+	reachedAt          atomic.Int64 // local unix ns this run last touched ReachedFile
 	stopCh             chan error   // a background loop's fatal refusal, for Run
 	run                Executor     // what runs MAIN's commands (localExec over Exec); nil: none
 	sealedMu           sync.Mutex   // one batch of sealed commands at a time (sealed.go)
@@ -758,24 +761,73 @@ func (a *Agent) fallbackHello(ctx context.Context) {
 // newer policy, run beside it.
 var MaxHeartbeatGap = 3 * time.Second
 
-// refreshLater refreshes the token in the background; one runs at a time.
+// RefreshRetryMin and RefreshRetryMax bound the wait after a refresh that
+// failed: it doubles from the first to the second. A fleet MAIN refuses for
+// want of a licence asks once every RefreshRetryMax instead of every tick,
+// and still gets its tokens within it of the licence's return (ADR 0004,
+// "Re-licensing a fleet"; the plan's drill allows two minutes).
+var (
+	RefreshRetryMin = 2 * time.Second
+	RefreshRetryMax = 30 * time.Second
+)
+
+// refreshLater refreshes the token in the background; one runs at a time,
+// and none while the backoff after a failed one lasts.
 func (a *Agent) refreshLater(ctx context.Context) {
-	if !a.refreshing.CompareAndSwap(false, true) {
+	if time.Now().UnixNano() < a.refreshNotBefore.Load() || !a.refreshing.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
 		defer a.refreshing.Store(false)
-		if _, err := a.Client.Refresh(ctx); err != nil {
-			if fatal(err) {
-				a.stop(err)
-				return
-			}
+		if err := a.refresh(ctx); err != nil && !fatal(err) {
 			// The current token lasts to exp; a later heartbeat re-keys if it must.
-			a.logf("cluster: token refresh: %v", err)
-			return
+			a.logf("cluster: token refresh: %v (next in %s)", err, a.refreshBackoff())
 		}
-		a.kickLease() // the lease the token came with
 	}()
+}
+
+// refresh asks MAIN for the next token: on success the backoff ends and the
+// lease the token came with is kept; a fatal refusal stops the agent.
+func (a *Agent) refresh(ctx context.Context) error {
+	if _, err := a.Client.Refresh(ctx); err != nil {
+		if fatal(err) {
+			a.stop(err)
+			return err
+		}
+		n := min(a.refreshFails.Add(1), 16)
+		wait := min(RefreshRetryMin<<(n-1), RefreshRetryMax)
+		a.refreshNotBefore.Store(time.Now().Add(wait).UnixNano())
+		return err
+	}
+	a.refreshFails.Store(0)
+	a.refreshNotBefore.Store(0)
+	a.kickLease()
+	return nil
+}
+
+// refreshBackoff is how long until the next scheduled refresh may be asked.
+func (a *Agent) refreshBackoff() time.Duration {
+	return time.Until(time.Unix(0, a.refreshNotBefore.Load())).Round(time.Second)
+}
+
+// rotateNow refreshes the token at once, for an operator's token.rotate_now,
+// whatever the backoff, once a refresh already running has ended, and says
+// how it went for the ack.
+func (a *Agent) rotateNow(ctx context.Context) (bool, []byte) {
+	for !a.refreshing.CompareAndSwap(false, true) {
+		select {
+		case <-ctx.Done():
+			return false, []byte("not rotated: " + ctx.Err().Error())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	defer a.refreshing.Store(false)
+	if err := a.refresh(ctx); err != nil {
+		a.logf("cluster: token.rotate_now: %v", err)
+		return false, []byte("refresh failed: " + err.Error())
+	}
+	tok, _ := a.Client.Current()
+	return true, []byte(fmt.Sprintf("rotated to epoch %d", tok.Epoch))
 }
 
 // setFenced notes whether MAIN refuses the session for want of a licence.
@@ -876,9 +928,37 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 		return nil, err
 	}
 	a.lastBeatMs.Store(time.Now().UnixMilli())
+	a.markReached()
 	a.publish(&r)
 	a.kickLease()
 	return &r, nil
+}
+
+// ReachedFile, beside the state file, is touched when MAIN answers a
+// heartbeat: at this run's first answer, then at most every ReachedEvery.
+// run.sh ends a new binary's trial on it, and puts the previous one back
+// when a new one never reaches MAIN (ADR 0004, "A failing agent on a node,
+// and a canary"). The agent says so in `version`'s features line
+// (FeatureReached), so the install asks it only of an agent that writes it.
+const (
+	ReachedFile    = "reached"
+	FeatureReached = "reached"
+)
+
+var ReachedEvery = 10 * time.Second
+
+func (a *Agent) markReached() {
+	now := time.Now()
+	if last := a.reachedAt.Load(); last != 0 && now.UnixNano()-last < int64(ReachedEvery) {
+		return
+	}
+	a.reachedAt.Store(now.UnixNano())
+	p := filepath.Join(filepath.Dir(a.Client.State.path), ReachedFile)
+	if err := os.Chtimes(p, now, now); err != nil {
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			a.logf("cluster: %s: %v", p, err)
+		}
+	}
 }
 
 // jitter spreads d by ±10 %, so a fleet recovering together does not arrive at once.

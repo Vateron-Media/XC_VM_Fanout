@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -95,17 +97,22 @@ func TestATokenRefreshDoesNotHoldTheHeartbeats(t *testing.T) {
 	}
 }
 
-// A refresh MAIN refuses for want of a licence is asked again on the next
-// tick, with no backoff, so the first one after the licence returns brings a
-// token and its lease (ADR 0004, "Re-licensing a fleet").
-func TestARefreshRefusedForTheLicenceIsAskedAgainEachTick(t *testing.T) {
+// A refresh MAIN refuses for want of a licence is asked again after a wait
+// that doubles up to RefreshRetryMax, not at every tick: a fleet without a
+// licence no longer asks every 2 s, and still gets its token and lease
+// within RefreshRetryMax of the licence's return (ADR 0004, "Re-licensing a
+// fleet").
+func TestARefusedRefreshBacksOffAndIsStillAskedAgain(t *testing.T) {
+	oldMin, oldMax := RefreshRetryMin, RefreshRetryMax
+	RefreshRetryMin, RefreshRetryMax = 100*time.Millisecond, 400*time.Millisecond
+	t.Cleanup(func() { RefreshRetryMin, RefreshRetryMax = oldMin, oldMax })
 	f, st := newFake(t)
 	var mu sync.Mutex
-	refreshes := 0
+	var asked []time.Time
 	f.answer = func(w http.ResponseWriter, r *http.Request, reqCtx, nonce []byte) {
 		if strings.HasSuffix(r.URL.Path, "/token_refresh") {
 			mu.Lock()
-			refreshes++
+			asked = append(asked, time.Now())
 			mu.Unlock()
 			f.refuse(w, 403, nonce, "LICENCE_INVALID", nil)
 			return
@@ -115,14 +122,23 @@ func TestARefreshRefusedForTheLicenceIsAskedAgainEachTick(t *testing.T) {
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	st.MainURLs, st.Enrolled = []string{srv.URL + "/cluster/v1/"}, true
-	a := &Agent{Client: NewClient(st, "xc_agent/test"), Interval: 100 * time.Millisecond, Logf: t.Logf}
+	a := &Agent{Client: NewClient(st, "xc_agent/test"), Interval: 20 * time.Millisecond, Logf: t.Logf}
 	s, _ := a.Client.current()
 	s.tok.RefreshAt = 0 // due from the start
-	runFor(t, a, 1500*time.Millisecond)
+	runFor(t, a, 2*time.Second)
 	mu.Lock()
 	defer mu.Unlock()
-	if refreshes < 3 {
-		t.Fatalf("a refused refresh was asked %d times in 15 ticks", refreshes)
+	// About 100 ticks: asked at 0, then after 0.1, 0.2, 0.4, 0.4, … s.
+	if len(asked) < 4 || len(asked) > 10 {
+		t.Fatalf("a refused refresh was asked %d times in 2 s of 20 ms ticks, want the backoff's 4-10", len(asked))
+	}
+	for i := 2; i < len(asked); i++ {
+		if gap := asked[i].Sub(asked[i-1]); gap < 150*time.Millisecond {
+			t.Fatalf("ask %d came %s after the one before, inside the backoff", i, gap)
+		}
+	}
+	if gap := asked[len(asked)-1].Sub(asked[len(asked)-2]); gap > 600*time.Millisecond {
+		t.Fatalf("asked again only after %s, past RefreshRetryMax", gap)
 	}
 }
 
@@ -142,5 +158,41 @@ func TestAnUnreachableURLGoesLast(t *testing.T) {
 	a.Client.now = func() time.Time { return time.Now().Add(URLRetry + time.Second) }
 	if got := a.Client.urls(); got[0] != dead {
 		t.Fatalf("order after URLRetry: %v", got)
+	}
+}
+
+// run.sh judges a new binary by ReachedFile: an answered heartbeat touches
+// it (the first of the run at once, then at most every ReachedEvery), and a
+// heartbeat MAIN never answered does not.
+func TestAnAnsweredHeartbeatMarksTheNodeReached(t *testing.T) {
+	_, a := newBeatMain(t)
+	p := filepath.Join(filepath.Dir(a.Client.State.path), ReachedFile)
+	ctx := context.Background()
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("not marked after an answer: %v", err)
+	}
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	os.Chtimes(p, old, old)
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(p); !st.ModTime().Equal(old) {
+		t.Fatalf("touched again within ReachedEvery (%s)", st.ModTime())
+	}
+
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	dead := "http://" + l.Addr().String() + "/cluster/v1/"
+	l.Close()
+	_, st := newFake(t)
+	st.MainURLs, st.Enrolled = []string{dead}, true
+	b := &Agent{Client: NewClient(st, "xc_agent/test"), Logf: t.Logf}
+	if _, err := b.Heartbeat(ctx); err == nil {
+		t.Fatal("a heartbeat to nowhere was answered")
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(st.path), ReachedFile)); !os.IsNotExist(err) {
+		t.Fatalf("marked without an answer: %v", err)
 	}
 }
