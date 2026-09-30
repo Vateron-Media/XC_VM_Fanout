@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -211,6 +212,32 @@ func (a *Agent) RunStreams(ctx context.Context, kick <-chan struct{}) {
 			}
 		}
 	}
+}
+
+// FeatureStreamsSync, in flows.json's features, tells the node's PHP it may
+// ask for a streams sync (POST /v1/streams_sync) when a start finds no entry.
+const FeatureStreamsSync = "streams_sync"
+
+// StreamsSyncWait bounds a sync the node's PHP waits on.
+var StreamsSyncWait = 10 * time.Second
+
+// serveStreamsSync syncs the streams section at once, for the node's PHP: a
+// start found no entry for a stream MAIN may have just assigned it, whose
+// record a delta brings before the next poll would (ADR 0004, a start miss).
+// It answers once the sync has ended: 200, or 502 with why not.
+func (a *Agent) serveStreamsSync(w http.ResponseWriter, r *http.Request) {
+	if a.ReplicaDir == "" {
+		http.Error(w, "no replica", http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), StreamsSyncWait)
+	defer cancel()
+	if err := a.SyncStreams(ctx); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"synced":true}`))
 }
 
 // SyncStreams brings the streams section up to date: a delta, a full pass

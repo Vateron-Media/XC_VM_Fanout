@@ -865,6 +865,33 @@ func TestArtefactFeatureFollowsThePHP(t *testing.T) {
 	}
 }
 
+// typed_starts follows the node's PHP as artefact does: said at hello only
+// once its cluster:exec --types lists stream.start, and whether or not the
+// agent keeps an artefacts directory.
+func TestTypedStartsFollowThePHP(t *testing.T) {
+	m, a, ex, _ := newArtefactAgent(t)
+	a.Exec = ex.run
+	types := []string{"node.rpc", "stream.stop"}
+	a.Types = func(context.Context) ([]string, error) { return types, nil }
+	ctx := context.Background()
+	hello := func() []string {
+		t.Helper()
+		if _, err := a.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return m.lastHello()
+	}
+	a.Client.State.Enrolled = true
+	if f := hello(); slices.Contains(f, FeatureTypedStarts) {
+		t.Fatalf("said %v for a PHP without stream.start", f)
+	}
+	types = []string{"node.rpc", "stream.stop", "stream.start", "vod.start"}
+	a.ArtefactDir = ""
+	if f := hello(); !slices.Contains(f, FeatureTypedStarts) {
+		t.Fatalf("said %v once the PHP runs stream.start", f)
+	}
+}
+
 func TestTypesViaPHP(t *testing.T) {
 	dir := t.TempDir()
 	script := func(name, body string) string {

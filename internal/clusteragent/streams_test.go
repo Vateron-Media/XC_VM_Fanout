@@ -1284,3 +1284,40 @@ func TestStreamsApplyWhenTheCursorMoves(t *testing.T) {
 		t.Fatalf("applies saw streams.json %v, want a second at %d", got, m.head)
 	}
 }
+
+// A start on the node that finds no entry asks its agent for a streams sync
+// (POST /v1/streams_sync) and reads again: the stream MAIN just assigned is
+// then stored, before the next poll would have brought it.
+func TestAStreamsSyncOnRequestStoresWhatMainJustAssigned(t *testing.T) {
+	m, a := newStreamsMain(t)
+	if err := a.SyncStreams(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.set(7, streamData(7, "a")) // assigned since the last sync
+	rec := httptest.NewRecorder()
+	a.socketHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/streams_sync", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"synced":true`) {
+		t.Fatalf("answer %d %s", rec.Code, rec.Body)
+	}
+	if storedIDs(a) != "7" {
+		t.Fatalf("stored %q after the sync", storedIDs(a))
+	}
+
+	// MAIN refusing: the node's PHP hears why, and reads what it has.
+	m.mu.Lock()
+	m.refuse = append(m.refuse, m.refuse1)
+	m.mu.Unlock()
+	rec = httptest.NewRecorder()
+	a.socketHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/streams_sync", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("a refused sync answered %d %s", rec.Code, rec.Body)
+	}
+
+	// An agent that keeps no replica has no such thing.
+	b := &Agent{Client: a.Client, Logf: t.Logf}
+	rec = httptest.NewRecorder()
+	b.socketHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/streams_sync", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("without a replica: %d", rec.Code)
+	}
+}

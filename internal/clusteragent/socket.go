@@ -102,6 +102,10 @@ func (a *Agent) socketHandler() http.Handler {
 			a.serveStatus(w, r)
 			return
 		}
+		if r.URL.Path == "/v1/streams_sync" && r.Method == http.MethodPost {
+			a.serveStreamsSync(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/v1/conn/") {
 			if a.Registry == nil {
 				http.Error(w, "no registry", http.StatusServiceUnavailable)

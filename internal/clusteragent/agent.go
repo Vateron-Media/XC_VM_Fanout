@@ -97,6 +97,7 @@ type Agent struct {
 	refreshFails       atomic.Int32 // refreshes refused or failed in a row, for the backoff
 	refreshNotBefore   atomic.Int64 // local unix ns before which no scheduled refresh is asked
 	reachedAt          atomic.Int64 // local unix ns this run last touched ReachedFile
+	typedStarts        atomic.Bool  // the node's PHP runs stream.start and vod.start (checkTypes)
 	stopCh             chan error   // a background loop's fatal refusal, for Run
 	run                Executor     // what runs MAIN's commands (localExec over Exec); nil: none
 	sealedMu           sync.Mutex   // one batch of sealed commands at a time (sealed.go)
@@ -210,6 +211,9 @@ func (a *Agent) features() []string {
 	if a.ReplicaDir != "" {
 		// The R2 streams section, kept as streams.go does.
 		out = append(out, FeatureStreams)
+	}
+	if (a.Exec != nil || a.run != nil) && a.typedStarts.Load() {
+		out = append(out, FeatureTypedStarts)
 	}
 	if a.ArtefactDir != "" && (a.Exec != nil || a.run != nil) && a.artefactOn.Load() {
 		// Only while the node's PHP runs artefact.fetch (artefact.go).
@@ -376,6 +380,10 @@ func (a *Agent) publish(r *Reply) {
 		// The node's own reaper (UsersCronJob, MySQL mode) leaves idle HLS
 		// viewers to the registry's.
 		features = append(features, "hls_reaper")
+	}
+	if a.ReplicaDir != "" {
+		// A start that finds no entry may ask for a streams sync (streams.go).
+		features = append(features, FeatureStreamsSync)
 	}
 	if features != nil {
 		doc["features"] = features
