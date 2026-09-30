@@ -126,6 +126,27 @@ func (a *Agent) laneStatus(lane Lane) LaneStatus {
 	return out
 }
 
+// laneLags is each event lane's backlog for the heartbeat: the files waiting
+// and how long the oldest has waited (ms, both ends on this machine's clock,
+// so MAIN judges it with no clock offset). Nil without a spool.
+// ponytail: stats every spooled file each heartbeat, as /v1/status does; keep
+// the oldest mtime per lane if a large backlog makes that costly.
+func (a *Agent) laneLags(now time.Time) map[string]map[string]int64 {
+	if a.SpoolDir == "" {
+		return nil
+	}
+	out := make(map[string]map[string]int64, len(Lanes))
+	for _, lane := range Lanes {
+		ls := a.laneStatus(lane)
+		lag := int64(0)
+		if ls.OldestMs > 0 {
+			lag = max(0, now.UnixMilli()-ls.OldestMs)
+		}
+		out[lane.Name] = map[string]int64{"files": int64(ls.Files), "lag_ms": lag}
+	}
+	return out
+}
+
 func (a *Agent) serveStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "not allowed", http.StatusMethodNotAllowed)

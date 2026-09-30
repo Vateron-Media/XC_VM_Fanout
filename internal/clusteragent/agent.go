@@ -863,6 +863,11 @@ func (a *Agent) Heartbeat(ctx context.Context) (*Reply, error) {
 		payload["relay"] = relay
 	}
 	payload["digest_n1"] = a.DigestN1Report(time.Now())
+	// The event lanes' backlog and the MAIN URLs that fail, for MAIN's badges.
+	if lanes := a.laneLags(time.Now()); lanes != nil {
+		payload["lanes"] = lanes
+	}
+	payload["unreachable"] = a.Client.Unreachable()
 	if a.Registry != nil && a.flows.Load()&FlowConnections != 0 {
 		payload["conn_digest"] = a.Registry.Digest()
 	}

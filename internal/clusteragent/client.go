@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -169,6 +170,20 @@ func (c *Client) reached(ctx context.Context, base string, err error) {
 			c.failed[base] = c.now().Add(URLRetry)
 		}
 	}
+}
+
+// Unreachable lists, by URL, the MAIN URLs that failed and have not answered
+// since, each with how long ago it first failed (ms), for the heartbeat.
+func (c *Client) Unreachable() []map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	out := make([]map[string]any, 0, len(c.failed))
+	for url, retry := range c.failed {
+		out = append(out, map[string]any{"url": url, "for_ms": max(0, now.Sub(retry.Add(-URLRetry)).Milliseconds())})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["url"].(string) < out[j]["url"].(string) })
+	return out
 }
 
 // NewClient opens every stored epoch's token (verifying the panel signature)

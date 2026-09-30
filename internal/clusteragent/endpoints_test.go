@@ -294,3 +294,49 @@ func TestAHeartbeatCarriesTheNodesOwnClock(t *testing.T) {
 		t.Fatalf("stamped %d, want MAIN's time %d", got, at.UnixMilli()-600000)
 	}
 }
+
+func TestAHeartbeatCarriesTheLanesLagAndTheURLsThatFail(t *testing.T) {
+	m, c := newReplayMain(t)
+	c.State.Enrolled = true
+	spool := t.TempDir()
+	a := &Agent{Client: c, Logf: t.Logf, SpoolDir: spool}
+	ctx := context.Background()
+	if _, err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// One P1 file spooled three minutes ago; P0 empty.
+	if err := os.MkdirAll(filepath.Join(spool, "p1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(spool, "p1", "1.ndjson")
+	if err := os.WriteFile(file, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-3 * time.Minute)
+	if err := os.Chtimes(file, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// A URL that first failed a minute ago and has not answered since.
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	c.mu.Lock()
+	c.failed = map[string]time.Time{"https://down.example:8443": now.Add(-time.Minute).Add(URLRetry)}
+	c.mu.Unlock()
+	if _, err := a.Heartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	body := m.bodies["heartbeat"][0]
+	lanes, _ := body["lanes"].(map[string]any)
+	p0, _ := lanes["p0"].(map[string]any)
+	p1, _ := lanes["p1"].(map[string]any)
+	if p0["files"] != float64(0) || p0["lag_ms"] != float64(0) {
+		t.Fatalf("p0 %v, want empty", p0)
+	}
+	if lag, _ := p1["lag_ms"].(float64); p1["files"] != float64(1) || lag < 180000 || lag > 190000 {
+		t.Fatalf("p1 %v, want one file three minutes old", p1)
+	}
+	urls, _ := body["unreachable"].([]any)
+	if len(urls) != 1 || urls[0].(map[string]any)["url"] != "https://down.example:8443" || urls[0].(map[string]any)["for_ms"] != float64(60000) {
+		t.Fatalf("unreachable %v, want the URL that failed a minute ago", urls)
+	}
+}
