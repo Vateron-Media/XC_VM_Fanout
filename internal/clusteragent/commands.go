@@ -204,10 +204,10 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 	} else if cmd.Type == TypeRotateNow {
 		// The agent's own: the token lives here, not in the node's PHP, which
 		// would refuse the type. An operator asking for a rotation wants it
-		// before the refresh window would have come round.
-		id, ok, result = cmd.CmdID, true, []byte("rotating")
-		seq = cmd.Seq
-		a.refreshLater(ctx)
+		// before the refresh window would have come round, and the ack says
+		// whether it happened: the new epoch, or why not.
+		id, seq = cmd.CmdID, cmd.Seq
+		ok, result = a.rotateNow(ctx)
 	} else {
 		id = cmd.CmdID
 		ok, result = run(ctx, cmd, w)
