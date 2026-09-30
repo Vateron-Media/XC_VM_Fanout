@@ -377,6 +377,10 @@ func (a *Agent) publish(r *Reply) {
 		// viewers to the registry's.
 		features = append(features, "hls_reaper")
 	}
+	if a.ReplicaDir != "" {
+		// A start that finds no entry may ask for a streams sync (streams.go).
+		features = append(features, FeatureStreamsSync)
+	}
 	if features != nil {
 		doc["features"] = features
 	}
