@@ -302,7 +302,7 @@ func TestArtefactGrantShape(t *testing.T) {
 		return string(b)
 	}
 	id := cmdIDFor(1)
-	for _, ok := range []string{"offair/connected", "offair/expiring", "module/radio-2/1.0.3", "module/a/V_1-2", "agent/amd64", "agent/arm64", "agent/armv7", "agent/386"} {
+	for _, ok := range []string{"offair/connected", "offair/expiring", "module/radio-2/1.0.3", "module/a/V_1-2", "agent/amd64", "agent/arm64", "agent/armv7", "agent/386", "fanout/amd64", "fanout/arm64", "core/php8.1", "core/php8.4"} {
 		g := valid()
 		g["id"] = ok
 		if _, _, err := parseGrant(id, doc(id, g)); err != nil {
@@ -322,6 +322,10 @@ func TestArtefactGrantShape(t *testing.T) {
 		"a version with ..":        func(g map[string]any) { g["id"] = "module/radio/1..0" },
 		"a longer module id":       func(g map[string]any) { g["id"] = "module/radio/1.0/x" },
 		"an unknown arch":          func(g map[string]any) { g["id"] = "agent/mips" },
+		"a fanout of no arch":      func(g map[string]any) { g["id"] = "fanout/mips" },
+		"a core of no PHP":         func(g map[string]any) { g["id"] = "core/php" },
+		"a core past its group":    func(g map[string]any) { g["id"] = "core/php8.1/x" },
+		"a core group traversing":  func(g map[string]any) { g["id"] = "core/../x" },
 		"no id":                    func(g map[string]any) { delete(g, "id") },
 		"a numeric id":             func(g map[string]any) { g["id"] = 7 },
 		"a dot file":               func(g map[string]any) { g["name"] = ".hidden.ts" },
@@ -889,6 +893,40 @@ func TestTypedStartsFollowThePHP(t *testing.T) {
 	a.ArtefactDir = ""
 	if f := hello(); !slices.Contains(f, FeatureTypedStarts) {
 		t.Fatalf("said %v once the PHP runs stream.start", f)
+	}
+}
+
+// The fanout daemon and xcvm_core follow the agent's path only to a node
+// whose PHP installs them: artefact_binaries, beside artefact, while its
+// cluster:exec --types lists both root installs.
+func TestArtefactBinariesFollowThePHP(t *testing.T) {
+	m, a, ex, _ := newArtefactAgent(t)
+	a.Exec = ex.run
+	types := []string{"node.rpc", TypeArtefactFetch}
+	a.Types = func(context.Context) ([]string, error) { return types, nil }
+	ctx := context.Background()
+	hello := func() []string {
+		t.Helper()
+		if _, err := a.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return m.lastHello()
+	}
+	a.Client.State.Enrolled = true
+	if f := hello(); !slices.Contains(f, FeatureArtefact) || slices.Contains(f, FeatureArtefactBinaries) {
+		t.Fatalf("an older PHP: artefacts only, said %v", f)
+	}
+	types = append(types, "root:fanout_binary")
+	if f := hello(); slices.Contains(f, FeatureArtefactBinaries) {
+		t.Fatalf("one of the two root installs is not enough, said %v", f)
+	}
+	types = append(types, "root:xcvm_core")
+	if f := hello(); !slices.Contains(f, FeatureArtefactBinaries) {
+		t.Fatalf("the PHP installs both, said %v", f)
+	}
+	types = []string{"node.rpc", "root:fanout_binary", "root:xcvm_core"}
+	if f := hello(); slices.Contains(f, FeatureArtefactBinaries) {
+		t.Fatalf("never without artefacts, said %v", f)
 	}
 }
 

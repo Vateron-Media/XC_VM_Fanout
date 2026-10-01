@@ -129,10 +129,13 @@ var (
 	offAirNames = map[string]bool{"connected": true, "not_on_air": true, "banned": true, "expired": true, "expiring": true}
 	// The release arches (ReleaseAsset::ARCH_MAP's values).
 	agentArches = map[string]bool{"amd64": true, "arm64": true, "armv7": true, "386": true}
+	// An xcvm_core archive's PHP group (XcvmCoreCommand::GROUP_PATTERN).
+	coreGroupRe = regexp.MustCompile(`^php[0-9]\.[0-9]{1,2}$`)
 )
 
-// validArtefactID reports whether id is one of the three kinds MAIN's
-// registry serves: offair/<name>, module/<name>/<version>, agent/<arch>.
+// validArtefactID reports whether id is one of the kinds MAIN's registry
+// serves: offair/<name>, module/<name>/<version>, agent/<arch>, and the
+// binaries that follow the agent's path, fanout/<arch> and core/<php group>.
 func validArtefactID(id string) bool {
 	p := strings.Split(id, "/")
 	switch p[0] {
@@ -140,8 +143,10 @@ func validArtefactID(id string) bool {
 		return len(p) == 2 && offAirNames[p[1]]
 	case "module":
 		return len(p) == 3 && moduleRe.MatchString(p[1]) && moduleVerRe.MatchString(p[2]) && !strings.Contains(p[2], "..")
-	case "agent":
+	case "agent", "fanout":
 		return len(p) == 2 && agentArches[p[1]]
+	case "core":
+		return len(p) == 2 && coreGroupRe.MatchString(p[1])
 	}
 	return false
 }
@@ -662,15 +667,22 @@ func (a *Agent) sweepArtefacts() {
 // MAIN sends a start typed rather than as node.rpc (XC_VM's ClusterRoute).
 const FeatureTypedStarts = "typed_starts"
 
+// FeatureArtefactBinaries: the node's PHP installs the fanout daemon and
+// xcvm_core MAIN grants (`node.root fanout_binary` and `xcvm_core`), so MAIN
+// rolls them out to it as it does the agent. Said with FeatureArtefact only.
+const FeatureArtefactBinaries = "artefact_binaries"
+
 // checkTypes asks the node's PHP which command types it runs, and says
-// FeatureTypedStarts at the next hello while stream.start is one, and
-// FeatureArtefact while artefact.fetch is.
+// FeatureTypedStarts at the next hello while stream.start is one,
+// FeatureArtefact while artefact.fetch is, and FeatureArtefactBinaries while
+// it also lists the root installs of the fanout daemon and xcvm_core.
 func (a *Agent) checkTypes(ctx context.Context) {
 	if a.Types == nil {
 		return
 	}
 	types, err := a.Types(ctx)
 	a.typedStarts.Store(err == nil && slices.Contains(types, "stream.start"))
+	a.binaries.Store(err == nil && slices.Contains(types, "root:fanout_binary") && slices.Contains(types, "root:xcvm_core"))
 	if a.ArtefactDir == "" {
 		return
 	}
