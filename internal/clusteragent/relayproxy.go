@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -121,10 +122,12 @@ type serverRoutes struct {
 type serverRoute struct {
 	ip, private string
 	port        int64
+	seal        bool // it seals the relays it serves (relay_seal; relayseal.go)
 }
 
 type routeNode struct {
 	pub   []byte
+	box   []byte // its box key, what a relay's session key is sealed to
 	gen   int64
 	state string
 }
@@ -398,6 +401,17 @@ func (p *RelayProxy) relay(w http.ResponseWriter, r *http.Request, id int64, pre
 	if prebuffer {
 		target += "&prebuffer=1"
 	}
+	// A parent that seals (relayseal.go): a fresh session key sealed to it, in
+	// the target the proof signs; its answer is taken sealed or not at all.
+	key, sealed, err := p.sealKey(parent, relaySealContext(parent, id))
+	if err != nil {
+		a.logf("cluster: relay: stream %d: %v", id, err)
+		http.Error(w, "parent key unknown", http.StatusBadGateway)
+		return
+	}
+	if key != nil {
+		target += "&" + relaySealParam + "=" + sealed
+	}
 	resp, _, err := p.upstream(r.Context(), base, target, "X-XCVM-Relay", "X-XCVM-Relay-Auth", wire)
 	if err != nil {
 		a.logf("cluster: relay: stream %d from server %d: %v", id, parent, err)
@@ -410,11 +424,22 @@ func (p *RelayProxy) relay(w http.ResponseWriter, r *http.Request, id int64, pre
 		http.Error(w, "upstream refused", http.StatusBadGateway)
 		return
 	}
+	if key != nil && resp.Header.Get(relaySealHeader) != relaySealVersion {
+		a.logf("cluster: relay: stream %d: server %d answered unsealed", id, parent)
+		http.Error(w, "upstream unsealed", http.StatusBadGateway)
+		return
+	}
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
 	w.WriteHeader(http.StatusOK)
-	flushCopy(w, resp.Body)
+	if key == nil {
+		flushCopy(w, resp.Body)
+		return
+	}
+	if err := copyRelayFrames(w, resp.Body, key); err != nil {
+		a.logf("cluster: relay: stream %d from server %d: %v", id, parent, err)
+	}
 }
 
 // upstream sends one signed GET to base+target; nonce is the proof's, which
@@ -598,6 +623,15 @@ func (c *chunkReader) fetchOnce(off int64) (body []byte, after time.Duration, er
 		return nil, -1, err
 	}
 	target := "/xfile?o=" + strconv.FormatInt(off, 10) + "&n=" + strconv.Itoa(cc.FileChunk)
+	// An owner that seals (relayseal.go): the chunk comes framed under a key
+	// sealed to it in the target the proof signs.
+	key, sealed, err := c.p.sealKey(c.owner, fileSealContext(c.owner, c.tid))
+	if err != nil {
+		return nil, -1, err
+	}
+	if key != nil {
+		target += "&" + relaySealParam + "=" + sealed
+	}
 	resp, nonce, err := c.p.upstream(c.ctx, c.base, target, "X-XCVM-File", "X-XCVM-File-Auth", c.wire)
 	if err != nil {
 		return nil, -1, err
@@ -611,12 +645,13 @@ func (c *chunkReader) fetchOnce(off int64) (body []byte, after time.Duration, er
 		}
 		return nil, after, fmt.Errorf("the owner answered %d", resp.StatusCode)
 	}
-	body, err = c.check(off, nonce, resp)
+	body, err = c.check(off, nonce, resp, key)
 	return body, -1, err
 }
 
-// check verifies one chunk's response to the request that carried nonce.
-func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response) ([]byte, error) {
+// check verifies one chunk's response to the request that carried nonce,
+// opened first when it was asked for sealed under key.
+func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response, key []byte) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("the owner answered %d", resp.StatusCode)
 	}
@@ -630,9 +665,23 @@ func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response) ([]byt
 	if d.Nonce == "" && !c.p.a.takeDigestN1(c.owner) {
 		return nil, errors.New("the chunk's digest names no request, which lb_digest_nonce_required refuses")
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, cc.FileChunk+1))
-	if err != nil {
-		return nil, err
+	var body []byte
+	if key != nil {
+		if resp.Header.Get(relaySealHeader) != relaySealVersion {
+			return nil, errors.New("the owner answered unsealed")
+		}
+		var plain bytes.Buffer
+		// At most a chunk in frames of relayFrameMax, each 20 bytes over.
+		limit := int64(cc.FileChunk) + int64(cc.FileChunk/relayFrameMax+2)*(4+relayTag)
+		if err := copyRelayFrames(&plain, io.LimitReader(resp.Body, limit), key); err != nil {
+			return nil, err
+		}
+		body = plain.Bytes()
+	} else {
+		var err error
+		if body, err = io.ReadAll(io.LimitReader(resp.Body, cc.FileChunk+1)); err != nil {
+			return nil, err
+		}
 	}
 	if !d.ChunkMatches(off, body) {
 		return nil, errors.New("the chunk does not match its digest")
@@ -823,12 +872,14 @@ func parseServerRoutes(b []byte, self int64) (*serverRoutes, error) {
 				ServerIP  *string `json:"server_ip"`
 				PrivateIP *string `json:"private_ip"`
 				HTTPPort  int64   `json:"http_broadcast_port"`
+				RelaySeal int64   `json:"relay_seal"`
 			} `json:"servers"`
 			Nodes []struct {
-				Sid   int64  `json:"sid"`
-				Gen   int64  `json:"gen"`
-				State string `json:"state"`
-				EdPub []byte `json:"ed_pub"`
+				Sid    int64  `json:"sid"`
+				Gen    int64  `json:"gen"`
+				State  string `json:"state"`
+				EdPub  []byte `json:"ed_pub"`
+				BoxPub []byte `json:"box_pub"`
 			} `json:"nodes"`
 		} `json:"data"`
 	}
@@ -837,7 +888,7 @@ func parseServerRoutes(b []byte, self int64) (*serverRoutes, error) {
 	}
 	rt := &serverRoutes{self: self, byID: map[int64]serverRoute{}, nodes: map[int64]routeNode{}}
 	for _, s := range doc.Data.Servers {
-		r := serverRoute{port: s.HTTPPort}
+		r := serverRoute{port: s.HTTPPort, seal: s.RelaySeal == 1}
 		if s.ServerIP != nil {
 			r.ip = strings.TrimSpace(*s.ServerIP)
 		}
@@ -851,7 +902,7 @@ func parseServerRoutes(b []byte, self int64) (*serverRoutes, error) {
 	}
 	for _, n := range doc.Data.Nodes {
 		if len(n.EdPub) == 32 {
-			rt.nodes[n.Sid] = routeNode{pub: n.EdPub, gen: n.Gen, state: n.State}
+			rt.nodes[n.Sid] = routeNode{pub: n.EdPub, box: n.BoxPub, gen: n.Gen, state: n.State}
 		}
 	}
 	return rt, nil

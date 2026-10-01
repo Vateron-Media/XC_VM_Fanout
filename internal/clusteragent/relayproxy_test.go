@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -212,6 +213,10 @@ type fakeOwner struct {
 	asks   []int64
 	legacy bool
 	age    time.Duration
+	// boxSk set: the owner seals (relayseal.go) when the fetcher sent a key;
+	// unsealed set too: it answers in the clear all the same.
+	boxSk    []byte
+	unsealed bool
 }
 
 func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +245,16 @@ func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		chunk = o.tamper(off, chunk)
 	}
 	w.Header().Set("X-XCVM-File-Digest", cc.JoinSigned(d, cc.SignNode(o.key, "digest", d)))
+	if rk := r.URL.Query().Get(relaySealParam); o.boxSk != nil && rk != "" && !o.unsealed {
+		sealed, _ := base64.RawURLEncoding.DecodeString(rk)
+		key, err := cc.Open(o.boxSk, relaySealPurpose, fileSealContext(5, doc.Tid), sealed)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set(relaySealHeader, relaySealVersion)
+		chunk = sealFrames(key, chunk, relayFrameMax)
+	}
 	w.Write(chunk)
 }
 

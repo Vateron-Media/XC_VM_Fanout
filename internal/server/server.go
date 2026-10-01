@@ -927,6 +927,12 @@ type Manager struct {
 
 	ingestDir string // base dir for per-stream push-fed ingest sockets
 
+	// filesDir is where the panel writes file manifests (files.go); files holds
+	// the viewers of each panel id served from disk, guarded by mu.
+	filesDir  string
+	fileRoots []string
+	files     map[string]*Stream
+
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
 	signals   *signalStore // pending per-uuid "send message" overlays
@@ -1550,6 +1556,7 @@ func (m *Manager) ClientHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/live/", m.serveLive)
 	mux.HandleFunc("/hls/", m.serveHLS)
+	mux.HandleFunc("/file/", m.serveFile)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -1589,12 +1596,7 @@ func (m *Manager) ControlHandler() http.Handler {
 // it. A daemon that predates the parameter ignores it and answers the bare
 // array, which the agent reads too.
 func (m *Manager) serveConnections(w http.ResponseWriter, r *http.Request) {
-	m.mu.Lock()
-	streams := make([]*Stream, 0, len(m.streams))
-	for _, st := range m.streams {
-		streams = append(streams, st)
-	}
-	m.mu.Unlock()
+	streams := m.connStreams() // the live streams and the files served from disk
 
 	w.Header().Set("Content-Type", "application/json")
 	if r.URL.Query().Get("detail") == "1" {
@@ -1615,12 +1617,7 @@ func (m *Manager) serveConnections(w http.ResponseWriter, r *http.Request) {
 // DropConnection disconnects every live-TS viewer carrying uuid, across all
 // streams, and returns how many streams it was connected to.
 func (m *Manager) DropConnection(uuid string) int {
-	m.mu.Lock()
-	streams := make([]*Stream, 0, len(m.streams))
-	for _, st := range m.streams {
-		streams = append(streams, st)
-	}
-	m.mu.Unlock()
+	streams := m.connStreams() // the live streams and the files served from disk
 
 	n := 0
 	for _, st := range streams {
@@ -1662,12 +1659,7 @@ func (m *Manager) serveDropConnection(w http.ResponseWriter, r *http.Request) {
 // DIVERGENCE_TMP_PATH before the byte path left PHP (ADR 0003, P4). On the rare
 // chance a uuid is live on more than one stream, the higher rate wins.
 func (m *Manager) serveRates(w http.ResponseWriter, _ *http.Request) {
-	m.mu.Lock()
-	streams := make([]*Stream, 0, len(m.streams))
-	for _, st := range m.streams {
-		streams = append(streams, st)
-	}
-	m.mu.Unlock()
+	streams := m.connStreams() // the live streams and the files served from disk
 
 	rates := make(map[string]int)
 	for _, st := range streams {

@@ -65,6 +65,8 @@ func main() {
 	sock := flag.String("sock", "/home/xc_vm/bin/xc_fanout/sockets/http.sock", "client unix socket (nginx-facing)")
 	ctl := flag.String("ctl", "", "control unix socket (PHP-only), e.g. /home/xc_vm/bin/xc_fanout/sockets/control.sock; empty = no control API")
 	ingestDir := flag.String("ingestdir", "", "dir for per-stream push-fed ingest sockets (non-proxy tee); empty = <sock dir>/ingest")
+	filesDir := flag.String("filesdir", "", "dir the panel writes VOD/timeshift file manifests to; empty = <sock dir>/files")
+	fileRoots := flag.String("fileroots", "/home/xc_vm/content", "comma-separated dirs a file manifest's parts may lie under (the panel's VOD and archive)")
 	id := flag.String("id", "", "stream id to feed at launch (testing; empty = serve only)")
 	in := flag.String("in", "", "input file for -id, or - for stdin (testing)")
 	source := flag.String("source", "", "comma-separated source URLs for -id (testing)")
@@ -179,6 +181,14 @@ func main() {
 	}
 	_ = os.MkdirAll(idir, 0o755)
 	mgr.SetIngestDir(idir)
+	fdir := *filesDir
+	if fdir == "" {
+		fdir = filepath.Join(filepath.Dir(*sock), "files")
+	}
+	_ = os.MkdirAll(fdir, 0o750)
+	mgr.SetFilesDir(fdir)
+	mgr.SetFileRoots(strings.Split(*fileRoots, ","))
+	mgr.SweepManifests(ctx.Done())
 	mgr.SetOverlay(*ffmpeg, *font) // admin "send message" drawtext overlay (no font ⇒ disabled)
 	// Encoder supervision is always wired, and does nothing on its own: a stream
 	// is supervised only once the panel hands it over, and the daemon accepts a
