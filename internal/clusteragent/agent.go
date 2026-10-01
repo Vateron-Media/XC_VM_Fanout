@@ -98,6 +98,7 @@ type Agent struct {
 	refreshNotBefore   atomic.Int64 // local unix ns before which no scheduled refresh is asked
 	reachedAt          atomic.Int64 // local unix ns this run last touched ReachedFile
 	typedStarts        atomic.Bool  // the node's PHP runs stream.start and vod.start (checkTypes)
+	binaries           atomic.Bool  // the node's PHP installs the fanout daemon and xcvm_core MAIN grants (checkTypes)
 	stopCh             chan error   // a background loop's fatal refusal, for Run
 	run                Executor     // what runs MAIN's commands (localExec over Exec); nil: none
 	sealedMu           sync.Mutex   // one batch of sealed commands at a time (sealed.go)
@@ -218,6 +219,9 @@ func (a *Agent) features() []string {
 	if a.ArtefactDir != "" && (a.Exec != nil || a.run != nil) && a.artefactOn.Load() {
 		// Only while the node's PHP runs artefact.fetch (artefact.go).
 		out = append(out, FeatureArtefact)
+		if a.binaries.Load() {
+			out = append(out, FeatureArtefactBinaries)
+		}
 	}
 	if a.RelayAddr != "" && a.RelayKeyDir != "" {
 		// The loopback relay proxy runs (relayproxy.go): MAIN lets an
