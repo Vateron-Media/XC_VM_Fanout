@@ -1,10 +1,13 @@
 package server
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,12 +32,29 @@ import (
 // No path ever travels in a URL: the manifest's name is 32 hex characters, and
 // only the panel (xc_vm) writes the directory.
 
-// filePart is one span of one file: Length -1 runs to the file's end.
+// filePart is one span of one file: Length -1 runs to the file's end. A
+// part with a URL instead (a direct-proxy movie) is the manifest's only part:
+// the daemon fetches it from its source, the viewer's range passed on.
 type filePart struct {
 	Path   string `json:"path"`
+	URL    string `json:"url,omitempty"`
 	Offset int64  `json:"offset"`
 	Length int64  `json:"length"`
 }
+
+// fileSourceUA is the User-Agent a direct-proxy movie's source is asked with,
+// the panel's as before.
+const fileSourceUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.16; rv:101.0) Gecko/20100101 Firefox/101.0"
+
+// fileSourceClient fetches direct-proxy movies. Their sources commonly serve
+// self-signed certificates (the panel's cURL relay never verified them); a
+// download may run for hours, so only the dial and the headers are timed.
+var fileSourceClient = &http.Client{Transport: &http.Transport{
+	TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // as the panel's relay, see above
+	DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+	ResponseHeaderTimeout: 30 * time.Second,
+	MaxIdleConnsPerHost:   4,
+}}
 
 // fileManifest is what the panel wrote for one request.
 type fileManifest struct {
@@ -119,8 +139,15 @@ func (m *Manager) readManifest(name string, now time.Time) (*fileManifest, int) 
 	if json.Unmarshal(raw, &mf) != nil || len(mf.Parts) == 0 || mf.Expires < now.Unix() || mf.LimitPerc < 0 || mf.LimitPerc > 100 || mf.Rate < 0 {
 		return nil, http.StatusNotFound
 	}
+	if mf.Parts[0].URL != "" {
+		u, err := url.Parse(mf.Parts[0].URL)
+		if len(mf.Parts) != 1 || err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || mf.Parts[0].Path != "" {
+			return nil, http.StatusBadRequest
+		}
+		return &mf, 0
+	}
 	for _, p := range mf.Parts {
-		if !filepath.IsAbs(p.Path) || filepath.Clean(p.Path) != p.Path || p.Offset < 0 || p.Length < -1 {
+		if p.URL != "" || !filepath.IsAbs(p.Path) || filepath.Clean(p.Path) != p.Path || p.Offset < 0 || p.Length < -1 {
 			return nil, http.StatusBadRequest
 		}
 	}
@@ -172,12 +199,6 @@ func (m *Manager) serveFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(code), code)
 		return
 	}
-	body, mod, files, err := openParts(mf.Parts)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer closeAll(files)
 
 	uuid := r.URL.Query().Get("c")
 	fw := &fileWriter{ResponseWriter: w, rc: http.NewResponseController(w), m: m, limitPerc: mf.LimitPerc, rate: mf.Rate, done: r.Context().Done()}
@@ -196,8 +217,52 @@ func (m *Manager) serveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	start := time.Now()
-	http.ServeContent(fw, r, "", mod, body)
+	if mf.Parts[0].URL != "" {
+		serveSource(fw, r, mf.Parts[0].URL)
+	} else {
+		body, mod, files, err := openParts(mf.Parts)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer closeAll(files)
+		http.ServeContent(fw, r, "", mod, body)
+	}
 	dlog.Logf("viewer", "id=%s file detach uuid=%s dur=%s sent=%dKB", id, uuid, time.Since(start).Round(time.Millisecond), fw.written/1024)
+}
+
+// serveSource relays a direct-proxy movie from its source: the viewer's range
+// asked for, the source's status and range headers passed on, the body
+// written through fw (its throttle, deadline and kill).
+func serveSource(fw *fileWriter, r *http.Request, src string) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, src, nil)
+	if err != nil {
+		http.Error(fw, "bad source", http.StatusBadGateway)
+		return
+	}
+	req.Header.Set("User-Agent", fileSourceUA)
+	if rg := r.Header.Get("Range"); rg != "" {
+		req.Header.Set("Range", rg)
+	}
+	resp, err := fileSourceClient.Do(req)
+	if err != nil {
+		http.Error(fw, "source unreachable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent, http.StatusRequestedRangeNotSatisfiable:
+	default:
+		http.Error(fw, "source answered "+strconv.Itoa(resp.StatusCode), http.StatusBadGateway)
+		return
+	}
+	for _, h := range []string{"Content-Length", "Content-Range", "Accept-Ranges"} {
+		if v := resp.Header.Get(h); v != "" {
+			fw.Header().Set(h, v)
+		}
+	}
+	fw.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(fw, resp.Body)
 }
 
 // fileWriter carries one file response: written in chunks, each under the

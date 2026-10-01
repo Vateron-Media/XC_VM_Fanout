@@ -211,3 +211,39 @@ func TestUnreadManifestsAreSwept(t *testing.T) {
 		t.Fatal("an unread manifest past its TTL is kept")
 	}
 }
+
+func TestADirectProxyMovieIsRelayedFromItsSourceWithTheViewersRange(t *testing.T) {
+	f := newFilesFixture(t)
+	movie := strings.Repeat("0123456789", 1000)
+	var gotRange, gotUA string
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange, gotUA = r.Header.Get("Range"), r.Header.Get("User-Agent")
+		http.ServeContent(w, r, "m.mp4", time.Time{}, strings.NewReader(movie))
+	}))
+	defer src.Close()
+
+	name := f.manifest(fileManifest{Type: "video/mp4", Parts: []filePart{{URL: src.URL + "/m.mp4"}}})
+	res, body := f.get("/file/8?c=u8&m="+name, map[string]string{"Range": "bytes=10-19"})
+	if res.StatusCode != 206 || body != movie[10:20] || res.Header.Get("Content-Range") != "bytes 10-19/10000" || res.Header.Get("Content-Type") != "video/mp4" {
+		t.Fatalf("got %d %q %q", res.StatusCode, body, res.Header.Get("Content-Range"))
+	}
+	if gotRange != "bytes=10-19" || gotUA != fileSourceUA {
+		t.Fatalf("the source was asked with %q, %q", gotRange, gotUA)
+	}
+
+	// A source that fails is the viewer's 502; a manifest naming anything but
+	// one http(s) source is refused.
+	src.Close()
+	if res, _ := f.get("/file/8?m="+f.manifest(fileManifest{Parts: []filePart{{URL: src.URL}}}), nil); res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("source down: got %d", res.StatusCode)
+	}
+	for _, mf := range []fileManifest{
+		{Parts: []filePart{{URL: "file:///etc/passwd"}}},
+		{Parts: []filePart{{URL: "http://a/1"}, {URL: "http://a/2"}}},
+		{Parts: []filePart{{URL: "http://a/1", Path: "/etc/passwd"}}},
+	} {
+		if res, _ := f.get("/file/8?m="+f.manifest(mf), nil); res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%+v: got %d", mf.Parts, res.StatusCode)
+		}
+	}
+}

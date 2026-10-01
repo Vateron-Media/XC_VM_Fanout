@@ -207,7 +207,10 @@ func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
 //
 // "files": /file/<id> serves a movie or timeshift the panel describes in a
 // manifest (files.go), so PHP hands its bytes over like a live viewer's.
-var Features = []string{"remux", "drop_connection", "files"}
+//
+// "file_urls": such a manifest may name a direct-proxy movie's source URL,
+// which the daemon fetches with the viewer's range.
+var Features = []string{"remux", "drop_connection", "files", "file_urls"}
 
 // EnableSupervision gives the manager an encoder supervisor. Streams are only
 // supervised once the panel PUTs a spec for one, so enabling this changes
