@@ -121,10 +121,12 @@ type serverRoutes struct {
 type serverRoute struct {
 	ip, private string
 	port        int64
+	seal        bool // it seals the relays it serves (relay_seal; relayseal.go)
 }
 
 type routeNode struct {
 	pub   []byte
+	box   []byte // its box key, what a relay's session key is sealed to
 	gen   int64
 	state string
 }
@@ -398,6 +400,17 @@ func (p *RelayProxy) relay(w http.ResponseWriter, r *http.Request, id int64, pre
 	if prebuffer {
 		target += "&prebuffer=1"
 	}
+	// A parent that seals (relayseal.go): a fresh session key sealed to it, in
+	// the target the proof signs; its answer is taken sealed or not at all.
+	key, sealed, err := p.relayKey(parent, id)
+	if err != nil {
+		a.logf("cluster: relay: stream %d: %v", id, err)
+		http.Error(w, "parent key unknown", http.StatusBadGateway)
+		return
+	}
+	if key != nil {
+		target += "&" + relaySealParam + "=" + sealed
+	}
 	resp, _, err := p.upstream(r.Context(), base, target, "X-XCVM-Relay", "X-XCVM-Relay-Auth", wire)
 	if err != nil {
 		a.logf("cluster: relay: stream %d from server %d: %v", id, parent, err)
@@ -410,11 +423,22 @@ func (p *RelayProxy) relay(w http.ResponseWriter, r *http.Request, id int64, pre
 		http.Error(w, "upstream refused", http.StatusBadGateway)
 		return
 	}
+	if key != nil && resp.Header.Get(relaySealHeader) != relaySealVersion {
+		a.logf("cluster: relay: stream %d: server %d answered unsealed", id, parent)
+		http.Error(w, "upstream unsealed", http.StatusBadGateway)
+		return
+	}
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
 	w.WriteHeader(http.StatusOK)
-	flushCopy(w, resp.Body)
+	if key == nil {
+		flushCopy(w, resp.Body)
+		return
+	}
+	if err := copyRelayFrames(w, resp.Body, key); err != nil {
+		a.logf("cluster: relay: stream %d from server %d: %v", id, parent, err)
+	}
 }
 
 // upstream sends one signed GET to base+target; nonce is the proof's, which
@@ -823,12 +847,14 @@ func parseServerRoutes(b []byte, self int64) (*serverRoutes, error) {
 				ServerIP  *string `json:"server_ip"`
 				PrivateIP *string `json:"private_ip"`
 				HTTPPort  int64   `json:"http_broadcast_port"`
+				RelaySeal int64   `json:"relay_seal"`
 			} `json:"servers"`
 			Nodes []struct {
-				Sid   int64  `json:"sid"`
-				Gen   int64  `json:"gen"`
-				State string `json:"state"`
-				EdPub []byte `json:"ed_pub"`
+				Sid    int64  `json:"sid"`
+				Gen    int64  `json:"gen"`
+				State  string `json:"state"`
+				EdPub  []byte `json:"ed_pub"`
+				BoxPub []byte `json:"box_pub"`
 			} `json:"nodes"`
 		} `json:"data"`
 	}
@@ -837,7 +863,7 @@ func parseServerRoutes(b []byte, self int64) (*serverRoutes, error) {
 	}
 	rt := &serverRoutes{self: self, byID: map[int64]serverRoute{}, nodes: map[int64]routeNode{}}
 	for _, s := range doc.Data.Servers {
-		r := serverRoute{port: s.HTTPPort}
+		r := serverRoute{port: s.HTTPPort, seal: s.RelaySeal == 1}
 		if s.ServerIP != nil {
 			r.ip = strings.TrimSpace(*s.ServerIP)
 		}
@@ -851,7 +877,7 @@ func parseServerRoutes(b []byte, self int64) (*serverRoutes, error) {
 	}
 	for _, n := range doc.Data.Nodes {
 		if len(n.EdPub) == 32 {
-			rt.nodes[n.Sid] = routeNode{pub: n.EdPub, gen: n.Gen, state: n.State}
+			rt.nodes[n.Sid] = routeNode{pub: n.EdPub, box: n.BoxPub, gen: n.Gen, state: n.State}
 		}
 	}
 	return rt, nil
