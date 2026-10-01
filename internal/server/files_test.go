@@ -106,14 +106,16 @@ func TestAManifestTheDaemonCannotTrustIsRefused(t *testing.T) {
 	f := newFilesFixture(t)
 	p := f.file("m.mp4", "data")
 	for what, mf := range map[string]fileManifest{
-		"relative path": {Parts: []filePart{{Path: "m.mp4", Length: -1}}},
-		"unclean path":  {Parts: []filePart{{Path: f.media + "/../" + filepath.Base(f.media) + "/m.mp4", Length: -1}}},
-		"expired":       {Parts: []filePart{{Path: p, Length: -1}}, Expires: time.Now().Add(-time.Second).Unix()},
-		"no parts":      {},
-		"a directory":   {Parts: []filePart{{Path: f.media, Length: -1}}},
-		"past its end":  {Parts: []filePart{{Path: p, Offset: 9, Length: -1}}},
-		"outside roots": {Parts: []filePart{{Path: "/etc/hostname", Length: -1}}},
-		"the root":      {Parts: []filePart{{Path: f.media, Length: -1}}},
+		"relative path":  {Parts: []filePart{{Path: "m.mp4", Length: -1}}},
+		"unclean path":   {Parts: []filePart{{Path: f.media + "/../" + filepath.Base(f.media) + "/m.mp4", Length: -1}}},
+		"expired":        {Parts: []filePart{{Path: p, Length: -1}}, Expires: time.Now().Add(-time.Second).Unix()},
+		"no parts":       {},
+		"a directory":    {Parts: []filePart{{Path: f.media, Length: -1}}},
+		"past its end":   {Parts: []filePart{{Path: p, Offset: 9, Length: -1}}},
+		"outside roots":  {Parts: []filePart{{Path: "/etc/hostname", Length: -1}}},
+		"a dot element":  {Parts: []filePart{{Path: f.media + "/./m.mp4", Length: -1}}},
+		"a double slash": {Parts: []filePart{{Path: f.media + "//m.mp4", Length: -1}}},
+		"the root":       {Parts: []filePart{{Path: f.media, Length: -1}}},
 	} {
 		if res, _ := f.get("/file/1?m="+f.manifest(mf), nil); res.StatusCode < 400 {
 			t.Errorf("%s: got %d", what, res.StatusCode)
@@ -248,5 +250,20 @@ func TestADirectProxyMovieIsRelayedFromItsSourceWithTheViewersRange(t *testing.T
 		if res, _ := f.get("/file/8?m="+f.manifest(mf), nil); res.StatusCode != http.StatusBadRequest {
 			t.Errorf("%+v: got %d", mf.Parts, res.StatusCode)
 		}
+	}
+}
+
+func TestALinkUnderARootIsFollowedAsTheVodLinksAre(t *testing.T) {
+	f := newFilesFixture(t)
+	elsewhere := filepath.Join(t.TempDir(), "movie.mkv")
+	if err := os.WriteFile(elsewhere, []byte("on another disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(f.media, "7.mkv")
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Fatal(err)
+	}
+	if res, body := f.get("/file/7?m="+f.manifest(fileManifest{Parts: []filePart{{Path: link, Length: -1}}}), nil); res.StatusCode != 200 || body != "on another disk" {
+		t.Fatalf("got %d %q", res.StatusCode, body)
 	}
 }

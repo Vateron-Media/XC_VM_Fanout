@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -42,6 +43,10 @@ type filePart struct {
 	URL    string `json:"url,omitempty"`
 	Offset int64  `json:"offset"`
 	Length int64  `json:"length"`
+
+	// root and rel: Path split at the file root it lies under (readManifest),
+	// what openParts opens it through.
+	root, rel string
 }
 
 // fileSourceUA is the User-Agent a direct-proxy movie's source is asked with,
@@ -52,7 +57,7 @@ const fileSourceUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.16; rv:101.0) Ge
 // self-signed certificates (the panel's cURL relay never verified them); a
 // download may run for hours, so only the dial and the headers are timed.
 var fileSourceClient = &http.Client{Transport: &http.Transport{
-	TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // as the panel's relay, see above
+	TLSClientConfig:       &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // as the panel's relay, see above; 1.2 for older sources
 	DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 	ResponseHeaderTimeout: 30 * time.Second,
 	MaxIdleConnsPerHost:   4,
@@ -83,28 +88,29 @@ var errFileKilled = errors.New("dropped by the panel")
 // SetFilesDir sets the directory the panel writes file manifests to.
 func (m *Manager) SetFilesDir(dir string) { m.filesDir = dir }
 
-// SetFileRoots sets the directories a manifest's parts may lie under.
+// SetFileRoots sets the directories a manifest's parts may lie under: each
+// absolute, its own elements valid (no ".", ".." or empty one).
 func (m *Manager) SetFileRoots(roots []string) {
 	m.fileRoots = nil
 	for _, r := range roots {
-		if r = strings.TrimSpace(r); filepath.IsAbs(r) {
-			m.fileRoots = append(m.fileRoots, filepath.Clean(r))
+		r = strings.TrimRight(strings.TrimSpace(r), "/")
+		if strings.HasPrefix(r, "/") && fs.ValidPath(r[1:]) {
+			m.fileRoots = append(m.fileRoots, r)
 		}
 	}
 }
 
-// underRoots is path, cleaned, when it lies strictly under a file root.
-func (m *Manager) underRoots(path string) (string, bool) {
-	if !filepath.IsAbs(path) {
-		return "", false
-	}
-	clean := filepath.Clean(path)
+// underRoots splits path at the file root it lies strictly under: the root,
+// and the rest as fs.ValidPath takes it (slash-separated, no ".", ".." or
+// empty element), so it names nothing outside the root. No cleaning: a path
+// that is not already in that form is refused.
+func (m *Manager) underRoots(path string) (root, rel string, ok bool) {
 	for _, root := range m.fileRoots {
-		if strings.HasPrefix(clean, root+string(filepath.Separator)) {
-			return clean, true
+		if rel, found := strings.CutPrefix(path, root+"/"); found && rel != "" && fs.ValidPath(rel) {
+			return root, rel, true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 // fileStream is the bookkeeping holder for the file viewers of panel id id:
@@ -173,11 +179,11 @@ func (m *Manager) readManifest(name string, now time.Time) (*fileManifest, int) 
 		return &mf, 0
 	}
 	for i, p := range mf.Parts {
-		clean, ok := m.underRoots(p.Path)
-		if p.URL != "" || !ok || clean != p.Path || p.Offset < 0 || p.Length < -1 {
+		root, rel, ok := m.underRoots(p.Path)
+		if p.URL != "" || !ok || p.Offset < 0 || p.Length < -1 {
 			return nil, http.StatusBadRequest
 		}
-		mf.Parts[i].Path = clean
+		mf.Parts[i].root, mf.Parts[i].rel = root, rel
 	}
 	return &mf, 0
 }
@@ -189,10 +195,18 @@ func openParts(parts []filePart) (*partsReader, time.Time, []*os.File, error) {
 	pr := &partsReader{}
 	var mod time.Time
 	for _, p := range parts {
-		f, err := os.Open(filepath.Clean(p.Path)) // under a file root (readManifest)
+		// Through the root it lies under (readManifest): os.DirFS refuses a
+		// name that is not fs.ValidPath, so nothing outside it opens.
+		ff, err := os.DirFS(p.root).Open(p.rel)
 		if err != nil {
 			closeAll(files)
 			return nil, mod, nil, err
+		}
+		f, ok := ff.(*os.File)
+		if !ok {
+			_ = ff.Close()
+			closeAll(files)
+			return nil, mod, nil, os.ErrInvalid
 		}
 		files = append(files, f)
 		fi, err := f.Stat()
