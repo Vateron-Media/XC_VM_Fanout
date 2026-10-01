@@ -302,7 +302,7 @@ func TestArtefactGrantShape(t *testing.T) {
 		return string(b)
 	}
 	id := cmdIDFor(1)
-	for _, ok := range []string{"offair/connected", "offair/expiring", "module/radio-2/1.0.3", "module/a/V_1-2", "agent/amd64", "agent/arm64", "agent/armv7", "agent/386", "fanout/amd64", "fanout/arm64", "core/php8.1", "core/php8.4"} {
+	for _, ok := range []string{"offair/connected", "offair/expiring", "module/radio-2/1.0.3", "module/a/V_1-2"} {
 		g := valid()
 		g["id"] = ok
 		if _, _, err := parseGrant(id, doc(id, g)); err != nil {
@@ -321,6 +321,9 @@ func TestArtefactGrantShape(t *testing.T) {
 		"a module in capitals":     func(g map[string]any) { g["id"] = "module/Radio/1.0" },
 		"a version with ..":        func(g map[string]any) { g["id"] = "module/radio/1..0" },
 		"a longer module id":       func(g map[string]any) { g["id"] = "module/radio/1.0/x" },
+		"an agent binary":          func(g map[string]any) { g["id"] = "agent/amd64" },
+		"a fanout daemon":          func(g map[string]any) { g["id"] = "fanout/amd64" },
+		"an xcvm_core archive":     func(g map[string]any) { g["id"] = "core/php8.1" },
 		"an unknown arch":          func(g map[string]any) { g["id"] = "agent/mips" },
 		"a fanout of no arch":      func(g map[string]any) { g["id"] = "fanout/mips" },
 		"a core of no PHP":         func(g map[string]any) { g["id"] = "core/php" },
@@ -370,7 +373,7 @@ func TestArtefactGrantShape(t *testing.T) {
 		want bool
 	}{
 		{Command{Type: "artefact.fetch"}, true},
-		{Command{Type: "node.root", Action: "agent_binary", Args: map[string]any{"artefact": map[string]any{}}}, true},
+		{Command{Type: "node.root", Action: "install_module", Args: map[string]any{"artefact": map[string]any{}}}, true},
 		{Command{Type: "node.root", Action: "install_module", Args: map[string]any{}}, false},
 		{Command{Type: "node.rpc", Args: map[string]any{"artefact": map[string]any{}}}, false},
 	} {
@@ -391,7 +394,7 @@ func TestArtefactMalformedGrantIsRefusedNotRun(t *testing.T) {
 	}
 	g = grantFor("offair/not_on_air", "off.ts", payload(10))
 	delete(g, "id")
-	a.handleCommand(ctx, m.command(2, "node.root", map[string]any{"action": "agent_binary", "arch": "amd64", "artefact": g}, nil), a.run)
+	a.handleCommand(ctx, m.command(2, "node.root", map[string]any{"action": "install_module", "source": "local", "name": "radio", "version": "1.0", "artefact": g}, nil), a.run)
 	if got := m.ackOf(t, cmdIDFor(2)); got.OK || got.Result != "artefact refused: ?: a malformed grant" {
 		t.Fatalf("ack %+v", got)
 	}
@@ -439,8 +442,8 @@ func TestArtefactFetchedInChunksAndHandedOn(t *testing.T) {
 func TestArtefactDownloadModes(t *testing.T) {
 	m, a, ex, _ := newArtefactAgent(t)
 	data := payload(100)
-	g := grantFor("agent/amd64", "xc_agent-linux-amd64", data)
-	a.handleCommand(context.Background(), m.command(1, "node.root", map[string]any{"action": "agent_binary", "arch": "amd64", "version": "1.5.0", "artefact": g}, data), a.run)
+	g := grantFor("module/radio/1.0", "radio_1.0.zip", data)
+	a.handleCommand(context.Background(), m.command(1, "node.root", map[string]any{"action": "install_module", "source": "local", "name": "radio", "version": "1.0", "artefact": g}, data), a.run)
 	var mode os.FileMode
 	ex.outcome = func(cmd *Command) (bool, []byte) {
 		fi, _ := os.Stat(filepath.Join(a.ArtefactDir, cmd.CmdID))
@@ -716,7 +719,7 @@ func TestRootCommandsGoInSeqOrder(t *testing.T) {
 	m.gate = make(chan struct{})
 	ctx := context.Background()
 	bin := payload(300)
-	a.handleCommand(ctx, m.command(1, "node.root", map[string]any{"action": "agent_binary", "arch": "amd64", "version": "1.5.0", "artefact": grantFor("agent/amd64", "xc_agent-linux-amd64", bin)}, bin), a.run)
+	a.handleCommand(ctx, m.command(1, "node.root", map[string]any{"action": "install_module", "source": "local", "name": "radio", "version": "1.0", "artefact": grantFor("module/radio/1.0", "radio_1.0.zip", bin)}, bin), a.run)
 	a.handleCommand(ctx, m.command(2, "node.root", map[string]any{"action": "reload_nginx"}, nil), a.run)
 	a.handleCommand(ctx, m.command(3, "node.rpc", map[string]any{"action": "get_pids"}, nil), a.run)
 	vid := payload(50)
@@ -893,40 +896,6 @@ func TestTypedStartsFollowThePHP(t *testing.T) {
 	a.ArtefactDir = ""
 	if f := hello(); !slices.Contains(f, FeatureTypedStarts) {
 		t.Fatalf("said %v once the PHP runs stream.start", f)
-	}
-}
-
-// The fanout daemon and xcvm_core follow the agent's path only to a node
-// whose PHP installs them: artefact_binaries, beside artefact, while its
-// cluster:exec --types lists both root installs.
-func TestArtefactBinariesFollowThePHP(t *testing.T) {
-	m, a, ex, _ := newArtefactAgent(t)
-	a.Exec = ex.run
-	types := []string{"node.rpc", TypeArtefactFetch}
-	a.Types = func(context.Context) ([]string, error) { return types, nil }
-	ctx := context.Background()
-	hello := func() []string {
-		t.Helper()
-		if _, err := a.Start(ctx); err != nil {
-			t.Fatal(err)
-		}
-		return m.lastHello()
-	}
-	a.Client.State.Enrolled = true
-	if f := hello(); !slices.Contains(f, FeatureArtefact) || slices.Contains(f, FeatureArtefactBinaries) {
-		t.Fatalf("an older PHP: artefacts only, said %v", f)
-	}
-	types = append(types, "root:fanout_binary")
-	if f := hello(); slices.Contains(f, FeatureArtefactBinaries) {
-		t.Fatalf("one of the two root installs is not enough, said %v", f)
-	}
-	types = append(types, "root:xcvm_core")
-	if f := hello(); !slices.Contains(f, FeatureArtefactBinaries) {
-		t.Fatalf("the PHP installs both, said %v", f)
-	}
-	types = []string{"node.rpc", "root:fanout_binary", "root:xcvm_core"}
-	if f := hello(); slices.Contains(f, FeatureArtefactBinaries) {
-		t.Fatalf("never without artefacts, said %v", f)
 	}
 }
 
