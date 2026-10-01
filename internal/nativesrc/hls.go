@@ -391,6 +391,39 @@ type hlsPuller struct {
 	// sends no Content-Length and io.Copy has to grow) per segment per stream —
 	// pure garbage on the ingest hot path.
 	segBuf bytes.Buffer
+
+	// paceStart and paced hold a VOD playlist to real time (pace): when the
+	// first segment went out, and the seconds of #EXTINF streamed since.
+	paceStart time.Time
+	paced     float64
+}
+
+// hlsVODLead is how far (seconds) a VOD playlist may run ahead of the clock:
+// the join's prebuffer, let through at download speed.
+var hlsVODLead = 6.0
+
+// pace holds a VOD (#EXT-X-ENDLIST) playlist's next segment until the clock
+// has caught up with what already went out, less hlsVODLead, as ffmpeg's -re
+// does. Read at download speed, a finite playlist reaches its end in seconds:
+// a channel made of it ended and started over every few seconds, and its
+// viewers got not-on-air. A live playlist paces itself. False once the pull is
+// cancelled.
+func (p *hlsPuller) pace() bool {
+	if p.paceStart.IsZero() {
+		p.paceStart = time.Now()
+	}
+	wait := time.Duration((p.paced-hlsVODLead)*float64(time.Second)) - time.Since(p.paceStart)
+	if wait <= 0 {
+		return true
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-p.ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func (p *hlsPuller) run(initial *hlsPlaylist) {
@@ -420,6 +453,9 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			}
 			if p.streamed(pl, i) {
 				continue
+			}
+			if pl.Endlist && !p.pace() {
+				return
 			}
 			if err := p.streamSegment(seg, pl.MediaSequence+int64(i)); err != nil {
 				// A segment body that is not MPEG-TS says the upstream is
@@ -477,6 +513,9 @@ func (p *hlsPuller) run(initial *hlsPlaylist) {
 			p.markStreamed(pl, i)
 			p.clearStall()
 			segFails, notTS = 0, 0
+			if pl.Endlist {
+				p.paced += seg.Duration
+			}
 		}
 		if pl.Endlist && !stalled {
 			return // VOD: source-side ended.
