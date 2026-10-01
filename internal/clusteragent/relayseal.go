@@ -28,7 +28,9 @@ import (
 //
 // each frame's plaintext at most 64 KiB. A parent the servers section marks as
 // sealing (relay_seal) is taken sealed only: an unsealed answer, or a frame
-// that does not open, ends the read.
+// that does not open, ends the read. A file chunk from such an owner (/xfile)
+// is fetched the same way, under fileSealContext, and its digest checked over
+// the plaintext.
 
 const (
 	relaySealPurpose = "relay"
@@ -45,30 +47,35 @@ func relaySealContext(parent, stream int64) string {
 	return fmt.Sprintf("relay|%d|%d", parent, stream)
 }
 
-// relayKey is the session key for stream from parent, and the sealed form the
-// target carries; nil when the parent does not seal.
-func (p *RelayProxy) relayKey(parent, stream int64) (key []byte, sealed string, err error) {
+// fileSealContext binds a file chunk's key to its owner and file ticket (/xfile).
+func fileSealContext(owner int64, tid string) string {
+	return fmt.Sprintf("file|%d|%s", owner, tid)
+}
+
+// sealKey is a fresh session key for a request to server sid under context,
+// and the sealed form the target carries; nil when the server does not seal.
+func (p *RelayProxy) sealKey(sid int64, context string) (key []byte, sealed string, err error) {
 	rt, err := p.serverRoutes()
 	if err != nil {
 		return nil, "", err
 	}
-	if !rt.byID[parent].seal {
+	if !rt.byID[sid].seal {
 		return nil, "", nil
 	}
 	var pub []byte
-	if parent == rt.mainSid {
+	if sid == rt.mainSid {
 		pub = p.a.Client.State.PanelBoxPub
-	} else if n, ok := rt.nodes[parent]; ok && n.state == "active" {
+	} else if n, ok := rt.nodes[sid]; ok && n.state == "active" {
 		pub = n.box
 	}
 	if len(pub) != 32 {
-		return nil, "", fmt.Errorf("no box key for server %d", parent)
+		return nil, "", fmt.Errorf("no box key for server %d", sid)
 	}
 	key = make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, "", err
 	}
-	b, err := cc.Seal(pub, relaySealPurpose, relaySealContext(parent, stream), key)
+	b, err := cc.Seal(pub, relaySealPurpose, context, key)
 	if err != nil {
 		return nil, "", err
 	}

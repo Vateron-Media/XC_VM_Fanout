@@ -154,3 +154,28 @@ func TestTheServersSectionCarriesSealingAndBoxKeys(t *testing.T) {
 		t.Fatalf("%+v %v", rt, err)
 	}
 }
+
+func TestASealingOwnersFileIsReadSealedChunkByChunk(t *testing.T) {
+	fx, o, path := xfileFixture(t, 2*cc.FileChunk+1000)
+	o.boxSk = make([]byte, 32)
+	_, _ = rand.Read(o.boxSk)
+	boxPub, _ := cc.X25519Public(o.boxSk)
+	n := fx.routes.nodes[5]
+	n.box = boxPub
+	fx.routes.nodes[5] = n
+	r := fx.routes.byID[5]
+	r.seal = true
+	fx.routes.byID[5] = r
+
+	res := fx.get(path)
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 || !bytes.Equal(body, o.data) {
+		t.Fatalf("sealed file: %d, %d bytes", res.StatusCode, len(body))
+	}
+	// An owner that answers a sealing request in the clear is refused.
+	o.unsealed = true
+	res = fx.get(path)
+	if body, _ := io.ReadAll(res.Body); res.StatusCode == 200 && len(body) == len(o.data) {
+		t.Fatal("an unsealed chunk from a sealing owner was taken")
+	}
+}

@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -402,7 +403,7 @@ func (p *RelayProxy) relay(w http.ResponseWriter, r *http.Request, id int64, pre
 	}
 	// A parent that seals (relayseal.go): a fresh session key sealed to it, in
 	// the target the proof signs; its answer is taken sealed or not at all.
-	key, sealed, err := p.relayKey(parent, id)
+	key, sealed, err := p.sealKey(parent, relaySealContext(parent, id))
 	if err != nil {
 		a.logf("cluster: relay: stream %d: %v", id, err)
 		http.Error(w, "parent key unknown", http.StatusBadGateway)
@@ -622,6 +623,15 @@ func (c *chunkReader) fetchOnce(off int64) (body []byte, after time.Duration, er
 		return nil, -1, err
 	}
 	target := "/xfile?o=" + strconv.FormatInt(off, 10) + "&n=" + strconv.Itoa(cc.FileChunk)
+	// An owner that seals (relayseal.go): the chunk comes framed under a key
+	// sealed to it in the target the proof signs.
+	key, sealed, err := c.p.sealKey(c.owner, fileSealContext(c.owner, c.tid))
+	if err != nil {
+		return nil, -1, err
+	}
+	if key != nil {
+		target += "&" + relaySealParam + "=" + sealed
+	}
 	resp, nonce, err := c.p.upstream(c.ctx, c.base, target, "X-XCVM-File", "X-XCVM-File-Auth", c.wire)
 	if err != nil {
 		return nil, -1, err
@@ -635,12 +645,13 @@ func (c *chunkReader) fetchOnce(off int64) (body []byte, after time.Duration, er
 		}
 		return nil, after, fmt.Errorf("the owner answered %d", resp.StatusCode)
 	}
-	body, err = c.check(off, nonce, resp)
+	body, err = c.check(off, nonce, resp, key)
 	return body, -1, err
 }
 
-// check verifies one chunk's response to the request that carried nonce.
-func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response) ([]byte, error) {
+// check verifies one chunk's response to the request that carried nonce,
+// opened first when it was asked for sealed under key.
+func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response, key []byte) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("the owner answered %d", resp.StatusCode)
 	}
@@ -654,9 +665,23 @@ func (c *chunkReader) check(off int64, nonce []byte, resp *http.Response) ([]byt
 	if d.Nonce == "" && !c.p.a.takeDigestN1(c.owner) {
 		return nil, errors.New("the chunk's digest names no request, which lb_digest_nonce_required refuses")
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, cc.FileChunk+1))
-	if err != nil {
-		return nil, err
+	var body []byte
+	if key != nil {
+		if resp.Header.Get(relaySealHeader) != relaySealVersion {
+			return nil, errors.New("the owner answered unsealed")
+		}
+		var plain bytes.Buffer
+		// At most a chunk in frames of relayFrameMax, each 20 bytes over.
+		limit := int64(cc.FileChunk) + int64(cc.FileChunk/relayFrameMax+2)*(4+relayTag)
+		if err := copyRelayFrames(&plain, io.LimitReader(resp.Body, limit), key); err != nil {
+			return nil, err
+		}
+		body = plain.Bytes()
+	} else {
+		var err error
+		if body, err = io.ReadAll(io.LimitReader(resp.Body, cc.FileChunk+1)); err != nil {
+			return nil, err
+		}
 	}
 	if !d.ChunkMatches(off, body) {
 		return nil, errors.New("the chunk does not match its digest")
