@@ -30,7 +30,9 @@ import (
 // it unchanged.
 //
 // No path ever travels in a URL: the manifest's name is 32 hex characters, and
-// only the panel (xc_vm) writes the directory.
+// only the panel (xc_vm) writes the directory. A part's path must also lie
+// under one of the file roots (-fileroots, the panel's content directory by
+// default), so a manifest names nothing else the daemon's user could read.
 
 // filePart is one span of one file: Length -1 runs to the file's end. A
 // part with a URL instead (a direct-proxy movie) is the manifest's only part:
@@ -80,6 +82,30 @@ var errFileKilled = errors.New("dropped by the panel")
 
 // SetFilesDir sets the directory the panel writes file manifests to.
 func (m *Manager) SetFilesDir(dir string) { m.filesDir = dir }
+
+// SetFileRoots sets the directories a manifest's parts may lie under.
+func (m *Manager) SetFileRoots(roots []string) {
+	m.fileRoots = nil
+	for _, r := range roots {
+		if r = strings.TrimSpace(r); filepath.IsAbs(r) {
+			m.fileRoots = append(m.fileRoots, filepath.Clean(r))
+		}
+	}
+}
+
+// underRoots is path, cleaned, when it lies strictly under a file root.
+func (m *Manager) underRoots(path string) (string, bool) {
+	if !filepath.IsAbs(path) {
+		return "", false
+	}
+	clean := filepath.Clean(path)
+	for _, root := range m.fileRoots {
+		if strings.HasPrefix(clean, root+string(filepath.Separator)) {
+			return clean, true
+		}
+	}
+	return "", false
+}
 
 // fileStream is the bookkeeping holder for the file viewers of panel id id:
 // a Stream with no hub, used only for its connection set, so the viewers are
@@ -146,10 +172,12 @@ func (m *Manager) readManifest(name string, now time.Time) (*fileManifest, int) 
 		}
 		return &mf, 0
 	}
-	for _, p := range mf.Parts {
-		if p.URL != "" || !filepath.IsAbs(p.Path) || filepath.Clean(p.Path) != p.Path || p.Offset < 0 || p.Length < -1 {
+	for i, p := range mf.Parts {
+		clean, ok := m.underRoots(p.Path)
+		if p.URL != "" || !ok || clean != p.Path || p.Offset < 0 || p.Length < -1 {
 			return nil, http.StatusBadRequest
 		}
+		mf.Parts[i].Path = clean
 	}
 	return &mf, 0
 }
@@ -161,7 +189,7 @@ func openParts(parts []filePart) (*partsReader, time.Time, []*os.File, error) {
 	pr := &partsReader{}
 	var mod time.Time
 	for _, p := range parts {
-		f, err := os.Open(p.Path)
+		f, err := os.Open(filepath.Clean(p.Path)) // under a file root (readManifest)
 		if err != nil {
 			closeAll(files)
 			return nil, mod, nil, err

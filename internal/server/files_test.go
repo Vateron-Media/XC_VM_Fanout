@@ -29,6 +29,7 @@ func newFilesFixture(t *testing.T) *filesFixture {
 	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	mgr.SetFilesDir(t.TempDir())
 	f := &filesFixture{t: t, mgr: mgr, cli: httptest.NewServer(mgr.ClientHandler()), ctl: httptest.NewServer(mgr.ControlHandler()), media: t.TempDir()}
+	mgr.SetFileRoots([]string{f.media})
 	t.Cleanup(func() { f.cli.Close(); f.ctl.Close() })
 	return f
 }
@@ -111,6 +112,8 @@ func TestAManifestTheDaemonCannotTrustIsRefused(t *testing.T) {
 		"no parts":      {},
 		"a directory":   {Parts: []filePart{{Path: f.media, Length: -1}}},
 		"past its end":  {Parts: []filePart{{Path: p, Offset: 9, Length: -1}}},
+		"outside roots": {Parts: []filePart{{Path: "/etc/hostname", Length: -1}}},
+		"the root":      {Parts: []filePart{{Path: f.media, Length: -1}}},
 	} {
 		if res, _ := f.get("/file/1?m="+f.manifest(mf), nil); res.StatusCode < 400 {
 			t.Errorf("%s: got %d", what, res.StatusCode)

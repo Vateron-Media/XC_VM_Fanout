@@ -929,8 +929,9 @@ type Manager struct {
 
 	// filesDir is where the panel writes file manifests (files.go); files holds
 	// the viewers of each panel id served from disk, guarded by mu.
-	filesDir string
-	files    map[string]*Stream
+	filesDir  string
+	fileRoots []string
+	files     map[string]*Stream
 
 	ffmpegBin string       // ffmpeg path for the "send message" drawtext overlay
 	fontPath  string       // font file for the overlay text
