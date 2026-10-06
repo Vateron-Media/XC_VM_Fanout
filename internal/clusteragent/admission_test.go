@@ -340,3 +340,37 @@ func TestOfflinePolicyComesFromRepliesAndSurvivesARestart(t *testing.T) {
 		t.Fatalf("not kept in the state file: %v %q", err, back.OfflineAdmission)
 	}
 }
+
+func TestAdmissionCopiesTheMintProofIntoConnAdmit(t *testing.T) {
+	m, a, s, sock := newAdmitAgent(t)
+	m.reply = func(w http.ResponseWriter, reqCtx, _ []byte) {
+		m.box(w, reqCtx, map[string]any{"admit": true, "exp": time.Now().Unix() + 30, "main_time_ms": time.Now().UnixMilli()})
+	}
+	mint := "tok1.1800000000." + strings.Repeat("ab", 16)
+	rec := viewer(42, "1.2.3.4", "VLC")
+	rec["mint"] = mint
+	if st, _ := putViewer(t, sock, "v1", rec, `{"line_id":42,"stream_id":7,"max_connections":2,"ip":"1.2.3.4","ua":"VLC","mint":"`+mint+`"}`); st != 200 {
+		t.Fatalf("admitted: %d", st)
+	}
+	if sent := m.last.Load().(map[string]any); sent["mint"] != mint {
+		t.Fatalf("conn_admit carries no mint: %v", sent)
+	}
+	// The record keeps it, and mirrors it to MAIN, like any other key.
+	if a.Registry.Get("v1")["mint"] != mint || s.events[0]["d"].(map[string]any)["record"].(map[string]any)["mint"] != mint {
+		t.Fatalf("the record's mint was not kept and mirrored: %v", a.Registry.Get("v1"))
+	}
+	// None without one, nor for a malformed one.
+	for i, h := range []string{
+		`{"line_id":42,"stream_id":7,"max_connections":2,"ip":"1.2.3.4","ua":"VLC"}`,
+		`{"line_id":42,"stream_id":7,"max_connections":2,"ip":"1.2.3.4","ua":"VLC","mint":"tok1.1800000000.XYZ"}`,
+		`{"line_id":42,"stream_id":7,"max_connections":2,"ip":"1.2.3.4","ua":"VLC","mint":42}`,
+	} {
+		putViewer(t, sock, "w"+strconv.Itoa(i), viewer(42, "1.2.3.4", "VLC"), h)
+		if _, ok := m.last.Load().(map[string]any)["mint"]; ok {
+			t.Fatalf("case %d: a mint went to MAIN: %v", i, m.last.Load())
+		}
+	}
+	if m.calls.Load() != 4 {
+		t.Fatalf("%d conn_admit calls", m.calls.Load())
+	}
+}
