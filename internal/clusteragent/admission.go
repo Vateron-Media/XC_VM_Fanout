@@ -16,7 +16,7 @@ import (
 // registered with an X-XCVM-Admission header on PUT /v1/conn/{uuid}, a
 // compact JSON object built by the node's PHP (AgentConnections::admission):
 //
-//	{adm?: {exp, sid}, line_id | hmac_id + identifier, stream_id, max_connections, ip, ua}
+//	{adm?: {exp, sid}, line_id | hmac_id + identifier, stream_id, max_connections, ip, ua, mint?}
 //
 //   - adm: MAIN admitted the viewer when it minted the token, until exp (MAIN's
 //     unix seconds). While exp is not past on MAIN's clock the viewer is
@@ -26,6 +26,11 @@ import (
 //     NOT_ACTIVE, FLOW_OFF or BAD_REQUEST admits (admission does not apply);
 //     anything else — no answer, a transport error, STARTING, RATE_LIMITED,
 //     DB, an older MAIN's UNKNOWN_OP — applies the offline policy.
+//   - mint: MAIN's proof that it minted the viewer's token (<uuid>.<iat>.<p>,
+//     ADR 0004, "The line a node names"), which the node's PHP also keeps in
+//     the record. It is copied into conn_admit as it is: MAIN reserves and
+//     cuts for a viewer whose mint it verifies, and under its `enforce`
+//     binding admits one without it with neither. A malformed one is left out.
 //   - the offline policy is MAIN's lb_offline_admission, delivered in every
 //     hello and heartbeat reply (offline_admission) and kept in the state
 //     file: allow admits, deny refuses (OFFLINE), local counts the viewer's
@@ -53,6 +58,10 @@ const (
 
 var admitReason = regexp.MustCompile(`^[A-Z_]{1,32}$`)
 
+// admitMint is the form of a mint proof: a connection uuid, MAIN's unix
+// seconds and 16 bytes of MAC as hex.
+var admitMint = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}\.[0-9]{1,12}\.[0-9a-f]{32}$`)
+
 // admissionReq is a parsed, valid X-XCVM-Admission header.
 type admissionReq struct {
 	adm        bool // a well-formed adm claim is present
@@ -63,6 +72,7 @@ type admissionReq struct {
 	streamID   int64
 	max        int64
 	ip, ua     string
+	mint       string // MAIN's proof of the token's mint, "" without one
 }
 
 // jsonInt reads a JSON integer (json.Number without a fraction or exponent).
@@ -111,6 +121,9 @@ func parseAdmission(h string) *admissionReq {
 	req.streamID, _ = jsonInt(doc["stream_id"])
 	req.ip, _ = doc["ip"].(string)
 	req.ua, _ = doc["ua"].(string)
+	if m, ok := doc["mint"].(string); ok && admitMint.MatchString(m) {
+		req.mint = m
+	}
 	if adm, ok := doc["adm"].(map[string]any); ok {
 		exp, ok1 := jsonInt(adm["exp"])
 		_, ok2 := jsonInt(adm["sid"])
@@ -214,6 +227,9 @@ func (a *Agent) admit(ctx context.Context, arrived time.Time, uuid string, rec m
 		payload["line_id"] = req.lineID
 	} else {
 		payload["hmac_id"], payload["identifier"] = req.hmacID, req.identifier
+	}
+	if req.mint != "" {
+		payload["mint"] = req.mint
 	}
 	cctx, cancel := context.WithDeadline(ctx, arrived.Add(AdmitWait))
 	defer cancel()
