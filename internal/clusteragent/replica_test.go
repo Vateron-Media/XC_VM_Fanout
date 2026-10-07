@@ -220,3 +220,42 @@ func TestReplicaKeepsTheSettingsSectionForPHP(t *testing.T) {
 		t.Fatalf("asked with %v, applied %d", have, applied)
 	}
 }
+
+// MAIN answers unchanged for a whole section the node holds: its deltas are
+// in it, or were undone since (a flush, a reload). Kept, the node would go on
+// blocking what MAIN no longer blocks.
+func TestAnUnchangedBlocklistDropsTheDeltasOverIt(t *testing.T) {
+	m, a := newReplicaMain(t)
+	ctx := context.Background()
+	etag := hex.EncodeToString(make([]byte, 32))
+	m.next = append(m.next, m.section(t, m.uuid, 5, etag))
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m.next = append(m.next, m.delta(t, m.panel, 6))
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d := ReplicaDeltas(a.ReplicaDir); len(d) != 1 {
+		t.Fatalf("deltas %v", d)
+	}
+
+	// A flush on MAIN: its whole blocklist is the section held again.
+	m.next = append(m.next, map[string]any{"seq": 8, "unchanged": true})
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d := ReplicaDeltas(a.ReplicaDir); len(d) != 0 {
+		t.Fatalf("deltas kept under an unchanged section: %v", d)
+	}
+	var mat struct {
+		Seq  int64 `json:"seq"`
+		Data struct {
+			IP []string `json:"ip"`
+		} `json:"data"`
+	}
+	b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "blocklist.json"))
+	if err := json.Unmarshal(b, &mat); err != nil || mat.Seq != 5 || strings.Join(mat.Data.IP, ",") != "203.0.113.1" {
+		t.Fatalf("materialised %s", b)
+	}
+}
