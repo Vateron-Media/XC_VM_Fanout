@@ -71,6 +71,9 @@ func TestSocketPassesOnlyAllowedOpsToMain(t *testing.T) {
 	if code, _ := post("/v1/main/queue_claim", `{"type":"movie","limit":5}`); code != 200 || gotPath != "/cluster/v1/queue_claim" {
 		t.Errorf("queue_claim: %d (MAIN saw %s)", code, gotPath)
 	}
+	if code, _ := post("/v1/main/rtmp_auth", `{"stream_id":100,"ip":"203.0.113.9","restream":false,"username":"line","password":"secret"}`); code != 200 || gotPath != "/cluster/v1/rtmp_auth" {
+		t.Errorf("rtmp_auth: %d (MAIN saw %s)", code, gotPath)
+	}
 	for _, path := range []string{"/v1/main/token_refresh", "/v1/main/heartbeat", "/v1/other"} {
 		if code, _ := post(path, `{}`); code != 403 {
 			t.Errorf("%s: %d, want 403", path, code)

@@ -261,7 +261,11 @@ func TestRestartsOnEncoderExit(t *testing.T) {
 		t.Errorf("Restarts = %d, want at least 2 (initial + restart)", st.Restarts)
 	}
 
-	got := actions(readLog(t, filepath.Join(dir, "stream_log.log")))
+	// The restart is logged after the new encoder is marked running (its pid
+	// is what the wait above sees), so the log is read once it has the event.
+	logPath := filepath.Join(dir, "stream_log.log")
+	waitFor(t, "the restart's log line", func() bool { return len(readLog(t, logPath)) >= 3 })
+	got := actions(readLog(t, logPath))
 	want := []string{EventStreamStart, EventStreamFailed, EventStreamRestart}
 	if len(got) < 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
 		t.Errorf("event trail = %v, want it to begin %v", got, want)
