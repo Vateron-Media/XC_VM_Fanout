@@ -70,3 +70,51 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH GOARM=$GOARM GOWORK=off \
               go build -trimpath -o /tmp/xc_agent-linux-$t ./cmd/xc_agent
           done
+
+  # The agent against MAIN's real PHP: every test that takes XCVM_PANEL_DIR
+  # (enrolment, the replica and its blocklist, commands, events, the data
+  # plane), on this commit and XC_VM's main, with the panel's unit-test
+  # database (MariaDB) and a redis-server. They are opt-in on a developer's
+  # machine, so a change on either side that broke them went unseen for weeks.
+  # XC_VM's CI runs the same against this repository's master.
+  interop:
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: xcvm-test
+        ports:
+          - 3306:3306
+        options: >-
+          --tmpfs /var/lib/mysql
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      GOWORK: 'off'
+      XCVM_PANEL_DIR: ${{ github.workspace }}/.panel
+      XCVM_TEST_DB_DSN: mysql:host=127.0.0.1;port=3306
+      XCVM_TEST_DB_USER: root
+      XCVM_TEST_DB_PASS: xcvm-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout XC_VM (main)
+        uses: actions/checkout@v4
+        with:
+          repository: Vateron-Media/XC_VM
+          ref: main
+          path: .panel
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: pdo_mysql, redis, igbinary
+      # The cluster-bus contract tests start a redis-server of their own.
+      - name: Install redis-server
+        run: sudo apt-get update -q && sudo apt-get install -y -q redis-server
+      - name: test against the panel
+        run: go test -count=1 ./internal/clusteragent/
