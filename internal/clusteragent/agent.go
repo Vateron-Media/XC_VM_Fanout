@@ -155,6 +155,11 @@ type Agent struct {
 	// (a resync command, fence.go).
 	replicaResync       atomic.Bool
 	streamsResyncWanted atomic.Bool
+
+	// Workers that save the state file, which Run waits for as it returns (goBg).
+	bgMu     sync.Mutex     // guards bgClosed, and bg's Add
+	bgClosed bool           // Run is returning: goBg starts nothing more
+	bg       sync.WaitGroup // the workers goBg started
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
@@ -468,6 +473,18 @@ func (a *Agent) Start(ctx context.Context) (*Reply, error) {
 // and retry; they never change the node's state. A node whose tokens are gone
 // re-keys and carries on.
 func (a *Agent) Run(ctx context.Context) error {
+	// Run returns only once the workers it started that save the state file
+	// (goBg) are done, after everything below is stopped: a save after Run
+	// returned would race whoever removes the state directory next.
+	a.bgMu.Lock()
+	a.bgClosed = false
+	a.bgMu.Unlock()
+	defer func() {
+		a.bgMu.Lock()
+		a.bgClosed = true
+		a.bgMu.Unlock()
+		a.bg.Wait()
+	}()
 	interval := a.heartbeatEvery()
 	backoff := interval
 	a.stopCh = make(chan error, 1)
@@ -491,7 +508,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.Client.OnDenial == nil {
 		a.Client.OnDenial = func(d *Denial) {
 			if d.Reason == "LICENCE_INVALID" && d.CommandsSealed != "" {
-				go a.takeSealed(ctx, d)
+				a.goBg(func() { a.takeSealed(ctx, d) })
 			}
 			if d.Reason == "HTTPS_REQUIRED" {
 				a.httpsFailing.Store(true)
@@ -557,7 +574,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.run != nil {
 		cctx, stopCommands := context.WithCancel(ctx)
 		defer stopCommands()
-		go a.RunCommands(cctx, a.run)
+		a.goBg(func() { a.RunCommands(cctx, a.run) })
 	}
 	if a.run != nil && a.ArtefactDir != "" {
 		// Stopped and waited for on return: a download writes beside the state.
@@ -713,10 +730,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.licenceBack()
 		a.httpsFailing.Store(false)
 		if a.hasUnackedSealed() && a.acking.CompareAndSwap(false, true) {
-			go func() {
+			if !a.goBg(func() {
 				defer a.acking.Store(false)
 				a.ackSealed(ctx)
-			}()
+			}) {
+				a.acking.Store(false)
+			}
 		}
 		if r.WantConnSnapshot {
 			go a.snapshot(ctx)
@@ -838,6 +857,24 @@ func (a *Agent) rotateNow(ctx context.Context) (bool, []byte) {
 }
 
 // setFenced notes whether MAIN refuses the session for want of a licence.
+// goBg starts f in the background, tracked so that Run waits for it before
+// returning; false, and nothing started, once Run is returning. A sealed
+// batch or an ack dropped then comes again: MAIN sends the batch with its
+// next refusal, and the acks wait in the state file.
+func (a *Agent) goBg(f func()) bool {
+	a.bgMu.Lock()
+	defer a.bgMu.Unlock()
+	if a.bgClosed {
+		return false
+	}
+	a.bg.Add(1)
+	go func() {
+		defer a.bg.Done()
+		f()
+	}()
+	return true
+}
+
 func (a *Agent) setFenced(on bool) {
 	if a.fenced.Swap(on) == on {
 		return
