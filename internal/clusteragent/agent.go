@@ -160,6 +160,7 @@ type Agent struct {
 	bgMu     sync.Mutex     // guards bgClosed, and bg's Add
 	bgClosed bool           // Run is returning: goBg starts nothing more
 	bg       sync.WaitGroup // the workers goBg started
+	aside    chan asideJob  // RunCommands' commands to run beside it (runAside); nil elsewhere
 }
 
 // Reply is what MAIN returns to enrol_complete, hello and heartbeat.
