@@ -34,6 +34,10 @@ var SocketOps = map[string]bool{
 	"queue_enqueue": true,
 	"queue_claim":   true,
 	"queue_update":  true,
+	// An RTMP viewer's line, which a load balancer is not shipped the lookup
+	// for: MAIN checks it at each connect (the panel's rtmp.php, nginx-rtmp's
+	// on_play), so a line disabled on MAIN is refused at once.
+	"rtmp_auth": true,
 }
 
 // MaxSocketBody caps a request from PHP.
