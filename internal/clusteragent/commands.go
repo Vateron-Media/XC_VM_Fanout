@@ -208,6 +208,19 @@ func (a *Agent) handleCommand(ctx context.Context, w WireCommand, run Executor) 
 		// whether it happened: the new epoch, or why not.
 		id, seq = cmd.CmdID, cmd.Seq
 		ok, result = a.rotateNow(ctx)
+	} else if asideTypes[cmd.Type] && a.sendAside(asideJob{cmd: cmd, w: w}) {
+		// Runs beside this loop (runAside): taken now, the high-water past
+		// it, and acked once it has run.
+		c.State.mu.Lock()
+		if cmd.Seq > c.State.CmdSeq {
+			c.State.CmdSeq = cmd.Seq
+		}
+		serr := c.State.saveLocked()
+		c.State.mu.Unlock()
+		if serr != nil {
+			a.logf("cluster: saving command high-water: %v", serr)
+		}
+		return cmdTaken
 	} else {
 		id = cmd.CmdID
 		ok, result = run(ctx, cmd, w)
@@ -278,6 +291,11 @@ func (a *Agent) ack(ctx context.Context, id string, ok bool, result []byte) erro
 // spin against it, one PHP worker a request, for as long as the row's own
 // exp says.
 func (a *Agent) RunCommands(ctx context.Context, run Executor) {
+	jobs := make(chan asideJob, AsideQueue)
+	if a.goBg(func() { a.runAside(ctx, run, jobs) }) {
+		a.aside = jobs
+		defer func() { a.aside = nil }()
+	}
 	backoff, stuck := time.Second, time.Duration(0)
 	type skipped struct {
 		until time.Time // zero: for good
@@ -345,6 +363,57 @@ func (a *Agent) RunCommands(ctx context.Context, run Executor) {
 		stuck = min(max(2*stuck, 250*time.Millisecond), CommandsStuck)
 		if !sleep(ctx, stuck) {
 			return
+		}
+	}
+}
+
+// asideTypes are the commands that run beside the commands loop
+// (runAside): the node's PHP work that can take seconds, a stream started or
+// stopped, a purge, an RPC. Run in the loop, each held up the next poll, and
+// a kill, a close or a fence queued behind it waited for it: up to 18 s on
+// XC_VM's test pair. Those, and everything else, stay in the loop, which
+// polls again at once. Among themselves the aside ones run in order.
+var asideTypes = map[string]bool{
+	"stream.start": true, "stream.stop": true, "stream.assign": true, "vod.start": true, "vod.stop": true,
+	"queue.poke": true, "node.purge": true, "node.rpc": true, "node.cache": true,
+}
+
+// AsideQueue bounds the commands waiting to run beside the loop; past it, a
+// command runs in the loop, as before.
+const AsideQueue = 256
+
+type asideJob struct {
+	cmd *Command
+	w   WireCommand
+}
+
+// sendAside queues j for runAside; false when RunCommands set up no queue
+// (a command handled outside it) or the queue is full.
+func (a *Agent) sendAside(j asideJob) bool {
+	if a.aside == nil {
+		return false
+	}
+	select {
+	case a.aside <- j:
+		return true
+	default:
+		return false
+	}
+}
+
+// runAside runs the commands RunCommands set aside, one at a time and in
+// the order they came, and acks each. A command still queued when ctx ends
+// is not run: as one cut short in the loop, MAIN has it as delivered.
+func (a *Agent) runAside(ctx context.Context, run Executor, jobs <-chan asideJob) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case j := <-jobs:
+			ok, result := run(ctx, j.cmd, j.w)
+			if err := a.ack(ctx, j.cmd.CmdID, ok, result); err != nil && ctx.Err() == nil {
+				a.logf("cluster: command %s: ack: %v", j.cmd.CmdID, err)
+			}
 		}
 	}
 }

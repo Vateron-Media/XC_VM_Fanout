@@ -657,3 +657,99 @@ func TestEveryRegistryTypeIsHandledOrForwarded(t *testing.T) {
 		}
 	}
 }
+
+// A slow command (a stream stopped through the node's PHP) runs beside the
+// commands loop: a kill queued behind it runs and is acked while it is
+// still running, and the slow ones keep their order among themselves.
+func TestAKillDoesNotWaitBehindASlowCommand(t *testing.T) {
+	f, st := newFake(t)
+	now := time.Now().Unix()
+	sign := func(seq uint64, typ string) WireCommand {
+		d := map[string]any{"v": 1, "type": typ, "cmd_id": strings.Repeat(fmt.Sprint(seq), 32), "exp": now + 3600, "iat": now, "seq": seq,
+			"node_uuid": f.uuid, "gen": 1, "dedupe_key": nil, "args": map[string]any{"uuid": strings.Repeat("a", 32), "stream_id": 7}}
+		b, _ := json.Marshal(d)
+		return WireCommand{Doc: string(b), Sig: base64.RawURLEncoding.EncodeToString(ed25519.Sign(f.panel, cc.PanelSigInput("cmd", b))), Seq: seq}
+	}
+	rows := []WireCommand{sign(1, "stream.stop"), sign(2, "conn.drop"), sign(3, "stream.start")}
+	var mu sync.Mutex
+	acked := map[string]int{}
+	f.answer = func(w http.ResponseWriter, r *http.Request, reqCtx, nonce []byte) {
+		op := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		req := f.opened(r, reqCtx)
+		mu.Lock()
+		defer mu.Unlock()
+		switch op {
+		case "commands":
+			after, _ := req["after_seq"].(float64)
+			var out []WireCommand
+			for _, w := range rows {
+				if w.Seq > uint64(after) {
+					out = append(out, w)
+				}
+			}
+			f.box(w, reqCtx, map[string]any{"commands": out})
+		case "ack":
+			id, _ := req["cmd_id"].(string)
+			acked[id]++
+			f.box(w, reqCtx, map[string]any{"ok": true})
+		default:
+			f.box(w, reqCtx, map[string]any{"state": "active", "flows": FlowCommands})
+		}
+	}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	st.MainURLs = []string{srv.URL + "/cluster/v1/"}
+	a := &Agent{Client: NewClient(st, "xc_agent/test"), Logf: t.Logf}
+	a.flows.Store(FlowCommands)
+	release := make(chan struct{})
+	var ran []string
+	run := func(rctx context.Context, cmd *Command, _ WireCommand) (bool, []byte) {
+		if cmd.Type == "stream.stop" {
+			select {
+			case <-release:
+			case <-rctx.Done(): // a failing test still ends
+			}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		ran = append(ran, cmd.Type)
+		return true, []byte("ran")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.RunCommands(ctx, run); close(done) }()
+	defer func() { cancel(); <-done }()
+	until := func(what string, ok func() bool) {
+		t.Helper()
+		for i := 0; i < 500; i++ {
+			mu.Lock()
+			got := ok()
+			mu.Unlock()
+			if got {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("%s: ran %v, acked %v", what, ran, acked)
+	}
+
+	until("the kill, while the stop still runs", func() bool { return acked[strings.Repeat("2", 32)] == 1 })
+	mu.Lock()
+	if len(ran) != 1 || ran[0] != "conn.drop" {
+		t.Fatalf("ran %v before the stop ended, want [conn.drop]", ran)
+	}
+	mu.Unlock()
+	close(release)
+	until("the stop, then the start", func() bool { return acked[strings.Repeat("3", 32)] == 1 })
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(ran, " ") != "conn.drop stream.stop stream.start" || acked[strings.Repeat("1", 32)] != 1 {
+		t.Fatalf("ran %v, acked %v", ran, acked)
+	}
+	st.mu.Lock()
+	high := st.CmdSeq
+	st.mu.Unlock()
+	if high != 3 {
+		t.Fatalf("high-water %d, want 3", high)
+	}
+}
