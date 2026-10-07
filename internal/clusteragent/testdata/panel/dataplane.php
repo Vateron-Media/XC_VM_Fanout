@@ -28,7 +28,7 @@ switch ($argv[1]) {
 		}
 		file_put_contents($rFile, substr($rBytes, 0, (int) $argv[2]));
 		$argv[2] = $rFile;
-		$rDb->query('INSERT OR IGNORE INTO `servers` (`id`, `status`, `server_name`, `is_main`, `server_ip`, `http_broadcast_port`, `total_clients`) VALUES (1, 1, ?, 1, ?, ?, 1000)', 'MAIN', '127.0.0.1', (int) getenv('XCVM_INTEROP_PORT'));
+		$rDb->query($rIgnore . ' INTO `servers` (`id`, `status`, `server_name`, `is_main`, `server_ip`, `http_broadcast_port`, `total_clients`) VALUES (1, 1, ?, 1, ?, ?, 1000)', 'MAIN', '127.0.0.1', (int) getenv('XCVM_INTEROP_PORT'));
 		$rDb->query('UPDATE `streams_servers` SET `parent_id` = 1 WHERE `stream_id` = 100 AND `server_id` = 7');
 		$rDb->query('UPDATE `streams` SET `stream_source` = ? WHERE `id` = 100', json_encode(['s:1:' . $argv[2]]));
 		StreamVersions::bump([100], $rDb);
