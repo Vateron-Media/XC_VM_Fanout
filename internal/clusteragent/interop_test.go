@@ -20,10 +20,13 @@ import (
 
 // TestInteropWithPanel runs this agent against MAIN's real PHP ClusterApi
 // (served by `php -S` from a panel checkout, with the panel's test fake of
-// xcvm_core and a SQLite file): enrolment, hello, heartbeat, and a token
+// xcvm_core and MAIN's database: a MariaDB schema the PHP processes share,
+// from the panel's install schema, or a SQLite file for a panel from before
+// its tests moved to MariaDB): enrolment, hello, heartbeat, and a token
 // refresh including a retried one, and a re-key after every token expired;
 // the policy version it dials and its audit, as MAIN records them; the
-// replica's blocklist and whole sections, secrets included. Opt-in:
+// replica's blocklist and whole sections, secrets included. Opt-in, with the
+// panel's test database (XCVM_TEST_DB_DSN, _USER, _PASS, as its unit suite):
 //
 //	XCVM_PANEL_DIR=/path/to/XC_VM go test ./internal/clusteragent -run Interop -v
 func TestInteropWithPanel(t *testing.T) {

@@ -15,7 +15,7 @@ switch ($argv[1]) {
 		$rDb->exec('CREATE TABLE IF NOT EXISTS `lines` (`id` INTEGER PRIMARY KEY, `max_connections` int, `enabled` int, `admin_enabled` int, `exp_date` int, `pair_id` int)');
 		$rDb->exec('CREATE TABLE IF NOT EXISTS `cluster_reservations` (`id` char(32) PRIMARY KEY, `identity` varchar(255), `server_id` int, `stream_id` int, `created_at` int, `exp` int)');
 		$rDb->exec('DELETE FROM `lines`');
-		$rDb->query('INSERT INTO `lines` VALUES (70, 1, 1, 1, NULL, NULL), (71, 1, 1, 1, ?, NULL)', time() - 60);
+		$rDb->query('INSERT INTO `lines` (`id`, `max_connections`, `enabled`, `admin_enabled`, `exp_date`, `pair_id`) VALUES (70, 1, 1, 1, NULL, NULL), (71, 1, 1, 1, ?, NULL)', time() - 60);
 		echo 'OK';
 		break;
 	case 'node':

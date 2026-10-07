@@ -46,9 +46,29 @@ function interopTable(string $rPanel, string $rName): string {
 	return 'CREATE TABLE `' . $rName . '` (' . implode(', ', $rCols) . ')';
 }
 
-$rNew = !file_exists($rDbFile);
-$rDb = new TestDb(new PDO('sqlite:' . $rDbFile));
-if ($rNew) {
+// A panel whose tests run on MariaDB (TestDb::connect) gets one schema the
+// harness's PHP processes share, named after the Go test (their parent), which
+// TestDb's orphan cleanup drops once that test has ended; XCVM_INTEROP_DB is
+// then the lock its first process seeds it under. An older panel: SQLite.
+$rMaria = method_exists(TestDb::class, 'connect');
+$rIgnore = $rMaria ? 'INSERT IGNORE' : 'INSERT OR IGNORE';
+if ($rMaria) {
+	$rLock = fopen($rDbFile, 'c+');
+	flock($rLock, LOCK_EX);
+	$rNew = fstat($rLock)['size'] === 0;
+	$rDb = new TestDb('xcvm_t' . posix_getppid() . '_' . crc32($rDbFile));
+} else {
+	$rNew = !file_exists($rDbFile);
+	$rDb = new TestDb(new PDO('sqlite:' . $rDbFile));
+}
+if ($rNew && $rMaria) {
+	// The panel's own install schema: every table and column a live MAIN has.
+	// The harness seeds its own servers, settings and crontab.
+	$rDb->exec((string) file_get_contents($rPanel . '/src/bin/install/database.sql'));
+	foreach (['servers', 'settings', 'crontab'] as $rTable) {
+		$rDb->exec('TRUNCATE `' . $rTable . '`');
+	}
+} elseif ($rNew) {
 	foreach (['029_create_cluster_nodes', '030_create_cluster_commands', '031_create_cluster_enrolment', '032_create_cluster_audit'] as $rName) {
 		$rSql = (string) file_get_contents($rPanel . '/src/migrations/database/up/' . $rName . '.sql');
 		$rSql = (string) preg_replace('/^--.*$/m', '', $rSql);
@@ -80,6 +100,18 @@ if ($rNew) {
 	foreach (['servers', 'crontab', 'streams_servers', 'streams', 'recordings', 'settings', 'cluster_stream_ver', 'streams_types', 'profiles', 'streams_options', 'streams_arguments', 'bouquets', 'streams_categories'] as $rTable) {
 		$rDb->exec(interopTable($rPanel, $rTable));
 	}
+	$rDb->exec('CREATE TABLE `lines_live` (`activity_id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_id` int, `stream_id` int, `server_id` int, `proxy_id` int, `user_agent` text, `user_ip` text, `container` text, `pid` int, `date_start` int, `geoip_country_code` text, `isp` text, `external_device` text, `hls_last_read` int, `hls_end` int DEFAULT 0, `hmac_id` int, `hmac_identifier` text, `uuid` text)');
+	$rDb->exec('CREATE TABLE `cluster_changes` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `section` varchar(32), `op` varchar(8), `kind` varchar(16), `value` varchar(255), `time` int)');
+	$rDb->exec('CREATE TABLE `blocked_ips` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `ip` varchar(39), `notes` text, `date` int)');
+	$rDb->exec('CREATE TABLE `blocked_uas` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_agent` varchar(255), `exact_match` int DEFAULT 0)');
+	$rDb->exec('CREATE TABLE `blocked_isps` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `isp` text, `blocked` int DEFAULT 0)');
+	$rDb->exec('CREATE TABLE `blocked_asns` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `asn` int, `blocked` int DEFAULT 0)');
+	$rDb->exec('CREATE TABLE `rtmp_ips` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `ip` varchar(255), `password` varchar(128), `push` int, `pull` int)');
+	$rDb->exec('CREATE TABLE `streams_logs` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `stream_id` int, `server_id` int, `action` text, `source` text, `date` int)');
+	// The resellers' DNS the servers section carries for verify_host (XC_VM #236).
+	$rDb->exec('CREATE TABLE `users` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `reseller_dns` text, `status` int DEFAULT 1)');
+}
+if ($rNew) {
 	$rDb->exec("INSERT INTO `servers` (`id`, `status`, `server_name`, `http_broadcast_port`, `total_clients`) VALUES (7, 0, 'LB 7', 8080, 1000)");
 	// xc_cluster_sim's other nodes (XCVM_INTEROP_SERVERS, e.g. "8,9").
 	foreach (array_filter(array_map('intval', explode(',', (string) getenv('XCVM_INTEROP_SERVERS')))) as $rSid) {
@@ -93,22 +125,19 @@ if ($rNew) {
 	$rDb->exec("INSERT INTO `recordings` (`id`, `stream_id`, `created_id`, `category_id`, `bouquets`, `title`, `description`, `start`, `end`, `source_id`, `status`) VALUES (1, 100, NULL, '[]', '[]', 'Match', '', 1800000000, 1800003600, 7, 1)");
 	// Migration 047's data: every server holding a stream gets its row at
 	// version 0, and the counter starts at 1 (R2 streams versions).
-	$rDb->exec('INSERT OR IGNORE INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `server_id`, `stream_id`, 0, 0 FROM `streams_servers` WHERE `server_id` > 0 AND `stream_id` > 0');
-	$rDb->exec('INSERT OR IGNORE INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `tv_archive_server_id`, `id`, 0, 0 FROM `streams` WHERE `tv_archive_server_id` > 0');
-	$rDb->exec('INSERT OR IGNORE INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `source_id`, `stream_id`, 0, 0 FROM `recordings` WHERE `source_id` > 0 AND `stream_id` > 0');
-	$rDb->exec("INSERT OR IGNORE INTO `cluster_meta` (`name`, `value`, `updated_at`) VALUES ('stream_ver', '1', 0)");
-	$rDb->exec('CREATE TABLE `lines_live` (`activity_id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_id` int, `stream_id` int, `server_id` int, `proxy_id` int, `user_agent` text, `user_ip` text, `container` text, `pid` int, `date_start` int, `geoip_country_code` text, `isp` text, `external_device` text, `hls_last_read` int, `hls_end` int DEFAULT 0, `hmac_id` int, `hmac_identifier` text, `uuid` text)');
-	$rDb->exec('CREATE TABLE `cluster_changes` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `section` varchar(32), `op` varchar(8), `kind` varchar(16), `value` varchar(255), `time` int)');
-	$rDb->exec('CREATE TABLE `blocked_ips` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `ip` varchar(39), `notes` text, `date` int)');
-	$rDb->exec('CREATE TABLE `blocked_uas` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_agent` varchar(255), `exact_match` int DEFAULT 0)');
-	$rDb->exec('CREATE TABLE `blocked_isps` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `isp` text, `blocked` int DEFAULT 0)');
-	$rDb->exec('CREATE TABLE `blocked_asns` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `asn` int, `blocked` int DEFAULT 0)');
+	$rDb->exec($rIgnore . ' INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `server_id`, `stream_id`, 0, 0 FROM `streams_servers` WHERE `server_id` > 0 AND `stream_id` > 0');
+	$rDb->exec($rIgnore . ' INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `tv_archive_server_id`, `id`, 0, 0 FROM `streams` WHERE `tv_archive_server_id` > 0');
+	$rDb->exec($rIgnore . ' INTO `cluster_stream_ver` (`server_id`, `stream_id`, `ver`, `updated_at`) SELECT `source_id`, `stream_id`, 0, 0 FROM `recordings` WHERE `source_id` > 0 AND `stream_id` > 0');
+	$rDb->exec($rIgnore . " INTO `cluster_meta` (`name`, `value`, `updated_at`) VALUES ('stream_ver', '1', 0)");
 	// live_streaming_pass is the secrets section's; the settings section withholds it.
 	$rDb->exec("INSERT INTO `settings` (`id`, `server_name`, `seg_time`, `api_pass`, `live_streaming_pass`, `cloudflare`) VALUES (1, 'Interop', 6, 'secret', 'InteropStreamPass', 0)");
-	$rDb->exec('CREATE TABLE `rtmp_ips` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `ip` varchar(255), `password` varchar(128), `push` int, `pull` int)');
-	$rDb->exec('CREATE TABLE `streams_logs` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `stream_id` int, `server_id` int, `action` text, `source` text, `date` int)');
-	// The resellers' DNS the servers section carries for verify_host (XC_VM #236).
-	$rDb->exec('CREATE TABLE `users` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `reseller_dns` text, `status` int DEFAULT 1)');
+}
+if ($rMaria) {
+	if ($rNew) {
+		fwrite($rLock, 'seeded');
+	}
+	flock($rLock, LOCK_UN);
+	fclose($rLock);
 }
 DatabaseFactory::set($rDb);
 $rSettings = ['cluster_api_enabled' => 1, 'lb_token_rotation_min' => (int) (getenv('XCVM_INTEROP_ROTATION') ?: 60), 'lb_new_node_mode' => 'legacy'];
