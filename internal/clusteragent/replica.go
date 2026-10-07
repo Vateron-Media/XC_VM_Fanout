@@ -175,6 +175,11 @@ type configReply struct {
 		Section   *struct {
 			Etag   string `json:"etag"`
 			Sealed string `json:"sealed"`
+			// TooLarge: the section's sealed record is too large for one
+			// reply, and MAIN staged it for this node in Parts parts
+			// (fetchParts), because the poll said "blocklist_parts".
+			TooLarge bool `json:"too_large"`
+			Parts    int  `json:"parts"`
 		} `json:"section"`
 	} `json:"blocklist"`
 }
@@ -284,7 +289,7 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 			}
 		}
 		var raw json.RawMessage
-		if err := a.Client.Call(ctx, "config", map[string]any{"blocklist_since": since, "have": have, "parts": true}, &raw, false); err != nil {
+		if err := a.Client.Call(ctx, "config", map[string]any{"blocklist_since": since, "have": have, "parts": true, "blocklist_parts": true}, &raw, false); err != nil {
 			// A 503 DB among them: keep every file and ETag held.
 			return false, err
 		}
@@ -329,13 +334,30 @@ func (a *Agent) syncReplica(ctx context.Context) (applied bool, err error) {
 		b := r.Blocklist
 		switch {
 		case b.Section != nil:
-			if err := a.storeSection(dir, deltas, b.Section.Etag, b.Section.Sealed, b.Seq); err != nil {
+			sealed, err := b.Section.Sealed, error(nil)
+			if b.Section.TooLarge {
+				// Its parts, joined, are the record; a failed fetch keeps the
+				// blocklist held and its seq, so the next poll asks again.
+				sealed, err = a.fetchParts(ctx, "blocklist", b.Section.Etag, b.Section.Parts)
+			}
+			if err == nil {
+				err = a.storeSection(dir, deltas, b.Section.Etag, sealed, b.Seq)
+			}
+			if err != nil {
 				a.saveReplicaState(dir, st)
 				return false, err
 			}
 			st.BlocklistSeq, st.BlocklistEtag, st.FullAt = b.Seq, b.Section.Etag, now
 			changed = true
 		case b.Unchanged:
+			// MAIN answers unchanged only for a whole section: the one held is
+			// the whole blocklist as of b.Seq, so the deltas stored over it are
+			// in it or were undone since (a flush, a reload, a log pruned
+			// while this node was away). Kept, they would block again what
+			// MAIN no longer blocks.
+			if dropDeltas(deltas) {
+				changed = true
+			}
 			st.BlocklistSeq, st.FullAt = b.Seq, now
 		case b.Delta != "":
 			if err := a.storeDelta(deltas, b.Delta, st.BlocklistSeq, b.Seq); err != nil {
@@ -421,11 +443,17 @@ func (a *Agent) storeSection(dir, deltas, etag, sealedB64 string, seq int64) err
 		return err
 	}
 	// The section holds everything up to its seq: the deltas before it go.
+	dropDeltas(deltas)
+	return nil
+}
+
+// dropDeltas removes every stored blocklist delta; it says whether there were any.
+func dropDeltas(deltas string) bool {
 	old, _ := os.ReadDir(deltas)
 	for _, e := range old {
 		os.Remove(filepath.Join(deltas, e.Name()))
 	}
-	return nil
+	return len(old) > 0
 }
 
 // storeWhole keeps a section sent whole once it verifies, and writes its data

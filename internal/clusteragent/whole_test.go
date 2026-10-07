@@ -598,3 +598,54 @@ func (a *Agent) recheckReplica() {
 	a.recheckLocked(dir)
 	a.replicaKeys = a.replicaKeyPrint()
 }
+
+func TestABlocklistTooLargeIsFetchedInParts(t *testing.T) {
+	m, a := newReplicaMain(t)
+	ctx := context.Background()
+	sealed := m.section(t, m.uuid, 7, etagOf("blk1"))["section"].(map[string]any)["sealed"].(string)
+	half := len(sealed) / 2
+	staged := func(seq int64, etag string, parts int) {
+		m.next = append(m.next, map[string]any{"seq": seq, "more": false, "section": map[string]any{"too_large": true, "etag": etag, "parts": parts}})
+	}
+	part := func(n int, data string) map[string]any {
+		return map[string]any{"section": "blocklist", "etag": etagOf("blk1"), "n": n, "parts": 2, "data": data}
+	}
+
+	staged(7, etagOf("blk1"), 2)
+	m.partQ = append(m.partQ, part(0, sealed[:half]), part(1, sealed[half:]))
+	if err := a.SyncReplica(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if m.asked[0]["blocklist_parts"] != true {
+		t.Fatalf("the poll does not say blocklist_parts: %v", m.asked[0])
+	}
+	for n, want := range []float64{0, 1} {
+		ask, _ := m.asked[1+n]["part"].(map[string]any)
+		if ask["section"] != "blocklist" || ask["etag"] != etagOf("blk1") || ask["n"] != want {
+			t.Fatalf("part %d asked as %v", n, m.asked[1+n])
+		}
+	}
+	if st := LoadReplicaState(a.ReplicaDir); st.BlocklistEtag != etagOf("blk1") || st.BlocklistSeq != 7 {
+		t.Fatalf("state %+v", st)
+	}
+	if got := readJSON(t, filepath.Join(a.ReplicaDir, "blocklist.json")); got["etag"] != etagOf("blk1") {
+		t.Fatalf("materialised %v", got)
+	}
+
+	// MAIN no longer holds the stage: the blocklist held and its seq stay, for the next poll.
+	staged(9, etagOf("blk2"), 2)
+	m.partQ = append(m.partQ, map[string]any{"section": "blocklist", "etag": etagOf("blk2"), "gone": true})
+	if err := a.SyncReplica(ctx); err == nil {
+		t.Fatal("a stage MAIN no longer holds taken")
+	}
+	if st := LoadReplicaState(a.ReplicaDir); st.BlocklistEtag != etagOf("blk1") || st.BlocklistSeq != 7 {
+		t.Fatalf("the blocklist moved on a failed fetch: %+v", st)
+	}
+
+	// No parts named: nothing asked for, refused.
+	asked := len(m.asked)
+	staged(9, etagOf("blk2"), 0)
+	if err := a.SyncReplica(ctx); err == nil || len(m.asked) != asked+1 {
+		t.Fatalf("a staged blocklist without parts: %v", err)
+	}
+}

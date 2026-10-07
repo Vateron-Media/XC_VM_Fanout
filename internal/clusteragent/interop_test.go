@@ -389,6 +389,26 @@ func TestInteropWithPanel(t *testing.T) {
 				t.Fatalf("MAIN kept its stage after the last part: %v", left)
 			}
 		}
+		// So does a blocklist too large for one reply, from a panel that stages it.
+		if src, _ := os.ReadFile(filepath.Join(panel, "src/Domain/Cluster/ReplicaBuilder.php")); strings.Contains(string(src), "BLOCKLIST_PARTS") {
+			cmd := exec.Command(php, filepath.Join(harness, "blocklist.php"))
+			cmd.Env = env
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("blocklist.php: %v\n%s", err, out)
+			}
+			before := LoadReplicaState(a.ReplicaDir)
+			if err := a.SyncReplica(ctx); err != nil {
+				t.Fatalf("blocklist in parts: %v", err)
+			}
+			now := LoadReplicaState(a.ReplicaDir)
+			b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "blocklist.json"))
+			if now.BlocklistEtag == before.BlocklistEtag || now.BlocklistSeq <= before.BlocklistSeq || len(b) < 3<<20 || !strings.Contains(string(b), `"2001:0db8:0000:0000:0000:0000:0001:387f"`) {
+				t.Fatalf("blocklist in parts: ETag %s (was %s), seq %d (was %d), %d bytes", now.BlocklistEtag, before.BlocklistEtag, now.BlocklistSeq, before.BlocklistSeq, len(b))
+			}
+			if left, _ := filepath.Glob(filepath.Join(dir, "xfer", "*")); len(left) != 0 {
+				t.Fatalf("MAIN kept the blocklist's stage after the last part: %v", left)
+			}
+		}
 	}
 
 	// A second attempt within the minute is refused, signed and about this request.
