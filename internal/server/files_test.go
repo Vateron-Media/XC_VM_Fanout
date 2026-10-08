@@ -267,3 +267,34 @@ func TestALinkUnderARootIsFollowedAsTheVodLinksAre(t *testing.T) {
 		t.Fatalf("got %d %q", res.StatusCode, body)
 	}
 }
+
+// The segment gateway's catch-up minutes: one file from an offset, ranges
+// honoured, nothing outside the file roots.
+func TestServeFilePart(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m.SetFileRoots([]string{root})
+	_ = os.MkdirAll(filepath.Join(root, "archive", "12"), 0o755)
+	path := filepath.Join(root, "archive", "12", "2026-10-08:12-00.ts")
+	_ = os.WriteFile(path, []byte("0123456789"), 0o644)
+
+	rec := httptest.NewRecorder()
+	m.ServeFilePart(rec, httptest.NewRequest(http.MethodGet, "/x", nil), path, 4, "video/mp2t")
+	if rec.Code != 200 || rec.Body.String() != "456789" || rec.Header().Get("Content-Type") != "video/mp2t" {
+		t.Fatalf("from offset: %d %q %v", rec.Code, rec.Body.String(), rec.Header())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Range", "bytes=1-2")
+	rec = httptest.NewRecorder()
+	m.ServeFilePart(rec, req, path, 4, "video/mp2t")
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != "56" {
+		t.Fatalf("range: %d %q", rec.Code, rec.Body.String())
+	}
+	for _, bad := range []string{"/etc/passwd", root + "/archive/../../etc/passwd", path + ".missing"} {
+		rec = httptest.NewRecorder()
+		m.ServeFilePart(rec, httptest.NewRequest(http.MethodGet, "/x", nil), bad, 0, "video/mp2t")
+		if rec.Code != 404 {
+			t.Errorf("%s: %d", bad, rec.Code)
+		}
+	}
+}
