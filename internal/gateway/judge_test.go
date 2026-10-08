@@ -145,6 +145,12 @@ func TestJudgeSegmentCatchUp(t *testing.T) {
 	if v.Path != "/archive/12/2026-10-08:12-00.ts" || v.Offset != 188 || v.Stream != 12 {
 		t.Fatalf("served minute: %+v", v)
 	}
+	heard := false
+	touchy := consAll
+	touchy.Heard = func(string) (bool, bool) { heard = true; return false, true }
+	if v = JudgeSegment(&q, archiveTok("12_2026-10-08:12-00.ts_0", ip), "203.0.113.9", testNow, touchy); v.Action != Deny || heard {
+		t.Fatalf("another address must be refused before the viewer is heard: %+v heard=%v", v, heard)
+	}
 	v = JudgeSegment(&q, archiveTok("12_2026-10-08:12-00.ts", ip), ip, testNow, consAll)
 	if v.Action != Serve || v.Offset != 0 {
 		t.Fatalf("no offset is the whole minute: %+v", v)

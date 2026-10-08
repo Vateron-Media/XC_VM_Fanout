@@ -162,6 +162,10 @@ func judgeArchive(p *Policy, f []string, clientIP string, env Env) Verdict {
 	if !env.Cons(uuid) {
 		return verdict(Deny, "connection")
 	}
+	// Before the viewer is heard: a request refused for its address touches nothing.
+	if p.RestrictSameIP && !ipMatch(f[3], clientIP, p.IPSubnetMatch) {
+		return verdict(Deny, "ip")
+	}
 	// The viewer is heard (or refused once its session ended) in its store:
 	// the agent's here; Redis or MySQL are PHP's.
 	if p.ConnStore != "agent" {
@@ -173,9 +177,6 @@ func judgeArchive(p *Policy, f []string, clientIP string, env Env) Verdict {
 	}
 	if ended {
 		return verdict(Deny, "ended")
-	}
-	if p.RestrictSameIP && !ipMatch(f[3], clientIP, p.IPSubnetMatch) {
-		return verdict(Deny, "ip")
 	}
 	return Verdict{Action: Serve, Reason: "archive", Stream: stream, UUID: uuid, Path: path, Offset: offset}
 }
