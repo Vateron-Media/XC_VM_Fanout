@@ -7,6 +7,7 @@ package supervisor
 import (
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -27,51 +28,56 @@ func fallbackSpec(dir string) Spec {
 }
 
 // TestUnsupportedSwitchesToFallback: a remuxer that says it cannot serve the
-// source (ExitUnsupported) hands that source to the panel's fallback command at
-// once — no fail sleep, no stop_failures charge — and stays there.
+// source (ExitUnsupported), or that crashed (ExitCrashed: Go's panic status, also
+// its bad usage), hands that source to the panel's fallback command at once — no
+// fail sleep, no stop_failures charge — and stays there.
 func TestUnsupportedSwitchesToFallback(t *testing.T) {
-	dir := t.TempDir()
-	h := newHarness(t)
-	spec := fallbackSpec(dir)
-	spec.Policy.StopFailures = 1 // a counted failure would end supervision
+	for _, code := range []int{ExitUnsupported, ExitCrashed} {
+		t.Run("exit "+strconv.Itoa(code), func(t *testing.T) {
+			dir := t.TempDir()
+			h := newHarness(t)
+			spec := fallbackSpec(dir)
+			spec.Policy.StopFailures = 1 // a counted failure would end supervision
 
-	if err := h.sup.Supervise("5", spec); err != nil {
-		t.Fatal(err)
-	}
-	native := h.nextProcess(t)
-	native.exit <- exitErr(ExitUnsupported)
+			if err := h.sup.Supervise("5", spec); err != nil {
+				t.Fatal(err)
+			}
+			native := h.nextProcess(t)
+			native.exit <- exitErr(code)
 
-	h.setData(true)
-	fb := h.nextProcess(t)
-	waitFor(t, "fallback running", func() bool {
-		st := h.sup.State("5")
-		return st.Running && st.PID == fb.Pid()
-	})
+			h.setData(true)
+			fb := h.nextProcess(t)
+			waitFor(t, "fallback running", func() bool {
+				st := h.sup.State("5")
+				return st.Running && st.PID == fb.Pid()
+			})
 
-	st := h.sup.State("5")
-	if !st.Fallback {
-		t.Error("state does not report the fallback command")
-	}
-	if st.GaveUp {
-		t.Error("an unsupported source was charged as a failed start and ended supervision")
-	}
-	h.mu.Lock()
-	got := append([]string(nil), h.launched...)
-	h.mu.Unlock()
-	if len(got) != 2 || got[0] != spec.Sources[0].Cmd || got[1] != spec.Sources[0].FallbackCmd {
-		t.Fatalf("launched %q, want the command then its fallback", got)
-	}
+			st := h.sup.State("5")
+			if !st.Fallback {
+				t.Error("state does not report the fallback command")
+			}
+			if st.GaveUp {
+				t.Error("an unsupported source was charged as a failed start and ended supervision")
+			}
+			h.mu.Lock()
+			got := append([]string(nil), h.launched...)
+			h.mu.Unlock()
+			if len(got) != 2 || got[0] != spec.Sources[0].Cmd || got[1] != spec.Sources[0].FallbackCmd {
+				t.Fatalf("launched %q, want the command then its fallback", got)
+			}
 
-	// The switch is sticky: a restart goes straight to the fallback rather than
-	// paying for another refused native start.
-	fb.exit <- errors.New("ffmpeg died")
-	again := h.nextProcess(t)
-	waitFor(t, "restart", func() bool { return h.sup.State("5").PID == again.Pid() })
-	h.mu.Lock()
-	last := h.launched[len(h.launched)-1]
-	h.mu.Unlock()
-	if last != spec.Sources[0].FallbackCmd {
-		t.Errorf("restart ran %q, want the fallback to stick", last)
+			// The switch is sticky: a restart goes straight to the fallback rather than
+			// paying for another refused native start.
+			fb.exit <- errors.New("ffmpeg died")
+			again := h.nextProcess(t)
+			waitFor(t, "restart", func() bool { return h.sup.State("5").PID == again.Pid() })
+			h.mu.Lock()
+			last := h.launched[len(h.launched)-1]
+			h.mu.Unlock()
+			if last != spec.Sources[0].FallbackCmd {
+				t.Errorf("restart ran %q, want the fallback to stick", last)
+			}
+		})
 	}
 }
 
@@ -118,30 +124,34 @@ func TestOrdinaryExitDoesNotFallBack(t *testing.T) {
 }
 
 // TestUnsupportedMidStreamSwitches: a source can turn unservable after the start
-// was confirmed (an HLS that changes segment format); the same exit then moves
-// it to the fallback instead of logging a failure.
+// was confirmed (an HLS that changes segment format), or the remuxer can crash on
+// it; the same exits then move it to the fallback instead of logging a failure.
 func TestUnsupportedMidStreamSwitches(t *testing.T) {
-	dir := t.TempDir()
-	h := newHarness(t)
-	h.setData(true)
-	spec := fallbackSpec(dir)
+	for _, code := range []int{ExitUnsupported, ExitCrashed} {
+		t.Run("exit "+strconv.Itoa(code), func(t *testing.T) {
+			dir := t.TempDir()
+			h := newHarness(t)
+			h.setData(true)
+			spec := fallbackSpec(dir)
 
-	if err := h.sup.Supervise("5", spec); err != nil {
-		t.Fatal(err)
-	}
-	native := h.nextProcess(t)
-	waitFor(t, "native running", func() bool { return h.sup.State("5").Running })
-	native.exit <- exitErr(ExitUnsupported)
+			if err := h.sup.Supervise("5", spec); err != nil {
+				t.Fatal(err)
+			}
+			native := h.nextProcess(t)
+			waitFor(t, "native running", func() bool { return h.sup.State("5").Running })
+			native.exit <- exitErr(code)
 
-	fb := h.nextProcess(t)
-	waitFor(t, "fallback running", func() bool {
-		st := h.sup.State("5")
-		return st.Running && st.PID == fb.Pid() && st.Fallback
-	})
-	for _, a := range actions(readLog(t, filepath.Join(dir, "stream_log.log"))) {
-		if a == EventStreamFailed {
-			t.Error("a pipeline switch was logged as STREAM_FAILED")
-		}
+			fb := h.nextProcess(t)
+			waitFor(t, "fallback running", func() bool {
+				st := h.sup.State("5")
+				return st.Running && st.PID == fb.Pid() && st.Fallback
+			})
+			for _, a := range actions(readLog(t, filepath.Join(dir, "stream_log.log"))) {
+				if a == EventStreamFailed {
+					t.Error("a pipeline switch was logged as STREAM_FAILED")
+				}
+			}
+		})
 	}
 }
 
@@ -163,39 +173,4 @@ func TestConfirmedOnlyOnceDataArrives(t *testing.T) {
 	}
 	h.setData(true)
 	waitFor(t, "confirmed", func() bool { return h.sup.State("5").Confirmed })
-}
-
-// TestCrashedCommandSwitchesToFallback: a native command that dies with Go's
-// panic status (2, also its bad-usage status) hands the source to the panel's
-// ffmpeg fallback, at startup and mid-stream alike, instead of restarting the
-// same crash forever.
-func TestCrashedCommandSwitchesToFallback(t *testing.T) {
-	for _, midStream := range []bool{false, true} {
-		dir := t.TempDir()
-		h := newHarness(t)
-		spec := fallbackSpec(dir)
-		spec.Policy.StopFailures = 1 // a counted failure would end supervision
-		if midStream {
-			h.setData(true)
-		}
-
-		if err := h.sup.Supervise("5", spec); err != nil {
-			t.Fatal(err)
-		}
-		native := h.nextProcess(t)
-		if midStream {
-			waitFor(t, "native running", func() bool { return h.sup.State("5").Running })
-		}
-		native.exit <- exitErr(ExitCrashed)
-
-		h.setData(true)
-		fb := h.nextProcess(t)
-		waitFor(t, "fallback running", func() bool {
-			st := h.sup.State("5")
-			return st.Running && st.PID == fb.Pid() && st.Fallback
-		})
-		if h.sup.State("5").GaveUp {
-			t.Errorf("midStream=%v: the crash ended supervision", midStream)
-		}
-	}
 }

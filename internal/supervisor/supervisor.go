@@ -60,11 +60,11 @@ const (
 type Source struct {
 	Label string `json:"label"`
 	Cmd   string `json:"cmd"`
-	// FallbackCmd is run in Cmd's place once Cmd has exited ExitUnsupported —
-	// the same source, through a pipeline that can take it. The panel sets it
-	// when Cmd is the native remuxer and the node's source backend allows an
-	// ffmpeg fallback ("auto"); it is empty everywhere else, and then an
-	// ExitUnsupported is an ordinary failure. The daemon never derives one.
+	// FallbackCmd is run in Cmd's place once Cmd has exited ExitUnsupported or
+	// ExitCrashed — the same source, through a pipeline that can take it. The
+	// panel sets it when Cmd is the native remuxer and the node's source backend
+	// allows an ffmpeg fallback ("auto"); it is empty everywhere else, and then
+	// either exit is an ordinary failure. The daemon never derives one.
 	FallbackCmd string `json:"fallback_cmd,omitempty"`
 	// ProbeCmd tests whether this source is reachable WITHOUT starting it, for
 	// the priority-backup check. Optional: a source without one is never
@@ -917,7 +917,14 @@ var errUnsupported = errors.New("command cannot serve this source")
 // ExitCode, and so may a test Process's error.
 func isUnsupportedExit(err error) bool {
 	var ec interface{ ExitCode() int }
-	return errors.As(err, &ec) && (ec.ExitCode() == ExitUnsupported || ec.ExitCode() == ExitCrashed)
+	if !errors.As(err, &ec) {
+		return false
+	}
+	switch ec.ExitCode() {
+	case ExitUnsupported, ExitCrashed:
+		return true
+	}
+	return false
 }
 
 // commandFor picks what to run for src: its FallbackCmd once its Cmd has
