@@ -1,9 +1,8 @@
 package gateway
 
 import (
-	// Spreads redirects over a server's URLs, as segment.php does: nothing secret is drawn.
-	// nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
-	"math/rand"
+	"crypto/rand"
+	"math/big"
 	"net"
 	"regexp"
 	"slices"
@@ -102,7 +101,11 @@ func JudgeSegment(p *Policy, token, clientIP string, now int64, env Env) Verdict
 		if len(bases) == 0 || sid != strconv.Itoa(server) {
 			return verdict(PHP, "server-unknown")
 		}
-		return Verdict{Action: Redirect, Reason: "owner", Location: bases[rand.Intn(len(bases))] + "/hls/" + token}
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(bases))))
+		if err != nil {
+			return verdict(PHP, "rand")
+		}
+		return Verdict{Action: Redirect, Reason: "owner", Location: bases[n.Int64()] + "/hls/" + token}
 	}
 	if archive {
 		return judgeArchive(p, f, clientIP, env)
