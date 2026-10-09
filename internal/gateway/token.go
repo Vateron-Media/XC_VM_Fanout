@@ -219,12 +219,15 @@ func newGCM(key []byte) cipher.AEAD {
 }
 
 // legacyKeyIV is Encryption::encrypt's AES-256-CBC key, md5(sha1(context) . key)
-// as 32 hex characters, and its IV, the first 16 of md5(sha1(key)).
+// as 32 hex characters, and its IV, the first 16 of md5(sha1(key)). PHP's
+// derivation, not a choice made here: a token must open on both sides, and
+// no hash in it signs anything (the format is read only where
+// secure_stream_tokens is off).
 func legacyKeyIV(key, context []byte) (k, iv []byte) {
-	h1 := sha1.Sum(context)
-	k5 := md5.Sum(append([]byte(hex.EncodeToString(h1[:])), key...))
-	h2 := sha1.Sum(key)
-	i5 := md5.Sum([]byte(hex.EncodeToString(h2[:])))
+	h1 := sha1.Sum(context)                                          // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-sha1
+	k5 := md5.Sum(append([]byte(hex.EncodeToString(h1[:])), key...)) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
+	h2 := sha1.Sum(key)                                              // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-sha1
+	i5 := md5.Sum([]byte(hex.EncodeToString(h2[:])))                 // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	return []byte(hex.EncodeToString(k5[:])), []byte(hex.EncodeToString(i5[:]))[:aes.BlockSize]
 }
 

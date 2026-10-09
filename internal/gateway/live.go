@@ -225,8 +225,10 @@ func liveMatches(rec map[string]json.RawMessage, r *Refresh) bool {
 }
 
 // hlsConnectionKey is ConnectionTracker::hlsConnectionKey with live.php's
-// identity ("u<user id>" or "h<hmac id>_<identifier>").
+// identity ("u<user id>" or "h<hmac id>_<identifier>"). PHP's md5: the key
+// names the viewer's record in the agent, which both sides must find.
 func hlsConnectionKey(identity string, stream int, ip, ua string) string {
+	// nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	sum := md5.Sum([]byte("hls#" + identity + "#" + strconv.Itoa(stream) + "#" + ip + "#" + ua))
 	return hex.EncodeToString(sum[:])
 }

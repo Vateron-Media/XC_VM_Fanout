@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	// Spreads redirects over a server's URLs, as segment.php does: nothing secret is drawn.
+	// nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
 	"math/rand"
 	"net"
 	"regexp"

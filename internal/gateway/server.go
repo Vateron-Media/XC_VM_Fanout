@@ -330,6 +330,9 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 	h.Set("Content-Type", "application/x-mpegurl")
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	h.Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	// The daemon's playlist with base64url tokens: the address (nginx's
+	// $remote_addr, not the client's header) is only ever sealed inside them.
+	// nosemgrep: go.net.xss.no-direct-write-to-responsewriter-taint.no-direct-write-to-responsewriter-taint
 	_, _ = w.Write([]byte(body))
 	return ""
 }
