@@ -263,6 +263,7 @@ func TestInteropWithPanel(t *testing.T) {
 	}
 	// Epoch 3 was minted but never used, so MAIN numbers from the node's
 	// current epoch (2); the old epoch 3 row is gone with its z.
+	rekeyMinute := time.Now().Unix() / 60
 	tok4, err := c.Rekey(ctx, a.identity())
 	if err != nil {
 		t.Fatalf("rekey: %v", err)
@@ -414,8 +415,13 @@ func TestInteropWithPanel(t *testing.T) {
 		}
 	}
 
-	// A second attempt within the minute is refused, signed and about this request.
+	// A second attempt within the minute is refused, signed and about this
+	// request. The limit is a claim on MAIN's minute (this machine's clock):
+	// one that turned since the re-key above freed it, so ask again in it.
 	_, err = c.Rekey(ctx, a.identity())
+	if err == nil && time.Now().Unix()/60 != rekeyMinute {
+		_, err = c.Rekey(ctx, a.identity())
+	}
 	if !errors.As(err, &d) || d.Reason != "RATE_LIMITED" || retryAfterMs(d) <= 0 {
 		t.Fatalf("want a signed RATE_LIMITED, got %v", err)
 	}
