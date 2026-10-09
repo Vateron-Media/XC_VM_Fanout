@@ -210,7 +210,10 @@ func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
 //
 // "file_urls": such a manifest may name a direct-proxy movie's source URL,
 // which the daemon fetches with the viewer's range.
-var Features = []string{"remux", "drop_connection", "files", "file_urls"}
+//
+// "remux_source_file": `xc_fanout remux -source_file` reads the source URL and
+// its fetch options from a file, so they stay out of /proc/<pid>/cmdline.
+var Features = []string{"remux", "drop_connection", "files", "file_urls", "remux_source_file"}
 
 // EnableSupervision gives the manager an encoder supervisor. Streams are only
 // supervised once the panel PUTs a spec for one, so enabling this changes

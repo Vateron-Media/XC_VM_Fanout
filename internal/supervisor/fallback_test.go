@@ -164,3 +164,38 @@ func TestConfirmedOnlyOnceDataArrives(t *testing.T) {
 	h.setData(true)
 	waitFor(t, "confirmed", func() bool { return h.sup.State("5").Confirmed })
 }
+
+// TestCrashedCommandSwitchesToFallback: a native command that dies with Go's
+// panic status (2, also its bad-usage status) hands the source to the panel's
+// ffmpeg fallback, at startup and mid-stream alike, instead of restarting the
+// same crash forever.
+func TestCrashedCommandSwitchesToFallback(t *testing.T) {
+	for _, midStream := range []bool{false, true} {
+		dir := t.TempDir()
+		h := newHarness(t)
+		spec := fallbackSpec(dir)
+		spec.Policy.StopFailures = 1 // a counted failure would end supervision
+		if midStream {
+			h.setData(true)
+		}
+
+		if err := h.sup.Supervise("5", spec); err != nil {
+			t.Fatal(err)
+		}
+		native := h.nextProcess(t)
+		if midStream {
+			waitFor(t, "native running", func() bool { return h.sup.State("5").Running })
+		}
+		native.exit <- exitErr(ExitCrashed)
+
+		h.setData(true)
+		fb := h.nextProcess(t)
+		waitFor(t, "fallback running", func() bool {
+			st := h.sup.State("5")
+			return st.Running && st.PID == fb.Pid() && st.Fallback
+		})
+		if h.sup.State("5").GaveUp {
+			t.Errorf("midStream=%v: the crash ended supervision", midStream)
+		}
+	}
+}

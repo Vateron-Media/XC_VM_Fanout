@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,8 +35,9 @@ no ffmpeg: the native equivalent of
   ffmpeg -i <url> -c copy -f tee "[f=hls:…]<playlist>|[f=mpegts]unix:<sock>"
 
 XC_VM composes this command (StreamProcess::buildNativeLive) and the daemon's
-supervisor runs it. Exit status: 0 stopped, 1 source failed, 2 bad usage,
-3 source cannot be served natively (use the ffmpeg fallback).
+supervisor runs it. Exit status: 0 stopped, 1 source failed, 2 bad usage
+(or a crash), 3 source cannot be served natively. With 2 or 3 the supervisor
+runs the source's ffmpeg fallback.
 
 options:
 `
@@ -51,6 +53,7 @@ func runRemux(args []string) int {
 		fs.PrintDefaults()
 	}
 	in := fs.String("i", "", "source URL: http(s) MPEG-TS or HLS with TS segments, udp://, rtp://")
+	srcFile := fs.String("source_file", "", "JSON file with the source and its fetch options (keys i, user_agent, cookies, http_proxy, headers), in place of those flags: it keeps credentials out of /proc/<pid>/cmdline")
 	ua := fs.String("user_agent", "", "source User-Agent")
 	cookies := fs.String("cookies", "", "source Cookie header")
 	proxy := fs.String("http_proxy", "", "source HTTP proxy (http://host:port or host:port)")
@@ -71,6 +74,18 @@ func runRemux(args []string) int {
 			return 0
 		}
 		return 2
+	}
+	if *srcFile != "" {
+		if *in != "" {
+			fmt.Fprintln(os.Stderr, "remux: -source_file replaces -i; give one of them")
+			return 2
+		}
+		sf, err := readSourceFile(*srcFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "remux: %v\n", err)
+			return 2
+		}
+		*in, *ua, *cookies, *proxy, *headers = sf.Input, sf.UserAgent, sf.Cookies, sf.Proxy, sf.Headers
 	}
 	if *in == "" || fs.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "remux: need -i <url> and exactly one output playlist")
@@ -167,4 +182,28 @@ func splitHeaders(v string) []string {
 		}
 	}
 	return out
+}
+
+// sourceFile is -source_file's content: the flags that can carry credentials,
+// under the same names. The panel writes it 0600 beside the stream's other files.
+type sourceFile struct {
+	Input     string `json:"i"`
+	UserAgent string `json:"user_agent"`
+	Cookies   string `json:"cookies"`
+	Proxy     string `json:"http_proxy"`
+	Headers   string `json:"headers"`
+}
+
+// readSourceFile loads a -source_file. Its errors name the path, never the
+// content: they go to <id>.errors.
+func readSourceFile(path string) (sourceFile, error) {
+	var sf sourceFile
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return sf, fmt.Errorf("source file: %w", err)
+	}
+	if err := json.Unmarshal(b, &sf); err != nil {
+		return sf, fmt.Errorf("source file %s is not valid JSON", path)
+	}
+	return sf, nil
 }

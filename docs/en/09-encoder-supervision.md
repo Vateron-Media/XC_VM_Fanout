@@ -229,6 +229,12 @@ number of files in the tmpfs whichever producer runs it. (Before 0.13.2 the timi
 which jitters around the keyframe; with the GOP equal to the target half the cuts were missed and
 segments averaged ~3.5 s against a 2 s `hls_time` — nearly twice ffmpeg's tmpfs footprint.)
 
+A panel that sees `remux_source_file` in the daemon's `features` passes the source and its
+fetch options in a 0600 file instead, `-source_file '…/streams/42_.source_0'` (one file per source): a JSON object with
+the keys `i`, `user_agent`, `cookies`, `http_proxy` and `headers`. That keeps the provider's
+account out of `/proc/<pid>/cmdline`, which every local user can read. `-i` and `-source_file`
+are exclusive.
+
 Unlike ffmpeg's tee slave, whose feed into the daemon stays broken once a daemon restart breaks
 it, the remuxer **redials** the ingest socket — after a daemon restart the stream is adopted and
 carries on without restarting.
@@ -262,6 +268,10 @@ then is the panel's choice, carried in the spec:
   sticks for the life of the spec. `GET /monitor/<id>` reports `"fallback": true`.
 - **`native`** — no fallback; exit 3 is an ordinary failed start.
 
+Exit **2** is handled the same way: it is the remuxer's bad-usage status and also the Go
+runtime's status for a crash (an unrecovered panic). A command line the remuxer cannot parse, or a
+source that crashes it, goes to ffmpeg in `auto` instead of restarting the same crash.
+
 Any other exit — the upstream is down, slow or closed the stream — is an ordinary failure and
 walks the source list exactly as an ffmpeg failure would. A `503` never selects the fallback:
 switching pipelines would not make an unreachable upstream answer.
@@ -270,7 +280,7 @@ switching pipelines would not make an unreachable upstream answer.
 |------|---------|
 | 0 | stopped (a signal) |
 | 1 | the source failed or ended |
-| 2 | bad command line |
+| 2 | bad command line, or a crash — run the fallback |
 | 3 | the source cannot be served natively — run the fallback |
 
 ### What it writes to the stream's log
@@ -339,9 +349,10 @@ become a second daemon on sockets the running one holds, so the stream never sta
 - **`streams_servers.monitor_pid` names the daemon** for a supervised stream. The panel paths that
   ask "is anything watching this stream?" ask the daemon too (`StreamProcess::isWatched`); anything
   else reading the column should treat a pid that is not an `XC_VM[<id>]` process as the daemon.
-- **Not yet exercised on a live node.** The launcher, process groups, adoption, the remuxer
-  pipeline and the fallback are covered by tests against real processes, sockets and HTTP
-  sources, but no production channel has run through this. Stage it before enabling it widely.
+- **Exercised on a test node, not yet in production.** Besides the tests against real processes,
+  sockets and HTTP sources, the remuxer ran on XC_VM's test load balancer (Oct 2026): 20
+  copy-only channels side by side with ffmpeg, and a channel whose timeshift and thumbnail were
+  served from its segments. Stage it before enabling it widely.
 
 ---
 
