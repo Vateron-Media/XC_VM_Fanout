@@ -273,6 +273,42 @@ func (m *Manager) serveFile(w http.ResponseWriter, r *http.Request) {
 	dlog.Logf("viewer", "id=%s file detach uuid=%s dur=%s sent=%dKB", id, uuid, time.Since(start).Round(time.Millisecond), fw.written/1024)
 }
 
+// ServeFilePart serves one file from offset as serveFile serves a manifest of
+// that one part: under the file roots, the viewer's range honoured, no
+// throttle and no viewer counted (a catch-up minute: the panel's HLS
+// connection is its viewer). The segment gateway's catch-up segments, which
+// segment.php handed over with a manifest.
+func (m *Manager) ServeFilePart(w http.ResponseWriter, r *http.Request, path string, offset int64, contentType string) {
+	root, rel, ok := m.underRoots(path)
+	if !ok || offset < 0 {
+		http.NotFound(w, r)
+		return
+	}
+	body, mod, files, err := openParts([]filePart{{Path: path, Offset: offset, Length: -1, root: root, rel: rel}})
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer closeAll(files)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+	fw := &fileWriter{ResponseWriter: w, rc: http.NewResponseController(w), m: m, done: r.Context().Done()}
+	http.ServeContent(fw, r, "", mod, body)
+}
+
+// FedPlaylist is the panel's isStreamFed + hlsPlaylist in-process (the
+// segment gateway's playlist refresh): the stream's HLS playlist while it is
+// on air (has_data), "" otherwise. As a GET of /hls/<id>/index.m3u8 does, it
+// keeps the stream's puller alive.
+func (m *Manager) FedPlaylist(id string) string {
+	st := m.Get(id)
+	if st == nil || !st.onAir() {
+		return ""
+	}
+	st.touch()
+	return st.Hub.HLSPlaylist()
+}
+
 // serveSource relays a direct-proxy movie from its source: the viewer's range
 // asked for, the source's status and range headers passed on, the body
 // written through fw (its throttle, deadline and kill).

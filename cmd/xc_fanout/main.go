@@ -41,6 +41,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/config"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/gateway"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/puller"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
@@ -84,6 +85,9 @@ func main() {
 	// keys), and polls. See internal/config.
 	configPath := flag.String("config", "/home/xc_vm/bin/xc_fanout/config.json", "operator-tuning JSON (prebuffer_max_sec, hls_target_sec, hls_window, grace_sec, write_timeout_sec, chunk_bytes, max_gop_bytes, source_insecure, source_backend). Self-created with defaults if absent; missing keys backfilled; polled and applied live. Empty disables the file (built-in defaults are used)")
 	configInterval := flag.Int("config-interval", 60, "seconds between config-file reloads (re-read only when the file's mtime changes)")
+	gw := flag.String("gw", "", "segment gateway unix socket (nginx-only, Phase 12), e.g. /home/xc_vm/bin/xc_fanout/sockets/gw.sock; empty = no gateway")
+	gwPolicy := flag.String("gw-policy", "/home/xc_vm/tmp/gateway/policy.json", "the panel's segment gateway policy (written every minute by cron:cache)")
+	gwState := flag.String("gw-state", "/home/xc_vm/bin/xc_fanout/gateway_shadow.json", "where the gateway keeps its shadow comparison with PHP across restarts; empty = in memory")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -211,6 +215,18 @@ func main() {
 	if *ctl != "" {
 		ctlSrv, cleanupCtl = serveUnix(*ctl, mgr.ControlHandler())
 	}
+	// The segment gateway is optional: without its socket nginx sends /hls/ and
+	// /key/ to PHP as before, so a socket it cannot bind is logged, not fatal.
+	gwSrv, cleanupGw := (*http.Server)(nil), func() {}
+	if *gw != "" {
+		gws := gateway.NewServer(*gwPolicy, mgr.ClientHandler(), mgr)
+		gws.KeepShadowIn(*gwState)
+		if srv, cleanup, err := listenUnix(*gw, gws); err != nil {
+			log.Printf("gateway: %v; PHP serves /hls/ and /key/", err)
+		} else {
+			gwSrv, cleanupGw = srv, cleanup
+		}
+	}
 
 	// Optional launch-time feed for isolated testing.
 	if *id != "" {
@@ -248,6 +264,12 @@ func main() {
 
 	<-ctx.Done()
 
+	if gwSrv != nil {
+		gwCtx, gwCancel := context.WithTimeout(context.Background(), shutdownGrace)
+		_ = gwSrv.Shutdown(gwCtx)
+		gwCancel()
+	}
+	cleanupGw()
 	shutdownDaemon(ctlSrv, clientSrv, func() {
 		// Stop watching the encoders but LEAVE THEM RUNNING. They are orphaned, not
 		// killed, and the next daemon adopts them (internal/supervisor/adopt.go), so a
