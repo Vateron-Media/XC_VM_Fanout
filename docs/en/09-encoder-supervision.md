@@ -262,6 +262,10 @@ then is the panel's choice, carried in the spec:
   sticks for the life of the spec. `GET /monitor/<id>` reports `"fallback": true`.
 - **`native`** — no fallback; exit 3 is an ordinary failed start.
 
+Exit **2** is handled the same way: it is the remuxer's bad-usage status and also the Go
+runtime's status for a crash (an unrecovered panic). A command line the remuxer cannot parse, or a
+source that crashes it, goes to ffmpeg in `auto` instead of restarting the same crash.
+
 Any other exit — the upstream is down, slow or closed the stream — is an ordinary failure and
 walks the source list exactly as an ffmpeg failure would. A `503` never selects the fallback:
 switching pipelines would not make an unreachable upstream answer.
@@ -270,7 +274,7 @@ switching pipelines would not make an unreachable upstream answer.
 |------|---------|
 | 0 | stopped (a signal) |
 | 1 | the source failed or ended |
-| 2 | bad command line |
+| 2 | bad command line, or a crash — run the fallback |
 | 3 | the source cannot be served natively — run the fallback |
 
 ### What it writes to the stream's log

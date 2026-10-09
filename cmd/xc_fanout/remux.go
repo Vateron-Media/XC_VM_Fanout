@@ -34,8 +34,9 @@ no ffmpeg: the native equivalent of
   ffmpeg -i <url> -c copy -f tee "[f=hls:…]<playlist>|[f=mpegts]unix:<sock>"
 
 XC_VM composes this command (StreamProcess::buildNativeLive) and the daemon's
-supervisor runs it. Exit status: 0 stopped, 1 source failed, 2 bad usage,
-3 source cannot be served natively (use the ffmpeg fallback).
+supervisor runs it. Exit status: 0 stopped, 1 source failed, 2 bad usage
+(or a crash), 3 source cannot be served natively. With 2 or 3 the supervisor
+runs the source's ffmpeg fallback.
 
 options:
 `

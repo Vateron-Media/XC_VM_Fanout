@@ -196,11 +196,19 @@ type State struct {
 // exits with it for a source its native reader does not take (fMP4 HLS, RTMP…),
 // and within a second or two of starting, so the decision costs no start timeout.
 //
-// It is the one exit status the supervisor reads, and only when the source has a
-// FallbackCmd: that source switches to the fallback for the rest of this spec's
-// life, without the failure counting towards stop_failures. Any other exit is an
-// ordinary failure and walks the source list as before.
+// It is one of the two exit statuses the supervisor reads (ExitCrashed is the
+// other), and only when the source has a FallbackCmd: that source switches to the
+// fallback for the rest of this spec's life, without the failure counting towards
+// stop_failures. Any other exit is an ordinary failure and walks the source list
+// as before.
 const ExitUnsupported = 3
+
+// ExitCrashed is the status of a Go program that panicked (the runtime's exit
+// status for an unrecovered panic or a fatal error), which is also the remuxer's
+// bad-usage status. Either way the native command cannot run this source, so
+// with a FallbackCmd it is handled as ExitUnsupported: restarting it would only
+// repeat the same crash while ffmpeg could be serving the channel.
+const ExitCrashed = 2
 
 // Process is a running encoder. It exists so the restart loop can be tested
 // without spawning anything: the real implementation wraps exec.Cmd, and tests
@@ -905,11 +913,11 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 var errUnsupported = errors.New("command cannot serve this source")
 
 // isUnsupportedExit reports whether a process's exit error carries
-// ExitUnsupported. exec.ExitError exposes the status through ExitCode, and so
-// may a test Process's error.
+// ExitUnsupported or ExitCrashed. exec.ExitError exposes the status through
+// ExitCode, and so may a test Process's error.
 func isUnsupportedExit(err error) bool {
 	var ec interface{ ExitCode() int }
-	return errors.As(err, &ec) && ec.ExitCode() == ExitUnsupported
+	return errors.As(err, &ec) && (ec.ExitCode() == ExitUnsupported || ec.ExitCode() == ExitCrashed)
 }
 
 // commandFor picks what to run for src: its FallbackCmd once its Cmd has
