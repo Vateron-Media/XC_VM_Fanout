@@ -320,6 +320,14 @@ func TestServeLiveAnswersAsLivePHPDoes(t *testing.T) {
 		t.Skip("no sleep binary: ", err)
 	}
 	t.Cleanup(func() { _ = producer.Process.Kill(); _ = producer.Wait() })
+	// Start returns once exec is under way; the command line isStreamAlive
+	// reads can still be empty for a moment after.
+	for deadline := time.Now().Add(3 * time.Second); !isStreamAlive(int64(producer.Process.Pid), 12); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			cmd, _ := os.ReadFile("/proc/" + itoa(int64(producer.Process.Pid)) + "/cmdline")
+			t.Fatalf("the producer never looked alive: cmdline %q", cmd)
+		}
+	}
 	_ = os.WriteFile(filepath.Join(dir, "streams", "12_.pid"), []byte(itoa(int64(producer.Process.Pid))+"\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "streams", "12_.m3u8"), []byte("#EXTM3U\n"), 0o644)
 	node := &fakeFiles{playlists: map[string]string{"12": st.playlist}}
