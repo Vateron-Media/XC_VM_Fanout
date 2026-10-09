@@ -349,9 +349,10 @@ become a second daemon on sockets the running one holds, so the stream never sta
 - **`streams_servers.monitor_pid` names the daemon** for a supervised stream. The panel paths that
   ask "is anything watching this stream?" ask the daemon too (`StreamProcess::isWatched`); anything
   else reading the column should treat a pid that is not an `XC_VM[<id>]` process as the daemon.
-- **Not yet exercised on a live node.** The launcher, process groups, adoption, the remuxer
-  pipeline and the fallback are covered by tests against real processes, sockets and HTTP
-  sources, but no production channel has run through this. Stage it before enabling it widely.
+- **Exercised on a test node, not yet in production.** Besides the tests against real processes,
+  sockets and HTTP sources, the remuxer ran on XC_VM's test load balancer (Oct 2026): 20
+  copy-only channels side by side with ffmpeg, and a channel whose timeshift and thumbnail were
+  served from its segments. Stage it before enabling it widely.
 
 ---
 
