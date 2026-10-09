@@ -229,6 +229,12 @@ number of files in the tmpfs whichever producer runs it. (Before 0.13.2 the timi
 which jitters around the keyframe; with the GOP equal to the target half the cuts were missed and
 segments averaged ~3.5 s against a 2 s `hls_time` — nearly twice ffmpeg's tmpfs footprint.)
 
+A panel that sees `remux_source_file` in the daemon's `features` passes the source and its
+fetch options in a 0600 file instead, `-source_file '…/streams/42_.source_0'` (one file per source): a JSON object with
+the keys `i`, `user_agent`, `cookies`, `http_proxy` and `headers`. That keeps the provider's
+account out of `/proc/<pid>/cmdline`, which every local user can read. `-i` and `-source_file`
+are exclusive.
+
 Unlike ffmpeg's tee slave, whose feed into the daemon stays broken once a daemon restart breaks
 it, the remuxer **redials** the ingest socket — after a daemon restart the stream is adopted and
 carries on without restarting.
