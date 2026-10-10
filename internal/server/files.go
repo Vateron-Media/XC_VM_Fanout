@@ -309,6 +309,14 @@ func (m *Manager) FedPlaylist(id string) string {
 	return st.Hub.HLSPlaylist()
 }
 
+// Fed is the panel's isStreamFed in-process (the segment gateway's TS
+// reconnect): is the stream on air (has_data)? The viewer it is asked for
+// attaches next, through /live/<id>, which keeps the puller alive.
+func (m *Manager) Fed(id string) bool {
+	st := m.Get(id)
+	return st != nil && st.onAir()
+}
+
 // serveSource relays a direct-proxy movie from its source: the viewer's range
 // asked for, the source's status and range headers passed on, the body
 // written through fw (its throttle, deadline and kill).

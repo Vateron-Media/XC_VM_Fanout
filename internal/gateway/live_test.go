@@ -198,9 +198,10 @@ func livePolicy() *Policy {
 }
 
 type liveEnvState struct {
-	alive, onDisk, agentAnswers, agentAlive bool
-	playlist                                string
-	rec                                     map[string]any
+	alive, onDisk, agentAnswers, agentAlive, fed bool
+	playlist                                     string
+	rec                                          map[string]any
+	recUUID                                      string // the record's key in the agent
 }
 
 func (st *liveEnvState) env() LiveEnv {
@@ -214,11 +215,12 @@ func (st *liveEnvState) env() LiveEnv {
 		StreamAlive: func(int, json.RawMessage) bool { return st.alive },
 		OnDisk:      func(int) bool { return st.onDisk },
 		Playlist:    func(int) string { return st.playlist },
+		Fed:         func(int) bool { return st.fed },
 		Record: func(uuid string) (map[string]json.RawMessage, bool, bool) {
 			if !st.agentAnswers {
 				return nil, false, false
 			}
-			if recRaw == nil || uuid != liveUUID() {
+			if recRaw == nil || uuid != st.recUUID {
 				return nil, false, true
 			}
 			return recRaw, true, true
@@ -228,9 +230,31 @@ func (st *liveEnvState) env() LiveEnv {
 }
 
 func goodLiveEnv() *liveEnvState {
-	return &liveEnvState{alive: true, onDisk: true, agentAnswers: true, agentAlive: true,
+	return &liveEnvState{alive: true, onDisk: true, agentAnswers: true, agentAlive: true, fed: true, recUUID: liveUUID(),
 		playlist: "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:4.0,\n5.ts\n",
 		rec:      map[string]any{"uuid": liveUUID(), "identity": "u41", "user_id": 41, "server_id": 3, "stream_id": 12, "container": "hls", "user_ip": "198.51.100.7", "hls_end": 0, "pid": 0}}
+}
+
+// goodTSEnv is a TS viewer's connection: the token's uuid, fanout's (pid 0).
+func goodTSEnv() *liveEnvState {
+	st := goodLiveEnv()
+	st.recUUID, st.rec["uuid"], st.rec["container"] = testUUID, testUUID, "ts"
+	return st
+}
+
+func tsTokenJSON(edit func(map[string]any)) string {
+	return liveTokenJSON(func(m map[string]any) {
+		m["extension"] = "ts"
+		if edit != nil {
+			edit(m)
+		}
+	})
+}
+
+func tsPolicy() *Policy {
+	p := livePolicy()
+	p.Live.TS, p.Live.ClientPrebuffer, p.Live.RestreamerPrebuffer, p.Live.SegTime = true, 3, 7, 10
+	return p
 }
 
 func TestJudgeLive(t *testing.T) {
@@ -252,7 +276,8 @@ func TestJudgeLive(t *testing.T) {
 		{"an adaptive token", liveTokenJSON(func(m map[string]any) { m["adaptive"] = []int{1} }), testUA, nil, nil, PHP, "off-air"},
 		{"a malformed uuid", liveTokenJSON(func(m map[string]any) { m["uuid"] = "../x" }), testUA, nil, nil, PHP, "token"},
 		{"an expired token", liveTokenJSON(func(m map[string]any) { m["expires"] = testNow - 1 }), testUA, nil, nil, PHP, "expired"},
-		{"TS", liveTokenJSON(func(m map[string]any) { m["extension"] = "ts" }), testUA, nil, nil, PHP, "extension"},
+		{"TS, from a panel without its settings", liveTokenJSON(func(m map[string]any) { m["extension"] = "ts" }), testUA, nil, nil, PHP, "extension"},
+		{"another container", liveTokenJSON(func(m map[string]any) { m["extension"] = "mp4" }), testUA, nil, nil, PHP, "extension"},
 		{"a proxied channel", liveTokenJSON(func(m map[string]any) { m["channel_info"].(map[string]any)["proxy"] = 1 }), testUA, nil, nil, PHP, "proxy"},
 		{"behind a proxy server", liveTokenJSON(func(m map[string]any) {
 			ci := m["channel_info"].(map[string]any)
@@ -293,6 +318,59 @@ func TestJudgeLive(t *testing.T) {
 	}
 }
 
+func TestJudgeLiveTS(t *testing.T) {
+	ip := "198.51.100.7"
+	cases := []struct {
+		name      string
+		token     string
+		policy    func(*Policy)
+		env       func(*liveEnvState)
+		want      Action
+		reason    string
+		prebuffer int64
+	}{
+		{"a known viewer's reconnect", tsTokenJSON(nil), nil, nil, Serve, "ts", 3},
+		{"a restreamer", tsTokenJSON(func(m map[string]any) { m["user_info"].(map[string]any)["is_restreamer"] = 1 }), nil, nil, Serve, "ts", 7},
+		{"a restreamer's link asking for a prebuffer", tsTokenJSON(func(m map[string]any) {
+			m["user_info"].(map[string]any)["is_restreamer"], m["prebuffer"] = 1, 1
+		}), nil, nil, Serve, "ts", 10},
+		{"a viewer's link asking for one", tsTokenJSON(func(m map[string]any) { m["prebuffer"] = 1 }), nil, nil, Serve, "ts", 3},
+		{"a proxied channel (PHP registers its source)", tsTokenJSON(func(m map[string]any) { m["channel_info"].(map[string]any)["proxy"] = 1 }), nil, nil, PHP, "proxy", 0},
+		{"no uuid in the token", tsTokenJSON(func(m map[string]any) { delete(m, "uuid") }), nil, nil, PHP, "token", 0},
+		{"the first request", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.rec = nil }, PHP, "new-connection", 0},
+		{"an HLS record under the uuid", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.rec["container"] = "hls" }, PHP, "new-connection", 0},
+		{"an ended connection (PHP re-opens it)", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.rec["hls_end"] = 1 }, PHP, "new-connection", 0},
+		{"a PHP worker feeding it", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.rec["pid"] = 777 }, PHP, "worker", 0},
+		{"another address", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.rec["user_ip"] = "203.0.113.9" }, PHP, "ip", 0},
+		{"another address, not restricted", tsTokenJSON(nil), func(p *Policy) { p.RestrictSameIP = false }, func(s *liveEnvState) { s.rec["user_ip"] = "203.0.113.9" }, Serve, "ts", 3},
+		{"the second-address rule", tsTokenJSON(nil), func(p *Policy) { p.Live.Disallow2ndIP = true }, nil, PHP, "second-ip", 0},
+		{"instant off", tsTokenJSON(func(m map[string]any) { m["channel_info"].(map[string]any)["on_demand"] = 1 }), func(p *Policy) { p.Live.InstantOff = true }, nil, PHP, "instant-off", 0},
+		{"a producer that is not running", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.alive = false }, PHP, "stream-down", 0},
+		{"no playlist on disk yet", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.onDisk = false }, PHP, "no-playlist", 0},
+		{"fanout not fed", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.fed = false }, PHP, "not-on-air", 0},
+		{"a limit and no agent draining the spool", tsTokenJSON(nil), nil, func(s *liveEnvState) { s.agentAlive = false }, PHP, "spool", 0},
+		{"viewers in MAIN's store", tsTokenJSON(nil), func(p *Policy) { p.ConnStore = "php" }, nil, PHP, "conn-store", 0},
+	}
+	for _, c := range cases {
+		p := tsPolicy()
+		if c.policy != nil {
+			c.policy(p)
+		}
+		st := goodTSEnv()
+		if c.env != nil {
+			c.env(st)
+		}
+		v, r := JudgeLive(p, c.token, ip, testUA, testNow, st.env())
+		if v.Action != c.want || v.Reason != c.reason {
+			t.Errorf("%s: %s (%s); want %s (%s)", c.name, v.Action, v.Reason, c.want, c.reason)
+			continue
+		}
+		if v.Action == Serve && (r == nil || !r.TS || r.UUID != testUUID || r.Prebuffer != c.prebuffer || r.Codec != "h264" || r.UserAgent != testUA) {
+			t.Errorf("%s: reconnect %+v", c.name, r)
+		}
+	}
+}
+
 // ── A refresh served ────────────────────────────────────────────────────
 
 func TestServeLiveAnswersAsLivePHPDoes(t *testing.T) {
@@ -313,23 +391,7 @@ func TestServeLiveAnswersAsLivePHPDoes(t *testing.T) {
 		paths["agent_sock"], paths["streams"], paths["signals"], paths["spool"], paths["flows"] = sock, dir+"/streams/", dir+"/signals/", dir+"/spool", flows
 		paths["cons"] = dir + "/cons"
 	})
-	// The producer: a process whose command line names stream 12 (isStreamAlive
-	// reads it), in the stream's pid file; the on-disk playlist exists.
-	producer := exec.Command("sleep", "12")
-	if err := producer.Start(); err != nil {
-		t.Skip("no sleep binary: ", err)
-	}
-	t.Cleanup(func() { _ = producer.Process.Kill(); _ = producer.Wait() })
-	// Start returns once exec is under way; the command line isStreamAlive
-	// reads can still be empty for a moment after.
-	for deadline := time.Now().Add(3 * time.Second); !isStreamAlive(int64(producer.Process.Pid), 12); time.Sleep(5 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			cmd, _ := os.ReadFile("/proc/" + itoa(int64(producer.Process.Pid)) + "/cmdline")
-			t.Fatalf("the producer never looked alive: cmdline %q", cmd)
-		}
-	}
-	_ = os.WriteFile(filepath.Join(dir, "streams", "12_.pid"), []byte(itoa(int64(producer.Process.Pid))+"\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(dir, "streams", "12_.m3u8"), []byte("#EXTM3U\n"), 0o644)
+	startProducer(t, filepath.Join(dir, "streams"))
 	node := &fakeFiles{playlists: map[string]string{"12": st.playlist}}
 	s := NewServer(path, http.NotFoundHandler(), node)
 
@@ -361,6 +423,98 @@ func TestServeLiveAnswersAsLivePHPDoes(t *testing.T) {
 	}
 }
 
+// startProducer runs stream 12's producer: a process whose command line
+// names the stream (isStreamAlive reads it), in the stream's pid file; the
+// on-disk playlist exists.
+func startProducer(t *testing.T, streams string) {
+	t.Helper()
+	producer := exec.Command("sleep", "12")
+	if err := producer.Start(); err != nil {
+		t.Skip("no sleep binary: ", err)
+	}
+	t.Cleanup(func() { _ = producer.Process.Kill(); _ = producer.Wait() })
+	// Start returns once exec is under way; the command line isStreamAlive
+	// reads can still be empty for a moment after.
+	for deadline := time.Now().Add(3 * time.Second); !isStreamAlive(int64(producer.Process.Pid), 12); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			cmd, _ := os.ReadFile("/proc/" + itoa(int64(producer.Process.Pid)) + "/cmdline")
+			t.Fatalf("the producer never looked alive: cmdline %q", cmd)
+		}
+	}
+	_ = os.WriteFile(filepath.Join(streams, "12_.pid"), []byte(itoa(int64(producer.Process.Pid))+"\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(streams, "12_.m3u8"), []byte("#EXTM3U\n"), 0o644)
+}
+
+// A TS viewer's reconnect: the record refreshed as live.php's TS arm does,
+// then the stream from fanout's /live/<id> with the viewer's uuid, prebuffer
+// and codec, as its X-Accel-Redirect to /xc_fanout/<id> hands it.
+func TestServeTSReconnectAnswersAsLivePHPDoes(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"cons", "streams", "signals", "spool"} {
+		_ = os.MkdirAll(filepath.Join(dir, d), 0o755)
+	}
+	flows := filepath.Join(dir, "flows.json")
+	_ = os.WriteFile(flows, []byte("{}"), 0o644)
+	st := goodTSEnv()
+	st.rec["server_id"], st.rec["proxy_id"] = 3, nil
+	a := &fakeAgent{records: map[string]map[string]any{testUUID: st.rec}}
+	sock := startAgent(t, a)
+	path := writeServePolicy(t, dir, "segments+playlist", func(doc map[string]any) {
+		doc["conn_store"] = "agent"
+		doc["time_offset"] = 10
+		doc["live"] = map[string]any{"use_buffer": true, "ts": true, "client_prebuffer": 4, "restreamer_prebuffer": 8, "seg_time": 10}
+		paths := doc["paths"].(map[string]any)
+		paths["agent_sock"], paths["streams"], paths["signals"], paths["spool"], paths["flows"] = sock, dir+"/streams/", dir+"/signals/", dir+"/spool", flows
+		paths["cons"] = dir + "/cons"
+	})
+	startProducer(t, filepath.Join(dir, "streams"))
+	var asked *http.Request
+	fanout := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = r
+		w.Header().Set("Content-Type", "video/mp2t")
+		_, _ = w.Write([]byte("TS"))
+	})
+	s := NewServer(path, fanout, &fakeFiles{playlists: map[string]string{"12": st.playlist}})
+
+	req := httptest.NewRequest(http.MethodGet, "/stream/live?token=x", nil)
+	req.Header.Set("X-XC-Original-URI", "/auth/"+tsTokenJSON(nil))
+	req.Header.Set("X-XC-Client-IP", "198.51.100.7")
+	req.Header.Set("User-Agent", testUA)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != 200 || rec.Body.String() != "TS" || rec.Header().Get("Content-Type") != "video/mp2t" || rec.Header().Get("X-Accel-Buffering") != "no" || rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("reconnect: %d %v %q; stats %v", rec.Code, rec.Header(), rec.Body.String(), s.Stats())
+	}
+	if asked == nil || asked.URL.Path != "/live/12" || asked.URL.Query().Get("c") != testUUID || asked.URL.Query().Get("prebuffer") != "4" || asked.URL.Query().Get("vc") != "h264" {
+		t.Fatalf("fanout asked for %v", asked)
+	}
+	got := a.records[testUUID]
+	if len(a.puts) != 1 || got["pid"] != float64(0) || got["hls_end"] != float64(0) || got["server_id"] != float64(3) || got["container"] != "ts" {
+		t.Fatalf("the record refreshed in the agent: %v %v", a.puts, got)
+	}
+	if last, ok := got["hls_last_read"].(float64); !ok || int64(last) < time.Now().Unix()-20 {
+		t.Fatalf("hls_last_read: %v", got["hls_last_read"])
+	}
+	spooled, _ := filepath.Glob(filepath.Join(dir, "spool", "p0", "*.ndjson"))
+	if len(spooled) != 1 || !strings.Contains(string(mustRead(t, spooled[0])), `"uuid":"`+testUUID+`"`) {
+		t.Fatalf("conn.limit spooled for MAIN: %v", spooled)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "cons", testUUID)); !os.IsNotExist(err) {
+		t.Fatalf("a TS viewer has no marker, as after live.php's hand-off: %v", err)
+	}
+	if s.Stats()["live serve ts"] != 1 {
+		t.Fatalf("stats: %v", s.Stats())
+	}
+
+	// The first request of a session stays PHP's: no record yet.
+	delete(a.records, testUUID)
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Header().Get("X-Accel-Redirect") != "@gw_live_php" {
+		t.Fatalf("first request: %d %v", rec.Code, rec.Header())
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -375,7 +529,8 @@ func FuzzLiveToken(f *testing.F) {
 	f.Add(`{"hmac_id":"5","identifier":7,"extension":"m3u8","channel_info":{"x":1},"user_info":{},"stream_id":"12"}`)
 	f.Add(`{"extension":"m3u8","channel_info":[],"user_info":null}`)
 	f.Add(`[]`)
-	p := livePolicy()
+	f.Add(`{"stream_id":12,"extension":"ts","uuid":7,"prebuffer":[1],"channel_info":{"redirect_id":3},"user_info":{"id":41,"is_restreamer":"1"}}`)
+	p := tsPolicy()
 	f.Fuzz(func(t *testing.T, plain string) {
 		JudgeLive(p, tok(plain), "198.51.100.7", testUA, testNow, goodLiveEnv().env())
 	})

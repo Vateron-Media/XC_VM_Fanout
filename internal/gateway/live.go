@@ -20,14 +20,22 @@ type LiveEnv struct {
 	OnDisk func(stream int) bool
 	// Playlist is fanout's HLS playlist of a stream on air, "" otherwise.
 	Playlist func(stream int) string
+	// Fed is FanoutClient::isStreamFed: is fanout serving the stream (has_data)?
+	Fed func(stream int) bool
 	// Record is the viewer's record in the agent: found, and whether the agent answered.
 	Record func(uuid string) (rec map[string]json.RawMessage, found, ok bool)
 	// AgentAlive: is the agent draining its spool (EventSpool::agentAlive)?
 	AgentAlive func() bool
 }
 
-// Refresh is a playlist refresh the gateway answers: what serving it writes and builds.
+// Refresh is a playlist refresh (or a TS viewer's reconnect) the gateway
+// answers: what serving it writes and builds.
 type Refresh struct {
+	// TS: an MPEG-TS viewer's reconnect, served from fanout's ring as
+	// live.php's X-Accel-Redirect to /xc_fanout/<id> is; else a playlist.
+	TS bool
+	// Prebuffer is the seconds of history a TS viewer joins with (live.php's ?prebuffer=).
+	Prebuffer int64
 	Stream    int
 	UUID      string
 	Record    map[string]json.RawMessage
@@ -51,12 +59,13 @@ type Refresh struct {
 
 var segLineRe = regexp.MustCompile(`(?m)^(\d+)\.ts$`)
 
-// JudgeLive is live.php's answer to an HLS playlist refresh as far as the
-// gateway owns it: a known viewer's next playlist on a node whose viewers
-// are in its agent. Anything else goes to PHP before anything is written:
-// the first request (admission, the connection's creation), a stream that is
-// not running, a proxied or adaptive link, a line under the second-address
-// rule, and any form PHP could read otherwise.
+// JudgeLive is live.php's answer to an HLS playlist refresh or an MPEG-TS
+// reconnect as far as the gateway owns it: a known viewer's next playlist, or
+// a known TS viewer's stream again from fanout, on a node whose viewers are in
+// its agent. Anything else goes to PHP before anything is written: the first
+// request (admission, the connection's creation), a stream that is not
+// running, a proxied or adaptive link, a line under the second-address rule,
+// and any form PHP could read otherwise.
 func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
 	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
 	if p == nil {
@@ -94,7 +103,12 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 			return php("expired")
 		}
 	}
-	if ext, _ := jsonString(t["extension"]); ext != "m3u8" {
+	ext, _ := jsonString(t["extension"])
+	if ext != "m3u8" && ext != "ts" {
+		return php("extension")
+	}
+	if ext == "ts" && !p.Live.TS {
+		// A panel from before the TS reconnect writes no prebuffer settings.
 		return php("extension")
 	}
 	var ch, ui map[string]json.RawMessage
@@ -108,7 +122,7 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if !ok || stream <= 0 || stream > math.MaxInt32 {
 		return php("stream-id")
 	}
-	r := &Refresh{Stream: int(stream), NoBuffer: !p.Live.UseBuffer}
+	r := &Refresh{Stream: int(stream), NoBuffer: !p.Live.UseBuffer, TS: ext == "ts"}
 
 	// The serving server and the proxy in front of it (live.php's channel block).
 	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
@@ -168,18 +182,37 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("user-agent")
 	}
 	r.UserAgent = ua
-	r.UUID = hlsConnectionKey(r.IdentityKey, r.Stream, clientIP, ua)
+	container := "hls"
+	if r.TS {
+		// A TS connection keeps the uuid MAIN put in its token (live.php keys
+		// only HLS on the viewer).
+		u, isStr := jsonString(t["uuid"])
+		if !isStr || !uuidRe.MatchString(u) {
+			return php("token")
+		}
+		r.UUID, container = u, "ts"
+	} else {
+		r.UUID = hlsConnectionKey(r.IdentityKey, r.Stream, clientIP, ua)
+	}
 
 	// The connection: open, this viewer's, on this server and stream (lookupLive in the agent).
 	rec, found, answered := env.Record(r.UUID)
 	if !answered {
 		return php("agent")
 	}
-	if !found || !liveMatches(rec, r) {
+	// An ended TS connection is re-opened by PHP (its lookup is not open-only).
+	if !found || !liveMatches(rec, r, container) {
 		return php("new-connection")
 	}
 	if !set(rec, "identity") || !set(rec, "uuid") {
 		return php("record")
+	}
+	if r.TS {
+		// live.php kills a PHP worker still feeding this connection; the
+		// gateway takes over only from fanout's own (pid 0).
+		if pid, ok := jsonInt(rec["pid"]); !ok || pid != 0 {
+			return php("worker")
+		}
 	}
 	recIP, _ := phpString(rec["user_ip"])
 	if p.RestrictSameIP && !ipMatch(recIP, clientIP, p.IPSubnetMatch) {
@@ -197,6 +230,20 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("token")
 	}
 
+	if r.TS {
+		if !env.Fed(r.Stream) {
+			return php("not-on-air")
+		}
+		// live.php's ?prebuffer=: a restreamer's link asking for one gets a segment's time.
+		r.Prebuffer = p.Live.ClientPrebuffer
+		if phpTruthy(ui["is_restreamer"]) {
+			r.Prebuffer = p.Live.RestreamerPrebuffer
+			if phpTruthy(t["prebuffer"]) {
+				r.Prebuffer = p.Live.SegTime
+			}
+		}
+		return Verdict{Action: Serve, Reason: "ts", Stream: r.Stream, UUID: r.UUID, Codec: r.Codec}, r
+	}
 	r.Playlist = env.Playlist(r.Stream)
 	if r.Playlist == "" || !segLineRe.MatchString(r.Playlist) {
 		return php("not-on-air")
@@ -204,12 +251,12 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	return Verdict{Action: Serve, Reason: "playlist", Stream: r.Stream, UUID: r.UUID}, r
 }
 
-// liveMatches is ConnectionTracker::liveMatches for an open HLS record.
-func liveMatches(rec map[string]json.RawMessage, r *Refresh) bool {
+// liveMatches is ConnectionTracker::liveMatches for an open record of the container.
+func liveMatches(rec map[string]json.RawMessage, r *Refresh, container string) bool {
 	if phpTruthy(rec["hls_end"]) {
 		return false
 	}
-	if c, _ := phpString(rec["container"]); c != "hls" {
+	if c, _ := phpString(rec["container"]); c != container {
 		return false
 	}
 	str := func(k string) string { s, _ := phpString(rec[k]); return s }
