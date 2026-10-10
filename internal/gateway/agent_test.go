@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/clusteragent"
 )
 
 // fakeAgent answers /v1/conn on a unix socket as xc_agent's registry does.
@@ -20,6 +22,9 @@ type fakeAgent struct {
 	touched []string // "<uuid> <body>"
 	puts    []string
 	down    bool
+	// admissions: each PUT's X-XCVM-Admission; refuse: the reason it answers them 403 with.
+	admissions []string
+	refuse     string
 }
 
 func startAgent(t *testing.T, a *fakeAgent) string {
@@ -38,6 +43,14 @@ func startAgent(t *testing.T, a *fakeAgent) string {
 		}
 		path := strings.TrimPrefix(r.URL.Path, "/v1/conn/")
 		uuid := strings.TrimSuffix(path, "/touch")
+		if h := r.Header.Get("X-XCVM-Admission"); r.Method == http.MethodPut && h != "" {
+			a.admissions = append(a.admissions, h)
+			if a.refuse != "" {
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]any{"admit": false, "reason": a.refuse})
+				return
+			}
+		}
 		if r.Method == http.MethodPut {
 			var rec map[string]any
 			if json.NewDecoder(r.Body).Decode(&rec) != nil {
@@ -164,5 +177,30 @@ func TestPHPNonEmpty(t *testing.T) {
 		if got := phpNonEmpty(json.RawMessage(raw)); got != want {
 			t.Errorf("%q: %v; want %v", raw, got, want)
 		}
+	}
+}
+
+// A new viewer's register: stored, refused by the agent's admission, or unanswered.
+func TestAgentConnsRegister(t *testing.T) {
+	if admissionHeaderName != clusteragent.AdmissionHeader {
+		t.Fatalf("the admission header: %q; the agent reads %q", admissionHeaderName, clusteragent.AdmissionHeader)
+	}
+	a := &fakeAgent{records: map[string]map[string]any{}}
+	c := NewAgentConns(startAgent(t, a))
+	rec := map[string]json.RawMessage{"uuid": json.RawMessage(`"u1"`), "pid": json.RawMessage("0")}
+
+	if stored, refused := c.Register("u1", rec, ""); !stored || refused || len(a.admissions) != 0 {
+		t.Fatalf("a plain register: %v %v %v", stored, refused, a.admissions)
+	}
+	if stored, refused := c.Register("u2", rec, `{"line_id":41}`); !stored || refused || len(a.admissions) != 1 || a.admissions[0] != `{"line_id":41}` {
+		t.Fatalf("an admitted register: %v %v %v", stored, refused, a.admissions)
+	}
+	a.refuse = "LIMIT"
+	if stored, refused := c.Register("u3", rec, `{"line_id":41}`); stored || !refused || a.records["u3"] != nil {
+		t.Fatalf("a refused viewer is stored nowhere: %v %v %v", stored, refused, a.records["u3"])
+	}
+	a.down = true
+	if stored, refused := c.Register("u4", rec, `{"line_id":41}`); stored || refused {
+		t.Fatalf("an agent that does not answer: %v %v", stored, refused)
 	}
 }

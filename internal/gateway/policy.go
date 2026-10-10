@@ -82,6 +82,13 @@ type LivePolicy struct {
 	ClientPrebuffer     int64 `json:"client_prebuffer"`
 	RestreamerPrebuffer int64 `json:"restreamer_prebuffer"`
 	SegTime             int64 `json:"seg_time"`
+	// CreateExpiration is live.php's create_expiration (never 0 there): how
+	// long after its mint a token still opens a new connection. Without it (a
+	// panel from before the gateway's first TS request) a new viewer is PHP's.
+	CreateExpiration int64 `json:"create_expiration"`
+	// Admission: a new viewer with a limit is admitted by the agent
+	// (AgentConnections::admission: the node is one MAIN has left active).
+	Admission bool `json:"admission"`
 }
 
 type hexKey struct {

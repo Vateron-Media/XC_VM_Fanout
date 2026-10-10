@@ -194,6 +194,11 @@ func (s *Server) shadow(r *http.Request) {
 	now := s.now()
 	j := s.judge(r, now, false)
 	kind, v := j.kind, j.verdict
+	if j.refresh != nil && j.refresh.New && j.refresh.Admission != "" {
+		// A new viewer the agent has to admit: its answer is known only by
+		// asking, which serving does and judging does not. Not compared.
+		v = verdict(PHP, "admission")
+	}
 	s.count(kind+" "+string(v.Action)+" "+v.Reason, s.now().Sub(now))
 	s.book.Gateway(r.Header.Get("X-XC-Request-ID"), kind, v)
 	// No token in the log: it is a credential.
@@ -284,28 +289,41 @@ func phpLocation(kind string) string {
 	return "@gw_segment_php"
 }
 
-// serveLive answers a playlist refresh or a TS reconnect as live.php does
-// once its connection is found: the record refreshed in the agent, the line's
-// limit spooled for MAIN, then the viewer's marker touched and the playlist
-// tokenized, or the stream served from fanout's ring. "" when served, else
+// serveLive answers a playlist refresh or a TS viewer as live.php does: the
+// record refreshed in the agent (a new TS viewer's created, admitted by the
+// agent), the line's limit spooled for MAIN, then the viewer's marker touched
+// and the playlist tokenized, or the stream served from fanout's ring. "" when served, else
 // why PHP answers it after all (it then does the same, as before).
 func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
 	ip := r.Header.Get("X-XC-Client-IP")
-	rec := make(map[string]json.RawMessage, len(ref.Record)+4)
-	for k, v := range ref.Record {
-		rec[k] = v
-	}
-	if ref.TS {
-		// live.php's TS arm: the connection is fanout's (pid 0), its server unchanged.
-		rec["pid"] = json.RawMessage("0")
+	if ref.New {
+		// live.php's createLive: the record stored, the viewer of a line with a
+		// limit admitted by the agent. One it refuses is PHP's to answer
+		// (StreamAuth::refuseAdmission): it asks again and is refused the same.
+		stored, refused := s.agentFor(p.Paths.AgentSock).Register(ref.UUID, ref.Record, ref.Admission)
+		if refused {
+			return "refused"
+		}
+		if !stored {
+			return "agent-put"
+		}
 	} else {
-		rec["server_id"] = ref.ServerID
-		rec["proxy_id"] = json.RawMessage("null")
-	}
-	rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
-	rec["hls_end"] = json.RawMessage("0")
-	if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
-		return "agent-put"
+		rec := make(map[string]json.RawMessage, len(ref.Record)+4)
+		for k, v := range ref.Record {
+			rec[k] = v
+		}
+		if ref.TS {
+			// live.php's TS arm: the connection is fanout's (pid 0), its server unchanged.
+			rec["pid"] = json.RawMessage("0")
+		} else {
+			rec["server_id"] = ref.ServerID
+			rec["proxy_id"] = json.RawMessage("null")
+		}
+		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
+		rec["hls_end"] = json.RawMessage("0")
+		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
+			return "agent-put"
+		}
 	}
 	if ref.Limit {
 		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil {

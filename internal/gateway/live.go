@@ -39,6 +39,11 @@ type Refresh struct {
 	Stream    int
 	UUID      string
 	Record    map[string]json.RawMessage
+	// New: a TS viewer's first request. Record is then the record to store
+	// (ConnectionTracker::createLive), and Admission the agent's
+	// X-XCVM-Admission for it ("" for a plain register).
+	New       bool
+	Admission string
 	ServerID  json.RawMessage
 	Playlist  string
 	UserAgent string // as live.php holds it: htmlentities(trim(UA))
@@ -60,12 +65,12 @@ type Refresh struct {
 var segLineRe = regexp.MustCompile(`(?m)^(\d+)\.ts$`)
 
 // JudgeLive is live.php's answer to an HLS playlist refresh or an MPEG-TS
-// reconnect as far as the gateway owns it: a known viewer's next playlist, or
-// a known TS viewer's stream again from fanout, on a node whose viewers are in
-// its agent. Anything else goes to PHP before anything is written: the first
-// request (admission, the connection's creation), a stream that is not
-// running, a proxied or adaptive link, a line under the second-address rule,
-// and any form PHP could read otherwise.
+// viewer as far as the gateway owns it: a known viewer's next playlist, or a
+// TS viewer's stream from fanout (a new viewer's connection is created
+// first, a known one's refreshed), on a node whose viewers are in its agent.
+// Anything else goes to PHP before anything is written: an HLS viewer's first
+// request, a stream that is not running, a proxied or adaptive link, a line
+// under the second-address rule, and any form PHP could read otherwise.
 func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
 	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
 	if p == nil {
@@ -200,23 +205,32 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if !answered {
 		return php("agent")
 	}
-	// An ended TS connection is re-opened by PHP (its lookup is not open-only).
-	if !found || !liveMatches(rec, r, container) {
-		return php("new-connection")
-	}
-	if !set(rec, "identity") || !set(rec, "uuid") {
-		return php("record")
-	}
-	if r.TS {
-		// live.php kills a PHP worker still feeding this connection; the
-		// gateway takes over only from fanout's own (pid 0).
-		if pid, ok := jsonInt(rec["pid"]); !ok || pid != 0 {
-			return php("worker")
+	if !found && r.TS && p.Live.CreateExpiration > 0 {
+		// A TS viewer's first request: its connection is created (createLive).
+		var why string
+		if rec, why = newTSRecord(p, t, ch, ui, r, clientIP, now); why != "" {
+			return php(why)
 		}
-	}
-	recIP, _ := phpString(rec["user_ip"])
-	if p.RestrictSameIP && !ipMatch(recIP, clientIP, p.IPSubnetMatch) {
-		return php("ip")
+		r.New = true
+	} else {
+		// An ended TS connection is re-opened by PHP (its lookup is not open-only).
+		if !found || !liveMatches(rec, r, container) {
+			return php("new-connection")
+		}
+		if !set(rec, "identity") || !set(rec, "uuid") {
+			return php("record")
+		}
+		if r.TS {
+			// live.php kills a PHP worker still feeding this connection; the
+			// gateway takes over only from fanout's own (pid 0).
+			if pid, ok := jsonInt(rec["pid"]); !ok || pid != 0 {
+				return php("worker")
+			}
+		}
+		recIP, _ := phpString(rec["user_ip"])
+		if p.RestrictSameIP && !ipMatch(recIP, clientIP, p.IPSubnetMatch) {
+			return php("ip")
+		}
 	}
 	r.Record = rec
 
@@ -228,6 +242,14 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		r.Limit, r.MaxConns = true, mc
 	} else if !ok && phpTruthy(ui["max_connections"]) {
 		return php("token")
+	}
+
+	if r.New {
+		adm, ok := admissionHeader(p, t, r, clientIP, now)
+		if !ok {
+			return php("token")
+		}
+		r.Admission = adm
 	}
 
 	if r.TS {
@@ -242,13 +264,140 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 				r.Prebuffer = p.Live.SegTime
 			}
 		}
-		return Verdict{Action: Serve, Reason: "ts", Stream: r.Stream, UUID: r.UUID, Codec: r.Codec}, r
+		reason := "ts"
+		if r.New {
+			reason = "ts-new"
+		}
+		return Verdict{Action: Serve, Reason: reason, Stream: r.Stream, UUID: r.UUID, Codec: r.Codec}, r
 	}
 	r.Playlist = env.Playlist(r.Stream)
 	if r.Playlist == "" || !segLineRe.MatchString(r.Playlist) {
 		return php("not-on-air")
 	}
 	return Verdict{Action: Serve, Reason: "playlist", Stream: r.Stream, UUID: r.UUID}, r
+}
+
+var mintProofRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// newTSRecord is the record ConnectionTracker::createLive and openRecord
+// store for a TS viewer fanout serves (pid 0), built from the token MAIN
+// sealed as live.php builds it; or why PHP creates the connection ("expired":
+// its TOKEN_EXPIRED, past the token's start plus create_expiration on MAIN's clock).
+func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (map[string]json.RawMessage, string) {
+	set := func(m map[string]json.RawMessage, k string) bool { v, ok := m[k]; return ok && !isNull(v) }
+	raw := func(v json.RawMessage) json.RawMessage {
+		if len(v) == 0 {
+			return json.RawMessage("null")
+		}
+		return v
+	}
+	str := func(s string) json.RawMessage { b, _ := json.Marshal(s); return b }
+	start, ok := jsonInt(t["activity_start"])
+	if !ok {
+		return nil, "token"
+	}
+	if now-p.TimeOffset > start+p.Live.CreateExpiration {
+		return nil, "expired"
+	}
+	// live.php names no reservation of its own for a TS viewer; a token that
+	// carries one is read by PHP.
+	if set(t, "adm_uuid") {
+		return nil, "token"
+	}
+	rec := map[string]json.RawMessage{
+		"stream_id":          json.RawMessage(strconv.Itoa(r.Stream)),
+		"server_id":          raw(r.ServerID),
+		"proxy_id":           json.RawMessage("null"),
+		"user_agent":         str(r.UserAgent),
+		"user_ip":            str(clientIP),
+		"container":          json.RawMessage(`"ts"`),
+		"pid":                json.RawMessage("0"),
+		"date_start":         raw(t["activity_start"]),
+		"geoip_country_code": raw(t["country_code"]),
+		"isp":                raw(ui["con_isp_name"]),
+		"external_device":    raw(t["external_device"]),
+		"hls_end":            json.RawMessage("0"),
+		"hls_last_read":      json.RawMessage(strconv.FormatInt(now-p.TimeOffset, 10)),
+		"on_demand":          raw(ch["on_demand"]),
+		"uuid":               str(r.UUID),
+	}
+	if r.HMAC != "" {
+		// The identity is PHP's concatenation of the token's own values.
+		h, _ := phpString(t["hmac_id"])
+		if h != r.HMAC {
+			return nil, "token"
+		}
+		rec["hmac_id"], rec["hmac_identifier"], rec["identity"] = raw(t["hmac_id"]), raw(t["identifier"]), str(h+"_"+r.Identifier)
+	} else {
+		if r.UserID <= 0 {
+			return nil, "token"
+		}
+		rec["user_id"], rec["identity"] = ui["id"], ui["id"]
+	}
+	// MAIN's proof that it minted the token (`prf`), kept as `mint` for the
+	// record's life: <uuid>.<iat>.<p>.
+	var prf map[string]json.RawMessage
+	if json.Unmarshal(t["prf"], &prf) == nil && prf != nil {
+		iat, okI := strictInt(prf["iat"])
+		proof, okP := jsonString(prf["p"])
+		if okI && iat > 0 && okP && mintProofRe.MatchString(proof) {
+			rec["mint"] = str(r.UUID + "." + strconv.FormatInt(iat, 10) + "." + proof)
+		}
+	}
+	return rec, ""
+}
+
+// admissionHeader is AgentConnections::admission for a new viewer's record:
+// the agent's X-XCVM-Admission, "" when admission does not apply (no limit,
+// or a node MAIN has not left active); false for a form PHP reads.
+func admissionHeader(p *Policy, t map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (string, bool) {
+	if !r.Limit || r.MaxConns <= 0 || !p.Live.Admission {
+		return "", true
+	}
+	server, ok := jsonInt(r.ServerID)
+	if !ok {
+		return "", false
+	}
+	out := map[string]any{"stream_id": r.Stream, "max_connections": r.MaxConns, "ip": clientIP, "ua": r.UserAgent}
+	// MAIN's admission at mint, passed on only while it holds and only for this node.
+	var adm map[string]json.RawMessage
+	if json.Unmarshal(t["adm"], &adm) == nil && adm != nil {
+		exp, okE := strictInt(adm["exp"])
+		sid, okS := strictInt(adm["sid"])
+		if okE && okS && exp >= now-p.TimeOffset && sid == server {
+			out["adm"] = map[string]int64{"exp": exp, "sid": sid}
+		}
+	}
+	if m, ok := r.Record["mint"]; ok {
+		out["mint"] = m
+	}
+	if r.HMAC != "" {
+		h, _ := jsonInt(json.RawMessage(r.HMAC))
+		out["hmac_id"], out["identifier"] = h, r.Identifier
+	} else {
+		out["line_id"] = r.UserID
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(out) != nil {
+		return "", false
+	}
+	h := strings.TrimRight(b.String(), "\n")
+	for i := 0; i < len(h); i++ {
+		// A header of plain ASCII only: PHP escapes the rest its own way.
+		if h[i] >= 0x80 {
+			return "", false
+		}
+	}
+	return h, true
+}
+
+// strictInt is PHP's is_int() on a decoded JSON value: an integer literal,
+// not a string of digits.
+func strictInt(r json.RawMessage) (int64, bool) {
+	n, err := strconv.ParseInt(string(r), 10, 64)
+	return n, err == nil
 }
 
 // liveMatches is ConnectionTracker::liveMatches for an open record of the container.

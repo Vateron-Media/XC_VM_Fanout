@@ -14,24 +14,31 @@ import (
 // agentTimeout bounds one call to the node's agent; past it, PHP answers.
 const agentTimeout = time.Second
 
+// admitTimeout is AgentConnections::ADMIT_TIMEOUT: a new viewer's register,
+// which may wait for the agent's conn_admit to MAIN (1.5 s) and then its
+// offline policy.
+const admitTimeout = 2500 * time.Millisecond
+
+// admissionHeaderName is the agent's X-XCVM-Admission (clusteragent.AdmissionHeader).
+const admissionHeaderName = "X-XCVM-Admission"
+
 // AgentConns reads and touches the viewers' records in the node's agent
 // (xc_agent's /v1/conn on its local socket), the store a node with the
 // CONNECTIONS flow keeps them in, as the panel's AgentConnections does.
 type AgentConns struct {
 	client *http.Client
+	admit  *http.Client // the same socket, with a new viewer's longer wait
 }
 
 // NewAgentConns talks to the agent on the unix socket at sock.
 func NewAgentConns(sock string) *AgentConns {
-	return &AgentConns{client: &http.Client{
-		Timeout: agentTimeout,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
-			},
-			MaxIdleConnsPerHost: 8,
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		},
-	}}
+		MaxIdleConnsPerHost: 8,
+	}
+	return &AgentConns{client: &http.Client{Timeout: agentTimeout, Transport: tr}, admit: &http.Client{Timeout: admitTimeout, Transport: tr}}
 }
 
 // Touch is ConnectionTracker::heartbeat on a CONNECTIONS node: the record's
@@ -134,20 +141,46 @@ func (a *AgentConns) Get(uuid string) (rec map[string]json.RawMessage, found, ok
 // Put is AgentConnections::put: the record replaced (no admission header: a
 // refresh of a viewer the agent already holds). True when the agent stored it.
 func (a *AgentConns) Put(uuid string, rec map[string]json.RawMessage) bool {
+	stored, _ := a.put(a.client, uuid, rec, "")
+	return stored
+}
+
+// Register is AgentConnections::register: a new viewer's record stored,
+// admitted by the agent when admission (its X-XCVM-Admission) is given.
+// refused: the agent answered 403 {"admit": false} and stored nothing.
+// Neither: it did not answer, and PHP decides.
+func (a *AgentConns) Register(uuid string, rec map[string]json.RawMessage, admission string) (stored, refused bool) {
+	if admission == "" {
+		return a.put(a.client, uuid, rec, "")
+	}
+	return a.put(a.admit, uuid, rec, admission)
+}
+
+func (a *AgentConns) put(client *http.Client, uuid string, rec map[string]json.RawMessage, admission string) (stored, refused bool) {
 	b, err := json.Marshal(rec)
 	if err != nil {
-		return false
+		return false, false
 	}
 	req, err := http.NewRequest(http.MethodPut, "http://agent/v1/conn/"+uuid, strings.NewReader(string(b)))
 	if err != nil {
-		return false
+		return false, false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := a.client.Do(req)
+	if admission != "" {
+		req.Header.Set(admissionHeaderName, admission)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return false, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden && admission != "" {
+		var out map[string]json.RawMessage
+		if json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&out) == nil && string(out["admit"]) == "false" {
+			return false, true
+		}
+		return false, false
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	return resp.StatusCode == http.StatusOK, false
 }
