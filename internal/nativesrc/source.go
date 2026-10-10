@@ -21,7 +21,8 @@
 //   - EXT-X-BYTERANGE HLS      → each slice fetched with a Range request
 //   - packed AAC HLS           → framed as MPEG-TS (internal/tsmux)
 //   - fMP4/CMAF HLS            → remuxed against its init segment (internal/fmp4)
-//   - SAMPLE-AES, AC-3, MP3, WebVTT, a demuxed audio rendition → ErrFormat
+//   - HLS audio in separate MPEG-TS renditions → pulled side by side and joined (internal/tsmerge)
+//   - SAMPLE-AES, AC-3, MP3, WebVTT, a separate audio rendition that is fMP4 or packed AAC → ErrFormat
 //   - anything else            → ErrUnsupported
 //
 // Refusing loudly is the whole contract: the caller runs ffmpeg for whatever
