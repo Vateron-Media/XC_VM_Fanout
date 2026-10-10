@@ -176,6 +176,15 @@ func PTS(pkt []byte) (int64, bool) {
 // I-frame. It is the fallback for a source that never sets
 // random_access_indicator.
 //
+// An H.264 stream with open GOPs has no IDR after its first picture: its
+// random access points are I pictures that say so, and those are accepted on
+// all three of the signs such a picture carries — the SPS in front of it, a
+// recovery point SEI whose recovery_frame_cnt is 0 (decoding is exact from
+// this picture on), and a first slice that is an I slice. That is what the
+// standard's random access point is (ISO/IEC 13818-1 for AVC) and what an
+// encoder that does set random_access_indicator sets it on. A recovery point
+// that only promises a correct picture some frames later is not accepted.
+//
 // Like the original it reads only THIS packet — a keyframe whose NAL starts in a
 // later packet (a long SEI in front of it) is simply not a cut point, and the
 // segment runs on to the next keyframe that is. A missed cut makes one segment
@@ -203,6 +212,7 @@ func StartsKeyframe(pkt []byte, streamType byte) bool {
 
 	// Walk the Annex-B start codes (00 00 01, or 00 00 00 01) in what is left of
 	// the packet, reading the header byte that follows each.
+	sps, recovery := false, false
 	for i := 0; i+3 < len(es); {
 		if es[i] != 0 || es[i+1] != 0 {
 			i++
@@ -224,8 +234,17 @@ func StartsKeyframe(pkt []byte, streamType byte) bool {
 		}
 		switch streamType {
 		case StreamTypeH264:
-			if es[k]&0x1f == 5 { // IDR slice
+			switch es[k] & 0x1f {
+			case 5: // IDR slice
 				return true
+			case 7:
+				sps = true
+			case 6:
+				recovery = recovery || exactRecoveryPoint(es[k+1:])
+			case 1:
+				// The picture's first slice, and not an IDR one: nothing after
+				// it in this access unit can make the picture a keyframe.
+				return sps && recovery && intraSlice(es[k+1:])
 			}
 		case StreamTypeHEVC:
 			if t := (es[k] >> 1) & 0x3f; t >= 16 && t <= 23 { // IRAP
@@ -239,6 +258,122 @@ func StartsKeyframe(pkt []byte, streamType byte) bool {
 		i = k
 	}
 	return false
+}
+
+// unescape copies a NAL unit's payload into dst without its emulation
+// prevention bytes (the 03 of 00 00 03), up to the next start code or to
+// len(dst), and returns how much it wrote.
+func unescape(dst, src []byte) int {
+	n, zeros := 0, 0
+	for _, c := range src {
+		if n == len(dst) {
+			break
+		}
+		if zeros >= 2 {
+			if c == 3 {
+				zeros = 0
+				continue
+			}
+			if c <= 1 {
+				break // 00 00 00 / 00 00 01: the next NAL unit
+			}
+		}
+		dst[n] = c
+		n++
+		if c == 0 {
+			zeros++
+		} else {
+			zeros = 0
+		}
+	}
+	return n
+}
+
+// exactRecoveryPoint reports whether an H.264 SEI NAL unit (what follows its
+// header byte, to the end of the packet) holds a recovery point message
+// (payloadType 6) with recovery_frame_cnt 0. A message the packet cuts short
+// is not one.
+func exactRecoveryPoint(b []byte) bool {
+	var buf [PacketSize]byte
+	r := buf[:unescape(buf[:], b)]
+	for len(r) > 0 && r[len(r)-1] == 0 {
+		r = r[:len(r)-1] // the zeros in front of the next start code
+	}
+	for i := 0; i < len(r); {
+		typ, size := 0, 0
+		for ; i < len(r) && r[i] == 0xff; i++ {
+			typ += 255
+		}
+		if i >= len(r) {
+			return false
+		}
+		typ += int(r[i])
+		i++
+		for ; i < len(r) && r[i] == 0xff; i++ {
+			size += 255
+		}
+		if i >= len(r) {
+			return false
+		}
+		size += int(r[i])
+		i++
+		if typ == 6 {
+			// recovery_frame_cnt is ue(v) and comes first: 0 is a single 1 bit.
+			return size > 0 && i < len(r) && r[i]&0x80 != 0
+		}
+		i += size
+	}
+	return false
+}
+
+// intraSlice reports whether an H.264 slice (what follows its NAL header byte)
+// is an I slice: slice_type, the second ue(v) of the slice header, is 2 or 7.
+func intraSlice(b []byte) bool {
+	var buf [8]byte
+	r := bitReader{b: buf[:unescape(buf[:], b)]}
+	if _, ok := r.ue(); !ok { // first_mb_in_slice
+		return false
+	}
+	t, ok := r.ue()
+	return ok && t%5 == 2
+}
+
+// bitReader reads Exp-Golomb codes from the front of a slice header.
+type bitReader struct {
+	b   []byte
+	pos int
+}
+
+func (r *bitReader) bit() (int, bool) {
+	if r.pos>>3 >= len(r.b) {
+		return 0, false
+	}
+	v := int(r.b[r.pos>>3]>>(7-uint(r.pos&7))) & 1
+	r.pos++
+	return v, true
+}
+
+func (r *bitReader) ue() (int, bool) {
+	zeros := 0
+	for {
+		v, ok := r.bit()
+		if !ok || zeros > 16 {
+			return 0, false
+		}
+		if v == 1 {
+			break
+		}
+		zeros++
+	}
+	n := 0
+	for i := 0; i < zeros; i++ {
+		v, ok := r.bit()
+		if !ok {
+			return 0, false
+		}
+		n = n<<1 | v
+	}
+	return 1<<uint(zeros) - 1 + n, true
 }
 
 // ES is one elementary stream a PMT declares.
