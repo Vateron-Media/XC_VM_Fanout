@@ -12,7 +12,8 @@
 // one is there because a real source needed it:
 //
 //   - segments open only at a keyframe — random_access_indicator, or failing
-//     that the elementary stream's own IDR/IRAP/sequence header
+//     that the elementary stream's own IDR/IRAP/sequence header or, for H.264
+//     with open GOPs, its exact recovery point
 //     (tspes.StartsKeyframe) — so each one decodes on its own;
 //   - the latest PAT, PMT and SDT are re-emitted at every segment head, so a
 //     player (or the panel's tv_archive worker) can start from any file;
