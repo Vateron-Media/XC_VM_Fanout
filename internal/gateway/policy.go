@@ -67,13 +67,21 @@ type Policy struct {
 	Keys Keys `json:"-"`
 }
 
-// LivePolicy is the settings live.php reads for a playlist refresh.
+// LivePolicy is the settings live.php reads for a playlist refresh or a TS reconnect.
 type LivePolicy struct {
 	UseBuffer        bool  `json:"use_buffer"`
 	InstantOff       bool  `json:"on_demand_instant_off"`
 	Disallow2ndIP    bool  `json:"disallow_2nd_ip_con"`
 	Disallow2ndIPMax int64 `json:"disallow_2nd_ip_max"`
 	UniqueHeader     bool  `json:"unique_header"`
+	// TS: the panel writes the TS fields below; without them a TS reconnect is PHP's.
+	TS bool `json:"ts"`
+	// The seconds of history a TS viewer joins with (live.php's ?prebuffer=):
+	// client_prebuffer, restreamer_prebuffer, and max(1, seg_time) for a
+	// restreamer's link that asks for a prebuffer.
+	ClientPrebuffer     int64 `json:"client_prebuffer"`
+	RestreamerPrebuffer int64 `json:"restreamer_prebuffer"`
+	SegTime             int64 `json:"seg_time"`
 }
 
 type hexKey struct {

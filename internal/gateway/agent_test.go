@@ -101,6 +101,8 @@ type fakeFiles struct {
 
 func (f *fakeFiles) FedPlaylist(id string) string { return f.playlists[id] }
 
+func (f *fakeFiles) Fed(id string) bool { return f.playlists[id] != "" }
+
 func (f *fakeFiles) ServeFilePart(w http.ResponseWriter, _ *http.Request, path string, offset int64, contentType string) {
 	f.path, f.offset = path, offset
 	w.Header().Set("Content-Type", contentType)

@@ -50,3 +50,24 @@ func TestStaleChannelIsNotOnAir(t *testing.T) {
 		t.Errorf("a flowing channel: has_data=%v after %s, want true at once", probe.HasData, time.Since(began))
 	}
 }
+
+// TestFedIsHasData: the segment gateway's in-process isStreamFed answers as
+// GET /streams/<id>'s has_data does — unknown, silent and flowing streams.
+func TestFedIsHasData(t *testing.T) {
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	if m.Fed("9") {
+		t.Fatal("an unknown stream is fed")
+	}
+	st := m.GetOrCreate("9")
+	if m.Fed("9") {
+		t.Fatal("a stream that never had data is fed")
+	}
+	st.Publish(tsfixture.PAT(0x100))
+	if !m.Fed("9") {
+		t.Fatal("a flowing stream is not fed")
+	}
+	st.lastData.Store(time.Now().Add(-time.Hour).UnixNano())
+	if m.Fed("9") {
+		t.Fatal("a stream silent for an hour is fed")
+	}
+}

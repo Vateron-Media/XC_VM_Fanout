@@ -54,15 +54,17 @@ var latencyBuckets = [...]time.Duration{100 * time.Microsecond, 500 * time.Micro
 
 // Node is what the gateway asks of the fanout it runs in (the server
 // package's Manager): a file served from an offset, as its file server serves
-// a manifest of one part, and a stream's HLS playlist while it is on air.
+// a manifest of one part, a stream's HLS playlist while it is on air, and
+// whether it is on air.
 type Node interface {
 	ServeFilePart(w http.ResponseWriter, r *http.Request, path string, offset int64, contentType string)
 	FedPlaylist(id string) string
+	Fed(id string) bool
 }
 
 // NewServer judges with the policy file at policyPath, serves live segments
-// through segments, fanout's client handler (its /hls/<id>/<seq>.ts), and
-// catch-up minutes and playlists through node.
+// and TS through segments, fanout's client handler (its /hls/<id>/<seq>.ts
+// and /live/<id>), and catch-up minutes and playlists through node.
 func NewServer(policyPath string, segments http.Handler, node Node) *Server {
 	return &Server{policy: NewPolicyFile(policyPath), segments: segments, node: node, book: NewShadowBook(""), now: time.Now, counts: map[string]uint64{}, took: map[string]*[len(latencyBuckets) + 1]uint64{}}
 }
@@ -167,6 +169,7 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 		},
 		OnDisk:   func(stream int) bool { return exists(p.Paths.Streams + strconv.Itoa(stream) + "_.m3u8") },
 		Playlist: func(stream int) string { return s.node.FedPlaylist(strconv.Itoa(stream)) },
+		Fed:      func(stream int) bool { return s.node.Fed(strconv.Itoa(stream)) },
 		Record: func(uuid string) (map[string]json.RawMessage, bool, bool) {
 			if p.Paths.AgentSock == "" {
 				return nil, false, false
@@ -281,18 +284,24 @@ func phpLocation(kind string) string {
 	return "@gw_segment_php"
 }
 
-// serveLive answers a playlist refresh as live.php does once its connection
-// is found: the record refreshed in the agent, the line's limit spooled for
-// MAIN, the playlist tokenized, the viewer's marker touched. "" when served,
-// else why PHP answers it after all (it then does the same, as before).
+// serveLive answers a playlist refresh or a TS reconnect as live.php does
+// once its connection is found: the record refreshed in the agent, the line's
+// limit spooled for MAIN, then the viewer's marker touched and the playlist
+// tokenized, or the stream served from fanout's ring. "" when served, else
+// why PHP answers it after all (it then does the same, as before).
 func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
 	ip := r.Header.Get("X-XC-Client-IP")
 	rec := make(map[string]json.RawMessage, len(ref.Record)+4)
 	for k, v := range ref.Record {
 		rec[k] = v
 	}
-	rec["server_id"] = ref.ServerID
-	rec["proxy_id"] = json.RawMessage("null")
+	if ref.TS {
+		// live.php's TS arm: the connection is fanout's (pid 0), its server unchanged.
+		rec["pid"] = json.RawMessage("0")
+	} else {
+		rec["server_id"] = ref.ServerID
+		rec["proxy_id"] = json.RawMessage("null")
+	}
 	rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
 	rec["hls_end"] = json.RawMessage("0")
 	if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
@@ -303,14 +312,20 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 			return "spool"
 		}
 	}
-	body, err := Tokenize(p, ref, ip, now)
-	if err != nil {
-		return "tokenize"
+	var body string
+	if !ref.TS {
+		var err error
+		if body, err = Tokenize(p, ref, ip, now); err != nil {
+			return "tokenize"
+		}
 	}
-	marker := filepath.Join(p.Paths.Cons, ref.UUID)
-	if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-		f.Close()
-		_ = os.Chtimes(marker, now, now)
+	if !ref.TS {
+		// A TS viewer has no marker: live.php's hand-off to fanout leaves none.
+		marker := filepath.Join(p.Paths.Cons, ref.UUID)
+		if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			f.Close()
+			_ = os.Chtimes(marker, now, now)
+		}
 	}
 	h := w.Header()
 	h.Set("Access-Control-Allow-Origin", "*")
@@ -324,8 +339,19 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 	if p.Headers.AltsvcPort > 0 {
 		h.Set("Alt-Svc", altsvc(p.Headers.AltsvcPort))
 	}
-	if ref.NoBuffer {
+	if ref.NoBuffer || ref.TS {
 		h.Set("X-Accel-Buffering", "no")
+	}
+	if ref.TS {
+		// live.php's X-Accel-Redirect to /xc_fanout/<id>, without the hop:
+		// fanout's own /live/<id>, which counts the viewer under its uuid
+		// (fanout_sync, the agent) and sends the overlay due to it.
+		in := r.Clone(r.Context())
+		in.URL = &url.URL{Path: "/live/" + strconv.Itoa(ref.Stream), RawQuery: url.Values{"c": {ref.UUID}, "prebuffer": {strconv.FormatInt(ref.Prebuffer, 10)}, "vc": {ref.Codec}}.Encode()}
+		in.RequestURI = in.URL.RequestURI()
+		h.Set("Content-Type", "video/mp2t")
+		s.segments.ServeHTTP(w, in)
+		return ""
 	}
 	h.Set("Content-Type", "application/x-mpegurl")
 	h.Set("Content-Length", strconv.Itoa(len(body)))
