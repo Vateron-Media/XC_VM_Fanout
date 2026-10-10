@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -59,6 +60,21 @@ type liveVectors struct {
 			Output       string                     `json:"output"`
 		} `json:"cases"`
 	} `json:"playlist"`
+	// A TS viewer's first request: the record createLive stores and the
+	// admission AgentConnections::admission asks, for each token.
+	FirstTS struct {
+		Now        int64  `json:"now"`
+		TimeOffset int64  `json:"time_offset"`
+		ServerID   int    `json:"server_id"`
+		IP         string `json:"ip"`
+		UserAgent  string `json:"user_agent"`
+		Cases      []struct {
+			Name      string          `json:"name"`
+			Token     json.RawMessage `json:"token"`
+			Record    map[string]any  `json:"record"`
+			Admission map[string]any  `json:"admission"`
+		} `json:"cases"`
+	} `json:"first_ts"`
 }
 
 func loadLive(t *testing.T) liveVectors {
@@ -371,6 +387,153 @@ func TestJudgeLiveTS(t *testing.T) {
 	}
 }
 
+// The record and the admission the gateway builds for a TS viewer's first
+// request are the panel's: its own createLive and admission wrote the file.
+func TestFirstTSRecordAndAdmissionMatchThePanel(t *testing.T) {
+	v := loadLive(t).FirstTS
+	if len(v.Cases) == 0 {
+		t.Fatal("no first_ts vectors")
+	}
+	for _, c := range v.Cases {
+		p := tsPolicy()
+		p.ServerID, p.TimeOffset, p.Live.CreateExpiration, p.Live.Admission = v.ServerID, v.TimeOffset, 5, true
+		st := goodTSEnv()
+		st.rec = nil
+		verdict, r := JudgeLive(p, tok(string(c.Token)), v.IP, v.UserAgent, v.Now, st.env())
+		if verdict.Action != Serve || verdict.Reason != "ts-new" || r == nil {
+			t.Errorf("%s: %s (%s)", c.Name, verdict.Action, verdict.Reason)
+			continue
+		}
+		raw, _ := json.Marshal(r.Record)
+		var rec map[string]any
+		_ = json.Unmarshal(raw, &rec)
+		if !reflect.DeepEqual(rec, c.Record) {
+			want, _ := json.Marshal(c.Record)
+			t.Errorf("%s: record\n%s\nwant\n%s", c.Name, raw, want)
+		}
+		var adm map[string]any
+		if r.Admission != "" && json.Unmarshal([]byte(r.Admission), &adm) != nil {
+			t.Errorf("%s: admission %q", c.Name, r.Admission)
+		}
+		if !reflect.DeepEqual(adm, c.Admission) {
+			want, _ := json.Marshal(c.Admission)
+			t.Errorf("%s: admission %s; want %s", c.Name, r.Admission, want)
+		}
+	}
+}
+
+// firstTSToken is a TS link just minted (inside create_expiration), with what MAIN seals for its record.
+func firstTSToken(edit func(map[string]any)) string {
+	return tsTokenJSON(func(m map[string]any) {
+		m["activity_start"], m["country_code"], m["external_device"] = testNow-2, "PT", ""
+		m["user_info"].(map[string]any)["con_isp_name"] = "Example ISP"
+		if edit != nil {
+			edit(m)
+		}
+	})
+}
+
+// A TS viewer's first request: its connection is created as createLive and
+// openRecord create it, and admitted by the agent as AgentConnections::admission asks.
+func TestJudgeLiveTSFirstRequest(t *testing.T) {
+	ip := "198.51.100.7"
+	proof := strings.Repeat("ab", 16)
+	type want struct {
+		action    Action
+		reason    string
+		admission string // "-": none; else the header's JSON
+		mint      string
+	}
+	first := func(p *Policy) { p.Live.CreateExpiration, p.Live.Admission, p.TimeOffset = 5, true, 0 }
+	cases := []struct {
+		name   string
+		token  string
+		policy func(*Policy)
+		want   want
+	}{
+		{"a line with a limit", firstTSToken(nil), nil, want{Serve, "ts-new", `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"` + testUA + `"}`, ""}},
+		{"MAIN's admission at mint", firstTSToken(func(m map[string]any) { m["adm"] = map[string]any{"exp": testNow + 60, "sid": 3} }), nil,
+			want{Serve, "ts-new", `{"adm":{"exp":1800000060,"sid":3},"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"` + testUA + `"}`, ""}},
+		{"an admission that is past", firstTSToken(func(m map[string]any) { m["adm"] = map[string]any{"exp": testNow - 1, "sid": 3} }), nil,
+			want{Serve, "ts-new", `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"` + testUA + `"}`, ""}},
+		{"an admission for another node", firstTSToken(func(m map[string]any) { m["adm"] = map[string]any{"exp": testNow + 60, "sid": 9} }), nil,
+			want{Serve, "ts-new", `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"` + testUA + `"}`, ""}},
+		{"an admission whose values are text (not PHP's is_int)", firstTSToken(func(m map[string]any) { m["adm"] = map[string]any{"exp": "1800000060", "sid": 3} }), nil,
+			want{Serve, "ts-new", `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"` + testUA + `"}`, ""}},
+		{"MAIN's proof of the mint", firstTSToken(func(m map[string]any) { m["prf"] = map[string]any{"iat": 1799999990, "p": proof} }), nil,
+			want{Serve, "ts-new", `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"mint":"` + testUUID + `.1799999990.` + proof + `","stream_id":12,"ua":"` + testUA + `"}`, testUUID + ".1799999990." + proof}},
+		{"a proof that is not one", firstTSToken(func(m map[string]any) { m["prf"] = map[string]any{"iat": 1799999990, "p": "zz"} }), nil,
+			want{Serve, "ts-new", `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"` + testUA + `"}`, ""}},
+		{"no limit: a plain register", firstTSToken(func(m map[string]any) { m["user_info"].(map[string]any)["max_connections"] = 0 }), nil, want{Serve, "ts-new", "-", ""}},
+		{"a node MAIN has not left active: a plain register", firstTSToken(nil), func(p *Policy) { p.Live.Admission = false }, want{Serve, "ts-new", "-", ""}},
+		{"an HMAC viewer", firstTSToken(func(m map[string]any) {
+			delete(m, "username")
+			delete(m, "password")
+			m["hmac_id"], m["identifier"] = 7, "dev-1"
+		}), nil, want{Serve, "ts-new", `{"hmac_id":7,"identifier":"dev-1","ip":"198.51.100.7","max_connections":2,"stream_id":12,"ua":"` + testUA + `"}`, ""}},
+		{"past create_expiration (PHP's TOKEN_EXPIRED)", firstTSToken(func(m map[string]any) { m["activity_start"] = testNow - 6 }), nil, want{PHP, "expired", "", ""}},
+		{"the node's clock ahead of MAIN's", firstTSToken(func(m map[string]any) { m["activity_start"] = testNow - 36 }), func(p *Policy) { p.TimeOffset = 30 }, want{PHP, "expired", "", ""}},
+		{"a token naming a reservation", firstTSToken(func(m map[string]any) { m["adm_uuid"] = testUUID }), nil, want{PHP, "token", "", ""}},
+		{"a line with no id", firstTSToken(func(m map[string]any) { m["user_info"].(map[string]any)["id"] = 0 }), nil, want{PHP, "token", "", ""}},
+		{"a panel that does not say how long a token opens a connection", firstTSToken(nil), func(p *Policy) { p.Live.CreateExpiration = 0 }, want{PHP, "new-connection", "", ""}},
+	}
+	for _, c := range cases {
+		p := tsPolicy()
+		first(p)
+		if c.policy != nil {
+			c.policy(p)
+		}
+		st := goodTSEnv()
+		st.rec = nil
+		v, r := JudgeLive(p, c.token, ip, testUA, testNow, st.env())
+		if v.Action != c.want.action || v.Reason != c.want.reason {
+			t.Errorf("%s: %s (%s); want %s (%s)", c.name, v.Action, v.Reason, c.want.action, c.want.reason)
+			continue
+		}
+		if v.Action != Serve {
+			continue
+		}
+		wantAdm := c.want.admission
+		if wantAdm == "-" {
+			wantAdm = ""
+		}
+		if r == nil || !r.New || !r.TS || r.Admission != wantAdm {
+			t.Errorf("%s: admission %q; want %q", c.name, r.Admission, wantAdm)
+			continue
+		}
+		mint, _ := jsonString(r.Record["mint"])
+		if mint != c.want.mint {
+			t.Errorf("%s: mint %q; want %q", c.name, mint, c.want.mint)
+		}
+	}
+
+	// The record, field for field what createLive stores for a TS viewer fanout serves.
+	p := tsPolicy()
+	first(p)
+	p.TimeOffset = 10
+	st := goodTSEnv()
+	st.rec = nil
+	_, r := JudgeLive(p, firstTSToken(func(m map[string]any) { m["activity_start"] = testNow - 12 }), ip, testUA, testNow, st.env())
+	if r == nil {
+		t.Fatal("not served")
+	}
+	got, _ := json.Marshal(r.Record)
+	wantRec := `{"container":"ts","date_start":1799999988,"external_device":"","geoip_country_code":"PT","hls_end":0,"hls_last_read":1799999990,"identity":41,"isp":"Example ISP","on_demand":0,"pid":0,"proxy_id":null,"server_id":3,"stream_id":12,"user_agent":"` + testUA + `","user_id":41,"user_ip":"198.51.100.7","uuid":"` + testUUID + `"}`
+	if string(got) != wantRec {
+		t.Fatalf("record\n%s\nwant\n%s", got, wantRec)
+	}
+
+	// An HMAC viewer's: its identity is the token's two values joined.
+	_, r = JudgeLive(p, firstTSToken(func(m map[string]any) {
+		delete(m, "username")
+		delete(m, "password")
+		m["hmac_id"], m["identifier"], m["activity_start"] = 7, "dev-1", testNow-12
+	}), ip, testUA, testNow, st.env())
+	if r == nil || string(r.Record["hmac_id"]) != "7" || string(r.Record["hmac_identifier"]) != `"dev-1"` || string(r.Record["identity"]) != `"7_dev-1"` || r.Record["user_id"] != nil {
+		t.Fatalf("an HMAC viewer's record: %v", r)
+	}
+}
+
 // ── A refresh served ────────────────────────────────────────────────────
 
 func TestServeLiveAnswersAsLivePHPDoes(t *testing.T) {
@@ -506,12 +669,102 @@ func TestServeTSReconnectAnswersAsLivePHPDoes(t *testing.T) {
 		t.Fatalf("stats: %v", s.Stats())
 	}
 
-	// The first request of a session stays PHP's: no record yet.
+	// The first request of a session stays PHP's while the panel does not say
+	// how long a token opens a connection: no record yet.
 	delete(a.records, testUUID)
 	rec = httptest.NewRecorder()
 	s.ServeHTTP(rec, req)
 	if rec.Header().Get("X-Accel-Redirect") != "@gw_live_php" {
 		t.Fatalf("first request: %d %v", rec.Code, rec.Header())
+	}
+}
+
+// A TS viewer's first request: the connection created in the agent as
+// createLive creates it (admitted by the agent for a line with a limit), the
+// limit spooled, then the stream from fanout. A viewer the agent refuses, or
+// one it does not answer for, is PHP's, with nothing stored.
+func TestServeTSFirstRequestAnswersAsLivePHPDoes(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"cons", "streams", "signals", "spool"} {
+		_ = os.MkdirAll(filepath.Join(dir, d), 0o755)
+	}
+	flows := filepath.Join(dir, "flows.json")
+	_ = os.WriteFile(flows, []byte("{}"), 0o644)
+	a := &fakeAgent{records: map[string]map[string]any{}}
+	sock := startAgent(t, a)
+	path := writeServePolicy(t, dir, "segments+playlist", func(doc map[string]any) {
+		doc["conn_store"] = "agent"
+		doc["live"] = map[string]any{"use_buffer": true, "ts": true, "client_prebuffer": 4, "restreamer_prebuffer": 8, "seg_time": 10, "create_expiration": 5, "admission": true}
+		paths := doc["paths"].(map[string]any)
+		paths["agent_sock"], paths["streams"], paths["signals"], paths["spool"], paths["flows"] = sock, dir+"/streams/", dir+"/signals/", dir+"/spool", flows
+		paths["cons"] = dir + "/cons"
+	})
+	startProducer(t, filepath.Join(dir, "streams"))
+	asked := 0
+	fanout := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked++
+		_, _ = w.Write([]byte("TS"))
+	})
+	s := NewServer(path, fanout, &fakeFiles{playlists: map[string]string{"12": goodTSEnv().playlist}})
+	ask := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/stream/live?token=x", nil)
+		// Minted now: the server judges on the real clock.
+		req.Header.Set("X-XC-Original-URI", "/auth/"+firstTSToken(func(m map[string]any) { m["activity_start"] = time.Now().Unix() }))
+		req.Header.Set("X-XC-Client-IP", "198.51.100.7")
+		req.Header.Set("User-Agent", testUA)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Refused by the agent: PHP's to answer, nothing stored, nothing spooled, fanout not asked.
+	a.refuse = "LIMIT"
+	if rec := ask(); rec.Header().Get("X-Accel-Redirect") != "@gw_live_php" || len(a.records) != 0 || asked != 0 || s.Stats()["live php refused"] != 1 {
+		t.Fatalf("a refused viewer: %d %v records %v stats %v", rec.Code, rec.Header(), a.records, s.Stats())
+	}
+	if spooled, _ := filepath.Glob(filepath.Join(dir, "spool", "p0", "*.ndjson")); len(spooled) != 0 {
+		t.Fatalf("a refused viewer spools nothing: %v", spooled)
+	}
+
+	// Admitted: stored with the admission asked of the agent, spooled, served.
+	a.refuse = ""
+	rec := ask()
+	if rec.Code != 200 || rec.Body.String() != "TS" || rec.Header().Get("Content-Type") != "video/mp2t" || asked != 1 {
+		t.Fatalf("first request: %d %v %q; stats %v", rec.Code, rec.Header(), rec.Body.String(), s.Stats())
+	}
+	got := a.records[testUUID]
+	if got == nil || got["container"] != "ts" || got["pid"] != float64(0) || got["user_id"] != float64(41) || got["identity"] != float64(41) || got["server_id"] != float64(3) || got["user_ip"] != "198.51.100.7" || got["geoip_country_code"] != "PT" || got["isp"] != "Example ISP" {
+		t.Fatalf("the record created in the agent: %v", got)
+	}
+	var adm map[string]any
+	if len(a.admissions) != 2 || json.Unmarshal([]byte(a.admissions[1]), &adm) != nil || adm["line_id"] != float64(41) || adm["max_connections"] != float64(2) || adm["stream_id"] != float64(12) {
+		t.Fatalf("the admission asked of the agent: %v", a.admissions)
+	}
+	spooled, _ := filepath.Glob(filepath.Join(dir, "spool", "p0", "*.ndjson"))
+	if len(spooled) != 1 || !strings.Contains(string(mustRead(t, spooled[0])), `"uuid":"`+testUUID+`"`) {
+		t.Fatalf("conn.limit spooled for MAIN: %v", spooled)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "cons", testUUID)); !os.IsNotExist(err) {
+		t.Fatalf("a TS viewer has no marker: %v", err)
+	}
+	if s.Stats()["live serve ts-new"] != 1 {
+		t.Fatalf("stats: %v", s.Stats())
+	}
+
+	// The same link again: the viewer is known now, a reconnect.
+	if rec := ask(); rec.Code != 200 || s.Stats()["live serve ts"] != 1 || len(a.admissions) != 2 {
+		t.Fatalf("the reconnect: %d stats %v admissions %d", rec.Code, s.Stats(), len(a.admissions))
+	}
+
+	// Shadow only judges: a new viewer the agent would have to admit is not compared.
+	delete(a.records, testUUID)
+	req := httptest.NewRequest(http.MethodPost, "/shadow", nil)
+	req.Header.Set("X-XC-Original-URI", "/auth/"+firstTSToken(func(m map[string]any) { m["activity_start"] = time.Now().Unix() }))
+	req.Header.Set("X-XC-Client-IP", "198.51.100.7")
+	req.Header.Set("User-Agent", testUA)
+	s.ServeHTTP(httptest.NewRecorder(), req)
+	if s.Stats()["live php admission"] != 1 || len(a.records) != 0 || len(a.admissions) != 2 {
+		t.Fatalf("shadow: stats %v records %v admissions %d", s.Stats(), a.records, len(a.admissions))
 	}
 }
 
