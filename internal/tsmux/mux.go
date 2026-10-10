@@ -236,7 +236,12 @@ func pmtSection(hasVideo bool) []byte {
 // that fails it, so a zero CRC there is no programme at all. The daemon's own
 // parsers read section_length and never check the CRC, so this costs them
 // nothing; it is purely for the players downstream.
-func section(tableID byte, body []byte) []byte {
+func section(tableID byte, body []byte) []byte { return Section(tableID, body) }
+
+// Section is section for a caller that writes a table of its own (the joined
+// PMT of internal/tsmerge): body is everything between section_length and the
+// CRC.
+func Section(tableID byte, body []byte) []byte {
 	const crcLen = 4
 	secLen := len(body) + crcLen
 	out := make([]byte, 0, 3+secLen)

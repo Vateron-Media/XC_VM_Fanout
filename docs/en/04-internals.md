@@ -85,7 +85,8 @@ stream**; natively it is a goroutine and a pipe. It also removes the process spa
 | HLS with **packed AAC** segments (`.aac`) | **native** — framed as MPEG-TS in process |
 | HLS with **fMP4/CMAF** segments | **native** — read against the `EXT-X-MAP` init segment and remuxed |
 | HLS with **AC-3 / E-AC-3 / MP3** segments | ffmpeg |
-| HLS whose audio is a **separate rendition** (`EXT-X-MEDIA`) | ffmpeg |
+| HLS whose audio is a **separate rendition** (`EXT-X-MEDIA`), MPEG-TS on both sides | **native** — the variant and every rendition of its audio group are pulled side by side and joined into one programme ([`internal/tsmerge`](../../internal/tsmerge)) |
+| HLS whose audio is a separate rendition in **fMP4 or packed AAC** | ffmpeg |
 | HLS encrypted with **SAMPLE-AES** | ffmpeg |
 | RTMP / SRT / RTSP | ffmpeg |
 | anything it cannot positively identify | ffmpeg |

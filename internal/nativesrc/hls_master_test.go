@@ -5,6 +5,7 @@
 package nativesrc
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -13,6 +14,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsfixture"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tspes"
 )
 
 // masterServer serves a master playlist, one media playlist per variant, and
@@ -22,6 +26,8 @@ type masterServer struct {
 	mu   sync.Mutex
 	got  []string
 	body map[string]string
+	// segs holds the segments that are not the stock one, by name.
+	segs map[string][]byte
 }
 
 func newMasterServer(t *testing.T, body map[string]string) *masterServer {
@@ -34,6 +40,10 @@ func newMasterServer(t *testing.T, body map[string]string) *masterServer {
 		m.mu.Unlock()
 		if strings.HasSuffix(name, ".ts") {
 			w.Header().Set("Content-Type", "video/mp2t")
+			if seg, ok := m.segs[name]; ok {
+				_, _ = w.Write(seg)
+				return
+			}
 			_, _ = w.Write(tsSegment(0))
 			return
 		}
@@ -55,32 +65,102 @@ func (m *masterServer) paths() []string {
 	return append([]string(nil), m.got...)
 }
 
-// TestMasterWithSeparateAudioRenditionIsRefused: an EXT-X-MEDIA rendition that
-// carries its own URI lives OUTSIDE the variant (RFC 8216), so the variant's TS
-// segments hold video only. The parser skipped EXT-X-MEDIA as a tag it did not
-// model and pickVariant looked only at EXT-X-STREAM-INF, so such a master was
-// accepted and the channel went out silent — no audio, no error, and no
-// fallback to ffmpeg, which would have muxed the rendition in. That breaks the
-// package's refuse-loudly-rather-than-half-serve contract.
-func TestMasterWithSeparateAudioRenditionIsRefused(t *testing.T) {
+// splitMaster is a master whose only variant has its audio in a separate
+// rendition, which carries its own URI and so lives OUTSIDE the variant (RFC
+// 8216): the variant's segments hold video only.
+const splitMaster = "#EXTM3U\n" +
+	"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Portugues\",LANGUAGE=\"por\",DEFAULT=YES,URI=\"audio.m3u8\"\n" +
+	"#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"aud\"\nvideo.m3u8\n"
+
+// TestMasterWithSeparateAudioRenditionIsJoined: the variant and its audio
+// rendition are pulled side by side and come out as one programme, its table
+// declaring both and the audio on a PID of its own. Taking the variant alone
+// would fan the channel out silent, with nothing to say anything was wrong;
+// that used to be refused, and ffmpeg ran the channel.
+func TestMasterWithSeparateAudioRenditionIsJoined(t *testing.T) {
+	// Two muxers that know nothing of each other: the same PIDs on both sides.
+	video := tsfixture.Concat(tsfixture.PAT(0x100), tsfixture.PMT(0x100, 0x101))
+	audio := tsfixture.Concat(tsfixture.PAT(0x100), tsfixture.PMTType(0x100, 0x101, 0x0f))
+	for i := int64(0); i < 5; i++ {
+		video = append(video, tsfixture.KeyframePCR(0x101, i*3600, i*3600)...)
+		video = append(video, tsfixture.Fill(0x101)...)
+		audio = append(audio, tsfixture.PESStart(0x101, i*1920, 0xff)...)
+	}
 	srv := newMasterServer(t, map[string]string{
-		"master.m3u8": "#EXTM3U\n" +
-			"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",DEFAULT=YES,URI=\"audio.m3u8\"\n" +
-			"#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"aud\"\nvideo.m3u8\n",
-		"video.m3u8": "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nv1.ts\n",
-		"audio.m3u8": "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\na1.ts\n",
+		"master.m3u8": splitMaster,
+		"video.m3u8":  "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nv1.ts\n#EXT-X-ENDLIST\n",
+		"audio.m3u8":  "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\na1.ts\n#EXT-X-ENDLIST\n",
 	})
+	srv.segs = map[string][]byte{"v1.ts": video, "a1.ts": audio}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	rc, err := Open(ctx, srv.URL+"/master.m3u8", Options{})
-	if err == nil {
-		_ = rc.Close()
-		t.Fatalf("a master whose audio is a separate rendition was accepted; it would be "+
-			"fanned out video-only. Fetched: %v", srv.paths())
+	if err != nil {
+		t.Fatalf("a master whose audio is a separate MPEG-TS rendition was refused: %v", err)
 	}
-	if !IsFormat(err) {
-		t.Fatalf("err = %v, want a format refusal so the caller falls back to ffmpeg", err)
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	var asm tspes.SectionAssembler
+	var streams []tspes.ES
+	frames := map[uint16]int{}
+	for b := got; len(b) >= tsPacketSize; b = b[tsPacketSize:] {
+		p := b[:tsPacketSize]
+		switch pid := tspes.PID(p); {
+		case pid == 0x100:
+			if sec := asm.Feed(p); sec != nil {
+				streams, _ = tspes.PMTStreamsSection(sec)
+				if !bytes.Contains(sec, []byte{0x0a, 0x04, 'p', 'o', 'r', 0x00}) {
+					t.Errorf("the audio entry does not name the rendition's language: % x", sec)
+				}
+			}
+		case pid != 0 && tspes.PUSI(p):
+			frames[pid]++
+		}
+	}
+	var videoPID, audioPID uint16
+	for _, es := range streams {
+		switch es.Type {
+		case 0x1b:
+			videoPID = es.PID
+		case 0x0f:
+			audioPID = es.PID
+		}
+	}
+	if videoPID != 0x101 || audioPID == 0 || audioPID == videoPID {
+		t.Fatalf("PMT streams = %+v: want the video on 0x101 and the audio on a PID of its own", streams)
+	}
+	if frames[videoPID] != 5 || frames[audioPID] != 5 {
+		t.Fatalf("frames by PID = %v: want 5 of video on %#x and 5 of audio on %#x", frames, videoPID, audioPID)
+	}
+}
+
+// TestSeparateAudioThatCannotBeJoinedIsRefused: only MPEG-TS renditions are
+// joined. Anything else keeps the refusal that sends the channel to ffmpeg,
+// which is a format refusal so the caller does not retry it natively.
+func TestSeparateAudioThatCannotBeJoinedIsRefused(t *testing.T) {
+	const video = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nv1.ts\n"
+	for name, audio := range map[string]string{
+		"fMP4 audio":   "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\na1.m4s\n",
+		"packed audio": "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\na1.aac\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := newMasterServer(t, map[string]string{"master.m3u8": splitMaster, "video.m3u8": video, "audio.m3u8": audio})
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			rc, err := Open(ctx, srv.URL+"/master.m3u8", Options{})
+			if err == nil {
+				_ = rc.Close()
+				t.Fatalf("accepted; fetched %v", srv.paths())
+			}
+			if !IsFormat(err) {
+				t.Fatalf("err = %v, want a format refusal so the caller falls back to ffmpeg", err)
+			}
+		})
 	}
 }
 

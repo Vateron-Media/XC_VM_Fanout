@@ -25,6 +25,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/fmp4"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/hlscrypt"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsmerge"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsmux"
 )
 
@@ -157,10 +158,16 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		}
 		// A variant whose audio is a separate EXT-X-MEDIA rendition has
 		// video-only segments, and this package passes segment bytes through
-		// unread — so taking it would fan out a silent channel with nothing to
-		// say anything was wrong. Refuse: ffmpeg maps the rendition back in.
+		// unread — so taking it alone would fan out a silent channel with
+		// nothing to say anything was wrong. The variant and its renditions are
+		// pulled side by side and joined into one stream; what cannot be joined
+		// is refused, and ffmpeg maps the rendition back in.
 		if pl.audioIsElsewhere(variant.Audio) {
-			return refuse(fmt.Errorf("%w: hls audio is a separate rendition (EXT-X-MEDIA group %q)", ErrFormat, variant.Audio))
+			rc, err := openSplit(ctx, opt, client, variant, pl.Renditions[variant.Audio])
+			if err != nil {
+				return refuse(err)
+			}
+			return rc, nil
 		}
 		body, finalURL, err := hlsFetch(ctx, variant.URI, opt, client)
 		if err != nil {
@@ -219,6 +226,99 @@ func startHLSPull(ctx context.Context, base *url.URL, opt Options, client *http.
 		pw:     pw,
 	}).run(pl)
 	return &hlsReader{PipeReader: pr, idle: hlsIdleBound(pl), cancel: cancel}, nil
+}
+
+// openSplit pulls a variant whose audio is in separate renditions and joins
+// them (internal/tsmerge): the variant's video-only segments and every
+// rendition of its audio group, each read as a live playlist of its own.
+//
+// Only MPEG-TS renditions are joined. An fMP4 or packed-audio rendition is
+// turned into a transport stream by this package's own muxer, on a clock that
+// starts where that pull did, and two pulls that start a segment apart would
+// then be joined out of step: those stay refused, for ffmpeg.
+// ponytail: TS renditions only; joining fMP4 ones needs the muxer to keep the
+// media's own decode times across pulls.
+func openSplit(ctx context.Context, opt Options, client *http.Client, variant *hlsVariant, renditions []hlsRendition) (io.ReadCloser, error) {
+	if len(renditions) == 0 {
+		return nil, fmt.Errorf("%w: hls audio is a separate rendition (EXT-X-MEDIA group %q) with no playlist", ErrFormat, variant.Audio)
+	}
+	if len(renditions) > tsmerge.MaxAudio {
+		return nil, fmt.Errorf("%w: hls audio group %q has %d renditions", ErrFormat, variant.Audio, len(renditions))
+	}
+	var opened []io.ReadCloser
+	fail := func(err error) (io.ReadCloser, error) {
+		for _, rc := range opened {
+			rc.Close()
+		}
+		return nil, err
+	}
+	// The variant on the client that read the master; a rendition on its own,
+	// as every pull owns its client and closes it.
+	video, err := openRendition(ctx, variant.URI, opt, client, "video")
+	if err != nil {
+		return nil, err
+	}
+	opened = append(opened, video)
+	audio := make([]io.ReadCloser, 0, len(renditions))
+	languages := make([]string, 0, len(renditions))
+	for _, r := range renditions {
+		rc, err := openRendition(ctx, r.URI, opt, newPullClient(opt), "audio")
+		if err != nil {
+			return fail(err)
+		}
+		opened = append(opened, rc)
+		audio = append(audio, rc)
+		languages = append(languages, iso639(r.Language))
+	}
+	m, err := tsmerge.New(video, audio, languages)
+	if err != nil {
+		return fail(fmt.Errorf("%w: %v", ErrFormat, err))
+	}
+	dlog.Logf("hls", "joining %s with %d separate audio rendition(s) of group %q", redactURL(variant.URI), len(audio), variant.Audio)
+	return m, nil
+}
+
+// openRendition starts the pull of one media playlist of a split programme.
+// The client is the pull's from here on: closed on a refusal, as startHLSPull
+// does for its own.
+func openRendition(ctx context.Context, u *url.URL, opt Options, client *http.Client, what string) (io.ReadCloser, error) {
+	refuse := func(err error) (io.ReadCloser, error) {
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	body, finalURL, err := hlsFetch(ctx, u, opt, client)
+	if err != nil {
+		return refuse(err)
+	}
+	pl, perr := parseHLSPlaylist(body, finalURL)
+	if perr != nil {
+		return refuse(fmt.Errorf("%w: parse %s rendition: %v", ErrUnsupportedSource, what, perr))
+	}
+	switch {
+	case pl.IsMaster:
+		return refuse(fmt.Errorf("%w: %s rendition is a master playlist", ErrUnsupportedSource, what))
+	case pl.HasFMP4:
+		return refuse(fmt.Errorf("%w: hls audio is a separate rendition and the %s one is fMP4", ErrFormat, what))
+	case pl.packedAudio():
+		return refuse(fmt.Errorf("%w: hls audio is a separate rendition of packed audio", ErrFormat))
+	}
+	return startHLSPull(ctx, finalURL, opt, client, body)
+}
+
+// iso639 is an HLS LANGUAGE tag as the three letters a PMT's language
+// descriptor holds, or "" when it is not written that way already: mapping the
+// two-letter codes would need the registry, and a track with no name plays.
+func iso639(tag string) string {
+	tag = strings.ToLower(strings.TrimSpace(tag))
+	if len(tag) != 3 {
+		return ""
+	}
+	for _, c := range tag {
+		if c < 'a' || c > 'z' {
+			return ""
+		}
+	}
+	return tag
 }
 
 // describePlaylist names, for the debug log, how this playlist's segments will
@@ -1138,6 +1238,16 @@ type hlsPlaylist struct {
 	// hold both shapes (a muxed default language plus separate alternates), and
 	// then the variant does carry sound: see audioIsElsewhere.
 	MuxedAudio map[string]bool
+	// Renditions holds, by GROUP-ID, the AUDIO renditions that have a URI, the
+	// default one first and the rest in the playlist's order: what a variant
+	// whose audio is elsewhere is joined with (openSplit).
+	Renditions map[string][]hlsRendition
+}
+
+// hlsRendition is one #EXT-X-MEDIA TYPE=AUDIO rendition with a playlist of its own.
+type hlsRendition struct {
+	URI      *url.URL
+	Language string // LANGUAGE as written (RFC 5646), "" when absent
 }
 
 // audioIsElsewhere reports whether a variant's audio group leaves the variant's
@@ -1374,6 +1484,17 @@ func parseHLSPlaylist(body []byte, base *url.URL) (*hlsPlaylist, error) {
 				pl.DemuxedAudio = map[string]bool{}
 			}
 			pl.DemuxedAudio[g] = true
+			if ru, rerr := resolveURI(base, attrValue(attrs, "URI")); rerr == nil {
+				if pl.Renditions == nil {
+					pl.Renditions = map[string][]hlsRendition{}
+				}
+				r := hlsRendition{URI: ru, Language: attrValue(attrs, "LANGUAGE")}
+				if strings.EqualFold(attrValue(attrs, "DEFAULT"), "YES") {
+					pl.Renditions[g] = append([]hlsRendition{r}, pl.Renditions[g]...)
+				} else {
+					pl.Renditions[g] = append(pl.Renditions[g], r)
+				}
+			}
 		case strings.HasPrefix(line, "#EXTINF:"):
 			rest := strings.TrimPrefix(line, "#EXTINF:")
 			if comma := strings.IndexByte(rest, ','); comma >= 0 {
