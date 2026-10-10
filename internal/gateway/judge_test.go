@@ -405,3 +405,31 @@ func TestBootstrapRefusesAsPHPDoes(t *testing.T) {
 		}
 	}
 }
+
+// The panel's NetworkUtils::ipMatches, case for case (its NetworkUtilsTest).
+func TestIPMatchIsThePanels(t *testing.T) {
+	cases := []struct {
+		a, b   string
+		subnet bool
+		want   bool
+	}{
+		{"1.2.3.4", "1.2.3.4", false, true},
+		{"1.2.3.4", "1.2.3.5", false, false},
+		{"1.2.3.4", "1.2.3.99", true, true},
+		{"1.2.3.4", "1.2.9.4", true, false},
+		{"2001:db8:1:2::1", "2a02:1234:5:6::9", true, false},
+		{"2001:db8:1:2::1", "2001:db8:1:3::1", true, false},
+		{"2001:db8:1:2::1", "2001:db8:1:2:aaaa:bbbb:cccc:dddd", true, true},
+		{"::ffff:1.2.3.4", "1.2.3.99", true, true},
+		{"::ffff:1.2.3.4", "::ffff:9.9.9.9", true, false},
+		{"1.2.3.4", "2001:db8:1:2::1", true, false},
+		{"", "2001:db8::1", true, false},
+		{"abc", "xyz", true, false},
+		{"unknown", "unknown", true, true},
+	}
+	for _, c := range cases {
+		if got := ipMatch(c.a, c.b, c.subnet); got != c.want {
+			t.Errorf("ipMatch(%q, %q, %v) = %v; want %v", c.a, c.b, c.subnet, got, c.want)
+		}
+	}
+}

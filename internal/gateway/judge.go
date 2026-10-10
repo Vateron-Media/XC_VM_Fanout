@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"math/big"
 	"net"
+	"net/netip"
 	"regexp"
 	"slices"
 	"strconv"
@@ -275,19 +276,35 @@ func daemonSeq(name string, stream int) (int64, bool) {
 	return seq, err == nil
 }
 
-// ipMatch is segment.php's address check: the whole address, or with
-// ip_subnet_match every dot-separated part but the last (which for an
-// address without dots, IPv6, compares nothing, as PHP's does).
+// ipMatch is the panel's address check (NetworkUtils::ipMatches): the whole
+// address, or with ip_subnet_match the same subnet, the /24 of an IPv4
+// address and the /64 of an IPv6 one (an IPv4-mapped address is its IPv4).
+// One of each, or what is not an address, matches only when equal. It used to
+// drop what followed the last dot, as PHP did: an IPv6 address has none, so
+// any two of them matched.
 func ipMatch(tokenIP, clientIP string, subnet bool) bool {
-	if !subnet {
-		return tokenIP == clientIP
+	if tokenIP == clientIP {
+		return true
 	}
-	return dropLast(tokenIP) == dropLast(clientIP)
+	if !subnet {
+		return false
+	}
+	a, okA := subnetOf(tokenIP)
+	b, okB := subnetOf(clientIP)
+	return okA && okB && a == b
 }
 
-func dropLast(ip string) string {
-	if i := strings.LastIndexByte(ip, '.'); i >= 0 {
-		return ip[:i]
+// subnetOf is an address's /24 (IPv4) or /64 (IPv6); false for what is not an address.
+func subnetOf(ip string) (netip.Prefix, bool) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || addr.Zone() != "" {
+		return netip.Prefix{}, false
 	}
-	return ""
+	addr = addr.Unmap()
+	bits := 64
+	if addr.Is4() {
+		bits = 24
+	}
+	prefix, err := addr.Prefix(bits)
+	return prefix, err == nil
 }
