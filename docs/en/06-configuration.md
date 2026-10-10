@@ -13,7 +13,7 @@ JSON file the panel edits and the daemon polls; the flags that carried those kno
 (see [Migration from 0.10.0](#migration-from-0100) below).
 
 The dynamic part (which streams to serve) still arrives at runtime via the
-[control API](03-endpoints.md#control-surface--php-only).
+[control API](03-endpoints.md#control-surface-php-only).
 
 ## Command-line flags
 
@@ -24,6 +24,9 @@ are fixed for the lifetime of the process.
 |------|---------|---------|
 | `-sock` | `/home/xc_vm/bin/xc_fanout/sockets/http.sock` | Client unix socket (this is where nginx/viewers connect). |
 | `-ctl` | `""` (off) | Control unix socket (PHP only). Empty = no control API. |
+| `-gw` | `""` (off) | Segment gateway unix socket (nginx only), e.g. `/home/xc_vm/bin/xc_fanout/sockets/gw.sock`. Empty = no gateway; a socket that cannot be bound is logged, not fatal (PHP keeps answering). See [10. Segment gateway](10-segment-gateway.md). |
+| `-gw-policy` | `/home/xc_vm/tmp/gateway/policy.json` | The panel's gateway policy, written every minute by its `cron:cache`. Missing or stale: every request goes to PHP. |
+| `-gw-state` | `/home/xc_vm/bin/xc_fanout/gateway_shadow.json` | Where the shadow comparison with PHP is kept across restarts. Empty = in memory only. |
 | `-ingestdir` | `<dir of -sock>/ingest` | Directory for per-stream push sockets (for ingest mode). |
 | `-config` | `/home/xc_vm/bin/xc_fanout/config.json` | Path to the operator-tuning JSON (see [The config file](#the-config-file)). Self-created with defaults if absent; missing keys backfilled; polled and applied live. Empty = disable the file (the built-in defaults are used). |
 | `-config-interval` | `60` | Seconds between config-file reloads. The file is re-read only when its mtime changes. |
@@ -112,7 +115,7 @@ never push the daemon into a pathological state.
 | `source_insecure` | `true` | — | Skip upstream TLS verification when pulling HTTPS sources. `true` because the panel commonly pulls upstreams with self-signed / mismatched certs; set `false` to require valid certificates. |
 | `idle_buffer_grace_sec` | `30` | `0…3600` | No-viewer window before the ring collapses (`0` = the idle gate is off). See [The idle-buffer gate](#the-idle-buffer-gate). |
 | `idle_buffer_ratio` | `0.5` | `0.1…1` | Fraction of the buffer kept while a stream is unwatched. HLS is still cut from the reduced ring, so the channel stays openable. |
-| `viewer_idle_timeout_sec` | `30` | `0`, or `5…3600` | Drop a live-TS viewer that has received **nothing** for this long (`0` = never). This is what bounds a ghost on an off-air stream — `write_timeout_sec` can only fire while there are bytes to write. See [Guarding against stalled and idle viewers](04-internals.md#guarding-against-stalled-viewers). |
+| `viewer_idle_timeout_sec` | `30` | `0`, or `5…3600` | Drop a live-TS viewer that has received **nothing** for this long (`0` = never). This is what bounds a ghost on an off-air stream — `write_timeout_sec` can only fire while there are bytes to write. See [Guarding against stalled and idle viewers](04-internals.md#guarding-against-stalled-and-idle-viewers). |
 | `source_backend` | `auto` | `auto`, `ffmpeg`, `native` | How a **non-mp2t** source becomes MPEG-TS. The panel reads the same setting to choose what its supervised streams run. See [The source backend](#the-source-backend). Matched case-insensitively; an unknown value falls back to `auto`. |
 | `supervise` | `false` | `true`, `false` | Accept live streams the panel hands over for [encoder supervision](09-encoder-supervision.md). Written by the panel from its **Fanout Encoder Supervision** setting and applied live: turning it off stops new hand-overs (`PUT /monitor/<id>` answers `501`) but leaves streams already supervised running. |
 | `mem_limit_mb` | `0` (auto) | `0…1 TiB` | Explicit ceiling (MiB) for the Go soft memory limit. `0` derives it from the cgroup limit, else a share of the box's RAM. See [The memory budget](#the-memory-budget). |
@@ -188,7 +191,7 @@ imposes nothing on its own.
 - **`write_timeout_sec`** — the threshold for dropping a "stalled" viewer. Lower = we clean up
   dead connections faster, but with a higher risk of hitting a slow-but-alive one. 15 s has
   headroom, since a healthy realtime viewer accumulates ≤ 1 s of lag per second. See
-  [04, "Guarding against stalled viewers"](04-internals.md#guarding-against-stalled-viewers).
+  [04, "Guarding against stalled and idle viewers"](04-internals.md#guarding-against-stalled-and-idle-viewers).
 - **`viewer_idle_timeout_sec`** — the threshold for dropping an **idle** viewer, i.e. one being
   sent nothing at all. `write_timeout_sec` covers a viewer that will not *read*; this covers a
   stream that has nothing to *write*. Must stay comfortably above a source blip (reconnect backoff
@@ -279,7 +282,8 @@ reload.
    keys. An empty `-config` skips the file and uses the built-in defaults.
 3. Create the `Manager` with the resolved tuning; start the config poller (every `-config-interval`).
 4. Create the ingest-socket directory, start the reaper.
-5. Bring up the client HTTP server on `-sock`; if `-ctl` is set — the control one too.
+5. Bring up the client HTTP server on `-sock`; if `-ctl` is set — the control one too; if `-gw` is
+   set — the segment gateway.
 6. If `-id` is set — a one-off feed of the test stream.
 7. Wait for a signal; on `SIGINT`/`SIGTERM` — graceful shutdown (2 s) and removal of the sockets.
 

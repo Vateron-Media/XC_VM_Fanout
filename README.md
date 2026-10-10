@@ -34,6 +34,7 @@ of network and memory, not of worker count.
 
 - **Pull once, fan out to many** — a viewer is a connection, not a pinned worker, and it reads the one shared ring rather than a per-viewer copy.
 - **HLS in memory** — `.m3u8` + segments produced on the fly, including **AES-128** encryption, with no on-disk segment store.
+- **PHP out of the request path too** — an optional segment gateway answers HLS segments, keys, a known viewer's playlist refresh and a known MPEG-TS viewer's reconnect in Go, with the panel's tokens and checks, and hands PHP whatever it is not sure of.
 - **Pull, push or launch** — the daemon pulls the source itself, or takes a stream a producer pushes into an ingest socket, or feeds one stream straight from flags for testing.
 - **No transcoding for the common case** — an in-process native remuxer serves plain MPEG-TS / HLS sources with **no per-stream `ffmpeg` child**; unsupported sources degrade cleanly to `ffmpeg`.
 - **On-demand lifecycle** — the puller starts on the first viewer and stops after the last one leaves; an idle reaper reclaims resources.
@@ -57,12 +58,13 @@ flowchart LR
     PHP[XC_VM PHP panel] -->|control unix socket<br/>register / status| D
 ```
 
-The daemon exposes **two HTTP surfaces on separate unix sockets**:
+The daemon exposes **two HTTP surfaces on separate unix sockets**, and a third when the segment gateway is on:
 
 | Surface     | Socket  | Audience               | Purpose                                                                                                       |
 | ----------- | ------- | ---------------------- | ------------------------------------------------------------------------------------------------------------- |
 | **Client**  | `-sock` | nginx-facing (viewers) | `GET /live/<id>`, `GET /hls/<id>/index.m3u8`, `GET /hls/<id>/<seq>.ts`, `GET /healthz`                        |
 | **Control** | `-ctl`  | PHP panel only         | Sources (`/streams/<id>` pull, `/ingest/<id>` push), status and off-air warm-up (`/probe/<id>`), viewer reconciliation and telemetry (`/connections`, `/rates`, `/memory`), the admin overlay (`/signal/<uuid>`) and encoder supervision (`/monitor/<id>`, `/monitors`) |
+| **Gateway** | `-gw`   | nginx only (optional)  | The viewer's own `/hls/<token>`, `/key/<token>` and `/auth/<token>` requests, answered as the panel's PHP would or handed back to it; `/stats` (see [docs: segment gateway](docs/en/10-segment-gateway.md)) |
 
 ## Installation
 

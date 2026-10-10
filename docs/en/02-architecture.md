@@ -41,6 +41,10 @@ with `0660` permissions). The split is by purpose and trust:
 The control surface is enabled only if the `-ctl` flag is set. A full reference of the
 addresses is in [03. Endpoints](03-endpoints.md).
 
+A third, optional surface, the **segment gateway** (`-gw`, nginx only), answers the viewer's own
+requests (`/hls/<token>`, `/key/<token>`, `/auth/<token>`) as the panel's PHP would, serving
+from the same in-process streams; see [10. Segment gateway](10-segment-gateway.md).
+
 Why unix sockets rather than TCP ports: they are local to the machine, have file
 permissions (`0660`), are not visible from outside, and exchange with nginx/PHP on the same
 machine is faster.
@@ -56,6 +60,7 @@ machine is faster.
 | `puller` | [puller.go](../../internal/puller/puller.go) | Source acquisition (direct mp2t, native conversion or ffmpeg remux), reconnect with backoff. |
 | `nativesrc` | [nativesrc](../../internal/nativesrc) | In-process conversion of a non-mp2t source (HLS/udp/rtp) to MPEG-TS, so the common case needs no ffmpeg child. Refuses anything it cannot take, and the puller falls back to ffmpeg. |
 | `ingest` | [ingest.go](../../internal/ingest/ingest.go) | Copying a TS stream into the publish callback in 188-byte-aligned chunks. |
+| `gateway` | [gateway](../../internal/gateway) | The segment gateway: the panel's tokens and policy, the judgement of each viewer request, serving it from the `Manager` in-process or handing it back to PHP, and the shadow comparison. |
 | `config` | [config.go](../../internal/config/config.go) | The panel↔daemon tuning bridge: a self-healing JSON file, polled and applied live. |
 | `defaults` | [defaults.go](../../internal/defaults/defaults.go) | The built-in operational tuning constants (the config-file seeds and other invariants). |
 | `cmd/xc_fanout` | [main.go](../../cmd/xc_fanout/main.go) | Entry point: flags, config load/poll, socket setup, graceful shutdown. |

@@ -21,6 +21,7 @@ project, read in order: 01 → 02 → then whatever interests you.
 | 07 | [integration.md](07-integration.md) | **Integration with the XC_VM panel.** How nginx, PHP, `fanout_sync` and binary install work with it. |
 | 08 | [build-release.md](08-build-release.md) | **Build, test, release.** How to build, run the tests, cut a version. |
 | 09 | [encoder-supervision.md](09-encoder-supervision.md) | **Encoder supervision (runbook).** Letting the daemon run and watch stream encoders instead of the panel's per-stream PHP watchdog: turning it on, rolling it back, restarts and adoption, health checks. |
+| 10 | [segment-gateway.md](10-segment-gateway.md) | **Segment gateway.** The optional third surface that answers HLS segments, keys, playlist refreshes and MPEG-TS reconnects without PHP-FPM, and hands PHP whatever it is not sure of. |
 
 ## Terms in one line
 
@@ -30,5 +31,6 @@ project, read in order: 01 → 02 → then whatever interests you.
 - **Ingest** — the reverse mode: a producer pushes data to the daemon.
 - **Client surface** — HTTP for viewers (via nginx).
 - **Control surface** — HTTP for the PHP panel only (stream registration, status).
+- **Segment gateway** — optional HTTP for nginx only: answers a viewer's segment, key, playlist-refresh and TS-reconnect requests in place of PHP.
 - **MPEG-TS** — the transport video format, made of 188-byte packets; the daemon's base byte-path format.
 - **HLS** — streaming by cutting the stream into short segments + an `.m3u8` playlist.

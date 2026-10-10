@@ -91,6 +91,12 @@ Always `200` with body `ok`. For monitoring/keepalive.
 
 ---
 
+## Gateway surface (nginx-only, optional)
+
+Enabled by the `-gw` flag. It answers the viewer's own requests (`/hls/<token>`, `/key/<token>`,
+`/auth/<token>`, passed by nginx as `/stream/segment`, `/stream/key`, `/stream/live`) and serves
+`/stats` and the shadow comparison. Its reference is in [10. Segment gateway](10-segment-gateway.md#endpoints--gw-socket-nginx-only).
+
 ## Control surface (PHP-only)
 
 Enabled by the `-ctl` flag. Routing is handled by [`ControlHandler`](../../internal/server/server.go).

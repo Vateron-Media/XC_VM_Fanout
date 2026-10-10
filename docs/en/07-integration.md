@@ -30,7 +30,7 @@ nginx proxies viewer requests to the **client socket** (`-sock`). The key trick 
 `X-Accel-Redirect`: `live.php` authorizes the viewer and **hands nginx an internal URL** of the form
 
 ```
-/xc_fanout/<id>?c=<uuid>&prebuffer=<sec>
+/xc_fanout/<id>?c=<uuid>&prebuffer=<sec>&vc=<codec>
 ```
 
 It is precisely `/xc_fanout/<id>` that PHP emits; in an internal `location` nginx rewrites this
@@ -48,7 +48,9 @@ the **playlist `index.m3u8` is built by PHP**: `live.php` fetches it from the da
 socket itself (`FanoutClient::hlsPlaylist`), rewrites the relative `<seq>.ts` into tokenized
 authorized URLs (`HLSGenerator::tokenizeDaemonPlaylist`, adding `#EXT-X-KEY` when encryption is
 in play) and **serves** the result itself. The playlist is polled and small, so PHP is involved
-on every poll here — only the segments leave the byte path.
+on every poll here — only the segments leave the byte path — unless the
+[segment gateway](#the-segment-gateway--php-out-of-the-routine-requests) is on, which then
+answers the segments, the keys and a known viewer's later polls itself.
 
 ## The PHP panel — manages, but doesn't carry video
 
@@ -79,7 +81,7 @@ connection-uuid via `?c=<uuid>`. The `fanout_sync` daemon periodically reads
 `GET /connections` (the list of uuids of all active live-TS viewers across all streams) and
 **closes rows** whose uuid is no longer in that list. The daemon, for its part, reliably detects
 disconnects — including by dropping "stuck" viewers on `write_timeout_sec`
-(see [04](04-internals.md#guarding-against-stalled-viewers)).
+(see [04](04-internals.md#guarding-against-stalled-and-idle-viewers)).
 
 > **Closing is not instantaneous.** Between a viewer's actual departure and the closing of the
 > row, the following accumulates: up to `write_timeout_sec` (15 s) — until the daemon drops the
@@ -94,6 +96,17 @@ disconnects — including by dropping "stuck" viewers on `write_timeout_sec`
 > `write_timeout_sec`: with nothing being written, the write deadline never arms. Before 0.11.4
 > there was no bound at all in that case and the ghost was permanent — see
 > [04, "Guarding against stalled and idle viewers"](04-internals.md#guarding-against-stalled-and-idle-viewers).
+
+## The segment gateway — PHP out of the routine requests
+
+With the panel's `gateway_mode` on, nginx sends the viewer's `/hls/<token>`, `/key/<token>` and
+`/auth/<token>` requests to the daemon's **gateway socket** (`-gw`) first, through the include
+`bin/nginx/conf/gateway.conf` the panel renders. The gateway answers what it fully owns (segments,
+keys, a known viewer's playlist refresh, a known TS viewer's reconnect) from the daemon's memory,
+and hands the rest back with `X-Accel-Redirect: @gw_<kind>_php`, so PHP answers it as before. It
+reads the panel's `tmp/gateway/policy.json` (keys, rules, paths) and the node's cluster agent
+(viewer records, the spool to MAIN). Each session's first request stays PHP's. Details:
+[10. Segment gateway](10-segment-gateway.md).
 
 ## Installing and updating the binary
 
@@ -127,3 +140,5 @@ More on version releases — [08. Build and release](08-build-release.md).
   plan.
 - ADR 0002 — phases P2–P3 (fan-out TS, in-memory HLS).
 - ADR 0003 — off-air detection and encrypted HLS.
+- ADR 0005 — the segment gateway (HLS segments, keys, playlist refreshes and TS reconnects in Go).
+- `XC_VM/docs/en/development/ts-delivery.md` — how a live MPEG-TS viewer is delivered, end to end.
