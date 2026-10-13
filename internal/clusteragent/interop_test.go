@@ -356,7 +356,13 @@ func TestInteropWithPanel(t *testing.T) {
 		if secrets["live_streaming_pass"].(map[string]any)["current"] != "InteropStreamPass" || secrets["openssl_extra"].(map[string]any)["current"] != "test-openssl-extra" {
 			t.Fatalf("secrets %v", secrets)
 		}
-		if b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "crontab.json")); !strings.Contains(string(b), `"filename":"cache"`) || !strings.Contains(string(b), `"filename":"users"`) || strings.Contains(string(b), `"epg"`) {
+		// `cache` is an all-role cron (replicated to every node); `epg` is MAIN-only
+		// (role main) and must never reach a node. `users` is NOT asserted: the panel
+		// moved it from a sub-mode-2 (legacy) cron to MAIN-only (role main) in Phase 10,
+		// so it is present on a node's crontab before that change and absent after — this
+		// check must hold against a panel with or without Phase 10 (XC_VM CI runs this
+		// master test against every panel PR), so it only pins the two invariant rows.
+		if b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "crontab.json")); !strings.Contains(string(b), `"filename":"cache"`) || strings.Contains(string(b), `"epg"`) {
 			t.Fatalf("crontab.json %s", b)
 		}
 		if b, _ := os.ReadFile(filepath.Join(a.ReplicaDir, "cluster.json")); !strings.Contains(string(b), `"policy_ver":5`) {
