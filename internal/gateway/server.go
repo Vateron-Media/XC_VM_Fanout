@@ -595,7 +595,10 @@ func (s *Server) serveTimeshift(w http.ResponseWriter, r *http.Request, p *Polic
 		h := w.Header()
 		h.Set("Content-Type", "application/x-mpegurl")
 		h.Set("Content-Length", strconv.Itoa(len(body)))
-		// nosemgrep: the playlist is minted tokens and fixed tags, no request data.
+		// Fixed HLS tags and /hls/<token> lines; each token is a sealed (AES-GCM,
+		// base64url) blob minted by mintOwn, so no request data reaches the body
+		// as text, and it is served as application/x-mpegurl, not HTML (as serveLive's).
+		// nosemgrep: go.net.xss.no-direct-write-to-responsewriter-taint.no-direct-write-to-responsewriter-taint
 		_, _ = w.Write([]byte(body))
 		return ""
 	}
