@@ -43,7 +43,7 @@ func TestFrontRoutesServeToGateway(t *testing.T) {
 		gotIP = r.Header.Get("X-XC-Client-IP")
 		_, _ = io.WriteString(w, "GATEWAY")
 	})
-	front := NewServer(gw, newNginxStub(t).url, t.TempDir())
+	front := NewServer(gw, newNginxStub(t).url, t.TempDir(), LoadTrustedProxies())
 
 	req := httptest.NewRequest(http.MethodGet, "/vauth/abc123", nil)
 	req.RemoteAddr = "203.0.113.5:40000"
@@ -64,7 +64,7 @@ func TestFrontDefersToNginx(t *testing.T) {
 		w.Header().Set("X-Accel-Redirect", "@gw_vod_php")
 	})
 	nginx := newNginxStub(t)
-	front := NewServer(gw, nginx.url, t.TempDir())
+	front := NewServer(gw, nginx.url, t.TempDir(), LoadTrustedProxies())
 
 	req := httptest.NewRequest(http.MethodGet, "/vauth/abc123", nil)
 	rec := httptest.NewRecorder()
@@ -81,7 +81,7 @@ func TestFrontDefersToNginx(t *testing.T) {
 
 func TestFrontProxiesNonServeAndStripsSpoofedIP(t *testing.T) {
 	nginx := newNginxStub(t)
-	front := NewServer(http.NotFoundHandler(), nginx.url, t.TempDir())
+	front := NewServer(http.NotFoundHandler(), nginx.url, t.TempDir(), LoadTrustedProxies())
 
 	req := httptest.NewRequest(http.MethodGet, "/player_api", nil)
 	req.RemoteAddr = "203.0.113.9:50000"
@@ -109,7 +109,7 @@ func TestFrontACMEServesTokenNotTraversal(t *testing.T) {
 	}
 	_ = os.WriteFile(filepath.Join(challenge, "tok123"), []byte("challenge-body"), 0o644)
 	_ = os.WriteFile(filepath.Join(webroot, "secret"), []byte("TOPSECRET"), 0o600)
-	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, webroot)
+	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, webroot, LoadTrustedProxies())
 
 	get := func(p string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -139,7 +139,7 @@ func TestFrontTerminatesTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	front := NewServer(http.NotFoundHandler(), nginx.url, t.TempDir())
+	front := NewServer(http.NotFoundHandler(), nginx.url, t.TempDir(), LoadTrustedProxies())
 	srv := &http.Server{Handler: front, TLSConfig: certs.TLSConfig()}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

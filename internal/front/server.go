@@ -43,22 +43,26 @@ type Server struct {
 	gateway http.Handler
 	proxy   http.Handler
 	webroot string
+	trusted *TrustedProxies
 }
 
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
 // backend, and serves the ACME challenge from webroot (certbot's -w directory).
-func NewServer(gateway http.Handler, nginx *url.URL, webroot string) *Server {
+// trusted is the set_real_ip_from list the front uses to resolve the viewer's
+// address (see TrustedProxies.RealIP).
+func NewServer(gateway http.Handler, nginx *url.URL, webroot string, trusted *TrustedProxies) *Server {
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(nginx)
-			// SetXForwarded resets X-Forwarded-For to the real client, dropping any
-			// the viewer sent; X-Real-IP is set (overwriting a spoofed one) for
-			// nginx's real-ip. Rewrite runs after hop-by-hop stripping.
-			pr.SetXForwarded()
-			pr.Out.Header.Set("X-Real-IP", clientIP(pr.In))
+			// The front is the edge and the authority on the viewer's address:
+			// resolve it and pass it as the only forwarded value, dropping any the
+			// client sent. nginx (trusting the front) reads it straight back.
+			ip := trusted.RealIP(pr.In)
+			pr.Out.Header.Set("X-Real-IP", ip)
+			pr.Out.Header.Set("X-Forwarded-For", ip)
 		},
 	}
-	return &Server{gateway: gateway, proxy: rp, webroot: webroot}
+	return &Server{gateway: gateway, proxy: rp, webroot: webroot, trusted: trusted}
 }
 
 // serveACME answers certbot's http-01 challenge from the webroot. Only a single
@@ -99,7 +103,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, kind string) {
 	gr := r.Clone(r.Context())
 	gr.Header.Set("X-XC-Original-URI", r.URL.RequestURI())
-	gr.Header.Set("X-XC-Client-IP", clientIP(r))
+	gr.Header.Set("X-XC-Client-IP", s.trusted.RealIP(r))
 	gr.Header.Set("X-XC-Host", r.Host)
 	gr.URL = &url.URL{Path: "/stream/" + kind}
 	gr.RequestURI = ""
