@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -92,6 +93,21 @@ func TestJudgeTimeshift(t *testing.T) {
 		t.Fatalf("restreamer: limit=%d rate=%d", r.LimitPerc, r.Rate)
 	}
 
+	// The m3u8 arm: a VOD-type playlist, the viewer recorded container "hls"/pid
+	// null, every existing minute carried for minting.
+	stM := tsEnv()
+	stM.rec = nil
+	v, r = JudgeTimeshift(p, tsToken(func(m map[string]any) { m["extension"] = "m3u8" }), ip, testUA, testNow, stM.env())
+	if v.Action != Serve || v.Reason != "timeshift-m3u8-new" || r == nil || r.ContentType != "application/x-mpegurl" {
+		t.Fatalf("m3u8 arm: %s (%s) %+v", v.Action, v.Reason, r)
+	}
+	if string(r.Record["container"]) != `"hls"` || string(r.Record["pid"]) != "null" {
+		t.Fatalf("m3u8 record: %v", r.Record)
+	}
+	if len(r.Parts) != 3 || r.Parts[0].Offset != 1000 || r.Parts[1].Offset != 0 || r.Duration != 3 || r.Timestamp != tsStart || r.Username != "user1" {
+		t.Fatalf("m3u8 mint data: parts=%+v dur=%d ts=%d user=%q", r.Parts, r.Duration, r.Timestamp, r.Username)
+	}
+
 	// A date-form start parsed in the node's timezone (UTC here).
 	utcStart := time.Unix(tsStart, 0).UTC().Format("2006-01-02:15-04")
 	if v, _ := JudgeTimeshift(p, tsToken(func(m map[string]any) { m["start"] = utcStart }), ip, testUA, testNow, func() *liveEnvState { s := tsEnv(); s.rec = nil; return s }().env()); v.Action != Serve {
@@ -106,7 +122,6 @@ func TestJudgeTimeshift(t *testing.T) {
 		env    func(*liveEnvState)
 		reason string
 	}{
-		{"the m3u8 playlist arm", tsToken(func(m map[string]any) { m["extension"] = "m3u8" }), nil, nil, "extension"},
 		{"behind an originator", tsToken(func(m map[string]any) { m["originator_id"] = 9 }), nil, nil, "proxy"},
 		{"send_unique_header", tsToken(nil), func(p *Policy) { p.Headers.UniqueHeader = true }, nil, "unique-header"},
 		{"the first minute is gone", tsToken(nil), nil, func(s *liveEnvState) { s.sizes = map[string]int64{} }, "missing"},
@@ -196,5 +211,59 @@ func TestServeTimeshift(t *testing.T) {
 	rec = serveReq(NewServer(off, http.NotFoundHandler(), node), "/tsauth/"+tsToken(nil), "198.51.100.7")
 	if rec.Header().Get("X-Accel-Redirect") != "@gw_timeshift_php" {
 		t.Fatalf("mode off timeshift: want @gw_timeshift_php, got %v", rec.Header())
+	}
+}
+
+// The timeshift m3u8 arm end to end: a VOD-type playlist of the archive minutes,
+// each a /hls/ catch-up token; the viewer recorded container hls / pid null.
+func TestServeTimeshiftM3U8(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"cons", "spool", "archive/12"} {
+		_ = os.MkdirAll(filepath.Join(dir, d), 0o755)
+	}
+	nowStart := time.Now().Add(-3 * time.Minute).Unix()
+	for i := int64(0); i < 3; i++ {
+		_ = os.WriteFile(filepath.Join(dir, "archive/12", gmdateMinute(nowStart+i*60)+".ts"), make([]byte, 1000), 0o644)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "archive/12", gmdateMinute(nowStart)+".ts.offset"), []byte("100"), 0o644)
+	flows := filepath.Join(dir, "flows.json")
+	_ = os.WriteFile(flows, []byte("{}"), 0o644)
+	a := &fakeAgent{records: map[string]map[string]any{}}
+	sock := startAgent(t, a)
+	path := writeServePolicy(t, dir, "segments+playlist+thumb+subtitle+vod+timeshift", func(doc map[string]any) {
+		doc["conn_store"] = "agent"
+		doc["live"] = map[string]any{"use_buffer": true, "create_expiration": 5, "admission": true}
+		paths := doc["paths"].(map[string]any)
+		paths["agent_sock"], paths["spool"], paths["flows"], paths["archive"] = sock, dir+"/spool", flows, dir+"/archive/"
+		paths["cons"] = dir + "/cons"
+	})
+	s := NewServer(path, http.NotFoundHandler(), &fakeFiles{})
+	req := httptest.NewRequest(http.MethodGet, "/stream/timeshift?token=x", nil)
+	req.Header.Set("X-XC-Original-URI", "/tsauth/"+tsToken(func(m map[string]any) {
+		m["extension"] = "m3u8"
+		m["start"] = strconv.FormatInt(nowStart, 10)
+		m["activity_start"] = time.Now().Unix()
+	}))
+	req.Header.Set("X-XC-Client-IP", "198.51.100.7")
+	req.Header.Set("User-Agent", testUA)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/x-mpegurl" {
+		t.Fatalf("m3u8: %d %v", rec.Code, rec.Header())
+	}
+	if !strings.HasPrefix(body, "#EXTM3U\n") || !strings.Contains(body, "#EXT-X-PLAYLIST-TYPE:VOD") || !strings.HasSuffix(body, "#EXT-X-ENDLIST") {
+		t.Fatalf("playlist shape: %q", body)
+	}
+	if n := strings.Count(body, "\n/hls/"); n != 3 {
+		t.Fatalf("want 3 segment tokens, got %d: %q", n, body)
+	}
+	got := a.records[testUUID]
+	if got == nil || got["container"] != "hls" || got["pid"] != nil {
+		t.Fatalf("the record created: %v", got)
+	}
+	if s.Stats()["timeshift serve timeshift-m3u8-new"] != 1 {
+		t.Fatalf("stats: %v", s.Stats())
 	}
 }

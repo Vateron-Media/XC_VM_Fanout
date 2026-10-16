@@ -563,7 +563,7 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 // worker feeds never reaches here (JudgeVOD hands those to PHP). "" when served,
 // else why PHP answers it after all.
 func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
-	if why := s.serveFileConn(w, r, p, ref, now); why != "" {
+	if why := s.serveFileConn(w, r, p, ref, now, json.RawMessage("0")); why != "" {
 		return why
 	}
 	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, []server.FilePart{{Path: ref.Path, Length: -1}}, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
@@ -572,14 +572,32 @@ func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref
 	return ""
 }
 
-// serveTimeshift answers timeshift.php's archive-file arm: the connection as
-// serveFileConn records it, then the run of archive minutes (ref.Parts: the
-// queue, the first from its .offset) handed to the daemon as one video/mp2t
-// response. The m3u8 playlist arm, a proxy, a worker-kill and a legacy node
-// never reach here (JudgeTimeshift hands those to PHP).
+// serveTimeshift answers timeshift.php's two arms. The file arm (default): the
+// connection as serveFileConn records it, then the archive minutes (ref.Parts,
+// the first from its .offset) handed to the daemon as one video/mp2t response.
+// The m3u8 arm: the same connection (container "hls", pid untouched) and a
+// VOD-type playlist of catch-up segment tokens minted here. A proxy, a
+// worker-kill and a legacy node never reach here (JudgeTimeshift → PHP).
 func (s *Server) serveTimeshift(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
-	if why := s.serveFileConn(w, r, p, ref, now); why != "" {
+	m3u8 := ref.ContentType == "application/x-mpegurl"
+	refreshPID := json.RawMessage("0")
+	if m3u8 {
+		refreshPID = nil // a playlist viewer keeps its pid (null), as timeshift.php does
+	}
+	if why := s.serveFileConn(w, r, p, ref, now, refreshPID); why != "" {
 		return why
+	}
+	if m3u8 {
+		body, err := timeshiftPlaylist(p, ref, r.Header.Get("X-XC-Client-IP"))
+		if err != nil {
+			return "mint"
+		}
+		h := w.Header()
+		h.Set("Content-Type", "application/x-mpegurl")
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+		// nosemgrep: the playlist is minted tokens and fixed tags, no request data.
+		_, _ = w.Write([]byte(body))
+		return ""
 	}
 	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, ref.Parts, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
 		return "handover"
@@ -588,12 +606,13 @@ func (s *Server) serveTimeshift(w http.ResponseWriter, r *http.Request, p *Polic
 }
 
 // serveFileConn records (or refreshes) a file viewer's connection in the agent
-// (pid 0, the daemon's) as vod.php/timeshift.php do, spools its line limit,
-// touches its marker and writes the policy's stream headers — the shared lead
-// of serveVOD and serveTimeshift, before the daemon serves the bytes. A node
-// with send_unique_header never reaches here, so no cookie is written. "" when
-// ready to serve, else why PHP answers it after all.
-func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
+// as vod.php/timeshift.php do, spools its line limit, touches its marker and
+// writes the policy's stream headers — the shared lead of serveVOD and
+// serveTimeshift, before the bytes. refreshPID is the pid a refresh (updateLive)
+// sets — the daemon's "0" for a file serve, nil for the m3u8 playlist (which
+// leaves the viewer's pid as it is). A node with send_unique_header never
+// reaches here. "" when ready to serve, else why PHP answers it after all.
+func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time, refreshPID json.RawMessage) string {
 	ip := r.Header.Get("X-XC-Client-IP")
 	if ref.New {
 		// openRecord: stored, a limited line admitted by the agent.
@@ -605,12 +624,14 @@ func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy
 			return "agent-put"
 		}
 	} else {
-		// updateLive: the connection is the daemon's now (pid 0).
+		// updateLive.
 		rec := make(map[string]json.RawMessage, len(ref.Record)+4)
 		for k, v := range ref.Record {
 			rec[k] = v
 		}
-		rec["pid"] = json.RawMessage("0")
+		if refreshPID != nil {
+			rec["pid"] = refreshPID
+		}
 		rec["server_id"] = ref.ServerID
 		rec["proxy_id"] = json.RawMessage("null")
 		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))

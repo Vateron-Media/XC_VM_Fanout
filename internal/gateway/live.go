@@ -78,8 +78,12 @@ type Refresh struct {
 	Rate        int64
 	Range       string
 	// Parts is timeshift's run of archive minutes (the queue, the first from
-	// its .offset), served as one response.
+	// its .offset), served as one response (ts arm) or listed (m3u8 arm).
 	Parts []server.FilePart
+	// Duration and Timestamp are the timeshift link's, for the m3u8 arm's
+	// per-minute segment tokens.
+	Duration  int64
+	Timestamp int64
 }
 
 var segLineRe = regexp.MustCompile(`(?m)^(\d+)\.ts$`)
@@ -580,9 +584,19 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	}
 	set := func(m map[string]json.RawMessage, k string) bool { r, ok := m[k]; return ok && !isNull(r) }
 	ext, ok := phpString(t["extension"])
-	if !ok || ext == "m3u8" || !vodExtRe.MatchString(ext) {
-		// m3u8 is the playlist arm (it mints per-segment tokens): PHP's.
+	if !ok {
 		return php("extension")
+	}
+	// m3u8 is the playlist arm (a VOD-type list of the archive minutes, each a
+	// catch-up segment token); any other extension is the file arm. Both record
+	// the viewer, but the playlist is keyed container "hls" / pid null.
+	isM3U8 := ext == "m3u8"
+	if !isM3U8 && !vodExtRe.MatchString(ext) {
+		return php("extension")
+	}
+	container, pid := ext, json.RawMessage("0")
+	if isM3U8 {
+		container, pid = "hls", json.RawMessage("null")
 	}
 	var ui map[string]json.RawMessage
 	if json.Unmarshal(t["user_info"], &ui) != nil || ui == nil {
@@ -631,6 +645,8 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		return php("token")
 	}
 	r.UserID, r.IdentityKey = id, "u"+strconv.FormatInt(id, 10)
+	r.Username, _ = phpString(t["username"])
+	r.Password, _ = phpString(t["password"])
 	ua, ok := htmlentitiesASCII(rawUA)
 	if !ok {
 		return php("user-agent")
@@ -654,11 +670,12 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		scan = lim
 	}
 	offset := env.Offset(first)
-	var parts []server.FilePart
+	var parts []server.FilePart // ts: the parts to serve (size filtered); m3u8: every existing minute
 	var total int64
 	var count int
 	for i := int64(0); i < scan; i++ {
-		size, present := env.FileSize(base + gmdateMinute(ts+i*60) + ".ts")
+		path := base + gmdateMinute(ts+i*60) + ".ts"
+		size, present := env.FileSize(path)
 		if !present {
 			continue
 		}
@@ -668,8 +685,11 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 			from = offset
 		}
 		count++
-		if size > from {
-			parts = append(parts, server.FilePart{Path: base + gmdateMinute(ts+i*60) + ".ts", Offset: from, Length: size - from})
+		if isM3U8 {
+			// Every existing minute is a playlist line, whatever its size.
+			parts = append(parts, server.FilePart{Path: path, Offset: from})
+		} else if size > from {
+			parts = append(parts, server.FilePart{Path: path, Offset: from, Length: size - from})
 		}
 	}
 	if count == 0 || len(parts) == 0 {
@@ -683,19 +703,24 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	}
 	if !found {
 		var why string
-		if rec, why = newTimeshiftRecord(p, t, ui, r, clientIP, now, ext); why != "" {
+		if rec, why = newTimeshiftRecord(p, t, ui, r, clientIP, now, container, pid); why != "" {
 			return php(why)
 		}
 		r.New = true
 	} else {
-		if !liveMatches(rec, r, ext) {
+		if !liveMatches(rec, r, container) {
 			return php("new-connection")
 		}
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
-		if pid, okP := jsonInt(rec["pid"]); !okP || pid != 0 {
-			return php("worker")
+		// The file arm takes over only a connection fanout serves (pid 0); the
+		// m3u8 arm (no daemon stream) has no worker to check. timeshift.php only
+		// kills a worker on the file arm.
+		if !isM3U8 {
+			if rpid, okP := jsonInt(rec["pid"]); !okP || rpid != 0 {
+				return php("worker")
+			}
 		}
 		recIP, _ := phpString(rec["user_ip"])
 		if p.RestrictSameIP && !ipMatch(recIP, clientIP, p.IPSubnetMatch) {
@@ -718,8 +743,18 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		}
 		r.Admission = adm
 	}
-	// The recording's bitrate over the minutes it holds (timeshift.php), the
-	// response served at it plus vod_bitrate_plus percent, past vod_limit_perc.
+	if isM3U8 {
+		// The playlist arm: a VOD-type list of the archive minutes, each a
+		// catch-up segment token minted at serve time (serveTimeshift).
+		r.ContentType, r.Parts, r.Duration, r.Timestamp = "application/x-mpegurl", parts, duration, ts
+		reason := "timeshift-m3u8"
+		if r.New {
+			reason = "timeshift-m3u8-new"
+		}
+		return Verdict{Action: Serve, Reason: reason, Stream: int(stream), UUID: r.UUID}, r
+	}
+	// The file arm: the recording's bitrate over the minutes it holds
+	// (timeshift.php), served at it plus vod_bitrate_plus percent, past vod_limit_perc.
 	rSize := total - offset
 	download := float64(rSize) * 0.008 / float64(count*60) * 125
 	download += download * float64(p.VodBitratePlus) * 0.01
@@ -763,8 +798,8 @@ func newVODRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, c
 // the daemon serves (pid 0, container = the link's extension): newLiveRecord's
 // fields, with external_device and on_demand hardcoded as timeshift.php does,
 // and create_expiration fixed at 60. Like VOD/TS it keeps the token's own uuid.
-func newTimeshiftRecord(p *Policy, t, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64, container string) (map[string]json.RawMessage, string) {
-	rec, why := newLiveRecord(p, t, map[string]json.RawMessage{}, ui, r, clientIP, now, container, json.RawMessage("0"), r.UUID, 60)
+func newTimeshiftRecord(p *Policy, t, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64, container string, pid json.RawMessage) (map[string]json.RawMessage, string) {
+	rec, why := newLiveRecord(p, t, map[string]json.RawMessage{}, ui, r, clientIP, now, container, pid, r.UUID, 60)
 	if why != "" {
 		return nil, why
 	}

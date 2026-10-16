@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -115,6 +116,32 @@ func Tokenize(p *Policy, r *Refresh, clientIP string, now time.Time) (string, er
 		}
 	}
 	return out, nil
+}
+
+// timeshiftPlaylist is timeshift.php's m3u8 arm: a VOD-type playlist of the
+// archive minutes (r.Parts), each an #EXTINF line and a /hls/<token> where the
+// token is a catch-up segment token this node minted (ViewerKey::mintOwn) —
+// TS/user/pass/ip/duration/start/<stream>_<minute>_<offset>/uuid/server, which
+// judgeArchive reads. The gateway owns only the non-proxied case, so no proxy
+// route prefix.
+func timeshiftPlaylist(p *Policy, r *Refresh, clientIP string) (string, error) {
+	nonces := bufio.NewReaderSize(rand.Reader, 64*sealNonce)
+	server := string(r.ServerID)
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:60\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n")
+	for _, part := range r.Parts {
+		payload := "TS/" + rawurlencode(r.Username) + "/" + rawurlencode(r.Password) + "/" + clientIP + "/" +
+			strconv.FormatInt(r.Duration, 10) + "/" + strconv.FormatInt(r.Timestamp, 10) + "/" +
+			strconv.Itoa(r.Stream) + "_" + filepath.Base(part.Path) + "_" + strconv.FormatInt(part.Offset, 10) + "/" +
+			r.UUID + "/" + server
+		tok, err := mintOwn(p, payload, nonces)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString("#EXTINF:60.0,\n/hls/" + tok + "\n")
+	}
+	b.WriteString("#EXT-X-ENDLIST")
+	return b.String(), nil
 }
 
 // ── HlsSequence ─────────────────────────────────────────────────────────
