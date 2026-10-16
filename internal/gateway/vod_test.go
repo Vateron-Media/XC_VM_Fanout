@@ -166,7 +166,7 @@ func TestServeVOD(t *testing.T) {
 	if rec.Code != 200 || rec.Body.String() != "MOVIE" || rec.Header().Get("Content-Type") != "video/mp4" {
 		t.Fatalf("first VOD request: %d %q %v; stats %v", rec.Code, rec.Body.String(), rec.Header(), s.Stats())
 	}
-	if node.hoID != "12" || node.hoUUID != testUUID || node.hoPath != dir+"/vod/12.mp4" || node.hoType != "video/mp4" || node.hoLimitPerc != 80 || node.hoRate != 150000 {
+	if node.hoID != "12" || node.hoUUID != testUUID || len(node.hoParts) != 1 || node.hoParts[0].Path != dir+"/vod/12.mp4" || node.hoType != "video/mp4" || node.hoLimitPerc != 80 || node.hoRate != 150000 {
 		t.Fatalf("handed to the daemon: %+v", node)
 	}
 	got := a.records[testUUID]

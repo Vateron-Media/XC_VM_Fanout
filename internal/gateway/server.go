@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
 )
 
 // Server is the gateway's handler on its own socket (gw.sock), which only
@@ -58,11 +59,11 @@ var latencyBuckets = [...]time.Duration{100 * time.Microsecond, 500 * time.Micro
 // whether it is on air.
 type Node interface {
 	ServeFilePart(w http.ResponseWriter, r *http.Request, path string, offset int64, contentType string)
-	// HandOverFile serves a local file to a viewer counted under uuid (pid 0),
-	// its range honoured and the panel's throttle applied, as the panel's
-	// handOverFile does; false (nothing written) when the path is not under a
-	// file root, so the caller can still hand the request to PHP.
-	HandOverFile(w http.ResponseWriter, r *http.Request, id, uuid, path, contentType string, limitPerc int, rate int64, rng string) bool
+	// HandOverFile serves local files back to back to a viewer counted under
+	// uuid (pid 0), its range honoured and the panel's throttle applied, as the
+	// panel's handOverFile does; false (nothing written) when a part is not
+	// under a file root, so the caller can still hand the request to PHP.
+	HandOverFile(w http.ResponseWriter, r *http.Request, id, uuid string, parts []server.FilePart, contentType string, limitPerc int, rate int64, rng string) bool
 	FedPlaylist(id string) string
 	Fed(id string) bool
 }
@@ -585,7 +586,7 @@ func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref
 	if !p.Live.UseBuffer {
 		h.Set("X-Accel-Buffering", "no")
 	}
-	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, ref.Path, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
+	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, []server.FilePart{{Path: ref.Path, Length: -1}}, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
 		return "handover"
 	}
 	return ""
