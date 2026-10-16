@@ -123,6 +123,8 @@ func (s *Server) judge(r *http.Request, now time.Time, touch bool) judged {
 		j.verdict = JudgeKey(p, token, ip, now.Unix())
 	case "live":
 		j.verdict, j.refresh = JudgeLive(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
+	case "thumb":
+		j.verdict = JudgeThumb(p, token, now.Unix(), s.env(p, now, touch))
 	}
 	return j
 }
@@ -142,6 +144,13 @@ func (s *Server) env(p *Policy, now time.Time, touch bool) Env {
 		File: func(path string) bool {
 			_, err := os.Stat(path)
 			return err == nil
+		},
+		Mtime: func(path string) (int64, bool) {
+			fi, err := os.Stat(path)
+			if err != nil {
+				return 0, false
+			}
+			return fi.ModTime().Unix(), true
 		},
 		Heard: func(uuid string) (bool, bool) {
 			if p.Paths.AgentSock == "" {
@@ -415,7 +424,7 @@ func ParseURI(uri string) (kind, token string) {
 	if i := strings.IndexByte(uri, '?'); i >= 0 {
 		uri = uri[:i]
 	}
-	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live"} {
+	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb"} {
 		if rest, ok := strings.CutPrefix(uri, prefix); ok && !strings.Contains(rest, "/") {
 			return k, rest
 		}

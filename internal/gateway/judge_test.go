@@ -179,6 +179,8 @@ func TestParseURI(t *testing.T) {
 		"/key/abc?x=1": {"key", "abc"},
 		"/hls/abc/def": {"", ""},
 		"/auth/abc":    {"live", "abc"},
+		"/thauth/abc":  {"thumb", "abc"},
+		"/thauth/a/b":  {"", ""},
 		"/r1/hls/abc":  {"", ""},
 		"":             {"", ""},
 	} {
