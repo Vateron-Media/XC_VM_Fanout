@@ -57,6 +57,16 @@ func TestJudgeVOD(t *testing.T) {
 	if string(r.Record["container"]) != `"VOD"` || string(r.Record["pid"]) != "0" || r.Record["adm_uuid"] != nil {
 		t.Fatalf("the record: %v", r.Record)
 	}
+	// vod.php hardcodes these, whatever the token/channel carry.
+	stNew := vodEnv()
+	stNew.rec = nil
+	v2, r2 := JudgeVOD(p, vodToken(func(m map[string]any) {
+		m["channel_info"].(map[string]any)["on_demand"] = 1
+		delete(m, "external_device")
+	}), ip, testUA, testNow, stNew.env())
+	if v2.Action != Serve || string(r2.Record["external_device"]) != `""` || string(r2.Record["on_demand"]) != "0" {
+		t.Fatalf("hardcoded record fields: %s %s", r2.Record["external_device"], r2.Record["on_demand"])
+	}
 	if r.Admission != `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"`+testUA+`"}` {
 		t.Fatalf("admission: %q", r.Admission)
 	}

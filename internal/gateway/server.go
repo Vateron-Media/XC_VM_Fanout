@@ -87,7 +87,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// What PHP answered a mirrored request (GatewayShadow): its other side.
 		s.book.PHP(r.Header.Get("X-XC-Request-ID"), r.Header.Get("X-XC-Kind"), r.Header.Get("X-XC-Outcome"))
 		w.WriteHeader(http.StatusNoContent)
-	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb", "/stream/subtitle", "/stream/vod":
+	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb", "/stream/subtitle", "/stream/vod", "/stream/timeshift":
 		s.serve(w, r)
 	case "/stats":
 		w.Header().Set("Content-Type", "application/json")
@@ -135,6 +135,8 @@ func (s *Server) judge(r *http.Request, now time.Time, touch bool) judged {
 		j.verdict = JudgeSubtitle(p, token, now.Unix(), s.env(p, now, touch))
 	case "vod":
 		j.verdict, j.refresh = JudgeVOD(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
+	case "timeshift":
+		j.verdict, j.refresh = JudgeTimeshift(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
 	}
 	return j
 }
@@ -197,6 +199,20 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 		},
 		AgentAlive: func() bool { return agentAlive(p.Paths.Flows, now) },
 		File:       exists,
+		FileSize: func(path string) (int64, bool) {
+			fi, err := os.Stat(path)
+			if err != nil || !fi.Mode().IsRegular() {
+				return 0, false
+			}
+			return fi.Size(), true
+		},
+		Offset: func(path string) int64 {
+			b, err := os.ReadFile(path + ".offset")
+			if err != nil || len(b) > 32 {
+				return 0
+			}
+			return phpIntval(b)
+		},
 	}
 }
 
@@ -230,6 +246,11 @@ func (s *Server) shadow(r *http.Request) {
 // the rung below it does.
 func serves(mode, kind string) bool {
 	switch mode {
+	case "segments+playlist+thumb+subtitle+vod+timeshift":
+		if kind == "timeshift" {
+			return true
+		}
+		fallthrough
 	case "segments+playlist+thumb+subtitle+vod":
 		if kind == "vod" {
 			return true
@@ -306,6 +327,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		j.verdict = verdict(PHP, why)
 		v = j.verdict
 	}
+	if v.Action == Serve && j.kind == "timeshift" {
+		why := s.serveTimeshift(w, r, p, j.refresh, now)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
 	switch v.Action {
 	case PHP:
 		w.Header().Set("X-Accel-Redirect", phpLocation(j.kind))
@@ -355,6 +384,8 @@ func phpLocation(kind string) string {
 		return "@gw_subtitle_php"
 	case "vod":
 		return "@gw_vod_php"
+	case "timeshift":
+		return "@gw_timeshift_php"
 	}
 	return "@gw_segment_php"
 }
@@ -532,9 +563,40 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 // worker feeds never reaches here (JudgeVOD hands those to PHP). "" when served,
 // else why PHP answers it after all.
 func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
+	if why := s.serveFileConn(w, r, p, ref, now); why != "" {
+		return why
+	}
+	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, []server.FilePart{{Path: ref.Path, Length: -1}}, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
+		return "handover"
+	}
+	return ""
+}
+
+// serveTimeshift answers timeshift.php's archive-file arm: the connection as
+// serveFileConn records it, then the run of archive minutes (ref.Parts: the
+// queue, the first from its .offset) handed to the daemon as one video/mp2t
+// response. The m3u8 playlist arm, a proxy, a worker-kill and a legacy node
+// never reach here (JudgeTimeshift hands those to PHP).
+func (s *Server) serveTimeshift(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
+	if why := s.serveFileConn(w, r, p, ref, now); why != "" {
+		return why
+	}
+	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, ref.Parts, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
+		return "handover"
+	}
+	return ""
+}
+
+// serveFileConn records (or refreshes) a file viewer's connection in the agent
+// (pid 0, the daemon's) as vod.php/timeshift.php do, spools its line limit,
+// touches its marker and writes the policy's stream headers — the shared lead
+// of serveVOD and serveTimeshift, before the daemon serves the bytes. A node
+// with send_unique_header never reaches here, so no cookie is written. "" when
+// ready to serve, else why PHP answers it after all.
+func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
 	ip := r.Header.Get("X-XC-Client-IP")
 	if ref.New {
-		// vod.php's openRecord: stored, a limited line admitted by the agent.
+		// openRecord: stored, a limited line admitted by the agent.
 		stored, refused := s.agentFor(p.Paths.AgentSock).Register(ref.UUID, ref.Record, ref.Admission)
 		if refused {
 			return "refused"
@@ -543,7 +605,7 @@ func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref
 			return "agent-put"
 		}
 	} else {
-		// vod.php's updateLive: the connection is the daemon's now (pid 0).
+		// updateLive: the connection is the daemon's now (pid 0).
 		rec := make(map[string]json.RawMessage, len(ref.Record)+4)
 		for k, v := range ref.Record {
 			rec[k] = v
@@ -562,15 +624,14 @@ func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref
 			return "spool"
 		}
 	}
-	// vod.php touches the viewer's marker (CONS_TMP_PATH/<uuid>).
+	// The viewer's marker (CONS_TMP_PATH/<uuid>).
 	marker := filepath.Join(p.Paths.Cons, ref.UUID)
 	if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		f.Close()
 		_ = os.Chtimes(marker, now, now)
 	}
-	// vod.php's sendStreamHeaders, as thumb/subtitle send them (protection gates
-	// both headers), plus X-Accel-Buffering with use_buffer off. No cookie: a
-	// node with send_unique_header went to PHP.
+	// sendStreamHeaders, as thumb/subtitle send them (protection gates both
+	// headers), plus X-Accel-Buffering with use_buffer off.
 	h := w.Header()
 	h.Set("Access-Control-Allow-Origin", "*")
 	if p.Headers.Server != "" {
@@ -585,9 +646,6 @@ func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref
 	}
 	if !p.Live.UseBuffer {
 		h.Set("X-Accel-Buffering", "no")
-	}
-	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, []server.FilePart{{Path: ref.Path, Length: -1}}, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
-		return "handover"
 	}
 	return ""
 }
@@ -621,13 +679,14 @@ const notFoundPage = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<bo
 
 // ParseURI splits a viewer's request URI into its kind ("segment" for
 // /hls/<token>, "key" for /key/<token>, "live" for /auth/<token>, "thumb" for
-// /thauth/<token>, "subtitle" for /subauth/<token>) and its token, as nginx's
-// server-level rewrites read it; "" for anything else.
+// /thauth/<token>, "subtitle" for /subauth/<token>, "vod" for /vauth/<token>,
+// "timeshift" for /tsauth/<token>) and its token, as nginx's server-level
+// rewrites read it; "" for anything else.
 func ParseURI(uri string) (kind, token string) {
 	if i := strings.IndexByte(uri, '?'); i >= 0 {
 		uri = uri[:i]
 	}
-	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb", "/subauth/": "subtitle", "/vauth/": "vod"} {
+	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb", "/subauth/": "subtitle", "/vauth/": "vod", "/tsauth/": "timeshift"} {
 		if rest, ok := strings.CutPrefix(uri, prefix); ok && !strings.Contains(rest, "/") {
 			return k, rest
 		}

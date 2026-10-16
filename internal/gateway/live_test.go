@@ -218,7 +218,9 @@ type liveEnvState struct {
 	fileMissing                                  bool // vod.php's file_exists: the movie is gone
 	playlist                                     string
 	rec                                          map[string]any
-	recUUID                                      string // the record's key in the agent
+	recUUID                                      string           // the record's key in the agent
+	sizes                                        map[string]int64 // timeshift archive files present, by path
+	offset                                       int64            // the first archive minute's .offset
 }
 
 func (st *liveEnvState) env() LiveEnv {
@@ -244,6 +246,8 @@ func (st *liveEnvState) env() LiveEnv {
 		},
 		AgentAlive: func() bool { return st.agentAlive },
 		File:       func(string) bool { return !st.fileMissing },
+		FileSize:   func(path string) (int64, bool) { s, ok := st.sizes[path]; return s, ok },
+		Offset:     func(string) int64 { return st.offset },
 	}
 }
 

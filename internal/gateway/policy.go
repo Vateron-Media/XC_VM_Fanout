@@ -68,6 +68,9 @@ type Policy struct {
 	// of a movie, serve at its bitrate plus vod_bitrate_plus percent.
 	VodLimitPerc   int `json:"vod_limit_perc"`
 	VodBitratePlus int `json:"vod_bitrate_plus"`
+	// DefaultTimezone is the panel's default_timezone (LegacyInitializer sets
+	// it): timeshift.php parses its date-form start with mktime in this zone.
+	DefaultTimezone string `json:"default_timezone"`
 	// Live is what live.php reads for a playlist refresh.
 	Live LivePolicy `json:"live"`
 	// Redirect is each other server's base URLs, for a token it minted.

@@ -10,6 +10,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
 )
 
 // LiveEnv is what judging a playlist refresh asks of the node.
@@ -28,6 +31,10 @@ type LiveEnv struct {
 	AgentAlive func() bool
 	// File: does this path exist (vod.php's file_exists on the movie)?
 	File func(path string) bool
+	// FileSize is a file's size and whether it is there (timeshift's archive scan).
+	FileSize func(path string) (int64, bool)
+	// Offset reads a minute file's "<path>.offset" (timeshift's first partial minute), 0 when absent.
+	Offset func(path string) int64
 }
 
 // Refresh is a playlist refresh (or a TS viewer's reconnect) the gateway
@@ -70,6 +77,9 @@ type Refresh struct {
 	LimitPerc   int
 	Rate        int64
 	Range       string
+	// Parts is timeshift's run of archive minutes (the queue, the first from
+	// its .offset), served as one response.
+	Parts []server.FilePart
 }
 
 var segLineRe = regexp.MustCompile(`(?m)^(\d+)\.ts$`)
@@ -489,6 +499,245 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 	return Verdict{Action: Serve, Reason: reason, Stream: int(stream), UUID: r.UUID}, r
 }
 
+// tsStartRe is timeshift.php's accepted start: a Unix time, YYYYMMDD-HH or
+// YYYY-MM-DD:HH-MM (with optional seconds, ignored).
+var tsStartRe = regexp.MustCompile(`^(\d+|\d{8}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2}:\d{1,2}-\d{1,2}(?:[:-]\d{1,2})?)$`)
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseTimeshiftStart reads a start as timeshift.php does: a Unix time (no
+// timezone), or a YYYYMMDD-HH / YYYY-MM-DD:HH-MM date parsed in loc (mktime's
+// timezone), to the minute it names. false for any other form (PHP's NO_TIMESTAMP).
+func parseTimeshiftStart(start string, loc *time.Location) (int64, bool) {
+	if !tsStartRe.MatchString(start) {
+		return 0, false
+	}
+	if isAllDigits(start) {
+		n, err := strconv.ParseInt(start, 10, 64)
+		return n, err == nil
+	}
+	atoi := func(s string) int { n, _ := strconv.Atoi(s); return n }
+	var year, month, day, hour, min int
+	if strings.Count(start, "-") == 1 {
+		// YYYYMMDD-HH: PHP reads year/month/day by substring, the hour after the dash.
+		d := strings.SplitN(start, "-", 2)
+		if len(d[0]) != 8 {
+			return 0, false
+		}
+		year, month, day, hour = atoi(d[0][0:4]), atoi(d[0][4:6]), atoi(d[0][6:8]), atoi(d[1])
+	} else {
+		// YYYY-MM-DD:HH-MM(:SS|-SS)?: PHP's explode(':') then explode('-'), first two of each.
+		c := strings.Split(start, ":")
+		dmy := strings.Split(c[0], "-")
+		hm := strings.Split(c[1], "-")
+		if len(dmy) != 3 || len(hm) < 2 {
+			return 0, false
+		}
+		year, month, day, hour, min = atoi(dmy[0]), atoi(dmy[1]), atoi(dmy[2]), atoi(hm[0]), atoi(hm[1])
+	}
+	return time.Date(year, time.Month(month), day, hour, min, 0, 0, loc).Unix(), true
+}
+
+// gmdateMinute is timeshift.php's gmdate('Y-m-d:H-i') (UTC): the archive minute file's name.
+func gmdateMinute(ts int64) string { return time.Unix(ts, 0).UTC().Format("2006-01-02:15-04") }
+
+// JudgeTimeshift is timeshift.php's decision on /tsauth/<token> for the arm the
+// gateway owns: the run of archive minute files the daemon serves (handOverFile),
+// the viewer tracked in the agent with pid 0. The m3u8 playlist arm (it mints
+// per-segment tokens), a proxy, a node with send_unique_header, a connection a
+// PHP worker still feeds, and any form PHP reads otherwise go to PHP.
+func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
+	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	if p == nil {
+		return php("policy")
+	}
+	if p.ConnStore != "agent" {
+		return php("conn-store")
+	}
+	if p.ServeUntil != 0 && now > p.ServeUntil {
+		return php("lease")
+	}
+	if p.Headers.UniqueHeader {
+		return php("unique-header")
+	}
+	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
+	if v != Opened {
+		return php("token")
+	}
+	var t map[string]json.RawMessage
+	if json.Unmarshal(plain, &t) != nil || t == nil {
+		return php("token")
+	}
+	set := func(m map[string]json.RawMessage, k string) bool { r, ok := m[k]; return ok && !isNull(r) }
+	ext, ok := phpString(t["extension"])
+	if !ok || ext == "m3u8" || !vodExtRe.MatchString(ext) {
+		// m3u8 is the playlist arm (it mints per-segment tokens): PHP's.
+		return php("extension")
+	}
+	var ui map[string]json.RawMessage
+	if json.Unmarshal(t["user_info"], &ui) != nil || ui == nil {
+		return php("token")
+	}
+	stream, ok := jsonInt(t["stream"])
+	if !ok || stream <= 0 || stream > math.MaxInt32 {
+		return php("stream-id")
+	}
+	duration, ok := jsonInt(t["duration"])
+	if !ok || duration <= 0 {
+		return php("timestamp")
+	}
+	// The serving server; the gateway owns only the simple, non-proxied case.
+	r := &Refresh{Stream: int(stream)}
+	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
+	if phpTruthy(t["originator_id"]) {
+		return php("proxy")
+	} else if phpTruthy(t["redirect_id"]) {
+		r.ServerID = t["redirect_id"]
+	}
+	// The start, to the archive minute it names (parsed in the node's timezone).
+	start, _ := phpString(t["start"])
+	var ts int64
+	if isAllDigits(start) {
+		if ts, _ = strconv.ParseInt(start, 10, 64); ts <= 0 {
+			return php("timestamp")
+		}
+	} else {
+		loc := time.UTC
+		if p.DefaultTimezone != "" {
+			l, err := time.LoadLocation(p.DefaultTimezone)
+			if err != nil {
+				return php("timezone")
+			}
+			loc = l
+		}
+		var okT bool
+		if ts, okT = parseTimeshiftStart(start, loc); !okT || ts <= 0 {
+			return php("timestamp")
+		}
+	}
+	// The viewer: a line (timeshift has no HMAC identity).
+	id, okID := jsonInt(ui["id"])
+	if !okID && set(ui, "id") {
+		return php("token")
+	}
+	r.UserID, r.IdentityKey = id, "u"+strconv.FormatInt(id, 10)
+	ua, ok := htmlentitiesASCII(rawUA)
+	if !ok {
+		return php("user-agent")
+	}
+	r.UserAgent = ua
+	u, isStr := jsonString(t["uuid"])
+	if !isStr || !uuidRe.MatchString(u) {
+		return php("token")
+	}
+	r.UUID = u
+
+	// The archive: the first minute must be there, then the run of minutes up to
+	// the duration, no later than the present (timeshift.php's scan).
+	base := p.Paths.Archive + strconv.Itoa(int(stream)) + "/"
+	first := base + gmdateMinute(ts) + ".ts"
+	if _, present := env.FileSize(first); !present {
+		return php("missing")
+	}
+	scan := duration
+	if lim := now/60 - ts/60 + 1; lim < scan {
+		scan = lim
+	}
+	offset := env.Offset(first)
+	var parts []server.FilePart
+	var total int64
+	var count int
+	for i := int64(0); i < scan; i++ {
+		size, present := env.FileSize(base + gmdateMinute(ts+i*60) + ".ts")
+		if !present {
+			continue
+		}
+		total += size
+		from := int64(0)
+		if count == 0 {
+			from = offset
+		}
+		count++
+		if size > from {
+			parts = append(parts, server.FilePart{Path: base + gmdateMinute(ts+i*60) + ".ts", Offset: from, Length: size - from})
+		}
+	}
+	if count == 0 || len(parts) == 0 {
+		return php("missing")
+	}
+
+	// The connection, under the token's uuid.
+	rec, found, answered := env.Record(r.UUID)
+	if !answered {
+		return php("agent")
+	}
+	if !found {
+		var why string
+		if rec, why = newTimeshiftRecord(p, t, ui, r, clientIP, now, ext); why != "" {
+			return php(why)
+		}
+		r.New = true
+	} else {
+		if !liveMatches(rec, r, ext) {
+			return php("new-connection")
+		}
+		if !set(rec, "identity") || !set(rec, "uuid") {
+			return php("record")
+		}
+		if pid, okP := jsonInt(rec["pid"]); !okP || pid != 0 {
+			return php("worker")
+		}
+		recIP, _ := phpString(rec["user_ip"])
+		if p.RestrictSameIP && !ipMatch(recIP, clientIP, p.IPSubnetMatch) {
+			return php("ip")
+		}
+	}
+	r.Record = rec
+	if mc, okM := jsonInt(ui["max_connections"]); okM && mc != 0 {
+		if !env.AgentAlive() {
+			return php("spool")
+		}
+		r.Limit, r.MaxConns = true, mc
+	} else if !okM && phpTruthy(ui["max_connections"]) {
+		return php("token")
+	}
+	if r.New {
+		adm, okA := admissionHeader(p, t, r, clientIP, now)
+		if !okA {
+			return php("token")
+		}
+		r.Admission = adm
+	}
+	// The recording's bitrate over the minutes it holds (timeshift.php), the
+	// response served at it plus vod_bitrate_plus percent, past vod_limit_perc.
+	rSize := total - offset
+	download := float64(rSize) * 0.008 / float64(count*60) * 125
+	download += download * float64(p.VodBitratePlus) * 0.01
+	r.ContentType, r.Parts, r.Range = "video/mp2t", parts, ""
+	r.LimitPerc = p.VodLimitPerc
+	if p.VodLimitPerc > 0 && !phpTruthy(ui["is_restreamer"]) {
+		r.Rate = int64(download)
+	}
+	if hr, okR := phpString(t["http_range"]); okR {
+		r.Range = hr
+	}
+	reason := "timeshift"
+	if r.New {
+		reason = "timeshift-new"
+	}
+	return Verdict{Action: Serve, Reason: reason, Stream: int(stream), UUID: r.UUID}, r
+}
+
 // newTSRecord is the record createLive/openRecord store for a TS viewer fanout
 // serves (pid 0): newLiveRecord's TS arm. A TS viewer is keyed on the token's
 // own uuid (r.UUID), which is the reservation too.
@@ -501,7 +750,26 @@ func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, cl
 // the token's own uuid (its reservation), so it stores no adm_uuid. vod.php
 // fixes its create_expiration at 60 seconds (not the live setting).
 func newVODRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (map[string]json.RawMessage, string) {
-	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "VOD", json.RawMessage("0"), r.UUID, 60)
+	rec, why := newLiveRecord(p, t, ch, ui, r, clientIP, now, "VOD", json.RawMessage("0"), r.UUID, 60)
+	if why != "" {
+		return nil, why
+	}
+	// vod.php's record hardcodes these (not from the token/channel like live.php).
+	rec["external_device"], rec["on_demand"] = json.RawMessage(`""`), json.RawMessage("0")
+	return rec, ""
+}
+
+// newTimeshiftRecord is the record timeshift.php's ts arm stores for a viewer
+// the daemon serves (pid 0, container = the link's extension): newLiveRecord's
+// fields, with external_device and on_demand hardcoded as timeshift.php does,
+// and create_expiration fixed at 60. Like VOD/TS it keeps the token's own uuid.
+func newTimeshiftRecord(p *Policy, t, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64, container string) (map[string]json.RawMessage, string) {
+	rec, why := newLiveRecord(p, t, map[string]json.RawMessage{}, ui, r, clientIP, now, container, json.RawMessage("0"), r.UUID, 60)
+	if why != "" {
+		return nil, why
+	}
+	rec["external_device"], rec["on_demand"] = json.RawMessage(`""`), json.RawMessage("0")
+	return rec, ""
 }
 
 // newHLSRecord is the record createLive/openRecord store for an HLS viewer's
