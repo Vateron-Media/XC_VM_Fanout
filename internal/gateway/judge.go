@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"math/big"
 	"net"
 	"net/netip"
@@ -48,6 +49,9 @@ type Env struct {
 	// Heard is ConnectionTracker::heartbeat through the agent: whether the
 	// viewer's record says the session ended, and whether the agent answered.
 	Heard func(uuid string) (ended, ok bool)
+	// Mtime is a file's modification time (unix seconds) and whether it is
+	// there: thumb.php serves a thumbnail only while it is under a minute old.
+	Mtime func(path string) (modTime int64, ok bool)
 }
 
 var (
@@ -240,6 +244,49 @@ func JudgeKey(p *Policy, token, clientIP string, now int64) Verdict {
 		return verdict(PHP, "stream-id")
 	}
 	return Verdict{Action: Serve, Reason: "key", Stream: stream}
+}
+
+// JudgeThumb is thumb.php's decision on /thumb?token=…: the stream's current
+// thumbnail (STREAMS_PATH/<id>_.jpg, kept only while it is under a minute old)
+// for a token that names when it expires. A token that does not open, is not
+// the JSON a thumbnail link carries, has no expiry or has passed it, names no
+// stream, or whose thumbnail is missing or stale is PHP's — it emits the exact
+// TOKEN_EXPIRED / THUMBNAIL_DOESNT_EXIST the gateway does not. The expiry is
+// read against the node's clock less its time_offset, as the endpoint does;
+// the one-minute freshness is the raw clock, as filemtime is.
+func JudgeThumb(p *Policy, token string, now int64, env Env) Verdict {
+	if p == nil {
+		return verdict(PHP, "policy")
+	}
+	if p.ServeUntil != 0 && now > p.ServeUntil {
+		return verdict(PHP, "lease")
+	}
+	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
+	if v != Opened {
+		// Refused or Unsure: it is not a 404, so PHP answers (TOKEN_EXPIRED).
+		return verdict(PHP, "token")
+	}
+	var td struct {
+		Expires *int64 `json:"expires"`
+		Stream  int    `json:"stream"`
+	}
+	// A thumbnail link names when it expires; one that does not (or is another
+	// endpoint's slash-field token) is not this endpoint's.
+	if json.Unmarshal(plain, &td) != nil || td.Expires == nil {
+		return verdict(PHP, "token-json")
+	}
+	if *td.Expires < now-p.TimeOffset {
+		return verdict(PHP, "expired")
+	}
+	if td.Stream <= 0 {
+		return verdict(PHP, "stream")
+	}
+	path := p.Paths.Streams + strconv.Itoa(td.Stream) + "_.jpg"
+	mod, ok := env.Mtime(path)
+	if !ok || now-mod >= 60 {
+		return verdict(PHP, "stale")
+	}
+	return Verdict{Action: Serve, Reason: "thumb", Stream: td.Stream, Path: path}
 }
 
 // digits is a non-negative decimal written only in digits (what PHP's
