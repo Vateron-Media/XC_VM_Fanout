@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
 )
 
 // Server is the gateway's handler on its own socket (gw.sock), which only
@@ -58,6 +59,11 @@ var latencyBuckets = [...]time.Duration{100 * time.Microsecond, 500 * time.Micro
 // whether it is on air.
 type Node interface {
 	ServeFilePart(w http.ResponseWriter, r *http.Request, path string, offset int64, contentType string)
+	// HandOverFile serves local files back to back to a viewer counted under
+	// uuid (pid 0), its range honoured and the panel's throttle applied, as the
+	// panel's handOverFile does; false (nothing written) when a part is not
+	// under a file root, so the caller can still hand the request to PHP.
+	HandOverFile(w http.ResponseWriter, r *http.Request, id, uuid string, parts []server.FilePart, contentType string, limitPerc int, rate int64, rng string) bool
 	FedPlaylist(id string) string
 	Fed(id string) bool
 }
@@ -81,7 +87,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// What PHP answered a mirrored request (GatewayShadow): its other side.
 		s.book.PHP(r.Header.Get("X-XC-Request-ID"), r.Header.Get("X-XC-Kind"), r.Header.Get("X-XC-Outcome"))
 		w.WriteHeader(http.StatusNoContent)
-	case "/stream/segment", "/stream/key", "/stream/live":
+	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb", "/stream/subtitle", "/stream/vod", "/stream/timeshift":
 		s.serve(w, r)
 	case "/stats":
 		w.Header().Set("Content-Type", "application/json")
@@ -123,6 +129,14 @@ func (s *Server) judge(r *http.Request, now time.Time, touch bool) judged {
 		j.verdict = JudgeKey(p, token, ip, now.Unix())
 	case "live":
 		j.verdict, j.refresh = JudgeLive(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
+	case "thumb":
+		j.verdict = JudgeThumb(p, token, now.Unix(), s.env(p, now, touch))
+	case "subtitle":
+		j.verdict = JudgeSubtitle(p, token, now.Unix(), s.env(p, now, touch))
+	case "vod":
+		j.verdict, j.refresh = JudgeVOD(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
+	case "timeshift":
+		j.verdict, j.refresh = JudgeTimeshift(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
 	}
 	return j
 }
@@ -142,6 +156,13 @@ func (s *Server) env(p *Policy, now time.Time, touch bool) Env {
 		File: func(path string) bool {
 			_, err := os.Stat(path)
 			return err == nil
+		},
+		Mtime: func(path string) (int64, bool) {
+			fi, err := os.Stat(path)
+			if err != nil {
+				return 0, false
+			}
+			return fi.ModTime().Unix(), true
 		},
 		Heard: func(uuid string) (bool, bool) {
 			if p.Paths.AgentSock == "" {
@@ -177,6 +198,21 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 			return s.agentFor(p.Paths.AgentSock).Get(uuid)
 		},
 		AgentAlive: func() bool { return agentAlive(p.Paths.Flows, now) },
+		File:       exists,
+		FileSize: func(path string) (int64, bool) {
+			fi, err := os.Stat(path)
+			if err != nil || !fi.Mode().IsRegular() {
+				return 0, false
+			}
+			return fi.Size(), true
+		},
+		Offset: func(path string) int64 {
+			b, err := os.ReadFile(path + ".offset")
+			if err != nil || len(b) > 32 {
+				return 0
+			}
+			return phpIntval(b)
+		},
 	}
 }
 
@@ -205,13 +241,38 @@ func (s *Server) shadow(r *http.Request) {
 	dlog.Logf("gateway", "shadow %s: %s (%s) stream=%d seq=%d ip=%s", kind, v.Action, v.Reason, v.Stream, v.Seq, r.Header.Get("X-XC-Client-IP"))
 }
 
-// serves is whether the node's mode lets the gateway answer this kind.
+// serves is whether the node's mode lets the gateway answer this kind. The
+// modes are an additive ladder: each rung serves its own kind and everything
+// the rung below it does.
 func serves(mode, kind string) bool {
 	switch mode {
+	case "segments+playlist+thumb+subtitle+vod+timeshift":
+		if kind == "timeshift" {
+			return true
+		}
+		fallthrough
+	case "segments+playlist+thumb+subtitle+vod":
+		if kind == "vod" {
+			return true
+		}
+		fallthrough
+	case "segments+playlist+thumb+subtitle":
+		if kind == "subtitle" {
+			return true
+		}
+		fallthrough
+	case "segments+playlist+thumb":
+		if kind == "thumb" {
+			return true
+		}
+		fallthrough
+	case "segments+playlist":
+		if kind == "live" {
+			return true
+		}
+		fallthrough
 	case "segments":
 		return kind == "segment" || kind == "key"
-	case "segments+playlist":
-		return kind == "segment" || kind == "key" || kind == "live"
 	}
 	return false
 }
@@ -236,6 +297,38 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	p, v := j.policy, j.verdict
 	if v.Action == Serve && j.kind == "live" {
 		why := s.serveLive(w, r, p, j.refresh, now)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
+	if v.Action == Serve && j.kind == "thumb" {
+		why := s.serveThumb(w, p, v, now)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
+	if v.Action == Serve && j.kind == "subtitle" {
+		why := s.serveSubtitle(w, p, v)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
+	if v.Action == Serve && j.kind == "vod" {
+		why := s.serveVOD(w, r, p, j.refresh, now)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
+	if v.Action == Serve && j.kind == "timeshift" {
+		why := s.serveTimeshift(w, r, p, j.refresh, now)
 		if why == "" {
 			return
 		}
@@ -285,8 +378,89 @@ func phpLocation(kind string) string {
 		return "@gw_key_php"
 	case "live":
 		return "@gw_live_php"
+	case "thumb":
+		return "@gw_thumb_php"
+	case "subtitle":
+		return "@gw_subtitle_php"
+	case "vod":
+		return "@gw_vod_php"
+	case "timeshift":
+		return "@gw_timeshift_php"
 	}
 	return "@gw_segment_php"
+}
+
+// serveThumb answers thumb.php's happy path: the stream's thumbnail with the
+// headers thumb.php sends. A node with send_unique_header set never reaches
+// here (JudgeThumb hands those to PHP, which writes the per-response cookie),
+// so no cookie is written. "" when served; else why PHP answers after all (the
+// file went away between the judgement and here).
+func (s *Server) serveThumb(w http.ResponseWriter, p *Policy, v Verdict, now time.Time) string {
+	fi, err := os.Stat(v.Path)
+	if err != nil {
+		return "stale"
+	}
+	body, err := os.ReadFile(v.Path)
+	if err != nil {
+		return "stale"
+	}
+	// thumb.php's headers: unlike segment.php's policyHeaders, it sets
+	// X-Content-Type-Options only with the protection headers, not always.
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	if p.Headers.Server != "" {
+		h.Set("Server", p.Headers.Server)
+	}
+	if p.Headers.Protection {
+		h.Set("X-XSS-Protection", "0")
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
+	if p.Headers.AltsvcPort > 0 {
+		h.Set("Alt-Svc", altsvc(p.Headers.AltsvcPort))
+	}
+	age := now.Unix() - fi.ModTime().Unix()
+	if age < 0 {
+		age = 0
+	}
+	h.Set("Age", strconv.FormatInt(age, 10))
+	h.Set("Content-Type", "image/jpg")
+	_, _ = w.Write(body)
+	return ""
+}
+
+// serveSubtitle answers subtitle.php's happy path: the VOD subtitle file, as
+// WebVTT when the token asked, with the headers subtitle.php sends. Like
+// serveThumb, a node with send_unique_header set never reaches here. "" when
+// served; else why PHP answers after all (the file went away since the judgement).
+func (s *Server) serveSubtitle(w http.ResponseWriter, p *Policy, v Verdict) string {
+	body, err := os.ReadFile(v.Path)
+	if err != nil {
+		return "stale"
+	}
+	ext := "srt"
+	if v.WebVTT {
+		body = convertVTT(body)
+		ext = "vtt"
+	}
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	if p.Headers.Server != "" {
+		h.Set("Server", p.Headers.Server)
+	}
+	if p.Headers.Protection {
+		h.Set("X-XSS-Protection", "0")
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
+	if p.Headers.AltsvcPort > 0 {
+		h.Set("Alt-Svc", altsvc(p.Headers.AltsvcPort))
+	}
+	name := strconv.Itoa(v.Stream) + "_" + strconv.FormatInt(v.Seq, 10) + "." + ext
+	h.Set("Content-Description", "File Transfer")
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	_, _ = w.Write(body)
+	return ""
 }
 
 // serveLive answers a playlist refresh or a TS viewer as live.php does: the
@@ -381,6 +555,125 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 	return ""
 }
 
+// serveVOD answers vod.php's fanout-daemon happy path: the connection recorded
+// (or refreshed) in the agent with pid 0 and admitted, the limit spooled for
+// MAIN, the viewer's marker touched, then the movie file handed to the daemon
+// (node.HandOverFile) with vod.php's content type, throttle and range. A node
+// with send_unique_header, a direct proxy, a legacy node or a connection a PHP
+// worker feeds never reaches here (JudgeVOD hands those to PHP). "" when served,
+// else why PHP answers it after all.
+func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
+	if why := s.serveFileConn(w, r, p, ref, now, json.RawMessage("0")); why != "" {
+		return why
+	}
+	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, []server.FilePart{{Path: ref.Path, Length: -1}}, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
+		return "handover"
+	}
+	return ""
+}
+
+// serveTimeshift answers timeshift.php's two arms. The file arm (default): the
+// connection as serveFileConn records it, then the archive minutes (ref.Parts,
+// the first from its .offset) handed to the daemon as one video/mp2t response.
+// The m3u8 arm: the same connection (container "hls", pid untouched) and a
+// VOD-type playlist of catch-up segment tokens minted here. A proxy, a
+// worker-kill and a legacy node never reach here (JudgeTimeshift → PHP).
+func (s *Server) serveTimeshift(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
+	m3u8 := ref.ContentType == "application/x-mpegurl"
+	refreshPID := json.RawMessage("0")
+	if m3u8 {
+		refreshPID = nil // a playlist viewer keeps its pid (null), as timeshift.php does
+	}
+	if why := s.serveFileConn(w, r, p, ref, now, refreshPID); why != "" {
+		return why
+	}
+	if m3u8 {
+		body, err := timeshiftPlaylist(p, ref, r.Header.Get("X-XC-Client-IP"))
+		if err != nil {
+			return "mint"
+		}
+		h := w.Header()
+		h.Set("Content-Type", "application/x-mpegurl")
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+		// Fixed HLS tags and /hls/<token> lines; each token is a sealed (AES-GCM,
+		// base64url) blob minted by mintOwn, so no request data reaches the body
+		// as text, and it is served as application/x-mpegurl, not HTML (as serveLive's).
+		// nosemgrep: go.net.xss.no-direct-write-to-responsewriter-taint.no-direct-write-to-responsewriter-taint
+		_, _ = w.Write([]byte(body))
+		return ""
+	}
+	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, ref.Parts, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
+		return "handover"
+	}
+	return ""
+}
+
+// serveFileConn records (or refreshes) a file viewer's connection in the agent
+// as vod.php/timeshift.php do, spools its line limit, touches its marker and
+// writes the policy's stream headers — the shared lead of serveVOD and
+// serveTimeshift, before the bytes. refreshPID is the pid a refresh (updateLive)
+// sets — the daemon's "0" for a file serve, nil for the m3u8 playlist (which
+// leaves the viewer's pid as it is). A node with send_unique_header never
+// reaches here. "" when ready to serve, else why PHP answers it after all.
+func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time, refreshPID json.RawMessage) string {
+	ip := r.Header.Get("X-XC-Client-IP")
+	if ref.New {
+		// openRecord: stored, a limited line admitted by the agent.
+		stored, refused := s.agentFor(p.Paths.AgentSock).Register(ref.UUID, ref.Record, ref.Admission)
+		if refused {
+			return "refused"
+		}
+		if !stored {
+			return "agent-put"
+		}
+	} else {
+		// updateLive.
+		rec := make(map[string]json.RawMessage, len(ref.Record)+4)
+		for k, v := range ref.Record {
+			rec[k] = v
+		}
+		if refreshPID != nil {
+			rec["pid"] = refreshPID
+		}
+		rec["server_id"] = ref.ServerID
+		rec["proxy_id"] = json.RawMessage("null")
+		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
+		rec["hls_end"] = json.RawMessage("0")
+		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
+			return "agent-put"
+		}
+	}
+	if ref.Limit {
+		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil {
+			return "spool"
+		}
+	}
+	// The viewer's marker (CONS_TMP_PATH/<uuid>).
+	marker := filepath.Join(p.Paths.Cons, ref.UUID)
+	if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		f.Close()
+		_ = os.Chtimes(marker, now, now)
+	}
+	// sendStreamHeaders, as thumb/subtitle send them (protection gates both
+	// headers), plus X-Accel-Buffering with use_buffer off.
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	if p.Headers.Server != "" {
+		h.Set("Server", p.Headers.Server)
+	}
+	if p.Headers.Protection {
+		h.Set("X-XSS-Protection", "0")
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
+	if p.Headers.AltsvcPort > 0 {
+		h.Set("Alt-Svc", altsvc(p.Headers.AltsvcPort))
+	}
+	if !p.Live.UseBuffer {
+		h.Set("X-Accel-Buffering", "no")
+	}
+	return ""
+}
+
 // policyHeaders are the headers segment.php and key.php send.
 func policyHeaders(w http.ResponseWriter, p *Policy) {
 	h := w.Header()
@@ -409,13 +702,15 @@ const notFoundPage = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<bo
 	"<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n<!-- a padding to disable MSIE and Chrome friendly error page -->"
 
 // ParseURI splits a viewer's request URI into its kind ("segment" for
-// /hls/<token>, "key" for /key/<token>, "live" for /auth/<token>) and its
-// token, as nginx's server-level rewrites read it; "" for anything else.
+// /hls/<token>, "key" for /key/<token>, "live" for /auth/<token>, "thumb" for
+// /thauth/<token>, "subtitle" for /subauth/<token>, "vod" for /vauth/<token>,
+// "timeshift" for /tsauth/<token>) and its token, as nginx's server-level
+// rewrites read it; "" for anything else.
 func ParseURI(uri string) (kind, token string) {
 	if i := strings.IndexByte(uri, '?'); i >= 0 {
 		uri = uri[:i]
 	}
-	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live"} {
+	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb", "/subauth/": "subtitle", "/vauth/": "vod", "/tsauth/": "timeshift"} {
 		if rest, ok := strings.CutPrefix(uri, prefix); ok && !strings.Contains(rest, "/") {
 			return k, rest
 		}

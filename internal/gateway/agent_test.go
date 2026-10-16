@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/clusteragent"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
 )
 
 // fakeAgent answers /v1/conn on a unix socket as xc_agent's registry does.
@@ -110,6 +111,12 @@ type fakeFiles struct {
 	path      string
 	offset    int64
 	playlists map[string]string
+	// HandOverFile capture (the segment gateway's VOD/timeshift serve).
+	hoID, hoUUID, hoType, hoRange string
+	hoParts                       []server.FilePart
+	hoLimitPerc                   int
+	hoRate                        int64
+	hoRefuse                      bool // a part is not under a file root: return false
 }
 
 func (f *fakeFiles) FedPlaylist(id string) string { return f.playlists[id] }
@@ -120,6 +127,17 @@ func (f *fakeFiles) ServeFilePart(w http.ResponseWriter, _ *http.Request, path s
 	f.path, f.offset = path, offset
 	w.Header().Set("Content-Type", contentType)
 	_, _ = w.Write([]byte("MINUTE"))
+}
+
+func (f *fakeFiles) HandOverFile(w http.ResponseWriter, _ *http.Request, id, uuid string, parts []server.FilePart, contentType string, limitPerc int, rate int64, rng string) bool {
+	if f.hoRefuse {
+		return false
+	}
+	f.hoID, f.hoUUID, f.hoParts, f.hoType, f.hoRange = id, uuid, parts, contentType, rng
+	f.hoLimitPerc, f.hoRate = limitPerc, rate
+	w.Header().Set("Content-Type", contentType)
+	_, _ = w.Write([]byte("MOVIE"))
+	return true
 }
 
 func TestServeCatchUpTouchesTheViewerAndServesTheMinute(t *testing.T) {

@@ -37,6 +37,10 @@ type Policy struct {
 		Server     string `json:"server"`
 		Protection bool   `json:"protection"`
 		AltsvcPort int    `json:"altsvc_port"`
+		// UniqueHeader is send_unique_header on: the endpoints that set a fresh
+		// per-response cookie (thumb.php, subtitle.php) are then PHP's, since the
+		// gateway does not reproduce that cookie.
+		UniqueHeader bool `json:"unique_header"`
 	} `json:"headers"`
 	// ServeUntil is the node's lease fence on this host's clock: nothing is
 	// served past it (PHP answers from then). 0: no lease limits the node.
@@ -45,6 +49,7 @@ type Policy struct {
 		Cons      string `json:"cons"`
 		Streams   string `json:"streams"`
 		Archive   string `json:"archive"`
+		Vod       string `json:"vod"`
 		Flood     string `json:"flood"`
 		AgentSock string `json:"agent_sock"`
 		Signals   string `json:"signals"`
@@ -59,6 +64,13 @@ type Policy struct {
 	ConnStore string `json:"conn_store"`
 	// TimeOffset is the node's servers.time_offset: hls_last_read is now minus it.
 	TimeOffset int64 `json:"time_offset"`
+	// VodLimitPerc / VodBitratePlus are vod.php's throttle: past vod_limit_perc
+	// of a movie, serve at its bitrate plus vod_bitrate_plus percent.
+	VodLimitPerc   int `json:"vod_limit_perc"`
+	VodBitratePlus int `json:"vod_bitrate_plus"`
+	// DefaultTimezone is the panel's default_timezone (LegacyInitializer sets
+	// it): timeshift.php parses its date-form start with mktime in this zone.
+	DefaultTimezone string `json:"default_timezone"`
 	// Live is what live.php reads for a playlist refresh.
 	Live LivePolicy `json:"live"`
 	// Redirect is each other server's base URLs, for a token it minted.

@@ -215,9 +215,12 @@ func livePolicy() *Policy {
 
 type liveEnvState struct {
 	alive, onDisk, agentAnswers, agentAlive, fed bool
+	fileMissing                                  bool // vod.php's file_exists: the movie is gone
 	playlist                                     string
 	rec                                          map[string]any
-	recUUID                                      string // the record's key in the agent
+	recUUID                                      string           // the record's key in the agent
+	sizes                                        map[string]int64 // timeshift archive files present, by path
+	offset                                       int64            // the first archive minute's .offset
 }
 
 func (st *liveEnvState) env() LiveEnv {
@@ -242,6 +245,9 @@ func (st *liveEnvState) env() LiveEnv {
 			return recRaw, true, true
 		},
 		AgentAlive: func() bool { return st.agentAlive },
+		File:       func(string) bool { return !st.fileMissing },
+		FileSize:   func(path string) (int64, bool) { s, ok := st.sizes[path]; return s, ok },
+		Offset:     func(string) int64 { return st.offset },
 	}
 }
 
@@ -534,6 +540,106 @@ func TestJudgeLiveTSFirstRequest(t *testing.T) {
 	}
 }
 
+// firstHLSToken is an HLS (m3u8) link just minted, with what MAIN seals for its record.
+func firstHLSToken(edit func(map[string]any)) string {
+	return liveTokenJSON(func(m map[string]any) {
+		m["activity_start"], m["country_code"], m["external_device"] = testNow-2, "PT", ""
+		m["user_info"].(map[string]any)["con_isp_name"] = "Example ISP"
+		if edit != nil {
+			edit(m)
+		}
+	})
+}
+
+// An HLS viewer's first request: its connection is created as createLive and
+// openRecord create it — keyed on the deterministic playlist key, the uuid MAIN
+// reserved at mint kept as adm_uuid — and admitted by the agent as
+// AgentConnections::admission asks.
+func TestJudgeLiveHLSFirstRequest(t *testing.T) {
+	ip := "198.51.100.7"
+	proof := strings.Repeat("ab", 16)
+	first := func(p *Policy) { p.Live.CreateExpiration, p.Live.Admission, p.TimeOffset = 5, true, 0 }
+	serve := func(p *Policy, token string) (Verdict, *Refresh) {
+		st := goodLiveEnv()
+		st.rec = nil
+		return JudgeLive(p, token, ip, testUA, testNow, st.env())
+	}
+
+	// A line with a limit: a new connection keyed on the playlist key, admitted
+	// by the agent; no reservation and no mint without them in the token.
+	p := livePolicy()
+	first(p)
+	v, r := serve(p, firstHLSToken(nil))
+	if v.Action != Serve || v.Reason != "playlist-new" || r == nil || !r.New || r.TS || r.UUID != liveUUID() {
+		t.Fatalf("a new HLS viewer: %s (%s) %+v", v.Action, v.Reason, r)
+	}
+	if r.Admission != `{"ip":"198.51.100.7","line_id":41,"max_connections":2,"stream_id":12,"ua":"`+testUA+`"}` {
+		t.Fatalf("admission: %q", r.Admission)
+	}
+	if _, ok := r.Record["adm_uuid"]; ok {
+		t.Fatalf("no reservation without an admission claim: %s", r.Record["adm_uuid"])
+	}
+	if _, ok := r.Record["mint"]; ok {
+		t.Fatalf("no mint without a proof: %s", r.Record["mint"])
+	}
+	got, _ := json.Marshal(r.Record)
+	wantRec := `{"container":"hls","date_start":1799999998,"external_device":"","geoip_country_code":"PT","hls_end":0,"hls_last_read":1800000000,"identity":41,"isp":"Example ISP","on_demand":0,"pid":null,"proxy_id":null,"server_id":3,"stream_id":12,"user_agent":"` + testUA + `","user_id":41,"user_ip":"198.51.100.7","uuid":"` + liveUUID() + `"}`
+	if string(got) != wantRec {
+		t.Fatalf("record\n%s\nwant\n%s", got, wantRec)
+	}
+
+	// MAIN's admission at mint and its proof: the reservation kept as adm_uuid
+	// (the token's own uuid, not the playlist key), the proof as mint, both
+	// passed to the agent.
+	v, r = serve(p, firstHLSToken(func(m map[string]any) {
+		m["adm"] = map[string]any{"exp": testNow + 60, "sid": 3}
+		m["prf"] = map[string]any{"iat": 1799999990, "p": proof}
+	}))
+	if v.Action != Serve || string(r.Record["adm_uuid"]) != `"`+testUUID+`"` || string(r.Record["mint"]) != `"`+testUUID+".1799999990."+proof+`"` {
+		t.Fatalf("reservation/mint: adm_uuid=%s mint=%s", r.Record["adm_uuid"], r.Record["mint"])
+	}
+	if r.Admission != `{"adm":{"exp":1800000060,"sid":3},"ip":"198.51.100.7","line_id":41,"max_connections":2,"mint":"`+testUUID+".1799999990."+proof+`","stream_id":12,"ua":"`+testUA+`"}` {
+		t.Fatalf("admission with adm+mint: %q", r.Admission)
+	}
+
+	// A past admission is not passed on, but the reservation is still kept
+	// (openRecord stores adm_uuid whenever the token carries an adm object).
+	_, r = serve(p, firstHLSToken(func(m map[string]any) { m["adm"] = map[string]any{"exp": testNow - 1, "sid": 3} }))
+	if string(r.Record["adm_uuid"]) != `"`+testUUID+`"` || strings.Contains(r.Admission, `"adm"`) {
+		t.Fatalf("past admission: adm_uuid=%s admission=%q", r.Record["adm_uuid"], r.Admission)
+	}
+
+	// An HMAC viewer: keyed on its own identity, the record's identity joined.
+	_, r = serve(p, firstHLSToken(func(m map[string]any) {
+		delete(m, "username")
+		delete(m, "password")
+		m["hmac_id"], m["identifier"] = 7, "dev-1"
+	}))
+	if r == nil || r.UUID != hlsConnectionKey("h7_dev-1", 12, ip, testUA) || string(r.Record["identity"]) != `"7_dev-1"` || r.Record["user_id"] != nil {
+		t.Fatalf("an HMAC viewer: %+v", r)
+	}
+
+	// No limit: a plain register, no admission asked.
+	if _, r := serve(p, firstHLSToken(func(m map[string]any) { m["user_info"].(map[string]any)["max_connections"] = 0 })); r.Admission != "" {
+		t.Fatalf("no limit: %q", r.Admission)
+	}
+
+	// PHP's to create: expired, a token naming a reservation, a panel that does
+	// not say how long a token opens a connection.
+	if v, _ := serve(p, firstHLSToken(func(m map[string]any) { m["activity_start"] = testNow - 6 })); v.Action != PHP || v.Reason != "expired" {
+		t.Errorf("expired: %s (%s)", v.Action, v.Reason)
+	}
+	if v, _ := serve(p, firstHLSToken(func(m map[string]any) { m["adm_uuid"] = testUUID })); v.Action != PHP || v.Reason != "token" {
+		t.Errorf("a reservation token: %s (%s)", v.Action, v.Reason)
+	}
+	noCE := livePolicy()
+	first(noCE)
+	noCE.Live.CreateExpiration = 0
+	if v, _ := serve(noCE, firstHLSToken(nil)); v.Action != PHP || v.Reason != "new-connection" {
+		t.Errorf("no create_expiration: %s (%s)", v.Action, v.Reason)
+	}
+}
+
 // ── A refresh served ────────────────────────────────────────────────────
 
 func TestServeLiveAnswersAsLivePHPDoes(t *testing.T) {
@@ -765,6 +871,65 @@ func TestServeTSFirstRequestAnswersAsLivePHPDoes(t *testing.T) {
 	s.ServeHTTP(httptest.NewRecorder(), req)
 	if s.Stats()["live php admission"] != 1 || len(a.records) != 0 || len(a.admissions) != 2 {
 		t.Fatalf("shadow: stats %v records %v admissions %d", s.Stats(), a.records, len(a.admissions))
+	}
+}
+
+// An HLS viewer's first request served: the record createLive stores (keyed on
+// the playlist key, container hls, pid null), the viewer admitted by the agent,
+// the tokenized playlist returned and the marker touched. A second request is a
+// known viewer's refresh, with no new admission.
+func TestServeHLSFirstRequestAnswersAsLivePHPDoes(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"cons", "streams", "signals", "spool"} {
+		_ = os.MkdirAll(filepath.Join(dir, d), 0o755)
+	}
+	flows := filepath.Join(dir, "flows.json")
+	_ = os.WriteFile(flows, []byte("{}"), 0o644)
+	a := &fakeAgent{records: map[string]map[string]any{}}
+	sock := startAgent(t, a)
+	path := writeServePolicy(t, dir, "segments+playlist", func(doc map[string]any) {
+		doc["conn_store"] = "agent"
+		doc["live"] = map[string]any{"use_buffer": true, "create_expiration": 5, "admission": true}
+		paths := doc["paths"].(map[string]any)
+		paths["agent_sock"], paths["streams"], paths["signals"], paths["spool"], paths["flows"] = sock, dir+"/streams/", dir+"/signals/", dir+"/spool", flows
+		paths["cons"] = dir + "/cons"
+	})
+	startProducer(t, filepath.Join(dir, "streams"))
+	node := &fakeFiles{playlists: map[string]string{"12": goodLiveEnv().playlist}}
+	s := NewServer(path, http.NotFoundHandler(), node)
+	ask := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/stream/live?token=x", nil)
+		// Minted now: the server judges on the real clock.
+		req.Header.Set("X-XC-Original-URI", "/auth/"+firstHLSToken(func(m map[string]any) { m["activity_start"] = time.Now().Unix() }))
+		req.Header.Set("X-XC-Client-IP", "198.51.100.7")
+		req.Header.Set("User-Agent", testUA)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := ask()
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/x-mpegurl" || !strings.Contains(rec.Body.String(), "#EXT-X-MEDIA-SEQUENCE:") {
+		t.Fatalf("first HLS request: %d %v %q; stats %v", rec.Code, rec.Header(), rec.Body.String(), s.Stats())
+	}
+	got := a.records[liveUUID()]
+	if got == nil || got["container"] != "hls" || got["pid"] != nil || got["user_id"] != float64(41) || got["server_id"] != float64(3) || got["user_ip"] != "198.51.100.7" {
+		t.Fatalf("the record created in the agent: %v", got)
+	}
+	if len(a.admissions) == 0 {
+		t.Fatalf("the admission asked of the agent: %v", a.admissions)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "cons", liveUUID())); err != nil {
+		t.Fatalf("the viewer's marker touched: %v", err)
+	}
+	if s.Stats()["live serve playlist-new"] != 1 {
+		t.Fatalf("stats: %v", s.Stats())
+	}
+
+	// The same link again: a known viewer's refresh, no new admission.
+	n := len(a.admissions)
+	if rec := ask(); rec.Code != 200 || s.Stats()["live serve playlist"] != 1 || len(a.admissions) != n {
+		t.Fatalf("the refresh: %d stats %v admissions %d want %d", rec.Code, s.Stats(), len(a.admissions), n)
 	}
 }
 

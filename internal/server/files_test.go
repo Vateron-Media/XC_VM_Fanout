@@ -298,3 +298,60 @@ func TestServeFilePart(t *testing.T) {
 		}
 	}
 }
+
+// HandOverFile is serveFile in process (the segment gateway's VOD/timeshift
+// serve): the same manifest serve, built from arguments instead of a file.
+func TestHandOverFile(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m.SetFileRoots([]string{root})
+	path := filepath.Join(root, "123.mp4")
+	_ = os.WriteFile(path, []byte("0123456789"), 0o644)
+
+	whole := []FilePart{{Path: path, Length: -1}}
+
+	// Served whole, with the content type and cache header.
+	rec := httptest.NewRecorder()
+	if !m.HandOverFile(rec, httptest.NewRequest(http.MethodGet, "/x", nil), "123", "u1", whole, "video/mp4", 0, 0, "") {
+		t.Fatal("not handed over")
+	}
+	if rec.Code != 200 || rec.Body.String() != "0123456789" || rec.Header().Get("Content-Type") != "video/mp4" || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("whole: %d %q %v", rec.Code, rec.Body.String(), rec.Header())
+	}
+
+	// Several parts served back to back, each from its offset.
+	second := filepath.Join(root, "456.mp4")
+	_ = os.WriteFile(second, []byte("ABCDEF"), 0o644)
+	rec = httptest.NewRecorder()
+	m.HandOverFile(rec, httptest.NewRequest(http.MethodGet, "/x", nil), "123", "u1",
+		[]FilePart{{Path: path, Offset: 7, Length: -1}, {Path: second, Offset: 0, Length: 3}}, "video/mp2t", 0, 0, "")
+	if rec.Code != 200 || rec.Body.String() != "789ABC" {
+		t.Fatalf("parts: %d %q", rec.Code, rec.Body.String())
+	}
+
+	// The request's own Range wins.
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Range", "bytes=2-4")
+	rec = httptest.NewRecorder()
+	m.HandOverFile(rec, req, "123", "u1", whole, "video/mp4", 0, 0, "")
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != "234" {
+		t.Fatalf("request range: %d %q", rec.Code, rec.Body.String())
+	}
+
+	// The handed-over range (the token's http_range) is used when the request has none.
+	rec = httptest.NewRecorder()
+	m.HandOverFile(rec, httptest.NewRequest(http.MethodGet, "/x", nil), "123", "u1", whole, "video/mp4", 0, 0, "bytes=5-")
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != "56789" {
+		t.Fatalf("token range: %d %q", rec.Code, rec.Body.String())
+	}
+
+	// A part outside the file roots is refused and writes nothing, so the
+	// caller can still hand the request to PHP.
+	rec = httptest.NewRecorder()
+	if m.HandOverFile(rec, httptest.NewRequest(http.MethodGet, "/x", nil), "123", "u1", []FilePart{{Path: "/etc/passwd", Length: -1}}, "video/mp4", 0, 0, "") {
+		t.Fatal("a path outside the roots was served")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("refused but wrote: %q", rec.Body.String())
+	}
+}
