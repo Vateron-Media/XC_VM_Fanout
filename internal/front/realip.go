@@ -71,15 +71,21 @@ func (t *TrustedProxies) trusted(ip net.IP) bool {
 // header is ignored entirely.
 func (t *TrustedProxies) RealIP(r *http.Request) string {
 	peer := clientIP(r)
+	if t == nil { // no trusted proxies configured: the peer is the client
+		return peer
+	}
 	ip := net.ParseIP(peer)
 	if ip == nil || !t.trusted(ip) {
 		return peer
 	}
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff == "" {
+	// Match nginx: consider every X-Forwarded-For line, not just the first, and
+	// take the rightmost entry — a trusted proxy appends the true peer there even
+	// if the client sent its own line.
+	vals := r.Header.Values("X-Forwarded-For")
+	if len(vals) == 0 {
 		return peer
 	}
-	parts := strings.Split(xff, ",")
+	parts := strings.Split(strings.Join(vals, ","), ",")
 	if last := strings.TrimSpace(parts[len(parts)-1]); net.ParseIP(last) != nil {
 		return last
 	}

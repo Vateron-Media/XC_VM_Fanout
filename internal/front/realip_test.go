@@ -69,6 +69,27 @@ func TestLoadTrustedProxies(t *testing.T) {
 	}
 }
 
+func TestRealIPMultipleXFFHeadersAndNil(t *testing.T) {
+	tp := &TrustedProxies{}
+	tp.add("10.0.0.0/8")
+
+	// A client's spoofed X-Forwarded-For line plus the trusted proxy's appended
+	// line: the rightmost across all lines wins, as nginx does.
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "10.0.0.1:1"
+	r.Header.Add("X-Forwarded-For", "1.2.3.4")     // spoofed, first line
+	r.Header.Add("X-Forwarded-For", "88.88.88.88") // appended by the trusted proxy
+	if got := tp.RealIP(r); got != "88.88.88.88" {
+		t.Fatalf("multi-line XFF: got %q, want the rightmost 88.88.88.88", got)
+	}
+
+	// A nil TrustedProxies trusts no proxy: the peer is the client.
+	var nilTP *TrustedProxies
+	if got := nilTP.RealIP(reqFrom("10.0.0.1:1", "1.2.3.4")); got != "10.0.0.1" {
+		t.Fatalf("nil TrustedProxies: got %q, want the peer 10.0.0.1", got)
+	}
+}
+
 // Behind a trusted CDN, the gateway receives the viewer's real address, not the
 // CDN's, as X-XC-Client-IP.
 func TestFrontResolvesRealIPBehindCDN(t *testing.T) {
