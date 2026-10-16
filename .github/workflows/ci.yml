@@ -69,6 +69,8 @@ jobs:
               go build -trimpath -o /tmp/xc_fanout-linux-$t ./cmd/xc_fanout
             CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH GOARM=$GOARM GOWORK=off \
               go build -trimpath -o /tmp/xc_agent-linux-$t ./cmd/xc_agent
+            CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH GOARM=$GOARM GOWORK=off \
+              go build -trimpath -o /tmp/xc_node-linux-$t ./cmd/xc_node
           done
 
   # The agent against MAIN's real PHP: every test that takes XCVM_PANEL_DIR

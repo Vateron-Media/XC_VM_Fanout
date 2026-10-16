@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build the xc_fanout daemon and the xc_agent cluster agent for every target arch into ./dist as flat,
+# Build the xc_fanout daemon, the xc_agent cluster agent, and the merged xc_node binary for every target arch into ./dist as flat,
 # release-ready assets (+ SHA256SUMS). Binaries are NOT committed to the repo —
 # they are attached to a GitHub Release (see .github/workflows/release.yml, or
 # upload dist/* manually with `gh release create <tag> dist/*`).
@@ -45,14 +45,21 @@ for T in "${TARGETS[@]}"; do
   AGENT="$OUT/xc_agent-linux-$T"
   CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" \
     go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$AGENT" ./cmd/xc_agent
+  # The merged load-balancer binary: fanout + agent (+ remux) in one, dispatched
+  # by the name it is invoked under (xc_fanout/xc_agent symlinks) or a leading
+  # subcommand. Shipped alongside the two standalone binaries so a panel can
+  # adopt it without the standalone assets going away mid-transition.
+  NODE="$OUT/xc_node-linux-$T"
+  CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" \
+    go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$NODE" ./cmd/xc_node
   # abort if not fully static
-  for B in "$BIN" "$AGENT"; do
+  for B in "$BIN" "$AGENT" "$NODE"; do
     if command -v file >/dev/null && file "$B" | grep -qv "statically linked"; then
       echo "ERROR: $B is not statically linked"; exit 1
     fi
   done
 done
 
-( cd "$OUT" && sha256sum xc_fanout-linux-* xc_agent-linux-* > SHA256SUMS )
+( cd "$OUT" && sha256sum xc_fanout-linux-* xc_agent-linux-* xc_node-linux-* > SHA256SUMS )
 echo ">>> done — $OUT (tag as $VERSION and attach these as release assets)"
 ls -la "$OUT"
