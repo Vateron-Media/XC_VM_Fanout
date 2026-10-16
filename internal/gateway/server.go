@@ -81,7 +81,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// What PHP answered a mirrored request (GatewayShadow): its other side.
 		s.book.PHP(r.Header.Get("X-XC-Request-ID"), r.Header.Get("X-XC-Kind"), r.Header.Get("X-XC-Outcome"))
 		w.WriteHeader(http.StatusNoContent)
-	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb":
+	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb", "/stream/subtitle":
 		s.serve(w, r)
 	case "/stats":
 		w.Header().Set("Content-Type", "application/json")
@@ -125,6 +125,8 @@ func (s *Server) judge(r *http.Request, now time.Time, touch bool) judged {
 		j.verdict, j.refresh = JudgeLive(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
 	case "thumb":
 		j.verdict = JudgeThumb(p, token, now.Unix(), s.env(p, now, touch))
+	case "subtitle":
+		j.verdict = JudgeSubtitle(p, token, now.Unix(), s.env(p, now, touch))
 	}
 	return j
 }
@@ -219,6 +221,11 @@ func (s *Server) shadow(r *http.Request) {
 // the rung below it does.
 func serves(mode, kind string) bool {
 	switch mode {
+	case "segments+playlist+thumb+subtitle":
+		if kind == "subtitle" {
+			return true
+		}
+		fallthrough
 	case "segments+playlist+thumb":
 		if kind == "thumb" {
 			return true
@@ -263,6 +270,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if v.Action == Serve && j.kind == "thumb" {
 		why := s.serveThumb(w, p, v, now)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
+	if v.Action == Serve && j.kind == "subtitle" {
+		why := s.serveSubtitle(w, p, v)
 		if why == "" {
 			return
 		}
@@ -314,6 +329,8 @@ func phpLocation(kind string) string {
 		return "@gw_live_php"
 	case "thumb":
 		return "@gw_thumb_php"
+	case "subtitle":
+		return "@gw_subtitle_php"
 	}
 	return "@gw_segment_php"
 }
@@ -352,6 +369,41 @@ func (s *Server) serveThumb(w http.ResponseWriter, p *Policy, v Verdict, now tim
 	}
 	h.Set("Age", strconv.FormatInt(age, 10))
 	h.Set("Content-Type", "image/jpg")
+	_, _ = w.Write(body)
+	return ""
+}
+
+// serveSubtitle answers subtitle.php's happy path: the VOD subtitle file, as
+// WebVTT when the token asked, with the headers subtitle.php sends. Like
+// serveThumb, a node with send_unique_header set never reaches here. "" when
+// served; else why PHP answers after all (the file went away since the judgement).
+func (s *Server) serveSubtitle(w http.ResponseWriter, p *Policy, v Verdict) string {
+	body, err := os.ReadFile(v.Path)
+	if err != nil {
+		return "stale"
+	}
+	ext := "srt"
+	if v.WebVTT {
+		body = convertVTT(body)
+		ext = "vtt"
+	}
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	if p.Headers.Server != "" {
+		h.Set("Server", p.Headers.Server)
+	}
+	if p.Headers.Protection {
+		h.Set("X-XSS-Protection", "0")
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
+	if p.Headers.AltsvcPort > 0 {
+		h.Set("Alt-Svc", altsvc(p.Headers.AltsvcPort))
+	}
+	name := strconv.Itoa(v.Stream) + "_" + strconv.FormatInt(v.Seq, 10) + "." + ext
+	h.Set("Content-Description", "File Transfer")
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
 	_, _ = w.Write(body)
 	return ""
 }
@@ -476,13 +528,14 @@ const notFoundPage = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<bo
 	"<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n<!-- a padding to disable MSIE and Chrome friendly error page -->"
 
 // ParseURI splits a viewer's request URI into its kind ("segment" for
-// /hls/<token>, "key" for /key/<token>, "live" for /auth/<token>) and its
-// token, as nginx's server-level rewrites read it; "" for anything else.
+// /hls/<token>, "key" for /key/<token>, "live" for /auth/<token>, "thumb" for
+// /thauth/<token>, "subtitle" for /subauth/<token>) and its token, as nginx's
+// server-level rewrites read it; "" for anything else.
 func ParseURI(uri string) (kind, token string) {
 	if i := strings.IndexByte(uri, '?'); i >= 0 {
 		uri = uri[:i]
 	}
-	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb"} {
+	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb", "/subauth/": "subtitle"} {
 		if rest, ok := strings.CutPrefix(uri, prefix); ok && !strings.Contains(rest, "/") {
 			return k, rest
 		}

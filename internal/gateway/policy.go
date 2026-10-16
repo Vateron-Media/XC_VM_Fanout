@@ -49,6 +49,7 @@ type Policy struct {
 		Cons      string `json:"cons"`
 		Streams   string `json:"streams"`
 		Archive   string `json:"archive"`
+		Vod       string `json:"vod"`
 		Flood     string `json:"flood"`
 		AgentSock string `json:"agent_sock"`
 		Signals   string `json:"signals"`
