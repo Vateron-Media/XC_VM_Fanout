@@ -95,6 +95,7 @@ func Main(ver string) {
 	frontNginx := flag.String("front-nginx", "http://127.0.0.1:8080", "backend the front reverse-proxies non-serve requests to during the nginx transition")
 	frontWebroot := flag.String("front-webroot", "/home/xc_vm/certbot-webroot", "certbot webroot the front serves /.well-known/acme-challenge/ from")
 	frontRealip := flag.String("front-realip", "/home/xc_vm/bin/nginx/conf/realip_cdn.conf,/home/xc_vm/bin/nginx/conf/realip_cloudflare.conf,/home/xc_vm/bin/nginx/conf/realip_xc_vm.conf", "comma-separated nginx set_real_ip_from conf files the front trusts to resolve the viewer IP")
+	frontImages := flag.String("front-images", "/home/xc_vm/storage/images/", "dir the front serves /images/ from in-process (nginx's storage/images alias); empty proxies /images to nginx")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -244,7 +245,7 @@ func Main(ver string) {
 	// way: if it cannot start, nginx keeps serving the node.
 	frontSrv, cleanupFront := (*http.Server)(nil), func() {}
 	if *frontAddr != "" {
-		if srv, cleanup, err := serveFront(*frontAddr, gws, *frontNginx, *frontWebroot, *frontCert, *frontKey, *frontRealip); err != nil {
+		if srv, cleanup, err := serveFront(*frontAddr, gws, *frontNginx, *frontWebroot, *frontCert, *frontKey, *frontRealip, *frontImages); err != nil {
 			log.Printf("front: %v; nginx keeps serving", err)
 		} else {
 			frontSrv, cleanupFront = srv, cleanup

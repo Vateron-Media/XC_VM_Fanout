@@ -128,6 +128,37 @@ func TestFrontACMEServesTokenNotTraversal(t *testing.T) {
 	}
 }
 
+// The front serves /images/ in-process the way nginx does: the file, 403 for a
+// script extension, 404 for an auto-index or a directory, and no path that
+// escapes the image root.
+func TestServeStaticImages(t *testing.T) {
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "logo.png"), []byte("PNGDATA"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "evil.php"), []byte("<?php bad"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "sub", "index.html"), []byte("listing"), 0o644)
+	// A secret one level above the image root; a traversal must not reach it.
+	_ = os.WriteFile(filepath.Join(filepath.Dir(root), "secret.txt"), []byte("TOP"), 0o600)
+
+	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, t.TempDir(), LoadTrustedProxies()).WithImages(root)
+	get := func(p string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		front.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		return rec
+	}
+	if rec := get("/images/logo.png"); rec.Code != 200 || rec.Body.String() != "PNGDATA" {
+		t.Fatalf("logo: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := get("/images/evil.php"); rec.Code != 403 {
+		t.Errorf("script ext: code %d, want 403", rec.Code)
+	}
+	for _, p := range []string{"/images/sub/index.html", "/images/sub/", "/images/../secret.txt", "/images/missing.png"} {
+		if rec := get(p); rec.Code == 200 {
+			t.Errorf("%s served (200, %q), want rejected", p, rec.Body.String())
+		}
+	}
+}
+
 // The front terminates TLS with the reloading certificate and reverse-proxies
 // over a real localhost TLS connection.
 func TestFrontTerminatesTLS(t *testing.T) {

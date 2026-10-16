@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -47,12 +49,20 @@ const (
 	serveBurst = 8
 )
 
+// imagesPrefix is nginx's static image location (alias storage/images). scriptExt
+// is the set of extensions nginx returns 403 for there — the image store never
+// executes code.
+const imagesPrefix = "/images/"
+
+var scriptExt = regexp.MustCompile(`(?i)\.(php\d*|phtml|phar)$`)
+
 type Server struct {
 	gateway http.Handler
 	proxy   http.Handler
 	webroot string
 	trusted *TrustedProxies
 	limiter *rateLimiter
+	images  string // storage/images root; empty leaves /images to the proxy
 }
 
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
@@ -99,9 +109,42 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// WithImages makes the front serve /images/ from dir (nginx's storage/images
+// alias) in-process instead of proxying it. An empty dir leaves /images to the
+// proxy. Returns the server for chaining.
+func (s *Server) WithImages(dir string) *Server {
+	s.images = dir
+	return s
+}
+
+// serveImages serves a file under /images/ from the image store, matching
+// nginx: no code execution (403), no auto-index.html (404), no directory
+// listing, and confined to the root.
+func (s *Server) serveImages(w http.ResponseWriter, r *http.Request) {
+	rel := strings.TrimPrefix(r.URL.Path, imagesPrefix)
+	if rel == "" || rel == "index.html" || strings.HasSuffix(rel, "/index.html") {
+		http.NotFound(w, r)
+		return
+	}
+	if scriptExt.MatchString(rel) {
+		http.Error(w, "", http.StatusForbidden)
+		return
+	}
+	full := filepath.Join(s.images, filepath.FromSlash(path.Clean("/"+rel))) // the leading / anchors Clean, so .. cannot escape
+	if fi, err := os.Stat(full); err != nil || fi.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, full)
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, acmePrefix) {
 		s.serveACME(w, r)
+		return
+	}
+	if s.images != "" && strings.HasPrefix(r.URL.Path, imagesPrefix) {
+		s.serveImages(w, r)
 		return
 	}
 	if kind := serveKind(r.URL.Path); kind != "" {
