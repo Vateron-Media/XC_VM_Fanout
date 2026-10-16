@@ -37,6 +37,10 @@ type Policy struct {
 		Server     string `json:"server"`
 		Protection bool   `json:"protection"`
 		AltsvcPort int    `json:"altsvc_port"`
+		// UniqueHeader is send_unique_header on: the endpoints that set a fresh
+		// per-response cookie (thumb.php, subtitle.php) are then PHP's, since the
+		// gateway does not reproduce that cookie.
+		UniqueHeader bool `json:"unique_header"`
 	} `json:"headers"`
 	// ServeUntil is the node's lease fence on this host's clock: nothing is
 	// served past it (PHP answers from then). 0: no lease limits the node.

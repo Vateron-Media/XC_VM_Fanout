@@ -81,7 +81,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// What PHP answered a mirrored request (GatewayShadow): its other side.
 		s.book.PHP(r.Header.Get("X-XC-Request-ID"), r.Header.Get("X-XC-Kind"), r.Header.Get("X-XC-Outcome"))
 		w.WriteHeader(http.StatusNoContent)
-	case "/stream/segment", "/stream/key", "/stream/live":
+	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb":
 		s.serve(w, r)
 	case "/stats":
 		w.Header().Set("Content-Type", "application/json")
@@ -214,13 +214,23 @@ func (s *Server) shadow(r *http.Request) {
 	dlog.Logf("gateway", "shadow %s: %s (%s) stream=%d seq=%d ip=%s", kind, v.Action, v.Reason, v.Stream, v.Seq, r.Header.Get("X-XC-Client-IP"))
 }
 
-// serves is whether the node's mode lets the gateway answer this kind.
+// serves is whether the node's mode lets the gateway answer this kind. The
+// modes are an additive ladder: each rung serves its own kind and everything
+// the rung below it does.
 func serves(mode, kind string) bool {
 	switch mode {
+	case "segments+playlist+thumb":
+		if kind == "thumb" {
+			return true
+		}
+		fallthrough
+	case "segments+playlist":
+		if kind == "live" {
+			return true
+		}
+		fallthrough
 	case "segments":
 		return kind == "segment" || kind == "key"
-	case "segments+playlist":
-		return kind == "segment" || kind == "key" || kind == "live"
 	}
 	return false
 }
@@ -245,6 +255,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	p, v := j.policy, j.verdict
 	if v.Action == Serve && j.kind == "live" {
 		why := s.serveLive(w, r, p, j.refresh, now)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
+	if v.Action == Serve && j.kind == "thumb" {
+		why := s.serveThumb(w, p, v, now)
 		if why == "" {
 			return
 		}
@@ -294,8 +312,48 @@ func phpLocation(kind string) string {
 		return "@gw_key_php"
 	case "live":
 		return "@gw_live_php"
+	case "thumb":
+		return "@gw_thumb_php"
 	}
 	return "@gw_segment_php"
+}
+
+// serveThumb answers thumb.php's happy path: the stream's thumbnail with the
+// headers thumb.php sends. A node with send_unique_header set never reaches
+// here (JudgeThumb hands those to PHP, which writes the per-response cookie),
+// so no cookie is written. "" when served; else why PHP answers after all (the
+// file went away between the judgement and here).
+func (s *Server) serveThumb(w http.ResponseWriter, p *Policy, v Verdict, now time.Time) string {
+	fi, err := os.Stat(v.Path)
+	if err != nil {
+		return "stale"
+	}
+	body, err := os.ReadFile(v.Path)
+	if err != nil {
+		return "stale"
+	}
+	// thumb.php's headers: unlike segment.php's policyHeaders, it sets
+	// X-Content-Type-Options only with the protection headers, not always.
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	if p.Headers.Server != "" {
+		h.Set("Server", p.Headers.Server)
+	}
+	if p.Headers.Protection {
+		h.Set("X-XSS-Protection", "0")
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
+	if p.Headers.AltsvcPort > 0 {
+		h.Set("Alt-Svc", altsvc(p.Headers.AltsvcPort))
+	}
+	age := now.Unix() - fi.ModTime().Unix()
+	if age < 0 {
+		age = 0
+	}
+	h.Set("Age", strconv.FormatInt(age, 10))
+	h.Set("Content-Type", "image/jpg")
+	_, _ = w.Write(body)
+	return ""
 }
 
 // serveLive answers a playlist refresh or a TS viewer as live.php does: the

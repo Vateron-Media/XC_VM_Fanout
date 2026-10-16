@@ -1,8 +1,12 @@
 package gateway
 
 import (
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func decs(n int64) string { return strconv.FormatInt(n, 10) }
@@ -56,5 +60,51 @@ func TestJudgeThumb(t *testing.T) {
 	p.ServeUntil = testNow - 1
 	if v := JudgeThumb(p, tok(`{"expires":`+decs(testNow+3600)+`,"stream":12}`), testNow, fresh); v.Action != PHP {
 		t.Errorf("past lease: got %+v, want PHP", v)
+	}
+
+	// send_unique_header hands thumbnails to PHP: it writes a per-response
+	// cookie the gateway does not reproduce.
+	p.ServeUntil = 0
+	p.Headers.UniqueHeader = true
+	if v := JudgeThumb(p, tok(`{"expires":`+decs(testNow+3600)+`,"stream":12}`), testNow, fresh); v.Action != PHP {
+		t.Errorf("unique-header: got %+v, want PHP", v)
+	}
+}
+
+// TestServeThumb: the gateway serves the thumbnail as thumb.php does under a
+// mode that owns it, and hands it to PHP's @gw_thumb_php under one that does not.
+func TestServeThumb(t *testing.T) {
+	dir := t.TempDir()
+	streams := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(streams, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jpg := []byte("\xff\xd8\xff\xe0thumbnail-bytes")
+	if err := os.WriteFile(filepath.Join(streams, "12_.jpg"), jpg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The serve path judges on the wall clock (NewServer's now), so the token
+	// expires against it, not testNow.
+	token := tok(`{"expires":` + decs(time.Now().Unix()+3600) + `,"stream":12}`)
+	withStreams := func(doc map[string]any) { doc["paths"].(map[string]any)["streams"] = streams + "/" }
+
+	s := NewServer(writeServePolicy(t, dir, "segments+playlist+thumb", withStreams), http.NotFoundHandler(), nil)
+	rec := serveReq(s, "/thauth/"+token, "198.51.100.7")
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "image/jpg" || rec.Body.String() != string(jpg) {
+		t.Fatalf("served thumbnail: %d %v body=%q", rec.Code, rec.Header(), rec.Body.String())
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "*" || rec.Header().Get("Age") == "" {
+		t.Fatalf("thumb headers: %v", rec.Header())
+	}
+	// thumb.php sets X-Content-Type-Options only with the protection headers.
+	if rec.Header().Get("X-Content-Type-Options") != "" {
+		t.Fatalf("nosniff must track send_protection_headers: %v", rec.Header())
+	}
+
+	// A mode that does not serve thumb hands it to PHP's @gw_thumb_php.
+	off := NewServer(writeServePolicy(t, dir, "segments+playlist", withStreams), http.NotFoundHandler(), nil)
+	rec = serveReq(off, "/thauth/"+token, "198.51.100.7")
+	if rec.Header().Get("X-Accel-Redirect") != "@gw_thumb_php" {
+		t.Fatalf("mode off thumb: want @gw_thumb_php, got %v", rec.Header())
 	}
 }
