@@ -121,16 +121,20 @@ func (s *Server) WithImages(dir string) *Server {
 // nginx: no code execution (403), no auto-index.html (404), no directory
 // listing, and confined to the root.
 func (s *Server) serveImages(w http.ResponseWriter, r *http.Request) {
-	rel := strings.TrimPrefix(r.URL.Path, imagesPrefix)
-	if rel == "" || rel == "index.html" || strings.HasSuffix(rel, "/index.html") {
+	// Normalise FIRST, then run every check on the cleaned path: a check against
+	// the raw remainder is a differential (e.g. "evil.php/." fails a `\.php$`
+	// test but cleans to "/evil.php"). The leading / anchors Clean so .. cannot
+	// escape the root.
+	clean := path.Clean("/" + strings.TrimPrefix(r.URL.Path, imagesPrefix))
+	if clean == "/" || clean == "/index.html" || strings.HasSuffix(clean, "/index.html") {
 		http.NotFound(w, r)
 		return
 	}
-	if scriptExt.MatchString(rel) {
+	if scriptExt.MatchString(clean) {
 		http.Error(w, "", http.StatusForbidden)
 		return
 	}
-	full := filepath.Join(s.images, filepath.FromSlash(path.Clean("/"+rel))) // the leading / anchors Clean, so .. cannot escape
+	full := filepath.Join(s.images, filepath.FromSlash(clean))
 	if fi, err := os.Stat(full); err != nil || fi.IsDir() {
 		http.NotFound(w, r)
 		return

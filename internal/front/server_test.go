@@ -149,10 +149,14 @@ func TestServeStaticImages(t *testing.T) {
 	if rec := get("/images/logo.png"); rec.Code != 200 || rec.Body.String() != "PNGDATA" {
 		t.Fatalf("logo: %d %q", rec.Code, rec.Body.String())
 	}
-	if rec := get("/images/evil.php"); rec.Code != 403 {
-		t.Errorf("script ext: code %d, want 403", rec.Code)
+	// Script extensions are 403 — including normalization differentials that
+	// clean to a .php file ("evil.php/." → "/evil.php").
+	for _, p := range []string{"/images/evil.php", "/images/evil.php/.", "/images/evil.php/", "/images/sub/../evil.php"} {
+		if rec := get(p); rec.Code != 403 {
+			t.Errorf("%s: code %d (body %q), want 403", p, rec.Code, rec.Body.String())
+		}
 	}
-	for _, p := range []string{"/images/sub/index.html", "/images/sub/", "/images/../secret.txt", "/images/missing.png"} {
+	for _, p := range []string{"/images/sub/index.html", "/images/index.html/.", "/images/sub/", "/images/../secret.txt", "/images/missing.png"} {
 		if rec := get(p); rec.Code == 200 {
 			t.Errorf("%s served (200, %q), want rejected", p, rec.Body.String())
 		}
