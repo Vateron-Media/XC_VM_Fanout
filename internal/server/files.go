@@ -233,7 +233,9 @@ func closeAll(files []*os.File) {
 	}
 }
 
-// serveFile is the client handler for /file/<id>.
+// serveFile is the client handler for /file/<id>: the panel wrote the manifest
+// and X-Accel-Redirected here. The segment gateway serves the same thing in
+// process through HandOverFile, without the manifest file or the nginx hop.
 func (m *Manager) serveFile(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/file/")
 	mf, code := m.readManifest(r.URL.Query().Get("m"), time.Now())
@@ -241,8 +243,40 @@ func (m *Manager) serveFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(code), code)
 		return
 	}
+	m.serveManifest(w, r, id, r.URL.Query().Get("c"), mf)
+}
 
-	uuid := r.URL.Query().Get("c")
+// HandOverFile serves one local file to a viewer as the panel's handOverFile
+// does (FanoutClient::handOverFile → /file/<id>), but in process for the
+// segment gateway: the viewer counted under uuid with pid 0, its range
+// honoured, the panel's throttle applied (limitPerc: throttle after this share
+// of the response, rate: bytes/s once throttled, 0 = never). rng is a Range to
+// use when the request carries none. It reports whether the path lay under a
+// file root; false writes nothing, so the caller can still hand the request to
+// PHP.
+func (m *Manager) HandOverFile(w http.ResponseWriter, r *http.Request, id, uuid, path, contentType string, limitPerc int, rate int64, rng string) bool {
+	root, rel, ok := m.underRoots(path)
+	if !ok {
+		return false
+	}
+	if limitPerc < 0 {
+		limitPerc = 0
+	} else if limitPerc > 100 {
+		limitPerc = 100
+	}
+	if rate < 0 {
+		rate = 0
+	}
+	mf := &fileManifest{Type: contentType, LimitPerc: limitPerc, Rate: rate, Range: rng,
+		Parts: []filePart{{Path: path, Offset: 0, Length: -1, root: root, rel: rel}}}
+	m.serveManifest(w, r, id, uuid, mf)
+	return true
+}
+
+// serveManifest serves one request's manifest (serveFile and HandOverFile): the
+// viewer counted under uuid as a live one, its range honoured, the panel's
+// throttle, write deadline and kill channel applied between chunks.
+func (m *Manager) serveManifest(w http.ResponseWriter, r *http.Request, id, uuid string, mf *fileManifest) {
 	fw := &fileWriter{ResponseWriter: w, rc: http.NewResponseController(w), m: m, limitPerc: mf.LimitPerc, rate: mf.Rate, done: r.Context().Done()}
 	if uuid != "" {
 		st, cs := m.fileStream(id, uuid)

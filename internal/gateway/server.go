@@ -58,6 +58,11 @@ var latencyBuckets = [...]time.Duration{100 * time.Microsecond, 500 * time.Micro
 // whether it is on air.
 type Node interface {
 	ServeFilePart(w http.ResponseWriter, r *http.Request, path string, offset int64, contentType string)
+	// HandOverFile serves a local file to a viewer counted under uuid (pid 0),
+	// its range honoured and the panel's throttle applied, as the panel's
+	// handOverFile does; false (nothing written) when the path is not under a
+	// file root, so the caller can still hand the request to PHP.
+	HandOverFile(w http.ResponseWriter, r *http.Request, id, uuid, path, contentType string, limitPerc int, rate int64, rng string) bool
 	FedPlaylist(id string) string
 	Fed(id string) bool
 }
@@ -81,7 +86,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// What PHP answered a mirrored request (GatewayShadow): its other side.
 		s.book.PHP(r.Header.Get("X-XC-Request-ID"), r.Header.Get("X-XC-Kind"), r.Header.Get("X-XC-Outcome"))
 		w.WriteHeader(http.StatusNoContent)
-	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb", "/stream/subtitle":
+	case "/stream/segment", "/stream/key", "/stream/live", "/stream/thumb", "/stream/subtitle", "/stream/vod":
 		s.serve(w, r)
 	case "/stats":
 		w.Header().Set("Content-Type", "application/json")
@@ -127,6 +132,8 @@ func (s *Server) judge(r *http.Request, now time.Time, touch bool) judged {
 		j.verdict = JudgeThumb(p, token, now.Unix(), s.env(p, now, touch))
 	case "subtitle":
 		j.verdict = JudgeSubtitle(p, token, now.Unix(), s.env(p, now, touch))
+	case "vod":
+		j.verdict, j.refresh = JudgeVOD(p, token, ip, r.Header.Get("User-Agent"), now.Unix(), s.liveEnv(p, now))
 	}
 	return j
 }
@@ -188,6 +195,7 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 			return s.agentFor(p.Paths.AgentSock).Get(uuid)
 		},
 		AgentAlive: func() bool { return agentAlive(p.Paths.Flows, now) },
+		File:       exists,
 	}
 }
 
@@ -221,6 +229,11 @@ func (s *Server) shadow(r *http.Request) {
 // the rung below it does.
 func serves(mode, kind string) bool {
 	switch mode {
+	case "segments+playlist+thumb+subtitle+vod":
+		if kind == "vod" {
+			return true
+		}
+		fallthrough
 	case "segments+playlist+thumb+subtitle":
 		if kind == "subtitle" {
 			return true
@@ -284,6 +297,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		j.verdict = verdict(PHP, why)
 		v = j.verdict
 	}
+	if v.Action == Serve && j.kind == "vod" {
+		why := s.serveVOD(w, r, p, j.refresh, now)
+		if why == "" {
+			return
+		}
+		j.verdict = verdict(PHP, why)
+		v = j.verdict
+	}
 	switch v.Action {
 	case PHP:
 		w.Header().Set("X-Accel-Redirect", phpLocation(j.kind))
@@ -331,6 +352,8 @@ func phpLocation(kind string) string {
 		return "@gw_thumb_php"
 	case "subtitle":
 		return "@gw_subtitle_php"
+	case "vod":
+		return "@gw_vod_php"
 	}
 	return "@gw_segment_php"
 }
@@ -500,6 +523,74 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 	return ""
 }
 
+// serveVOD answers vod.php's fanout-daemon happy path: the connection recorded
+// (or refreshed) in the agent with pid 0 and admitted, the limit spooled for
+// MAIN, the viewer's marker touched, then the movie file handed to the daemon
+// (node.HandOverFile) with vod.php's content type, throttle and range. A node
+// with send_unique_header, a direct proxy, a legacy node or a connection a PHP
+// worker feeds never reaches here (JudgeVOD hands those to PHP). "" when served,
+// else why PHP answers it after all.
+func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
+	ip := r.Header.Get("X-XC-Client-IP")
+	if ref.New {
+		// vod.php's openRecord: stored, a limited line admitted by the agent.
+		stored, refused := s.agentFor(p.Paths.AgentSock).Register(ref.UUID, ref.Record, ref.Admission)
+		if refused {
+			return "refused"
+		}
+		if !stored {
+			return "agent-put"
+		}
+	} else {
+		// vod.php's updateLive: the connection is the daemon's now (pid 0).
+		rec := make(map[string]json.RawMessage, len(ref.Record)+4)
+		for k, v := range ref.Record {
+			rec[k] = v
+		}
+		rec["pid"] = json.RawMessage("0")
+		rec["server_id"] = ref.ServerID
+		rec["proxy_id"] = json.RawMessage("null")
+		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
+		rec["hls_end"] = json.RawMessage("0")
+		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
+			return "agent-put"
+		}
+	}
+	if ref.Limit {
+		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil {
+			return "spool"
+		}
+	}
+	// vod.php touches the viewer's marker (CONS_TMP_PATH/<uuid>).
+	marker := filepath.Join(p.Paths.Cons, ref.UUID)
+	if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		f.Close()
+		_ = os.Chtimes(marker, now, now)
+	}
+	// vod.php's sendStreamHeaders, as thumb/subtitle send them (protection gates
+	// both headers), plus X-Accel-Buffering with use_buffer off. No cookie: a
+	// node with send_unique_header went to PHP.
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	if p.Headers.Server != "" {
+		h.Set("Server", p.Headers.Server)
+	}
+	if p.Headers.Protection {
+		h.Set("X-XSS-Protection", "0")
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
+	if p.Headers.AltsvcPort > 0 {
+		h.Set("Alt-Svc", altsvc(p.Headers.AltsvcPort))
+	}
+	if !p.Live.UseBuffer {
+		h.Set("X-Accel-Buffering", "no")
+	}
+	if !s.node.HandOverFile(w, r, strconv.Itoa(ref.Stream), ref.UUID, ref.Path, ref.ContentType, ref.LimitPerc, ref.Rate, ref.Range) {
+		return "handover"
+	}
+	return ""
+}
+
 // policyHeaders are the headers segment.php and key.php send.
 func policyHeaders(w http.ResponseWriter, p *Policy) {
 	h := w.Header()
@@ -535,7 +626,7 @@ func ParseURI(uri string) (kind, token string) {
 	if i := strings.IndexByte(uri, '?'); i >= 0 {
 		uri = uri[:i]
 	}
-	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb", "/subauth/": "subtitle"} {
+	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb", "/subauth/": "subtitle", "/vauth/": "vod"} {
 		if rest, ok := strings.CutPrefix(uri, prefix); ok && !strings.Contains(rest, "/") {
 			return k, rest
 		}

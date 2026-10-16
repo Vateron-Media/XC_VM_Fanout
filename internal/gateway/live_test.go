@@ -215,6 +215,7 @@ func livePolicy() *Policy {
 
 type liveEnvState struct {
 	alive, onDisk, agentAnswers, agentAlive, fed bool
+	fileMissing                                  bool // vod.php's file_exists: the movie is gone
 	playlist                                     string
 	rec                                          map[string]any
 	recUUID                                      string // the record's key in the agent
@@ -242,6 +243,7 @@ func (st *liveEnvState) env() LiveEnv {
 			return recRaw, true, true
 		},
 		AgentAlive: func() bool { return st.agentAlive },
+		File:       func(string) bool { return !st.fileMissing },
 	}
 }
 

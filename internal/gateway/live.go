@@ -26,6 +26,8 @@ type LiveEnv struct {
 	Record func(uuid string) (rec map[string]json.RawMessage, found, ok bool)
 	// AgentAlive: is the agent draining its spool (EventSpool::agentAlive)?
 	AgentAlive func() bool
+	// File: does this path exist (vod.php's file_exists on the movie)?
+	File func(path string) bool
 }
 
 // Refresh is a playlist refresh (or a TS viewer's reconnect) the gateway
@@ -60,6 +62,14 @@ type Refresh struct {
 	UserID      int64
 	MaxConns    int64
 	IdentityKey string
+	// VOD's serve (vod.php handOverFile): the movie file the daemon serves, its
+	// content type, the throttle (past LimitPerc of the response, at Rate bytes/s)
+	// and a Range the token carried (used when the request has none).
+	Path        string
+	ContentType string
+	LimitPerc   int
+	Rate        int64
+	Range       string
 }
 
 var segLineRe = regexp.MustCompile(`(?m)^(\d+)\.ts$`)
@@ -289,11 +299,209 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 
 var mintProofRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
+// vodExtRe is a movie file's extension as it goes into VOD_PATH/<id>.<ext>:
+// plain alphanumerics, so it names nothing but a file beside the others.
+var vodExtRe = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+
+// vodContentType is vod.php's map from the channel's target_container to a MIME
+// type, application/octet-stream for anything else.
+func vodContentType(ch map[string]json.RawMessage) string {
+	c, _ := phpString(ch["target_container"])
+	switch c {
+	case "mp4", "m4v":
+		return "video/mp4"
+	case "mkv":
+		return "video/x-matroska"
+	case "avi":
+		return "video/x-msvideo"
+	case "3gp":
+		return "video/3gpp"
+	case "flv":
+		return "video/x-flv"
+	case "wmv":
+		return "video/x-ms-wmv"
+	case "mov":
+		return "video/quicktime"
+	case "ts":
+		return "video/mp2t"
+	case "mpg", "mpeg":
+		return "video/mpeg"
+	}
+	return "application/octet-stream"
+}
+
+// vodThrottle is vod.php's download pacing: limit_perc is passed through as the
+// setting; the rate (bytes/s once past that share) is the movie's bitrate plus
+// vod_bitrate_plus percent, but 0 (no throttle) without a limit or for a
+// restreamer.
+func vodThrottle(p *Policy, ch, ui map[string]json.RawMessage) (int, int64) {
+	limitPerc := p.VodLimitPerc
+	if limitPerc <= 0 || phpTruthy(ui["is_restreamer"]) {
+		return limitPerc, 0
+	}
+	bitrate, _ := jsonInt(ch["bitrate"])
+	download := float64(bitrate * 125)
+	download += download * float64(p.VodBitratePlus) * 0.01
+	return limitPerc, int64(download)
+}
+
+// JudgeVOD is vod.php's decision on /vauth/<token> as far as the gateway owns
+// it: a local movie file (VOD_PATH/<id>.<ext>) the fanout daemon serves
+// (handOverFile), the viewer tracked in the agent with pid 0, as on a modern
+// fanout node. A direct-proxy movie, a connection a PHP worker still feeds, a
+// node with send_unique_header, or any form PHP reads otherwise goes to PHP.
+func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
+	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	if p == nil {
+		return php("policy")
+	}
+	if p.ConnStore != "agent" {
+		return php("conn-store")
+	}
+	if p.ServeUntil != 0 && now > p.ServeUntil {
+		return php("lease")
+	}
+	if p.Headers.UniqueHeader {
+		// vod.php's sendStreamHeaders writes a fresh send_unique_header cookie.
+		return php("unique-header")
+	}
+	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
+	if v != Opened {
+		return php("token")
+	}
+	var t map[string]json.RawMessage
+	if json.Unmarshal(plain, &t) != nil || t == nil {
+		return php("token")
+	}
+	set := func(m map[string]json.RawMessage, k string) bool { r, ok := m[k]; return ok && !isNull(r) }
+	// A VOD link names the file's extension; one that does not, or an odd one,
+	// is another endpoint's or PHP's.
+	ext, ok := phpString(t["extension"])
+	if !ok || !vodExtRe.MatchString(ext) {
+		return php("extension")
+	}
+	var ch, ui map[string]json.RawMessage
+	if json.Unmarshal(t["channel_info"], &ch) != nil || len(ch) == 0 || json.Unmarshal(t["user_info"], &ui) != nil || ui == nil {
+		return php("token")
+	}
+	if phpTruthy(ch["proxy"]) {
+		// A direct-proxy movie: PHP relays its source.
+		return php("proxy")
+	}
+	stream, ok := jsonInt(t["stream_id"])
+	if !ok || stream <= 0 || stream > math.MaxInt32 {
+		return php("stream-id")
+	}
+	r := &Refresh{Stream: int(stream)}
+	// The serving server; the gateway owns only the simple, non-proxied case
+	// (an originator/redirect proxy is PHP's, which tracks the proxied source).
+	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
+	if phpTruthy(ch["originator_id"]) {
+		return php("proxy")
+	} else if phpTruthy(ch["redirect_id"]) {
+		r.ServerID = ch["redirect_id"]
+	}
+	// The viewer: a line, or an HMAC identity.
+	if set(t, "hmac_id") {
+		h, okH := jsonInt(t["hmac_id"])
+		ident, identOK := phpString(t["identifier"])
+		if !okH || !identOK {
+			return php("token")
+		}
+		r.HMAC, r.Identifier = strconv.FormatInt(h, 10), ident
+		r.IdentityKey = "h" + r.HMAC + "_" + ident
+	} else {
+		id, okID := jsonInt(ui["id"])
+		if !okID && set(ui, "id") {
+			return php("token")
+		}
+		r.UserID, r.IdentityKey = id, "u"+strconv.FormatInt(id, 10)
+	}
+	ua, ok := htmlentitiesASCII(rawUA)
+	if !ok {
+		return php("user-agent")
+	}
+	r.UserAgent = ua
+	// VOD keeps the token's own uuid (not an HLS playlist key).
+	u, isStr := jsonString(t["uuid"])
+	if !isStr || !uuidRe.MatchString(u) {
+		return php("token")
+	}
+	r.UUID = u
+	// The movie on disk; missing (and not a direct proxy) is PHP's VOD_DOESNT_EXIST.
+	path := p.Paths.Vod + strconv.Itoa(int(stream)) + "." + ext
+	if !env.File(path) {
+		return php("missing")
+	}
+	r.Path, r.ContentType = path, vodContentType(ch)
+	r.Range, _ = phpString(t["http_range"])
+
+	// The connection, under the token's uuid (findByUuid).
+	rec, found, answered := env.Record(r.UUID)
+	if !answered {
+		return php("agent")
+	}
+	if !found {
+		var why string
+		if rec, why = newVODRecord(p, t, ch, ui, r, clientIP, now); why != "" {
+			return php(why)
+		}
+		r.New = true
+	} else {
+		if !liveMatches(rec, r, "VOD") {
+			return php("new-connection")
+		}
+		if !set(rec, "identity") || !set(rec, "uuid") {
+			return php("record")
+		}
+		// The gateway takes over only a connection fanout already serves (pid 0);
+		// one a PHP worker still feeds (vod.php may kill it) is PHP's.
+		if pid, okP := jsonInt(rec["pid"]); !okP || pid != 0 {
+			return php("worker")
+		}
+		recIP, _ := phpString(rec["user_ip"])
+		if p.RestrictSameIP && !ipMatch(recIP, clientIP, p.IPSubnetMatch) {
+			return php("ip")
+		}
+	}
+	r.Record = rec
+	// The line's limit via the agent's spool; a stopped agent is PHP's limiter.
+	if mc, okM := jsonInt(ui["max_connections"]); okM && mc != 0 {
+		if !env.AgentAlive() {
+			return php("spool")
+		}
+		r.Limit, r.MaxConns = true, mc
+	} else if !okM && phpTruthy(ui["max_connections"]) {
+		return php("token")
+	}
+	if r.New {
+		adm, okA := admissionHeader(p, t, r, clientIP, now)
+		if !okA {
+			return php("token")
+		}
+		r.Admission = adm
+	}
+	r.LimitPerc, r.Rate = vodThrottle(p, ch, ui)
+	reason := "vod"
+	if r.New {
+		reason = "vod-new"
+	}
+	return Verdict{Action: Serve, Reason: reason, Stream: int(stream), UUID: r.UUID}, r
+}
+
 // newTSRecord is the record createLive/openRecord store for a TS viewer fanout
 // serves (pid 0): newLiveRecord's TS arm. A TS viewer is keyed on the token's
 // own uuid (r.UUID), which is the reservation too.
 func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (map[string]json.RawMessage, string) {
-	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "ts", json.RawMessage("0"), r.UUID)
+	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "ts", json.RawMessage("0"), r.UUID, p.Live.CreateExpiration)
+}
+
+// newVODRecord is the record createLive/openRecord store for a VOD viewer the
+// daemon serves (pid 0): newLiveRecord's VOD arm. Like a TS viewer, VOD keeps
+// the token's own uuid (its reservation), so it stores no adm_uuid. vod.php
+// fixes its create_expiration at 60 seconds (not the live setting).
+func newVODRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (map[string]json.RawMessage, string) {
+	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "VOD", json.RawMessage("0"), r.UUID, 60)
 }
 
 // newHLSRecord is the record createLive/openRecord store for an HLS viewer's
@@ -303,7 +511,7 @@ func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, cl
 // uuid is the reservation openRecord keeps as adm_uuid / names in mint.
 func newHLSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (map[string]json.RawMessage, string) {
 	reserved, _ := jsonString(t["uuid"])
-	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "hls", json.RawMessage("null"), reserved)
+	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "hls", json.RawMessage("null"), reserved, p.Live.CreateExpiration)
 }
 
 // newLiveRecord is the connection record ConnectionTracker::createLive and
@@ -314,7 +522,7 @@ func newHLSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, c
 // it differs from the record key and names in mint). "" or why PHP creates the
 // connection ("expired": its TOKEN_EXPIRED, past the token's start plus
 // create_expiration on MAIN's clock).
-func newLiveRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64, container string, pid json.RawMessage, reserved string) (map[string]json.RawMessage, string) {
+func newLiveRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64, container string, pid json.RawMessage, reserved string, createExp int64) (map[string]json.RawMessage, string) {
 	set := func(m map[string]json.RawMessage, k string) bool { v, ok := m[k]; return ok && !isNull(v) }
 	raw := func(v json.RawMessage) json.RawMessage {
 		if len(v) == 0 {
@@ -327,7 +535,7 @@ func newLiveRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, 
 	if !ok {
 		return nil, "token"
 	}
-	if now-p.TimeOffset > start+p.Live.CreateExpiration {
+	if now-p.TimeOffset > start+createExp {
 		return nil, "expired"
 	}
 	// The sealed token names no reservation of its own; live.php derives it from

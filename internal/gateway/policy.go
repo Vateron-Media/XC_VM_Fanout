@@ -64,6 +64,10 @@ type Policy struct {
 	ConnStore string `json:"conn_store"`
 	// TimeOffset is the node's servers.time_offset: hls_last_read is now minus it.
 	TimeOffset int64 `json:"time_offset"`
+	// VodLimitPerc / VodBitratePlus are vod.php's throttle: past vod_limit_perc
+	// of a movie, serve at its bitrate plus vod_bitrate_plus percent.
+	VodLimitPerc   int `json:"vod_limit_perc"`
+	VodBitratePlus int `json:"vod_bitrate_plus"`
 	// Live is what live.php reads for a playlist refresh.
 	Live LivePolicy `json:"live"`
 	// Redirect is each other server's base URLs, for a token it minted.
