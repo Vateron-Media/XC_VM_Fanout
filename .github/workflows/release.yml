@@ -48,4 +48,5 @@ jobs:
           files: |
             dist/xc_fanout-linux-*
             dist/xc_agent-linux-*
+            dist/xc_node-linux-*
             dist/SHA256SUMS

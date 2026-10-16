@@ -2,7 +2,7 @@
 // XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
 // See LICENSE and LICENSE-ADDITIONAL-TERMS.md
 
-package main
+package fanoutcmd
 
 import (
 	"os"
