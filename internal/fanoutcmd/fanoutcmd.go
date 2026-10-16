@@ -89,6 +89,12 @@ func Main(ver string) {
 	gw := flag.String("gw", "", "segment gateway unix socket (nginx-only, Phase 12), e.g. /home/xc_vm/bin/xc_fanout/sockets/gw.sock; empty = no gateway")
 	gwPolicy := flag.String("gw-policy", "/home/xc_vm/tmp/gateway/policy.json", "the panel's segment gateway policy (written every minute by cron:cache)")
 	gwState := flag.String("gw-state", "/home/xc_vm/bin/xc_fanout/gateway_shadow.json", "where the gateway keeps its shadow comparison with PHP across restarts; empty = in memory")
+	frontAddr := flag.String("front", "", "public HTTPS listen address for the single-binary LB front (serve-only, replaces nginx), e.g. :443; empty = no front (nginx serves)")
+	frontCert := flag.String("front-cert", "/home/xc_vm/bin/nginx/conf/server.crt", "TLS certificate for -front (certbot's)")
+	frontKey := flag.String("front-key", "/home/xc_vm/bin/nginx/conf/server.key", "TLS private key for -front")
+	frontNginx := flag.String("front-nginx", "http://127.0.0.1:8080", "backend the front reverse-proxies non-serve requests to during the nginx transition")
+	frontWebroot := flag.String("front-webroot", "/home/xc_vm/certbot-webroot", "certbot webroot the front serves /.well-known/acme-challenge/ from")
+	frontRealip := flag.String("front-realip", "/home/xc_vm/bin/nginx/conf/realip_cdn.conf,/home/xc_vm/bin/nginx/conf/realip_cloudflare.conf,/home/xc_vm/bin/nginx/conf/realip_xc_vm.conf", "comma-separated nginx set_real_ip_from conf files the front trusts to resolve the viewer IP")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -216,16 +222,32 @@ func Main(ver string) {
 	if *ctl != "" {
 		ctlSrv, cleanupCtl = serveUnix(*ctl, mgr.ControlHandler())
 	}
+	// The segment gateway drives both surfaces below, so build it once if either
+	// wants it: the unix socket nginx proxies to (-gw), and/or the public TLS
+	// front that serves it in-process (-front).
+	var gws *gateway.Server
+	if *gw != "" || *frontAddr != "" {
+		gws = gateway.NewServer(*gwPolicy, mgr.ClientHandler(), mgr)
+		gws.KeepShadowIn(*gwState)
+	}
 	// The segment gateway is optional: without its socket nginx sends /hls/ and
 	// /key/ to PHP as before, so a socket it cannot bind is logged, not fatal.
 	gwSrv, cleanupGw := (*http.Server)(nil), func() {}
 	if *gw != "" {
-		gws := gateway.NewServer(*gwPolicy, mgr.ClientHandler(), mgr)
-		gws.KeepShadowIn(*gwState)
 		if srv, cleanup, err := listenUnix(*gw, gws); err != nil {
 			log.Printf("gateway: %v; PHP serves /hls/ and /key/", err)
 		} else {
 			gwSrv, cleanupGw = srv, cleanup
+		}
+	}
+	// The public HTTPS front (single-binary LB) is opt-in and non-fatal the same
+	// way: if it cannot start, nginx keeps serving the node.
+	frontSrv, cleanupFront := (*http.Server)(nil), func() {}
+	if *frontAddr != "" {
+		if srv, cleanup, err := serveFront(*frontAddr, gws, *frontNginx, *frontWebroot, *frontCert, *frontKey, *frontRealip); err != nil {
+			log.Printf("front: %v; nginx keeps serving", err)
+		} else {
+			frontSrv, cleanupFront = srv, cleanup
 		}
 	}
 
@@ -265,6 +287,14 @@ func Main(ver string) {
 
 	<-ctx.Done()
 
+	// Drain the public front first so no new viewer arrives while the surfaces
+	// behind it are closing.
+	if frontSrv != nil {
+		fCtx, fCancel := context.WithTimeout(context.Background(), shutdownGrace)
+		_ = frontSrv.Shutdown(fCtx)
+		fCancel()
+	}
+	cleanupFront()
 	if gwSrv != nil {
 		gwCtx, gwCancel := context.WithTimeout(context.Background(), shutdownGrace)
 		_ = gwSrv.Shutdown(gwCtx)
