@@ -39,11 +39,20 @@ func serveKind(path string) string {
 // gateway, and reverse-proxies everything else — and the gateway's PHP-defer
 // verdicts — to the nginx behind it. As more moves in-process the proxied set
 // shrinks until nginx is gone.
+// serveRate / serveBurst mirror nginx's zone one on the serve routes
+// (limit_req zone=one burst=8; zone one = 20 r/s), which the front must apply
+// itself since those routes no longer reach nginx.
+const (
+	serveRate  = 20
+	serveBurst = 8
+)
+
 type Server struct {
 	gateway http.Handler
 	proxy   http.Handler
 	webroot string
 	trusted *TrustedProxies
+	limiter *rateLimiter
 }
 
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
@@ -62,7 +71,13 @@ func NewServer(gateway http.Handler, nginx *url.URL, webroot string, trusted *Tr
 			pr.Out.Header.Set("X-Forwarded-For", ip)
 		},
 	}
-	return &Server{gateway: gateway, proxy: rp, webroot: webroot, trusted: trusted}
+	return &Server{
+		gateway: gateway,
+		proxy:   rp,
+		webroot: webroot,
+		trusted: trusted,
+		limiter: newRateLimiter(serveRate, serveBurst),
+	}
 }
 
 // serveACME answers certbot's http-01 challenge from the webroot. Only a single
@@ -101,9 +116,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // /stream/<kind>. A verdict the gateway hands back to PHP (X-Accel-Redirect) is
 // re-proxied to nginx, so PHP answers it unchanged during the transition.
 func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, kind string) {
+	ip := s.trusted.RealIP(r)
+	if !s.limiter.allow(ip) {
+		http.Error(w, "", http.StatusServiceUnavailable) // nginx limit_req's default status
+		return
+	}
 	gr := r.Clone(r.Context())
 	gr.Header.Set("X-XC-Original-URI", r.URL.RequestURI())
-	gr.Header.Set("X-XC-Client-IP", s.trusted.RealIP(r))
+	gr.Header.Set("X-XC-Client-IP", ip)
 	gr.Header.Set("X-XC-Host", r.Host)
 	gr.URL = &url.URL{Path: "/stream/" + kind}
 	gr.RequestURI = ""
