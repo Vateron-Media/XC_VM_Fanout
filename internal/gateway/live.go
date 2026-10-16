@@ -205,15 +205,21 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if !answered {
 		return php("agent")
 	}
-	if !found && r.TS && p.Live.CreateExpiration > 0 {
-		// A TS viewer's first request: its connection is created (createLive).
+	if !found && p.Live.CreateExpiration > 0 {
+		// A viewer's first request: its connection is created (createLive). A TS
+		// viewer is keyed on the token's uuid, an HLS one on its playlist key.
 		var why string
-		if rec, why = newTSRecord(p, t, ch, ui, r, clientIP, now); why != "" {
+		if r.TS {
+			rec, why = newTSRecord(p, t, ch, ui, r, clientIP, now)
+		} else {
+			rec, why = newHLSRecord(p, t, ch, ui, r, clientIP, now)
+		}
+		if why != "" {
 			return php(why)
 		}
 		r.New = true
 	} else {
-		// An ended TS connection is re-opened by PHP (its lookup is not open-only).
+		// An ended connection is re-opened by PHP (its lookup is not open-only).
 		if !found || !liveMatches(rec, r, container) {
 			return php("new-connection")
 		}
@@ -274,16 +280,41 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if r.Playlist == "" || !segLineRe.MatchString(r.Playlist) {
 		return php("not-on-air")
 	}
-	return Verdict{Action: Serve, Reason: "playlist", Stream: r.Stream, UUID: r.UUID}, r
+	reason := "playlist"
+	if r.New {
+		reason = "playlist-new"
+	}
+	return Verdict{Action: Serve, Reason: reason, Stream: r.Stream, UUID: r.UUID}, r
 }
 
 var mintProofRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
-// newTSRecord is the record ConnectionTracker::createLive and openRecord
-// store for a TS viewer fanout serves (pid 0), built from the token MAIN
-// sealed as live.php builds it; or why PHP creates the connection ("expired":
-// its TOKEN_EXPIRED, past the token's start plus create_expiration on MAIN's clock).
+// newTSRecord is the record createLive/openRecord store for a TS viewer fanout
+// serves (pid 0): newLiveRecord's TS arm. A TS viewer is keyed on the token's
+// own uuid (r.UUID), which is the reservation too.
 func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (map[string]json.RawMessage, string) {
+	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "ts", json.RawMessage("0"), r.UUID)
+}
+
+// newHLSRecord is the record createLive/openRecord store for an HLS viewer's
+// first request (its playlist served per request, pid null): newLiveRecord's
+// HLS arm. live.php keys the record on a deterministic hlsConnectionKey
+// (r.UUID) but reserves the viewer at mint under the token's own uuid, so that
+// uuid is the reservation openRecord keeps as adm_uuid / names in mint.
+func newHLSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64) (map[string]json.RawMessage, string) {
+	reserved, _ := jsonString(t["uuid"])
+	return newLiveRecord(p, t, ch, ui, r, clientIP, now, "hls", json.RawMessage("null"), reserved)
+}
+
+// newLiveRecord is the connection record ConnectionTracker::createLive and
+// openRecord store for a new viewer, built from the token MAIN sealed as
+// live.php builds it, with the arm's container and pid. The record is keyed on
+// r.UUID; reserved is the uuid MAIN reserved at mint (r.UUID for a TS viewer,
+// the token's own uuid for an HLS one, which openRecord keeps as adm_uuid when
+// it differs from the record key and names in mint). "" or why PHP creates the
+// connection ("expired": its TOKEN_EXPIRED, past the token's start plus
+// create_expiration on MAIN's clock).
+func newLiveRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, clientIP string, now int64, container string, pid json.RawMessage, reserved string) (map[string]json.RawMessage, string) {
 	set := func(m map[string]json.RawMessage, k string) bool { v, ok := m[k]; return ok && !isNull(v) }
 	raw := func(v json.RawMessage) json.RawMessage {
 		if len(v) == 0 {
@@ -299,8 +330,8 @@ func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, cl
 	if now-p.TimeOffset > start+p.Live.CreateExpiration {
 		return nil, "expired"
 	}
-	// live.php names no reservation of its own for a TS viewer; a token that
-	// carries one is read by PHP.
+	// The sealed token names no reservation of its own; live.php derives it from
+	// the uuid. A token that carries adm_uuid is read by PHP.
 	if set(t, "adm_uuid") {
 		return nil, "token"
 	}
@@ -310,8 +341,8 @@ func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, cl
 		"proxy_id":           json.RawMessage("null"),
 		"user_agent":         str(r.UserAgent),
 		"user_ip":            str(clientIP),
-		"container":          json.RawMessage(`"ts"`),
-		"pid":                json.RawMessage("0"),
+		"container":          str(container),
+		"pid":                pid,
 		"date_start":         raw(t["activity_start"]),
 		"geoip_country_code": raw(t["country_code"]),
 		"isp":                raw(ui["con_isp_name"]),
@@ -334,14 +365,27 @@ func newTSRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, cl
 		}
 		rec["user_id"], rec["identity"] = ui["id"], ui["id"]
 	}
+	// openRecord keeps the reserved uuid as adm_uuid when the token carries an
+	// admission claim and it differs from the record key (always for an HLS
+	// viewer): MAIN releases the reservation by it when the viewer leaves
+	// (ConnectionIngest). A TS viewer is keyed on the reservation itself, so none.
+	if reserved != "" && reserved != r.UUID {
+		var adm map[string]json.RawMessage
+		if json.Unmarshal(t["adm"], &adm) == nil && adm != nil {
+			rec["adm_uuid"] = str(reserved)
+		}
+	}
 	// MAIN's proof that it minted the token (`prf`), kept as `mint` for the
-	// record's life: <uuid>.<iat>.<p>.
-	var prf map[string]json.RawMessage
-	if json.Unmarshal(t["prf"], &prf) == nil && prf != nil {
-		iat, okI := strictInt(prf["iat"])
-		proof, okP := jsonString(prf["p"])
-		if okI && iat > 0 && okP && mintProofRe.MatchString(proof) {
-			rec["mint"] = str(r.UUID + "." + strconv.FormatInt(iat, 10) + "." + proof)
+	// record's life: <reserved uuid>.<iat>.<p>, stored only when the reservation
+	// is a uuid.
+	if uuidRe.MatchString(reserved) {
+		var prf map[string]json.RawMessage
+		if json.Unmarshal(t["prf"], &prf) == nil && prf != nil {
+			iat, okI := strictInt(prf["iat"])
+			proof, okP := jsonString(prf["p"])
+			if okI && iat > 0 && okP && mintProofRe.MatchString(proof) {
+				rec["mint"] = str(reserved + "." + strconv.FormatInt(iat, 10) + "." + proof)
+			}
 		}
 	}
 	return rec, ""
