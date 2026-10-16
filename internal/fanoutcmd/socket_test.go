@@ -2,7 +2,7 @@
 // XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
 // See LICENSE and LICENSE-ADDITIONAL-TERMS.md
 
-package main
+package fanoutcmd
 
 import (
 	"context"
@@ -194,7 +194,7 @@ func buildDaemon(t *testing.T) string {
 		t.Skip("no go toolchain to build the daemon with")
 	}
 	bin := filepath.Join(t.TempDir(), "xc_fanout")
-	cmd := exec.Command("go", "build", "-o", bin, ".")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/Vateron-Media/XC_VM_Fanout/cmd/xc_fanout")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
