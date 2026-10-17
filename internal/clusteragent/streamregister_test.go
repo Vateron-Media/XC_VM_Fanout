@@ -547,3 +547,16 @@ func TestSeedHeldReSupervisesTranscodes(t *testing.T) {
 		t.Fatalf("a held transcode must be re-supervised on a fanout restart, got %d monitor PUTs", n)
 	}
 }
+
+func TestResolveSpecIgnoresFfmpegExpansion(t *testing.T) {
+	// ffmpeg's %{...} expansion (e.g. a drawtext timestamp overlay) must not read
+	// as an unresolved token — else the transcode fails closed and never serves.
+	out, err := resolveSpec(json.RawMessage(`{"cmd":"{ffmpeg_cpu} -vf drawtext=text='%{localtime}' {streams}1_.m3u8"}`),
+		agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i", "", "")
+	if err != nil {
+		t.Fatalf("ffmpeg %%{...} expansion must not trip the residual check: %v", err)
+	}
+	if !strings.Contains(string(out), "%{localtime}") {
+		t.Fatalf("the expansion should be preserved: %s", out)
+	}
+}

@@ -86,7 +86,11 @@ func (a *Agent) SetNodePaths(streams, logs, serverID, ffmpegGPU, ffprobe, binary
 	}
 }
 
-var residualToken = regexp.MustCompile(`\{[a-z_]+\}`)
+// residualToken matches a leftover placeholder after substitution. It excludes
+// `%`-prefixed forms so ffmpeg's own `%{...}` expansion syntax (a drawtext
+// `%{localtime}` overlay, say) is not misread as an unresolved token — which,
+// being fail-closed, would silently keep the transcode off air.
+var residualToken = regexp.MustCompile(`(?:^|[^%])(\{[a-z_]+\})`)
 
 // resolveSpec substitutes the placeholders in a portable transcode spec (4b-i)
 // with this node's values, the ingest socket and the generated key/IV. It fails
@@ -105,8 +109,8 @@ func resolveSpec(spec json.RawMessage, n agentNode, ingestSock, keyHex, ivHex st
 		}
 		s = strings.ReplaceAll(s, kv[0], kv[1])
 	}
-	if m := residualToken.FindString(s); m != "" {
-		return nil, fmt.Errorf("clusteragent: transcode spec has an unknown placeholder %s", m)
+	if m := residualToken.FindStringSubmatch(s); m != nil {
+		return nil, fmt.Errorf("clusteragent: transcode spec has an unknown placeholder %s", m[1])
 	}
 	return []byte(s), nil
 }
