@@ -584,6 +584,9 @@ func (s *streamSync) apply(r *streamsReply) error {
 		}
 		delete(s.a.streamsBad, c.id)
 		s.changed = true
+		// Serve-only LB: hand the stored record's runtime directive to the fanout
+		// (register a proxy stream / clear a non-proxy). No-op unless SeedFanout.
+		s.a.seedFanoutRecord(c.id, c.json)
 	}
 	for _, id := range r.Removed {
 		name := filepath.Join(sd, strconv.FormatInt(id, 10))
@@ -593,6 +596,7 @@ func (s *streamSync) apply(r *streamsReply) error {
 			s.changed = true
 		}
 		delete(s.a.streamsBad, id)
+		s.a.unseedFanoutRecord(id)
 	}
 	return nil
 }

@@ -125,6 +125,40 @@ func (a *Agent) unregisterStream(ctx context.Context, id int64) error {
 	return a.fanoutStreamCall(ctx, http.MethodDelete, id, nil)
 }
 
+// seedFanoutRecord hands one stored record's runtime directive to the fanout
+// when serve-only seeding is on: a proxy directive registers the puller,
+// anything else (a transcode, or no directive) unregisters it so a stream that
+// stopped being a proxy is cleared. No-op unless SeedFanout. Errors are logged
+// by id and swallowed — a down or busy fanout must never fail the streams sync;
+// the next sync (or a fanout-restart re-seed) retries. Only the id is logged,
+// never the record or its source (which carries credentials).
+func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
+	if !a.SeedFanout {
+		return
+	}
+	if d, ok := parseRuntimeDirective(recordJSON); ok {
+		if body, reg := d.registerBody(a.FfmpegBin); reg {
+			if err := a.registerStream(context.Background(), id, body); err != nil {
+				a.logf("cluster: fanout register stream %d: %v", id, err)
+			}
+			return
+		}
+	}
+	a.unseedFanoutRecord(id)
+}
+
+// unseedFanoutRecord removes a stream's fanout registration — on a removal, or
+// a stream that stopped being a proxy. No-op unless SeedFanout; errors logged
+// by id and swallowed.
+func (a *Agent) unseedFanoutRecord(id int64) {
+	if !a.SeedFanout {
+		return
+	}
+	if err := a.unregisterStream(context.Background(), id); err != nil {
+		a.logf("cluster: fanout unregister stream %d: %v", id, err)
+	}
+}
+
 func (a *Agent) fanoutStreamCall(ctx context.Context, method string, id int64, body []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

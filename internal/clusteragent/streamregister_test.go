@@ -165,3 +165,66 @@ func TestRegisterStreamNoSocketIsNoop(t *testing.T) {
 		t.Fatalf("empty FanoutCtl must no-op, got %v", err)
 	}
 }
+
+func TestSeedFanoutRecordProxyRegisters(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	a := st.agent()
+	a.SeedFanout, a.FfmpegBin = true, "/f"
+	data, _ := os.ReadFile("testdata/runtime_directive_proxy.json")
+
+	a.seedFanoutRecord(42, data)
+
+	if m, p, _ := st.seen(); m != http.MethodPut || p != "/streams/42" {
+		t.Fatalf("got %s %s, want PUT /streams/42", m, p)
+	}
+}
+
+func TestSeedFanoutRecordOtherUnregisters(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	a := st.agent()
+	a.SeedFanout = true
+
+	a.seedFanoutRecord(42, []byte(`{"data":{"runtime":{"kind":"other"}}}`))
+
+	if m, p, _ := st.seen(); m != http.MethodDelete || p != "/streams/42" {
+		t.Fatalf("got %s %s, want DELETE /streams/42 (clear a non-proxy)", m, p)
+	}
+}
+
+func TestSeedFanoutRecordDisabledMakesNoCall(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	a := st.agent() // SeedFanout stays false
+	data, _ := os.ReadFile("testdata/runtime_directive_proxy.json")
+
+	a.seedFanoutRecord(42, data)
+
+	if m, _, _ := st.seen(); m != "" {
+		t.Fatalf("SeedFanout off must make no call, saw %s", m)
+	}
+}
+
+func TestSeedFanoutRecordTransientIsSwallowed(t *testing.T) {
+	st := newFanoutStub(t, http.StatusServiceUnavailable)
+	a := st.agent()
+	a.SeedFanout, a.FfmpegBin = true, "/f"
+	data, _ := os.ReadFile("testdata/runtime_directive_proxy.json")
+
+	// A 503 must not panic or propagate — it is logged by id and retried next sync.
+	a.seedFanoutRecord(42, data)
+
+	if m, _, _ := st.seen(); m != http.MethodPut {
+		t.Fatalf("want a PUT attempt, saw %s", m)
+	}
+}
+
+func TestUnseedFanoutRecordDELETEs(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	a := st.agent()
+	a.SeedFanout = true
+
+	a.unseedFanoutRecord(42)
+
+	if m, p, _ := st.seen(); m != http.MethodDelete || p != "/streams/42" {
+		t.Fatalf("got %s %s, want DELETE /streams/42", m, p)
+	}
+}

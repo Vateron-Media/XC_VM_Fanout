@@ -102,6 +102,8 @@ func Main(version string) {
 	console := fs.String("console", "/home/xc_vm/console.php", "run: the panel console (cluster:exec)")
 	signalsDir := fs.String("signals", "/home/xc_vm/signals", "run: the node's SIGNALS_PATH, where a fence past its drain drops the viewers it holds; empty = off")
 	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
+	seedFanout := fs.Bool("seed-fanout", false, "run: serve-only LB — register assigned restreams on the fanout from the replica (replaces PHP seedLocal); off leaves registration to PHP")
+	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on")
 	relayAddr := fs.String("relay-addr", clusteragent.RelayProxyAddr, "run: the loopback relay proxy's address (DATAPLANE); empty = off")
 	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's data-plane client: the loopback relay proxy with MAIN's key, -state main_agent.json)")
 	var urls multiFlag
@@ -239,7 +241,7 @@ func Main(version string) {
 	go sampler.Run(stopSampler)
 	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
 		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
-		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl, LeaseFile: filepath.Join(filepath.Dir(*statePath), clusteragent.LeaseStateFile),
+		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl, SeedFanout: *seedFanout, FfmpegBin: *ffmpegBin, LeaseFile: filepath.Join(filepath.Dir(*statePath), clusteragent.LeaseStateFile),
 		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute),
 		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
 		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
