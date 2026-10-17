@@ -45,17 +45,20 @@ type runtimeDirective struct {
 	Source *directiveSource `json:"source"`
 }
 
-// parseRuntimeDirective reads the `runtime` directive from a stream record's
-// signed `data`. ok is false when the record carries no runtime directive (an
-// older MAIN, or a record from before the directive was added).
-func parseRuntimeDirective(recordData []byte) (runtimeDirective, bool) {
+// parseRuntimeDirective reads the `runtime` directive from a stored stream
+// record — the `{etag, ver, data}` envelope the agent writes (checkStream), so
+// the directive sits at `.data.runtime`. ok is false when the record carries no
+// runtime directive (an older MAIN, or a record from before it was added).
+func parseRuntimeDirective(recordJSON []byte) (runtimeDirective, bool) {
 	var wrap struct {
-		Runtime *runtimeDirective `json:"runtime"`
+		Data struct {
+			Runtime *runtimeDirective `json:"runtime"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(recordData, &wrap); err != nil || wrap.Runtime == nil {
+	if err := json.Unmarshal(recordJSON, &wrap); err != nil || wrap.Data.Runtime == nil {
 		return runtimeDirective{}, false
 	}
-	return *wrap.Runtime, true
+	return *wrap.Data.Runtime, true
 }
 
 // streamRegisterBody is the PUT /streams/<id> body — the fanout's streamConfig

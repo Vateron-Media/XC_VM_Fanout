@@ -77,13 +77,13 @@ func TestParseRuntimeDirectiveProxy(t *testing.T) {
 }
 
 func TestParseRuntimeDirectiveNoRuntime(t *testing.T) {
-	if _, ok := parseRuntimeDirective([]byte(`{"stream":{"id":1}}`)); ok {
+	if _, ok := parseRuntimeDirective([]byte(`{"etag":"x","ver":1,"data":{"stream":{"id":1}}}`)); ok {
 		t.Fatal("a record with no runtime directive must report ok=false")
 	}
 }
 
 func TestParseRuntimeDirectiveOther(t *testing.T) {
-	d, ok := parseRuntimeDirective([]byte(`{"runtime":{"kind":"other","source":null}}`))
+	d, ok := parseRuntimeDirective([]byte(`{"data":{"runtime":{"kind":"other","source":null}}}`))
 	if !ok {
 		t.Fatal("want ok")
 	}
