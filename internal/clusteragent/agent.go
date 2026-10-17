@@ -50,6 +50,18 @@ type Agent struct {
 	// FfmpegBin is the node-local ffmpeg path stamped into a restream's pull
 	// config (the directive omits it so MAIN stays environment-agnostic, D3).
 	FfmpegBin string
+	// node holds this node's values for the transcode-spec placeholders (4b-ii):
+	// paths, ffmpeg binaries and server id. Fed by agentcmd flags; empty values
+	// make a transcode directive that needs them skip (fail closed).
+	node agentNode
+	// supervisedSpec records, per stream id, the portable spec last handed to the
+	// supervisor, so a re-seed with an unchanged spec is a no-op: PUT /monitor/
+	// RESTARTS the encoder (monitor.go), so re-applying on every resync would drop
+	// every transcode's viewers periodically. Guarded by streamsMu (every mutator
+	// — seedFanoutRecord via apply(), seedHeldProxies, unseedFanoutRecord — runs
+	// under it). Cleared on a fanout restart so held transcodes re-PUT and the
+	// supervisor adopts the surviving encoders.
+	supervisedSpec map[int64][]byte
 	// ReplicaDir is where the node keeps its replica (replica.go); "" leaves
 	// it off.
 	ReplicaDir string

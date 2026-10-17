@@ -7,6 +7,8 @@ package clusteragent
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +16,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -50,6 +54,170 @@ type directiveSource struct {
 type runtimeDirective struct {
 	Kind   string           `json:"kind"`
 	Source *directiveSource `json:"source"`
+	// Spec is the portable supervisor.Spec for a kind:"transcode" directive
+	// (4b): a JSON object whose node-local values are placeholders the agent
+	// resolves. Stored raw and forwarded to /monitor/ after substitution.
+	Spec json.RawMessage `json:"spec"`
+}
+
+// transcodeSpec returns the raw portable Spec of a transcode directive, or
+// ok=false when this is not a transcode directive or carries no spec.
+func (d runtimeDirective) transcodeSpec() (json.RawMessage, bool) {
+	if d.Kind != "transcode" || len(d.Spec) == 0 {
+		return nil, false
+	}
+	return d.Spec, true
+}
+
+// agentNode is this node's resolved values for the transcode-spec placeholders
+// — its paths, ffmpeg binaries and server id, from the agent's config.
+type agentNode struct {
+	streams, logs, serverID, ffmpegCpu, ffmpegGpu, ffprobe, binary string
+}
+
+// SetNodePaths configures the transcode-spec placeholder values from the
+// install's node layout (called by agentcmd after FfmpegBin is set, which
+// doubles as the {ffmpeg_cpu} value). Leaving any empty makes a transcode
+// directive that needs that placeholder skip — fail closed.
+func (a *Agent) SetNodePaths(streams, logs, serverID, ffmpegGPU, ffprobe, binary string) {
+	a.node = agentNode{
+		streams: streams, logs: logs, serverID: serverID,
+		ffmpegCpu: a.FfmpegBin, ffmpegGpu: ffmpegGPU, ffprobe: ffprobe, binary: binary,
+	}
+}
+
+// residualToken matches a leftover placeholder after substitution. It excludes
+// `%`-prefixed forms so ffmpeg's own `%{...}` expansion syntax (a drawtext
+// `%{localtime}` overlay, say) is not misread as an unresolved token — which,
+// being fail-closed, would silently keep the transcode off air.
+var residualToken = regexp.MustCompile(`(?:^|[^%])(\{[a-z_]+\})`)
+
+// resolveSpec substitutes the placeholders in a portable transcode spec (4b-i)
+// with this node's values, the ingest socket and the generated key/IV. It fails
+// closed: a placeholder present in the spec whose value is empty (incomplete
+// node config), or any unknown token left over, is an error — a half-resolved
+// spec must never reach the supervisor.
+func resolveSpec(spec json.RawMessage, n agentNode, ingestSock, keyHex, ivHex string) ([]byte, error) {
+	s := string(spec)
+	for _, kv := range [][2]string{
+		{"{ingest_sock}", ingestSock}, {"{streams}", n.streams}, {"{logs}", n.logs},
+		{"{server_id}", n.serverID}, {"{ffmpeg_cpu}", n.ffmpegCpu}, {"{ffmpeg_gpu}", n.ffmpegGpu},
+		{"{ffprobe}", n.ffprobe}, {"{binary}", n.binary}, {"{key}", keyHex}, {"{iv}", ivHex},
+	} {
+		if strings.Contains(s, kv[0]) && kv[1] == "" {
+			return nil, fmt.Errorf("clusteragent: transcode spec needs %s but this node has no value for it", kv[0])
+		}
+		s = strings.ReplaceAll(s, kv[0], kv[1])
+	}
+	if m := residualToken.FindStringSubmatch(s); m != nil {
+		return nil, fmt.Errorf("clusteragent: transcode spec has an unknown placeholder %s", m[1])
+	}
+	return []byte(s), nil
+}
+
+// randHex16 is a fresh 16-byte value, hex-encoded — an HLS key or IV.
+func randHex16() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// registerIngest registers an ingest socket for the stream with the local
+// fanout (PUT /ingest/<id>, which also sets the HLS key/IV) and returns the
+// socket path — the encoder's tee target, resolving {ingest_sock}.
+func (a *Agent) registerIngest(ctx context.Context, id int64, keyHex, ivHex string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"key": keyHex, "iv": ivHex})
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://fanout/ingest/"+strconv.FormatInt(id, 10), bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("clusteragent: fanout PUT /ingest/%d: HTTP %d", id, res.StatusCode)
+	}
+	var out struct {
+		Socket string `json:"socket"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil || out.Socket == "" {
+		return "", fmt.Errorf("clusteragent: fanout /ingest/%d returned no socket", id)
+	}
+	return out.Socket, nil
+}
+
+// superviseStream hands a transcode stream to the fanout's supervisor: register
+// an ingest socket (with a fresh key/IV when the spec is encrypted), resolve the
+// spec's placeholders, and PUT /monitor/<id>. Fails closed — an unresolved
+// placeholder never reaches the supervisor. No-op when FanoutCtl is unset.
+func (a *Agent) superviseStream(ctx context.Context, id int64, spec json.RawMessage) error {
+	if a.FanoutCtl == "" {
+		return nil
+	}
+	var keyHex, ivHex string
+	if bytes.Contains(spec, []byte("{key}")) {
+		var err error
+		if keyHex, err = randHex16(); err != nil {
+			return err
+		}
+		if ivHex, err = randHex16(); err != nil {
+			return err
+		}
+	}
+	sock, err := a.registerIngest(ctx, id, keyHex, ivHex)
+	if err != nil {
+		return err
+	}
+	resolved, err := resolveSpec(spec, a.node, sock, keyHex, ivHex)
+	if err != nil {
+		return err // fail closed: never hand a half-resolved spec to the supervisor
+	}
+	return a.fanoutMonitorCall(ctx, http.MethodPut, id, resolved)
+}
+
+// unsuperviseStream stops the supervisor for a stream (DELETE /monitor/<id>) —
+// on a removal or a flip away from transcode. No-op when FanoutCtl is unset.
+func (a *Agent) unsuperviseStream(ctx context.Context, id int64) error {
+	if a.FanoutCtl == "" {
+		return nil
+	}
+	return a.fanoutMonitorCall(ctx, http.MethodDelete, id, nil)
+}
+
+func (a *Agent) fanoutMonitorCall(ctx context.Context, method string, id int64, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://fanout/monitor/"+strconv.FormatInt(id, 10), r)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	switch res.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return nil
+	case http.StatusServiceUnavailable:
+		return errFanoutTransient
+	default:
+		return fmt.Errorf("clusteragent: fanout %s /monitor/%d: HTTP %d", method, id, res.StatusCode)
+	}
 }
 
 // parseRuntimeDirective reads the `runtime` directive from a stored stream
@@ -133,33 +301,73 @@ func (a *Agent) unregisterStream(ctx context.Context, id int64) error {
 }
 
 // seedFanoutRecord hands one stored record's runtime directive to the fanout
-// when serve-only seeding is on: a proxy directive registers the puller,
-// anything else (a transcode, or no directive) unregisters it so a stream that
-// stopped being a proxy is cleared. No-op unless SeedFanout. Errors are logged
-// by id and swallowed — a down or busy fanout must never fail the streams sync.
-// A failed call is re-attempted only when the record next changes or the fanout
+// when serve-only seeding is on, routing by kind: a proxy directive registers
+// the puller (and releases a supervisor it had from a prior transcode); a
+// transcode directive supervises the encoder (applyTranscode); anything else
+// (or no directive) clears both. No-op unless SeedFanout. Errors are logged by
+// id and swallowed — a down or busy fanout must never fail the streams sync. A
+// failed call is re-attempted only when the record next changes or the fanout
 // restarts (boot-change re-seed), NOT on every sync — there is no periodic
 // reconcile yet (see errFanoutTransient). Only the id is logged, never the
-// record or its source (which carries credentials).
+// record or its source/spec (which carry credentials). A flip proxy->transcode
+// leaves the dormant puller registration in place (the supervised stream is
+// ingest-fed); clearing it safely is the serve path's concern (4b-iii).
 func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 	if !a.SeedFanout {
 		return
 	}
 	if d, ok := parseRuntimeDirective(recordJSON); ok {
 		if body, reg := d.registerBody(a.FfmpegBin); reg {
+			a.releaseSupervision(id) // a flip transcode->proxy: stop the encoder
 			if err := a.registerStream(context.Background(), id, body); err != nil {
 				a.logf("cluster: fanout register stream %d: %v", id, err)
 			}
+			return
+		}
+		if spec, ok := d.transcodeSpec(); ok {
+			a.applyTranscode(context.Background(), id, spec)
 			return
 		}
 	}
 	a.unseedFanoutRecord(id)
 }
 
-// seedHeldProxies registers every held proxy stream with the fanout, for when
-// the fanout (re)starts and its in-memory registry is empty: with no PHP to
-// re-register per request on a serve-only LB, the agent re-seeds. It only
-// registers proxies — a restarted fanout holds nothing to unregister — and
+// applyTranscode hands a transcode stream to the supervisor, but only when its
+// portable spec is new or changed: PUT /monitor/ restarts the encoder, so an
+// unchanged re-seed (a resync) must be a no-op. streamsMu is held by the caller.
+func (a *Agent) applyTranscode(ctx context.Context, id int64, spec json.RawMessage) {
+	if bytes.Equal(a.supervisedSpec[id], spec) {
+		return
+	}
+	if err := a.superviseStream(ctx, id, spec); err != nil {
+		a.logf("cluster: fanout supervise stream %d: %v", id, err)
+		return // unmarked, so the next change or resync retries
+	}
+	if a.supervisedSpec == nil {
+		a.supervisedSpec = map[int64][]byte{}
+	}
+	a.supervisedSpec[id] = append([]byte(nil), spec...)
+}
+
+// releaseSupervision stops the supervisor for a stream the agent had supervised
+// (a flip away from transcode, or a removal) and forgets it. No-op if it was
+// never supervised. streamsMu is held by the caller.
+func (a *Agent) releaseSupervision(id int64) {
+	if _, ok := a.supervisedSpec[id]; !ok {
+		return
+	}
+	if err := a.unsuperviseStream(context.Background(), id); err != nil {
+		a.logf("cluster: fanout release stream %d: %v", id, err)
+		return // keep the entry so a later seed retries the release
+	}
+	delete(a.supervisedSpec, id)
+}
+
+// seedHeldProxies re-seeds every held stream with the fanout, for when the
+// fanout (re)starts and its in-memory registry is empty: with no PHP to
+// re-register per request on a serve-only LB, the agent re-seeds. It registers
+// proxies (PUT /streams/) and re-supervises transcodes (PUT /monitor/, which
+// lets the supervisor adopt an encoder that outlived the daemon — adopt.go). It
 // reads records straight from the replica. No-op unless SeedFanout with a
 // replica; errors logged by id and swallowed.
 func (a *Agent) seedHeldProxies(ctx context.Context) {
@@ -174,6 +382,10 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 	// a fanout (re)start is rare.
 	a.streamsMu.Lock()
 	defer a.streamsMu.Unlock()
+	// The fanout forgot every stream, so forget what we thought was supervised
+	// and re-apply all: a transcode re-PUT makes the supervisor adopt the encoder
+	// that outlived the daemon rather than leaving it unwatched.
+	a.supervisedSpec = nil
 	for _, id := range heldStreams(a.ReplicaDir) {
 		recordJSON, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), strconv.FormatInt(id, 10)+".json"))
 		if err != nil {
@@ -187,6 +399,10 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 			if err := a.registerStream(ctx, id, body); err != nil {
 				a.logf("cluster: fanout re-seed stream %d: %v", id, err)
 			}
+			continue
+		}
+		if spec, ok := d.transcodeSpec(); ok {
+			a.applyTranscode(ctx, id, spec)
 		}
 	}
 }
@@ -273,12 +489,14 @@ func (a *Agent) reconcileFanout(ctx context.Context) {
 }
 
 // unseedFanoutRecord removes a stream's fanout registration — on a removal, or
-// a stream that stopped being a proxy. No-op unless SeedFanout; errors logged
-// by id and swallowed.
+// a stream that stopped being a proxy/transcode. Releases the supervisor first
+// (if it was a transcode), then unregisters the puller. No-op unless SeedFanout;
+// errors logged by id and swallowed.
 func (a *Agent) unseedFanoutRecord(id int64) {
 	if !a.SeedFanout {
 		return
 	}
+	a.releaseSupervision(id) // stop the encoder if this stream was a transcode
 	if err := a.unregisterStream(context.Background(), id); err != nil {
 		a.logf("cluster: fanout unregister stream %d: %v", id, err)
 	}

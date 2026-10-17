@@ -103,7 +103,13 @@ func Main(version string) {
 	signalsDir := fs.String("signals", "/home/xc_vm/signals", "run: the node's SIGNALS_PATH, where a fence past its drain drops the viewers it holds; empty = off")
 	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
 	seedFanout := fs.Bool("seed-fanout", false, "run: serve-only LB — register assigned restreams on the fanout from the replica (replaces PHP seedLocal); off leaves registration to PHP")
-	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on")
+	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on (also the {ffmpeg_cpu} transcode value)")
+	nodeStreams := fs.String("streams", "/home/xc_vm/streams/", "run: node streams path ({streams}) for applying a transcode directive")
+	nodeLogs := fs.String("logs", "/home/xc_vm/logs/tmp/", "run: node logs-tmp path ({logs}) for applying a transcode directive")
+	nodeServerID := fs.String("server-id", "", "run: this node's server id ({server_id}) for applying a transcode directive")
+	ffmpegGpu := fs.String("ffmpeg-gpu", "", "run: node GPU ffmpeg path ({ffmpeg_gpu}) for applying a transcode directive")
+	ffprobeBin := fs.String("ffprobe", "ffprobe", "run: node ffprobe path ({ffprobe}) for applying a transcode directive")
+	fanoutBinary := fs.String("fanout-binary", "", "run: node xc_fanout binary path ({binary}) for applying a transcode directive")
 	relayAddr := fs.String("relay-addr", clusteragent.RelayProxyAddr, "run: the loopback relay proxy's address (DATAPLANE); empty = off")
 	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's data-plane client: the loopback relay proxy with MAIN's key, -state main_agent.json)")
 	var urls multiFlag
@@ -246,6 +252,7 @@ func Main(version string) {
 		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
 		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
 		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir}
+	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
 	switch {

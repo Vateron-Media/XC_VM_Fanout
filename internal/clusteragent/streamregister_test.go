@@ -5,6 +5,7 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -319,5 +321,299 @@ func TestReconcileFanoutRegistersMissingClearsStale(t *testing.T) {
 	}
 	if dels["7"] {
 		t.Error("held proxy 7 must never be unregistered")
+	}
+}
+
+func TestParseTranscodeDirective(t *testing.T) {
+	data, err := os.ReadFile("testdata/runtime_directive_transcode.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := parseRuntimeDirective(data)
+	if !ok {
+		t.Fatal("want ok")
+	}
+	if d.Kind != "transcode" {
+		t.Fatalf("kind = %q, want transcode", d.Kind)
+	}
+	spec, ok := d.transcodeSpec()
+	if !ok {
+		t.Fatal("want a transcode spec")
+	}
+	if !bytes.Contains(spec, []byte("{ingest_sock}")) {
+		t.Fatalf("spec missing its placeholders: %s", spec)
+	}
+}
+
+func TestResolveSpec(t *testing.T) {
+	data, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	d, _ := parseRuntimeDirective(data)
+	spec, _ := d.transcodeSpec()
+	n := agentNode{streams: "/s/", logs: "/l/", serverID: "3", ffmpegCpu: "/ff", ffmpegGpu: "/ffg", ffprobe: "/fp", binary: "/bin"}
+
+	out, err := resolveSpec(spec, n, "/i/7.sock", "aabb", "ccdd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	for _, tok := range []string{"{ingest_sock}", "{streams}", "{ffmpeg_cpu}", "{key}", "{iv}", "{server_id}", "{logs}"} {
+		if strings.Contains(s, tok) {
+			t.Fatalf("unresolved token %s in %s", tok, s)
+		}
+	}
+	if !strings.Contains(s, "unix:/i/7.sock") || !strings.Contains(s, "/s/7_.pid") || !strings.Contains(s, "aabb") {
+		t.Fatalf("values not substituted: %s", s)
+	}
+}
+
+func TestResolveSpecResidualTokenErrors(t *testing.T) {
+	if _, err := resolveSpec(json.RawMessage(`{"cmd":"{bogus}"}`), agentNode{}, "", "", ""); err == nil {
+		t.Fatal("an unresolved/unknown token must error (incomplete node config)")
+	}
+}
+
+func TestResolveSpecNoEnc(t *testing.T) {
+	out, err := resolveSpec(json.RawMessage(`{"cmd":"{ffmpeg_cpu} -i x {streams}1_.m3u8"}`), agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Contains(s, "{ffmpeg_cpu}") || strings.Contains(s, "{streams}") || residualTokenTest.MatchString(s) {
+		t.Fatalf("unexpected residual token: %s", s)
+	}
+	if !strings.Contains(s, "/ff -i x /s/1_.m3u8") {
+		t.Fatalf("values not substituted: %s", s)
+	}
+}
+
+var residualTokenTest = regexp.MustCompile(`\{[a-z_]+\}`)
+
+func TestSuperviseStreamResolvesAndHandsOff(t *testing.T) {
+	var mu sync.Mutex
+	var monitorBody []byte
+	var ingestHit, monitorHit bool
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/ingest/"):
+			mu.Lock()
+			ingestHit = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"socket": "/i/7.sock"})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/monitor/"):
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			monitorBody, monitorHit = b, true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	a := &Agent{FanoutCtl: sock, node: agentNode{streams: "/s/", logs: "/l/", serverID: "3", ffmpegCpu: "/ff", ffmpegGpu: "/ffg", ffprobe: "/fp", binary: "/bin"}}
+	data, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	d, _ := parseRuntimeDirective(data)
+	spec, _ := d.transcodeSpec()
+
+	if err := a.superviseStream(context.Background(), 7, spec); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !ingestHit || !monitorHit {
+		t.Fatalf("want ingest + monitor PUTs (ingest=%v monitor=%v)", ingestHit, monitorHit)
+	}
+	if residualTokenTest.Match(monitorBody) {
+		t.Fatalf("unresolved token in the monitor body: %s", monitorBody)
+	}
+	if !bytes.Contains(monitorBody, []byte("unix:/i/7.sock")) {
+		t.Fatalf("ingest socket not substituted into the command: %s", monitorBody)
+	}
+}
+
+func TestSuperviseStreamResidualTokenDoesNotHandOff(t *testing.T) {
+	var monitorHit bool
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	ln, _ := net.Listen("unix", sock)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/ingest/") {
+			_ = json.NewEncoder(w).Encode(map[string]string{"socket": "/i/7.sock"})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/monitor/") {
+			monitorHit = true
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	// node missing ffmpegCpu → the spec's {ffmpeg_cpu} can't resolve → no /monitor PUT.
+	a := &Agent{FanoutCtl: sock, node: agentNode{streams: "/s/"}}
+	data, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	d, _ := parseRuntimeDirective(data)
+	spec, _ := d.transcodeSpec()
+	if err := a.superviseStream(context.Background(), 7, spec); err == nil {
+		t.Fatal("want an error when a placeholder can't resolve")
+	}
+	if monitorHit {
+		t.Fatal("must not hand off to the supervisor with an unresolved spec")
+	}
+}
+
+func TestUnsuperviseStreamDELETEsMonitor(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	if err := st.agent().unsuperviseStream(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	if m, p, _ := st.seen(); m != http.MethodDelete || p != "/monitor/7" {
+		t.Fatalf("got %s %s, want DELETE /monitor/7", m, p)
+	}
+}
+
+// routingStub records every control call and answers /ingest/ with a socket, so
+// the transcode routing (ingest + monitor + streams) can be asserted together.
+type routeRec struct {
+	method, path string
+	body         []byte
+}
+
+type routingStub struct {
+	sock string
+	mu   sync.Mutex
+	recs []routeRec
+}
+
+func newRoutingStub(t *testing.T) *routingStub {
+	t.Helper()
+	st := &routingStub{sock: filepath.Join(t.TempDir(), "ctl.sock")}
+	ln, err := net.Listen("unix", st.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		st.mu.Lock()
+		st.recs = append(st.recs, routeRec{r.Method, r.URL.Path, b})
+		st.mu.Unlock()
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/ingest/") {
+			_ = json.NewEncoder(w).Encode(map[string]string{"socket": "/i/7.sock"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return st
+}
+
+func (s *routingStub) count(method, prefix string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, r := range s.recs {
+		if r.method == method && strings.HasPrefix(r.path, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *routingStub) total() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.recs)
+}
+
+func (s *routingStub) agent() *Agent {
+	return &Agent{
+		FanoutCtl: s.sock, SeedFanout: true, FfmpegBin: "/opt/ffmpeg",
+		node: agentNode{streams: "/s/", logs: "/l/", serverID: "3", ffmpegCpu: "/ff", ffmpegGpu: "/ffg", ffprobe: "/fp", binary: "/bin"},
+	}
+}
+
+func TestSeedFanoutRecordTranscode(t *testing.T) {
+	st := newRoutingStub(t)
+	rec, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	st.agent().seedFanoutRecord(7, rec)
+	if n := st.count(http.MethodPut, "/ingest/"); n != 1 {
+		t.Fatalf("want 1 ingest PUT, got %d", n)
+	}
+	if n := st.count(http.MethodPut, "/monitor/"); n != 1 {
+		t.Fatalf("want 1 monitor PUT, got %d", n)
+	}
+}
+
+func TestSeedFanoutRecordTranscodeDedup(t *testing.T) {
+	st := newRoutingStub(t)
+	a := st.agent()
+	rec, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	a.seedFanoutRecord(7, rec)
+	a.seedFanoutRecord(7, rec) // same spec on a resync must NOT restart the encoder
+	if n := st.count(http.MethodPut, "/monitor/"); n != 1 {
+		t.Fatalf("want 1 monitor PUT after a duplicate seed (dedup), got %d", n)
+	}
+}
+
+func TestSeedFanoutRecordFlipTranscodeToProxy(t *testing.T) {
+	st := newRoutingStub(t)
+	a := st.agent()
+	tr, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	px, _ := os.ReadFile("testdata/runtime_directive_proxy.json")
+	a.seedFanoutRecord(7, tr)
+	a.seedFanoutRecord(7, px) // reconfigured to a proxy: release the encoder, register the puller
+	if n := st.count(http.MethodDelete, "/monitor/"); n != 1 {
+		t.Fatalf("flip to proxy must DELETE /monitor/, got %d", n)
+	}
+	if n := st.count(http.MethodPut, "/streams/"); n != 1 {
+		t.Fatalf("flip to proxy must register the puller, got %d", n)
+	}
+}
+
+func TestSeedFanoutRecordTranscodeSeedOff(t *testing.T) {
+	st := newRoutingStub(t)
+	a := st.agent()
+	a.SeedFanout = false
+	rec, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	a.seedFanoutRecord(7, rec)
+	if n := st.total(); n != 0 {
+		t.Fatalf("SeedFanout off must make no calls, got %d", n)
+	}
+}
+
+func TestSeedHeldReSupervisesTranscodes(t *testing.T) {
+	st := newRoutingStub(t)
+	dir := t.TempDir()
+	sd := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(sd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tr, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	if err := os.WriteFile(filepath.Join(sd, "7.json"), tr, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := st.agent()
+	a.ReplicaDir = dir
+	a.seedHeldProxies(context.Background()) // the fanout-restart re-seed
+	if n := st.count(http.MethodPut, "/monitor/"); n != 1 {
+		t.Fatalf("a held transcode must be re-supervised on a fanout restart, got %d monitor PUTs", n)
+	}
+}
+
+func TestResolveSpecIgnoresFfmpegExpansion(t *testing.T) {
+	// ffmpeg's %{...} expansion (e.g. a drawtext timestamp overlay) must not read
+	// as an unresolved token — else the transcode fails closed and never serves.
+	out, err := resolveSpec(json.RawMessage(`{"cmd":"{ffmpeg_cpu} -vf drawtext=text='%{localtime}' {streams}1_.m3u8"}`),
+		agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i", "", "")
+	if err != nil {
+		t.Fatalf("ffmpeg %%{...} expansion must not trip the residual check: %v", err)
+	}
+	if !strings.Contains(string(out), "%{localtime}") {
+		t.Fatalf("the expansion should be preserved: %s", out)
 	}
 }
