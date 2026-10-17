@@ -1348,6 +1348,20 @@ func (m *Manager) Get(id string) *Stream {
 	return m.streams[id]
 }
 
+// Registered reports whether the node holds a pull config for id — the stream
+// exists and the daemon pulls it (cfg set), as opposed to unknown or externally
+// fed. A serve-only LB serves-and-starts such a stream on demand; an unknown one
+// still fails closed.
+func (m *Manager) Registered(id string) bool {
+	st := m.Get(id)
+	if st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.cfg != nil
+}
+
 // GetOrCreate returns the stream for id, creating it if necessary.
 func (m *Manager) GetOrCreate(id string) *Stream {
 	m.mu.Lock()

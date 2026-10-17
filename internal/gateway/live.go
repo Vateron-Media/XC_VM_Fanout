@@ -25,6 +25,9 @@ type LiveEnv struct {
 	Playlist func(stream int) string
 	// Fed is FanoutClient::isStreamFed: is fanout serving the stream (has_data)?
 	Fed func(stream int) bool
+	// Registered reports whether the node holds a pull config for the stream, so
+	// a serve-only LB can serve-and-start it on demand instead of deferring.
+	Registered func(stream int) bool
 	// Record is the viewer's record in the agent: found, and whether the agent answered.
 	Record func(uuid string) (rec map[string]json.RawMessage, found, ok bool)
 	// AgentAlive: is the agent draining its spool (EventSpool::agentAlive)?

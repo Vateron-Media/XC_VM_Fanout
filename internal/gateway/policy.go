@@ -45,7 +45,12 @@ type Policy struct {
 	// ServeUntil is the node's lease fence on this host's clock: nothing is
 	// served past it (PHP answers from then). 0: no lease limits the node.
 	ServeUntil int64 `json:"serve_until"`
-	Paths      struct {
+	// ServeOnly marks a serve-only LB with no PHP/nginx behind the gateway: a
+	// defer that would hand off to PHP has nowhere to go, so the gateway serves
+	// a registered idle stream (starts its puller) instead of deferring
+	// not-on-air. Off (a transition node) keeps the defer-to-PHP path.
+	ServeOnly bool `json:"serve_only"`
+	Paths     struct {
 		Cons      string `json:"cons"`
 		Streams   string `json:"streams"`
 		Archive   string `json:"archive"`
