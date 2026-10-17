@@ -191,7 +191,7 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 			}
 			return isStreamAlive(pid, stream)
 		},
-		OnDisk:   func(stream int) bool { return exists(p.Paths.Streams + strconv.Itoa(stream) + "_.m3u8") },
+		OnDisk:     func(stream int) bool { return exists(p.Paths.Streams + strconv.Itoa(stream) + "_.m3u8") },
 		Playlist:   func(stream int) string { return s.node.FedPlaylist(strconv.Itoa(stream)) },
 		Fed:        func(stream int) bool { return s.node.Fed(strconv.Itoa(stream)) },
 		Registered: func(stream int) bool { return s.node.Registered(strconv.Itoa(stream)) },
