@@ -66,9 +66,10 @@ type Node interface {
 	HandOverFile(w http.ResponseWriter, r *http.Request, id, uuid string, parts []server.FilePart, contentType string, limitPerc int, rate int64, rng string) bool
 	FedPlaylist(id string) string
 	Fed(id string) bool
-	// Registered reports whether the node holds a pull config for the stream
-	// (it can be started on demand), as opposed to unknown or externally fed.
-	Registered(id string) bool
+	// Serveable reports whether the node can source the stream locally — a
+	// registered puller (started on demand) or an ingest-fed supervised transcode
+	// — so a serve-only gateway serves it in-process instead of deferring.
+	Serveable(id string) bool
 }
 
 // NewServer judges with the policy file at policyPath, serves live segments
@@ -191,10 +192,10 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 			}
 			return isStreamAlive(pid, stream)
 		},
-		OnDisk:     func(stream int) bool { return exists(p.Paths.Streams + strconv.Itoa(stream) + "_.m3u8") },
-		Playlist:   func(stream int) string { return s.node.FedPlaylist(strconv.Itoa(stream)) },
-		Fed:        func(stream int) bool { return s.node.Fed(strconv.Itoa(stream)) },
-		Registered: func(stream int) bool { return s.node.Registered(strconv.Itoa(stream)) },
+		OnDisk:    func(stream int) bool { return exists(p.Paths.Streams + strconv.Itoa(stream) + "_.m3u8") },
+		Playlist:  func(stream int) string { return s.node.FedPlaylist(strconv.Itoa(stream)) },
+		Fed:       func(stream int) bool { return s.node.Fed(strconv.Itoa(stream)) },
+		Serveable: func(stream int) bool { return s.node.Serveable(strconv.Itoa(stream)) },
 		Record: func(uuid string) (map[string]json.RawMessage, bool, bool) {
 			if p.Paths.AgentSock == "" {
 				return nil, false, false

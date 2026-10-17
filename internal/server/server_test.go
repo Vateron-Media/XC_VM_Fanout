@@ -695,3 +695,30 @@ func TestNormalizeBackendRejectsTypos(t *testing.T) {
 		}
 	}
 }
+
+// TestServeable: a serve-only gateway serves a stream the node can source
+// locally — a registered puller OR an ingest-fed stream (a supervised
+// transcode's encoder tees into the ingest). Everything else it defers.
+func TestServeable(t *testing.T) {
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
+	mgr.SetIngestDir(t.TempDir())
+
+	mgr.Register("3", puller.Source{URLs: []string{"http://src/3.ts"}}, 0)
+	if _, err := mgr.RegisterIngest("5", 0); err != nil {
+		t.Fatalf("RegisterIngest: %v", err)
+	}
+	mgr.GetOrCreate("7") // created, neither pulled nor ingest-fed
+
+	if !mgr.Serveable("3") {
+		t.Error("a registered puller must be serveable")
+	}
+	if !mgr.Serveable("5") {
+		t.Error("an ingest-fed stream (supervised transcode) must be serveable")
+	}
+	if mgr.Serveable("7") {
+		t.Error("a created-only stream must not be serveable")
+	}
+	if mgr.Serveable("9") {
+		t.Error("an absent stream must not be serveable")
+	}
+}

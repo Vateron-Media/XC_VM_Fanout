@@ -1362,6 +1362,21 @@ func (m *Manager) Registered(id string) bool {
 	return st.cfg != nil
 }
 
+// Serveable reports whether the node can source this stream locally, so a
+// serve-only gateway serves it in-process instead of deferring to PHP: a
+// registered puller (cfg set) OR an ingest-fed stream — a supervised transcode
+// whose encoder tees into the ingest socket (cfg nil, ingestLn set). serveHLS
+// serves either from the Hub; startLocked no-ops for the ingest-fed one.
+func (m *Manager) Serveable(id string) bool {
+	st := m.Get(id)
+	if st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.cfg != nil || st.ingestLn != nil
+}
+
 // GetOrCreate returns the stream for id, creating it if necessary.
 func (m *Manager) GetOrCreate(id string) *Stream {
 	m.mu.Lock()
