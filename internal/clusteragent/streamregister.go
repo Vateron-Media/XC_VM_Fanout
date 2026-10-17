@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -63,6 +65,37 @@ func (d runtimeDirective) transcodeSpec() (json.RawMessage, bool) {
 		return nil, false
 	}
 	return d.Spec, true
+}
+
+// agentNode is this node's resolved values for the transcode-spec placeholders
+// — its paths, ffmpeg binaries and server id, from the agent's config.
+type agentNode struct {
+	streams, logs, serverID, ffmpegCpu, ffmpegGpu, ffprobe, binary string
+}
+
+var residualToken = regexp.MustCompile(`\{[a-z_]+\}`)
+
+// resolveSpec substitutes the placeholders in a portable transcode spec (4b-i)
+// with this node's values, the ingest socket and the generated key/IV. It fails
+// closed: a placeholder present in the spec whose value is empty (incomplete
+// node config), or any unknown token left over, is an error — a half-resolved
+// spec must never reach the supervisor.
+func resolveSpec(spec json.RawMessage, n agentNode, ingestSock, keyHex, ivHex string) ([]byte, error) {
+	s := string(spec)
+	for _, kv := range [][2]string{
+		{"{ingest_sock}", ingestSock}, {"{streams}", n.streams}, {"{logs}", n.logs},
+		{"{server_id}", n.serverID}, {"{ffmpeg_cpu}", n.ffmpegCpu}, {"{ffmpeg_gpu}", n.ffmpegGpu},
+		{"{ffprobe}", n.ffprobe}, {"{binary}", n.binary}, {"{key}", keyHex}, {"{iv}", ivHex},
+	} {
+		if strings.Contains(s, kv[0]) && kv[1] == "" {
+			return nil, fmt.Errorf("clusteragent: transcode spec needs %s but this node has no value for it", kv[0])
+		}
+		s = strings.ReplaceAll(s, kv[0], kv[1])
+	}
+	if m := residualToken.FindString(s); m != "" {
+		return nil, fmt.Errorf("clusteragent: transcode spec has an unknown placeholder %s", m)
+	}
+	return []byte(s), nil
 }
 
 // parseRuntimeDirective reads the `runtime` directive from a stored stream

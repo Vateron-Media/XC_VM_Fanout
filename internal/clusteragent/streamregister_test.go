@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -285,3 +287,46 @@ func TestParseTranscodeDirective(t *testing.T) {
 		t.Fatalf("spec missing its placeholders: %s", spec)
 	}
 }
+
+func TestResolveSpec(t *testing.T) {
+	data, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	d, _ := parseRuntimeDirective(data)
+	spec, _ := d.transcodeSpec()
+	n := agentNode{streams: "/s/", logs: "/l/", serverID: "3", ffmpegCpu: "/ff", ffmpegGpu: "/ffg", ffprobe: "/fp", binary: "/bin"}
+
+	out, err := resolveSpec(spec, n, "/i/7.sock", "aabb", "ccdd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	for _, tok := range []string{"{ingest_sock}", "{streams}", "{ffmpeg_cpu}", "{key}", "{iv}", "{server_id}", "{logs}"} {
+		if strings.Contains(s, tok) {
+			t.Fatalf("unresolved token %s in %s", tok, s)
+		}
+	}
+	if !strings.Contains(s, "unix:/i/7.sock") || !strings.Contains(s, "/s/7_.pid") || !strings.Contains(s, "aabb") {
+		t.Fatalf("values not substituted: %s", s)
+	}
+}
+
+func TestResolveSpecResidualTokenErrors(t *testing.T) {
+	if _, err := resolveSpec(json.RawMessage(`{"cmd":"{bogus}"}`), agentNode{}, "", "", ""); err == nil {
+		t.Fatal("an unresolved/unknown token must error (incomplete node config)")
+	}
+}
+
+func TestResolveSpecNoEnc(t *testing.T) {
+	out, err := resolveSpec(json.RawMessage(`{"cmd":"{ffmpeg_cpu} -i x {streams}1_.m3u8"}`), agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Contains(s, "{ffmpeg_cpu}") || strings.Contains(s, "{streams}") || residualTokenTest.MatchString(s) {
+		t.Fatalf("unexpected residual token: %s", s)
+	}
+	if !strings.Contains(s, "/ff -i x /s/1_.m3u8") {
+		t.Fatalf("values not substituted: %s", s)
+	}
+}
+
+var residualTokenTest = regexp.MustCompile(`\{[a-z_]+\}`)
