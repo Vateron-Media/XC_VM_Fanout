@@ -330,3 +330,91 @@ func TestResolveSpecNoEnc(t *testing.T) {
 }
 
 var residualTokenTest = regexp.MustCompile(`\{[a-z_]+\}`)
+
+func TestSuperviseStreamResolvesAndHandsOff(t *testing.T) {
+	var mu sync.Mutex
+	var monitorBody []byte
+	var ingestHit, monitorHit bool
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/ingest/"):
+			mu.Lock()
+			ingestHit = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"socket": "/i/7.sock"})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/monitor/"):
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			monitorBody, monitorHit = b, true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	a := &Agent{FanoutCtl: sock, node: agentNode{streams: "/s/", logs: "/l/", serverID: "3", ffmpegCpu: "/ff", ffmpegGpu: "/ffg", ffprobe: "/fp", binary: "/bin"}}
+	data, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	d, _ := parseRuntimeDirective(data)
+	spec, _ := d.transcodeSpec()
+
+	if err := a.superviseStream(context.Background(), 7, spec); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !ingestHit || !monitorHit {
+		t.Fatalf("want ingest + monitor PUTs (ingest=%v monitor=%v)", ingestHit, monitorHit)
+	}
+	if residualTokenTest.Match(monitorBody) {
+		t.Fatalf("unresolved token in the monitor body: %s", monitorBody)
+	}
+	if !bytes.Contains(monitorBody, []byte("unix:/i/7.sock")) {
+		t.Fatalf("ingest socket not substituted into the command: %s", monitorBody)
+	}
+}
+
+func TestSuperviseStreamResidualTokenDoesNotHandOff(t *testing.T) {
+	var monitorHit bool
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	ln, _ := net.Listen("unix", sock)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/ingest/") {
+			_ = json.NewEncoder(w).Encode(map[string]string{"socket": "/i/7.sock"})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/monitor/") {
+			monitorHit = true
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	// node missing ffmpegCpu → the spec's {ffmpeg_cpu} can't resolve → no /monitor PUT.
+	a := &Agent{FanoutCtl: sock, node: agentNode{streams: "/s/"}}
+	data, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	d, _ := parseRuntimeDirective(data)
+	spec, _ := d.transcodeSpec()
+	if err := a.superviseStream(context.Background(), 7, spec); err == nil {
+		t.Fatal("want an error when a placeholder can't resolve")
+	}
+	if monitorHit {
+		t.Fatal("must not hand off to the supervisor with an unresolved spec")
+	}
+}
+
+func TestUnsuperviseStreamDELETEsMonitor(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	if err := st.agent().unsuperviseStream(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	if m, p, _ := st.seen(); m != http.MethodDelete || p != "/monitor/7" {
+		t.Fatalf("got %s %s, want DELETE /monitor/7", m, p)
+	}
+}

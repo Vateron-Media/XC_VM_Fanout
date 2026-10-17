@@ -7,6 +7,8 @@ package clusteragent
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,6 +98,111 @@ func resolveSpec(spec json.RawMessage, n agentNode, ingestSock, keyHex, ivHex st
 		return nil, fmt.Errorf("clusteragent: transcode spec has an unknown placeholder %s", m)
 	}
 	return []byte(s), nil
+}
+
+// randHex16 is a fresh 16-byte value, hex-encoded — an HLS key or IV.
+func randHex16() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// registerIngest registers an ingest socket for the stream with the local
+// fanout (PUT /ingest/<id>, which also sets the HLS key/IV) and returns the
+// socket path — the encoder's tee target, resolving {ingest_sock}.
+func (a *Agent) registerIngest(ctx context.Context, id int64, keyHex, ivHex string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"key": keyHex, "iv": ivHex})
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://fanout/ingest/"+strconv.FormatInt(id, 10), bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("clusteragent: fanout PUT /ingest/%d: HTTP %d", id, res.StatusCode)
+	}
+	var out struct {
+		Socket string `json:"socket"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil || out.Socket == "" {
+		return "", fmt.Errorf("clusteragent: fanout /ingest/%d returned no socket", id)
+	}
+	return out.Socket, nil
+}
+
+// superviseStream hands a transcode stream to the fanout's supervisor: register
+// an ingest socket (with a fresh key/IV when the spec is encrypted), resolve the
+// spec's placeholders, and PUT /monitor/<id>. Fails closed — an unresolved
+// placeholder never reaches the supervisor. No-op when FanoutCtl is unset.
+func (a *Agent) superviseStream(ctx context.Context, id int64, spec json.RawMessage) error {
+	if a.FanoutCtl == "" {
+		return nil
+	}
+	var keyHex, ivHex string
+	if bytes.Contains(spec, []byte("{key}")) {
+		var err error
+		if keyHex, err = randHex16(); err != nil {
+			return err
+		}
+		if ivHex, err = randHex16(); err != nil {
+			return err
+		}
+	}
+	sock, err := a.registerIngest(ctx, id, keyHex, ivHex)
+	if err != nil {
+		return err
+	}
+	resolved, err := resolveSpec(spec, a.node, sock, keyHex, ivHex)
+	if err != nil {
+		return err // fail closed: never hand a half-resolved spec to the supervisor
+	}
+	return a.fanoutMonitorCall(ctx, http.MethodPut, id, resolved)
+}
+
+// unsuperviseStream stops the supervisor for a stream (DELETE /monitor/<id>) —
+// on a removal or a flip away from transcode. No-op when FanoutCtl is unset.
+func (a *Agent) unsuperviseStream(ctx context.Context, id int64) error {
+	if a.FanoutCtl == "" {
+		return nil
+	}
+	return a.fanoutMonitorCall(ctx, http.MethodDelete, id, nil)
+}
+
+func (a *Agent) fanoutMonitorCall(ctx context.Context, method string, id int64, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://fanout/monitor/"+strconv.FormatInt(id, 10), r)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	switch res.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return nil
+	case http.StatusServiceUnavailable:
+		return errFanoutTransient
+	default:
+		return fmt.Errorf("clusteragent: fanout %s /monitor/%d: HTTP %d", method, id, res.StatusCode)
+	}
 }
 
 // parseRuntimeDirective reads the `runtime` directive from a stored stream
