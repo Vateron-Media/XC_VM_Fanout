@@ -17,7 +17,7 @@ import (
 // transition. It is opt-in and non-fatal — a bad cert or a taken port is
 // returned as an error so the caller logs it and leaves nginx serving, exactly
 // as the gateway socket does.
-func serveFront(addr string, gw http.Handler, nginxURL, webroot, certPath, keyPath, realipPaths string) (*http.Server, func(), error) {
+func serveFront(addr string, gw http.Handler, nginxURL, webroot, certPath, keyPath, realipPaths, images string) (*http.Server, func(), error) {
 	certs, err := front.NewCertReloader(certPath, keyPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tls certificate: %w", err)
@@ -26,7 +26,7 @@ func serveFront(addr string, gw http.Handler, nginxURL, webroot, certPath, keyPa
 	if err != nil || u.Host == "" {
 		return nil, nil, fmt.Errorf("nginx backend url %q is not usable", nginxURL)
 	}
-	f := front.NewServer(gw, u, webroot, front.LoadTrustedProxies(splitCSV(realipPaths)...))
+	f := front.NewServer(gw, u, webroot, front.LoadTrustedProxies(splitCSV(realipPaths)...)).WithImages(images)
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

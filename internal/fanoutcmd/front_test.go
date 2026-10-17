@@ -47,7 +47,7 @@ func writeCert(t *testing.T, certPath, keyPath string) {
 // it and leaves nginx serving.
 func TestServeFrontNonFatalOnBadCert(t *testing.T) {
 	if _, _, err := serveFront("127.0.0.1:0", http.NotFoundHandler(), "http://127.0.0.1:1", t.TempDir(),
-		filepath.Join(t.TempDir(), "absent.crt"), filepath.Join(t.TempDir(), "absent.key"), ""); err == nil {
+		filepath.Join(t.TempDir(), "absent.crt"), filepath.Join(t.TempDir(), "absent.key"), "", ""); err == nil {
 		t.Fatal("want an error for a missing certificate, got nil")
 	}
 }
@@ -70,7 +70,7 @@ func TestServeFrontServesAndProxies(t *testing.T) {
 	cp, kp := filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key")
 	writeCert(t, cp, kp)
 
-	srv, cleanup, err := serveFront("127.0.0.1:0", gw, backend.URL, dir, cp, kp, "")
+	srv, cleanup, err := serveFront("127.0.0.1:0", gw, backend.URL, dir, cp, kp, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
