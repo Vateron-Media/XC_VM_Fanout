@@ -19,8 +19,13 @@ import (
 )
 
 // errFanoutTransient is returned when the fanout answers 503 to a register —
-// a concurrent teardown beat it (server.go's serveControl). The caller retries
-// on the next sync rather than treating it as a hard failure.
+// a concurrent teardown beat it (server.go's serveControl). It is not a hard
+// failure, but note the stream re-registers only when its record next changes
+// or the fanout restarts (boot-change re-seed); there is no periodic reconcile
+// yet, so a 503 with the fanout up is not self-healed until then. A two-way
+// reconcile (register every held proxy, clear everything else) belongs with the
+// serve-not-defer slice, where a stale/missing registration becomes serving-
+// visible rather than inert.
 var errFanoutTransient = errors.New("clusteragent: fanout register: transient (concurrent teardown)")
 
 // The runtime directive is what MAIN decides a serve-only LB should run for a
@@ -131,9 +136,11 @@ func (a *Agent) unregisterStream(ctx context.Context, id int64) error {
 // when serve-only seeding is on: a proxy directive registers the puller,
 // anything else (a transcode, or no directive) unregisters it so a stream that
 // stopped being a proxy is cleared. No-op unless SeedFanout. Errors are logged
-// by id and swallowed — a down or busy fanout must never fail the streams sync;
-// the next sync (or a fanout-restart re-seed) retries. Only the id is logged,
-// never the record or its source (which carries credentials).
+// by id and swallowed — a down or busy fanout must never fail the streams sync.
+// A failed call is re-attempted only when the record next changes or the fanout
+// restarts (boot-change re-seed), NOT on every sync — there is no periodic
+// reconcile yet (see errFanoutTransient). Only the id is logged, never the
+// record or its source (which carries credentials).
 func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 	if !a.SeedFanout {
 		return
