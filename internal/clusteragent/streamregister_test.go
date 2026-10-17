@@ -24,6 +24,7 @@ type fanoutStub struct {
 	mu           sync.Mutex
 	method, path string
 	body         []byte
+	calls        int
 }
 
 func newFanoutStub(t *testing.T, status int) *fanoutStub {
@@ -37,6 +38,7 @@ func newFanoutStub(t *testing.T, status int) *fanoutStub {
 		b, _ := io.ReadAll(r.Body)
 		st.mu.Lock()
 		st.method, st.path, st.body = r.Method, r.URL.Path, b
+		st.calls++
 		st.mu.Unlock()
 		w.WriteHeader(status)
 	})}
@@ -51,6 +53,12 @@ func (s *fanoutStub) seen() (string, string, []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.method, s.path, s.body
+}
+
+func (s *fanoutStub) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 // The runtime directive is the cross-repo contract MAIN emits
@@ -226,5 +234,32 @@ func TestUnseedFanoutRecordDELETEs(t *testing.T) {
 
 	if m, p, _ := st.seen(); m != http.MethodDelete || p != "/streams/42" {
 		t.Fatalf("got %s %s, want DELETE /streams/42", m, p)
+	}
+}
+
+func TestSeedHeldProxiesRegistersOnlyProxies(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	dir := t.TempDir()
+	sd := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(sd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	proxy, _ := os.ReadFile("testdata/runtime_directive_proxy.json")
+	if err := os.WriteFile(filepath.Join(sd, "7.json"), proxy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sd, "8.json"), []byte(`{"data":{"runtime":{"kind":"other"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := st.agent()
+	a.SeedFanout, a.FfmpegBin, a.ReplicaDir = true, "/f", dir
+
+	a.seedHeldProxies(context.Background())
+
+	if n := st.count(); n != 1 {
+		t.Fatalf("made %d calls, want 1 (only the proxy stream)", n)
+	}
+	if m, p, _ := st.seen(); m != http.MethodPut || p != "/streams/7" {
+		t.Fatalf("got %s %s, want PUT /streams/7", m, p)
 	}
 }

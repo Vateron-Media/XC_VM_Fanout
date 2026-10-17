@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -145,6 +147,33 @@ func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 		}
 	}
 	a.unseedFanoutRecord(id)
+}
+
+// seedHeldProxies registers every held proxy stream with the fanout, for when
+// the fanout (re)starts and its in-memory registry is empty: with no PHP to
+// re-register per request on a serve-only LB, the agent re-seeds. It only
+// registers proxies — a restarted fanout holds nothing to unregister — and
+// reads records straight from the replica. No-op unless SeedFanout with a
+// replica; errors logged by id and swallowed.
+func (a *Agent) seedHeldProxies(ctx context.Context) {
+	if !a.SeedFanout || a.ReplicaDir == "" {
+		return
+	}
+	for _, id := range heldStreams(a.ReplicaDir) {
+		recordJSON, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), strconv.FormatInt(id, 10)+".json"))
+		if err != nil {
+			continue
+		}
+		d, ok := parseRuntimeDirective(recordJSON)
+		if !ok {
+			continue
+		}
+		if body, reg := d.registerBody(a.FfmpegBin); reg {
+			if err := a.registerStream(ctx, id, body); err != nil {
+				a.logf("cluster: fanout re-seed stream %d: %v", id, err)
+			}
+		}
+	}
 }
 
 // unseedFanoutRecord removes a stream's fanout registration — on a removal, or
