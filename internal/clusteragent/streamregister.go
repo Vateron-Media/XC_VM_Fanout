@@ -4,7 +4,22 @@
 
 package clusteragent
 
-import "encoding/json"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+// errFanoutTransient is returned when the fanout answers 503 to a register —
+// a concurrent teardown beat it (server.go's serveControl). The caller retries
+// on the next sync rather than treating it as a hard failure.
+var errFanoutTransient = errors.New("clusteragent: fanout register: transient (concurrent teardown)")
 
 // The runtime directive is what MAIN decides a serve-only LB should run for a
 // stream, embedded in the stream's replicated record (XC_VM
@@ -81,4 +96,57 @@ func (d runtimeDirective) registerBody(ffmpegBin string) (streamRegisterBody, bo
 		Cookie: d.Source.Cookie,
 		Ffmpeg: ffmpegBin,
 	}, true
+}
+
+// registerStream hands a restream's pull config to the fanout — PUT
+// /streams/<id> on the control socket, what PHP's FanoutClient::register did.
+// A no-op when this node has no control socket configured.
+func (a *Agent) registerStream(ctx context.Context, id int64, b streamRegisterBody) error {
+	if a.FanoutCtl == "" {
+		return nil
+	}
+	body, err := json.Marshal(b)
+	if err != nil {
+		return err
+	}
+	return a.fanoutStreamCall(ctx, http.MethodPut, id, body)
+}
+
+// unregisterStream removes a stream's registration from the fanout (DELETE
+// /streams/<id>), so a stream that was torn down or is no longer a proxy stops
+// being served. A no-op when this node has no control socket configured.
+func (a *Agent) unregisterStream(ctx context.Context, id int64) error {
+	if a.FanoutCtl == "" {
+		return nil
+	}
+	return a.fanoutStreamCall(ctx, http.MethodDelete, id, nil)
+}
+
+func (a *Agent) fanoutStreamCall(ctx context.Context, method string, id int64, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://fanout/streams/"+strconv.FormatInt(id, 10), r)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	switch res.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return nil
+	case http.StatusServiceUnavailable:
+		return errFanoutTransient
+	default:
+		return fmt.Errorf("clusteragent: fanout %s /streams/%d: HTTP %d", method, id, res.StatusCode)
+	}
 }
