@@ -236,7 +236,7 @@ func (st *liveEnvState) env() LiveEnv {
 		OnDisk:      func(int) bool { return st.onDisk },
 		Playlist:    func(int) string { return st.playlist },
 		Fed:         func(int) bool { return st.fed },
-		Registered:  func(int) bool { return st.registered },
+		Serveable:   func(int) bool { return st.registered },
 		Record: func(uuid string) (map[string]json.RawMessage, bool, bool) {
 			if !st.agentAnswers {
 				return nil, false, false
