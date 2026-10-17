@@ -42,3 +42,43 @@ func parseRuntimeDirective(recordData []byte) (runtimeDirective, bool) {
 	}
 	return *wrap.Runtime, true
 }
+
+// streamRegisterBody is the PUT /streams/<id> body — the fanout's streamConfig
+// (internal/server, server.go). The agent builds it from a proxy directive and
+// its own node ffmpeg path; Chunk 0 lets the fanout apply its configured
+// default.
+type streamRegisterBody struct {
+	URLs   []string `json:"urls"`
+	UA     string   `json:"ua"`
+	Proxy  string   `json:"proxy"`
+	Cookie string   `json:"cookie"`
+	Ffmpeg string   `json:"ffmpeg"`
+	Chunk  int      `json:"chunk"`
+}
+
+// registerBody turns a proxy directive into the fanout register body, filling
+// the node-local ffmpeg path the directive leaves out (D3). ok is false unless
+// this is a proxy directive with at least one non-empty url — so a transcode
+// (kind "other") or an empty-source stream is skipped, never registered as a
+// config the fanout would reject.
+func (d runtimeDirective) registerBody(ffmpegBin string) (streamRegisterBody, bool) {
+	if d.Kind != "proxy" || d.Source == nil {
+		return streamRegisterBody{}, false
+	}
+	var urls []string
+	for _, u := range d.Source.URLs {
+		if u != "" {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return streamRegisterBody{}, false
+	}
+	return streamRegisterBody{
+		URLs:   urls,
+		UA:     d.Source.UA,
+		Proxy:  d.Source.Proxy,
+		Cookie: d.Source.Cookie,
+		Ffmpeg: ffmpegBin,
+	}, true
+}
