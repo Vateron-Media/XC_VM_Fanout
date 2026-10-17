@@ -115,6 +115,12 @@ func (a *Agent) RunFanoutEvents(ctx context.Context) {
 				continue // not advanced: the same events come again
 			}
 		}
+		if out.Boot != boot {
+			// The fanout (re)started: its in-memory stream registry is empty, so a
+			// serve-only LB re-seeds every held proxy — no PHP re-registers per
+			// request. No-op unless SeedFanout. Fires on the first connect too.
+			a.seedHeldProxies(ctx)
+		}
 		boot, seq = out.Boot, out.Seq
 		a.setFanoutLive(true)
 	}

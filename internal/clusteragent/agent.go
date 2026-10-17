@@ -43,6 +43,13 @@ type Agent struct {
 	// FanoutCtl is xc_fanout's control socket, whose GET /events the agent
 	// follows while STREAMS is on (fanout.go); "" leaves it off.
 	FanoutCtl string
+	// SeedFanout, on a serve-only LB, has the agent register each assigned
+	// restream with the fanout from the replica's runtime directive — the job
+	// PHP's seedLocal did (streamregister.go). Off leaves the fanout to PHP.
+	SeedFanout bool
+	// FfmpegBin is the node-local ffmpeg path stamped into a restream's pull
+	// config (the directive omits it so MAIN stays environment-agnostic, D3).
+	FfmpegBin string
 	// ReplicaDir is where the node keeps its replica (replica.go); "" leaves
 	// it off.
 	ReplicaDir string
