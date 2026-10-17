@@ -5,6 +5,7 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -261,5 +262,26 @@ func TestSeedHeldProxiesRegistersOnlyProxies(t *testing.T) {
 	}
 	if m, p, _ := st.seen(); m != http.MethodPut || p != "/streams/7" {
 		t.Fatalf("got %s %s, want PUT /streams/7", m, p)
+	}
+}
+
+func TestParseTranscodeDirective(t *testing.T) {
+	data, err := os.ReadFile("testdata/runtime_directive_transcode.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := parseRuntimeDirective(data)
+	if !ok {
+		t.Fatal("want ok")
+	}
+	if d.Kind != "transcode" {
+		t.Fatalf("kind = %q, want transcode", d.Kind)
+	}
+	spec, ok := d.transcodeSpec()
+	if !ok {
+		t.Fatal("want a transcode spec")
+	}
+	if !bytes.Contains(spec, []byte("{ingest_sock}")) {
+		t.Fatalf("spec missing its placeholders: %s", spec)
 	}
 }

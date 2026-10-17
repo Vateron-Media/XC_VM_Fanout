@@ -50,6 +50,19 @@ type directiveSource struct {
 type runtimeDirective struct {
 	Kind   string           `json:"kind"`
 	Source *directiveSource `json:"source"`
+	// Spec is the portable supervisor.Spec for a kind:"transcode" directive
+	// (4b): a JSON object whose node-local values are placeholders the agent
+	// resolves. Stored raw and forwarded to /monitor/ after substitution.
+	Spec json.RawMessage `json:"spec"`
+}
+
+// transcodeSpec returns the raw portable Spec of a transcode directive, or
+// ok=false when this is not a transcode directive or carries no spec.
+func (d runtimeDirective) transcodeSpec() (json.RawMessage, bool) {
+	if d.Kind != "transcode" || len(d.Spec) == 0 {
+		return nil, false
+	}
+	return d.Spec, true
 }
 
 // parseRuntimeDirective reads the `runtime` directive from a stored stream
