@@ -71,8 +71,8 @@ func TestControlRegisterAndUnregister(t *testing.T) {
 }
 
 // TestControlTeardownAll covers DELETE /streams: the explicit bulk teardown
-// removes every registered stream in one call and reports the count, while any
-// other method on the collection is rejected.
+// removes every registered stream in one call and reports the count. (GET on
+// the collection lists the registered ids — see TestControlListRegistered.)
 func TestControlTeardownAll(t *testing.T) {
 	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
 	ts := httptest.NewServer(mgr.ControlHandler())
@@ -82,10 +82,10 @@ func TestControlTeardownAll(t *testing.T) {
 		mgr.GetOrCreate(id)
 	}
 
-	// A non-DELETE method on the collection is not allowed — this path never
-	// lists or mutates silently.
-	if code := ctlRequest(t, ts.URL, http.MethodGet, "/streams", ""); code != http.StatusMethodNotAllowed {
-		t.Fatalf("GET /streams: status %d, want 405", code)
+	// GET lists the registered ids (for the serve-only reconcile); these three
+	// are created but not registered, so the collection lists none of them.
+	if code := ctlRequest(t, ts.URL, http.MethodGet, "/streams", ""); code != http.StatusOK {
+		t.Fatalf("GET /streams: status %d, want 200", code)
 	}
 
 	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/streams", nil)
@@ -125,6 +125,45 @@ func TestControlTeardownAll(t *testing.T) {
 	_ = json.NewDecoder(resp2.Body).Decode(&got2)
 	if got2.Unregistered != 0 {
 		t.Fatalf("second teardown reported %d streams, want 0", got2.Unregistered)
+	}
+}
+
+// TestControlListRegistered covers GET /streams: it lists the ids the node has
+// registered (cfg set), which the serve-only agent's two-way reconcile reads.
+func TestControlListRegistered(t *testing.T) {
+	mgr := NewManager(1<<20, 0, 2, 6, time.Second)
+	ts := httptest.NewServer(mgr.ControlHandler())
+	defer ts.Close()
+
+	// Two registered, one merely created (no cfg) — only the registered show.
+	if code := ctlRequest(t, ts.URL, http.MethodPut, "/streams/3", `{"urls":["http://src/3.ts"]}`); code != http.StatusNoContent {
+		t.Fatalf("register 3: status %d", code)
+	}
+	if code := ctlRequest(t, ts.URL, http.MethodPut, "/streams/5", `{"urls":["http://src/5.ts"]}`); code != http.StatusNoContent {
+		t.Fatalf("register 5: status %d", code)
+	}
+	mgr.GetOrCreate("7") // created, not registered
+
+	resp, err := http.Get(ts.URL + "/streams")
+	if err != nil {
+		t.Fatalf("GET /streams: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /streams: status %d, want 200", resp.StatusCode)
+	}
+	var got struct {
+		Streams []string `json:"streams"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	set := map[string]bool{}
+	for _, id := range got.Streams {
+		set[id] = true
+	}
+	if len(got.Streams) != 2 || !set["3"] || !set["5"] {
+		t.Fatalf("streams = %v, want exactly {3,5}", got.Streams)
 	}
 }
 

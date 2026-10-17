@@ -25,6 +25,9 @@ type LiveEnv struct {
 	Playlist func(stream int) string
 	// Fed is FanoutClient::isStreamFed: is fanout serving the stream (has_data)?
 	Fed func(stream int) bool
+	// Registered reports whether the node holds a pull config for the stream, so
+	// a serve-only LB can serve-and-start it on demand instead of deferring.
+	Registered func(stream int) bool
 	// Record is the viewer's record in the agent: found, and whether the agent answered.
 	Record func(uuid string) (rec map[string]json.RawMessage, found, ok bool)
 	// AgentAlive: is the agent draining its spool (EventSpool::agentAlive)?
@@ -57,6 +60,10 @@ type Refresh struct {
 	Playlist  string
 	UserAgent string // as live.php holds it: htmlentities(trim(UA))
 	NoBuffer  bool   // use_buffer off: X-Accel-Buffering: no
+	// Warmup: a serve-only LB is serving a registered but idle stream. The
+	// serve path's attach (TS) / touch (HLS, via the client handler) starts its
+	// puller; HLS answers 404 until segments exist and the player retries.
+	Warmup bool
 	// The segment and key tokens' fields (tokenizeDaemonPlaylist).
 	HMAC       string // "" for a line
 	Identifier string
@@ -284,7 +291,14 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 
 	if r.TS {
 		if !env.Fed(r.Stream) {
-			return php("not-on-air")
+			// Serve-only LB: a registered stream that is idle is served-and-
+			// started (the serve path's attach starts the puller) rather than
+			// deferred to a PHP backend that does not exist. An unknown stream
+			// still fails closed.
+			if !(p.ServeOnly && env.Registered(r.Stream)) {
+				return php("not-on-air")
+			}
+			r.Warmup = true
 		}
 		// live.php's ?prebuffer=: a restreamer's link asking for one gets a segment's time.
 		r.Prebuffer = p.Live.ClientPrebuffer
@@ -302,6 +316,13 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	}
 	r.Playlist = env.Playlist(r.Stream)
 	if r.Playlist == "" || !segLineRe.MatchString(r.Playlist) {
+		// Serve-only LB: a registered idle stream warms up — the serve path
+		// routes to fanout's HLS handler (touch starts the puller) which answers
+		// 404 until segments exist, so the player retries. Unknown stream defers.
+		if p.ServeOnly && env.Registered(r.Stream) {
+			r.Warmup = true
+			return Verdict{Action: Serve, Reason: "playlist-warmup", Stream: r.Stream, UUID: r.UUID}, r
+		}
 		return php("not-on-air")
 	}
 	reason := "playlist"

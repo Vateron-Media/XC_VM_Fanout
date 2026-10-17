@@ -54,6 +54,11 @@ type fanoutReply struct {
 // idle timeout, so the agent is the side that closes.
 var FanoutIdleConn = 30 * time.Second
 
+// FanoutReconcileEvery is how often a serve-only LB reconciles the fanout's
+// registered set to its held proxies (register missing, clear stale), catching
+// drift that pure event-driven seeding would leave until a record changed.
+var FanoutReconcileEvery = 2 * time.Minute
+
 // fanoutClients holds one client per control socket path, for the life of the
 // process. A client of its own per call left each call's kept-alive
 // connection open behind a transport nobody used again: an fd and a goroutine
@@ -86,6 +91,9 @@ func (a *Agent) RunFanoutEvents(ctx context.Context) {
 	hc := fanoutClient(a.FanoutCtl)
 	boot, seq := "", uint64(0)
 	backoff := time.Second
+	// seedHeldProxies covers the first connect / restart; the periodic reconcile
+	// (first one an interval from now) catches drift, so start the clock now.
+	lastReconcile := time.Now()
 	for ctx.Err() == nil {
 		if a.flows.Load()&FlowStreams == 0 {
 			a.setFanoutLive(false)
@@ -120,6 +128,13 @@ func (a *Agent) RunFanoutEvents(ctx context.Context) {
 			// serve-only LB re-seeds every held proxy — no PHP re-registers per
 			// request. No-op unless SeedFanout. Fires on the first connect too.
 			a.seedHeldProxies(ctx)
+		}
+		if time.Since(lastReconcile) >= FanoutReconcileEvery {
+			// Two-way reconcile: register held proxies the fanout lacks, clear
+			// registrations that are no longer held proxies. Catches a failed
+			// register/unregister or a bulk drain. No-op unless SeedFanout.
+			a.reconcileFanout(ctx)
+			lastReconcile = time.Now()
 		}
 		boot, seq = out.Boot, out.Seq
 		a.setFanoutLive(true)

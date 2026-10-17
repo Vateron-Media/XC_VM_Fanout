@@ -215,6 +215,7 @@ func livePolicy() *Policy {
 
 type liveEnvState struct {
 	alive, onDisk, agentAnswers, agentAlive, fed bool
+	registered                                   bool // the node holds a pull config (serve-only serve-and-start)
 	fileMissing                                  bool // vod.php's file_exists: the movie is gone
 	playlist                                     string
 	rec                                          map[string]any
@@ -235,6 +236,7 @@ func (st *liveEnvState) env() LiveEnv {
 		OnDisk:      func(int) bool { return st.onDisk },
 		Playlist:    func(int) string { return st.playlist },
 		Fed:         func(int) bool { return st.fed },
+		Registered:  func(int) bool { return st.registered },
 		Record: func(uuid string) (map[string]json.RawMessage, bool, bool) {
 			if !st.agentAnswers {
 				return nil, false, false
@@ -951,5 +953,75 @@ func FuzzLiveToken(f *testing.F) {
 	p := tsPolicy()
 	f.Fuzz(func(t *testing.T, plain string) {
 		JudgeLive(p, tok(plain), "198.51.100.7", testUA, testNow, goodLiveEnv().env())
+	})
+}
+
+// Serve-not-defer (serve-only LB): a registered but idle stream is served-and-
+// started instead of deferred not-on-air; an unknown stream and a transition
+// node (serve_only off) still defer.
+func TestJudgeLiveServeOnlyServesIdleRegistered(t *testing.T) {
+	ip := "198.51.100.7"
+	first := func(p *Policy) { p.Live.CreateExpiration, p.Live.Admission, p.TimeOffset = 5, true, 0 }
+
+	t.Run("TS registered idle on serve-only serves", func(t *testing.T) {
+		p := tsPolicy()
+		first(p)
+		p.ServeOnly = true
+		st := goodTSEnv()
+		st.rec, st.fed, st.registered = nil, false, true
+		v, r := JudgeLive(p, firstTSToken(nil), ip, testUA, testNow, st.env())
+		if v.Action != Serve {
+			t.Fatalf("got %s (%s); want Serve", v.Action, v.Reason)
+		}
+		if r == nil || !r.TS {
+			t.Fatalf("want a TS refresh, got %+v", r)
+		}
+	})
+
+	t.Run("TS unregistered on serve-only defers not-on-air", func(t *testing.T) {
+		p := tsPolicy()
+		first(p)
+		p.ServeOnly = true
+		st := goodTSEnv()
+		st.rec, st.fed, st.registered = nil, false, false
+		if v, _ := JudgeLive(p, firstTSToken(nil), ip, testUA, testNow, st.env()); v.Action != PHP || v.Reason != "not-on-air" {
+			t.Fatalf("got %s/%s; want PHP/not-on-air", v.Action, v.Reason)
+		}
+	})
+
+	t.Run("TS registered idle but serve_only off defers", func(t *testing.T) {
+		p := tsPolicy()
+		first(p) // ServeOnly stays false
+		st := goodTSEnv()
+		st.rec, st.fed, st.registered = nil, false, true
+		if v, _ := JudgeLive(p, firstTSToken(nil), ip, testUA, testNow, st.env()); v.Action != PHP || v.Reason != "not-on-air" {
+			t.Fatalf("got %s/%s; want PHP/not-on-air", v.Action, v.Reason)
+		}
+	})
+
+	t.Run("HLS registered idle on serve-only warms up", func(t *testing.T) {
+		p := livePolicy()
+		first(p)
+		p.ServeOnly = true
+		st := goodLiveEnv()
+		st.rec, st.fed, st.playlist, st.registered = nil, false, "", true
+		v, r := JudgeLive(p, firstHLSToken(nil), ip, testUA, testNow, st.env())
+		if v.Action != Serve || v.Reason != "playlist-warmup" {
+			t.Fatalf("got %s/%s; want Serve/playlist-warmup", v.Action, v.Reason)
+		}
+		if r == nil || r.TS || !r.Warmup {
+			t.Fatalf("want an HLS warmup refresh, got %+v", r)
+		}
+	})
+
+	t.Run("HLS unregistered on serve-only defers not-on-air", func(t *testing.T) {
+		p := livePolicy()
+		first(p)
+		p.ServeOnly = true
+		st := goodLiveEnv()
+		st.rec, st.fed, st.playlist, st.registered = nil, false, "", false
+		if v, _ := JudgeLive(p, firstHLSToken(nil), ip, testUA, testNow, st.env()); v.Action != PHP || v.Reason != "not-on-air" {
+			t.Fatalf("got %s/%s; want PHP/not-on-air", v.Action, v.Reason)
+		}
 	})
 }
