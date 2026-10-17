@@ -54,6 +54,14 @@ type Agent struct {
 	// paths, ffmpeg binaries and server id. Fed by agentcmd flags; empty values
 	// make a transcode directive that needs them skip (fail closed).
 	node agentNode
+	// supervisedSpec records, per stream id, the portable spec last handed to the
+	// supervisor, so a re-seed with an unchanged spec is a no-op: PUT /monitor/
+	// RESTARTS the encoder (monitor.go), so re-applying on every resync would drop
+	// every transcode's viewers periodically. Guarded by streamsMu (every mutator
+	// — seedFanoutRecord via apply(), seedHeldProxies, unseedFanoutRecord — runs
+	// under it). Cleared on a fanout restart so held transcodes re-PUT and the
+	// supervisor adopts the surviving encoders.
+	supervisedSpec map[int64][]byte
 	// ReplicaDir is where the node keeps its replica (replica.go); "" leaves
 	// it off.
 	ReplicaDir string

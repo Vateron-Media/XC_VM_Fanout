@@ -418,3 +418,132 @@ func TestUnsuperviseStreamDELETEsMonitor(t *testing.T) {
 		t.Fatalf("got %s %s, want DELETE /monitor/7", m, p)
 	}
 }
+
+// routingStub records every control call and answers /ingest/ with a socket, so
+// the transcode routing (ingest + monitor + streams) can be asserted together.
+type routeRec struct {
+	method, path string
+	body         []byte
+}
+
+type routingStub struct {
+	sock string
+	mu   sync.Mutex
+	recs []routeRec
+}
+
+func newRoutingStub(t *testing.T) *routingStub {
+	t.Helper()
+	st := &routingStub{sock: filepath.Join(t.TempDir(), "ctl.sock")}
+	ln, err := net.Listen("unix", st.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		st.mu.Lock()
+		st.recs = append(st.recs, routeRec{r.Method, r.URL.Path, b})
+		st.mu.Unlock()
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/ingest/") {
+			_ = json.NewEncoder(w).Encode(map[string]string{"socket": "/i/7.sock"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return st
+}
+
+func (s *routingStub) count(method, prefix string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, r := range s.recs {
+		if r.method == method && strings.HasPrefix(r.path, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *routingStub) total() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.recs)
+}
+
+func (s *routingStub) agent() *Agent {
+	return &Agent{
+		FanoutCtl: s.sock, SeedFanout: true, FfmpegBin: "/opt/ffmpeg",
+		node: agentNode{streams: "/s/", logs: "/l/", serverID: "3", ffmpegCpu: "/ff", ffmpegGpu: "/ffg", ffprobe: "/fp", binary: "/bin"},
+	}
+}
+
+func TestSeedFanoutRecordTranscode(t *testing.T) {
+	st := newRoutingStub(t)
+	rec, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	st.agent().seedFanoutRecord(7, rec)
+	if n := st.count(http.MethodPut, "/ingest/"); n != 1 {
+		t.Fatalf("want 1 ingest PUT, got %d", n)
+	}
+	if n := st.count(http.MethodPut, "/monitor/"); n != 1 {
+		t.Fatalf("want 1 monitor PUT, got %d", n)
+	}
+}
+
+func TestSeedFanoutRecordTranscodeDedup(t *testing.T) {
+	st := newRoutingStub(t)
+	a := st.agent()
+	rec, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	a.seedFanoutRecord(7, rec)
+	a.seedFanoutRecord(7, rec) // same spec on a resync must NOT restart the encoder
+	if n := st.count(http.MethodPut, "/monitor/"); n != 1 {
+		t.Fatalf("want 1 monitor PUT after a duplicate seed (dedup), got %d", n)
+	}
+}
+
+func TestSeedFanoutRecordFlipTranscodeToProxy(t *testing.T) {
+	st := newRoutingStub(t)
+	a := st.agent()
+	tr, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	px, _ := os.ReadFile("testdata/runtime_directive_proxy.json")
+	a.seedFanoutRecord(7, tr)
+	a.seedFanoutRecord(7, px) // reconfigured to a proxy: release the encoder, register the puller
+	if n := st.count(http.MethodDelete, "/monitor/"); n != 1 {
+		t.Fatalf("flip to proxy must DELETE /monitor/, got %d", n)
+	}
+	if n := st.count(http.MethodPut, "/streams/"); n != 1 {
+		t.Fatalf("flip to proxy must register the puller, got %d", n)
+	}
+}
+
+func TestSeedFanoutRecordTranscodeSeedOff(t *testing.T) {
+	st := newRoutingStub(t)
+	a := st.agent()
+	a.SeedFanout = false
+	rec, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	a.seedFanoutRecord(7, rec)
+	if n := st.total(); n != 0 {
+		t.Fatalf("SeedFanout off must make no calls, got %d", n)
+	}
+}
+
+func TestSeedHeldReSupervisesTranscodes(t *testing.T) {
+	st := newRoutingStub(t)
+	dir := t.TempDir()
+	sd := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(sd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tr, _ := os.ReadFile("testdata/runtime_directive_transcode.json")
+	if err := os.WriteFile(filepath.Join(sd, "7.json"), tr, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := st.agent()
+	a.ReplicaDir = dir
+	a.seedHeldProxies(context.Background()) // the fanout-restart re-seed
+	if n := st.count(http.MethodPut, "/monitor/"); n != 1 {
+		t.Fatalf("a held transcode must be re-supervised on a fanout restart, got %d monitor PUTs", n)
+	}
+}

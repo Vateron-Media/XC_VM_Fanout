@@ -75,6 +75,17 @@ type agentNode struct {
 	streams, logs, serverID, ffmpegCpu, ffmpegGpu, ffprobe, binary string
 }
 
+// SetNodePaths configures the transcode-spec placeholder values from the
+// install's node layout (called by agentcmd after FfmpegBin is set, which
+// doubles as the {ffmpeg_cpu} value). Leaving any empty makes a transcode
+// directive that needs that placeholder skip — fail closed.
+func (a *Agent) SetNodePaths(streams, logs, serverID, ffmpegGPU, ffprobe, binary string) {
+	a.node = agentNode{
+		streams: streams, logs: logs, serverID: serverID,
+		ffmpegCpu: a.FfmpegBin, ffmpegGpu: ffmpegGPU, ffprobe: ffprobe, binary: binary,
+	}
+}
+
 var residualToken = regexp.MustCompile(`\{[a-z_]+\}`)
 
 // resolveSpec substitutes the placeholders in a portable transcode spec (4b-i)
@@ -286,33 +297,73 @@ func (a *Agent) unregisterStream(ctx context.Context, id int64) error {
 }
 
 // seedFanoutRecord hands one stored record's runtime directive to the fanout
-// when serve-only seeding is on: a proxy directive registers the puller,
-// anything else (a transcode, or no directive) unregisters it so a stream that
-// stopped being a proxy is cleared. No-op unless SeedFanout. Errors are logged
-// by id and swallowed — a down or busy fanout must never fail the streams sync.
-// A failed call is re-attempted only when the record next changes or the fanout
+// when serve-only seeding is on, routing by kind: a proxy directive registers
+// the puller (and releases a supervisor it had from a prior transcode); a
+// transcode directive supervises the encoder (applyTranscode); anything else
+// (or no directive) clears both. No-op unless SeedFanout. Errors are logged by
+// id and swallowed — a down or busy fanout must never fail the streams sync. A
+// failed call is re-attempted only when the record next changes or the fanout
 // restarts (boot-change re-seed), NOT on every sync — there is no periodic
 // reconcile yet (see errFanoutTransient). Only the id is logged, never the
-// record or its source (which carries credentials).
+// record or its source/spec (which carry credentials). A flip proxy->transcode
+// leaves the dormant puller registration in place (the supervised stream is
+// ingest-fed); clearing it safely is the serve path's concern (4b-iii).
 func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 	if !a.SeedFanout {
 		return
 	}
 	if d, ok := parseRuntimeDirective(recordJSON); ok {
 		if body, reg := d.registerBody(a.FfmpegBin); reg {
+			a.releaseSupervision(id) // a flip transcode->proxy: stop the encoder
 			if err := a.registerStream(context.Background(), id, body); err != nil {
 				a.logf("cluster: fanout register stream %d: %v", id, err)
 			}
+			return
+		}
+		if spec, ok := d.transcodeSpec(); ok {
+			a.applyTranscode(context.Background(), id, spec)
 			return
 		}
 	}
 	a.unseedFanoutRecord(id)
 }
 
-// seedHeldProxies registers every held proxy stream with the fanout, for when
-// the fanout (re)starts and its in-memory registry is empty: with no PHP to
-// re-register per request on a serve-only LB, the agent re-seeds. It only
-// registers proxies — a restarted fanout holds nothing to unregister — and
+// applyTranscode hands a transcode stream to the supervisor, but only when its
+// portable spec is new or changed: PUT /monitor/ restarts the encoder, so an
+// unchanged re-seed (a resync) must be a no-op. streamsMu is held by the caller.
+func (a *Agent) applyTranscode(ctx context.Context, id int64, spec json.RawMessage) {
+	if bytes.Equal(a.supervisedSpec[id], spec) {
+		return
+	}
+	if err := a.superviseStream(ctx, id, spec); err != nil {
+		a.logf("cluster: fanout supervise stream %d: %v", id, err)
+		return // unmarked, so the next change or resync retries
+	}
+	if a.supervisedSpec == nil {
+		a.supervisedSpec = map[int64][]byte{}
+	}
+	a.supervisedSpec[id] = append([]byte(nil), spec...)
+}
+
+// releaseSupervision stops the supervisor for a stream the agent had supervised
+// (a flip away from transcode, or a removal) and forgets it. No-op if it was
+// never supervised. streamsMu is held by the caller.
+func (a *Agent) releaseSupervision(id int64) {
+	if _, ok := a.supervisedSpec[id]; !ok {
+		return
+	}
+	if err := a.unsuperviseStream(context.Background(), id); err != nil {
+		a.logf("cluster: fanout release stream %d: %v", id, err)
+		return // keep the entry so a later seed retries the release
+	}
+	delete(a.supervisedSpec, id)
+}
+
+// seedHeldProxies re-seeds every held stream with the fanout, for when the
+// fanout (re)starts and its in-memory registry is empty: with no PHP to
+// re-register per request on a serve-only LB, the agent re-seeds. It registers
+// proxies (PUT /streams/) and re-supervises transcodes (PUT /monitor/, which
+// lets the supervisor adopt an encoder that outlived the daemon — adopt.go). It
 // reads records straight from the replica. No-op unless SeedFanout with a
 // replica; errors logged by id and swallowed.
 func (a *Agent) seedHeldProxies(ctx context.Context) {
@@ -327,6 +378,10 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 	// a fanout (re)start is rare.
 	a.streamsMu.Lock()
 	defer a.streamsMu.Unlock()
+	// The fanout forgot every stream, so forget what we thought was supervised
+	// and re-apply all: a transcode re-PUT makes the supervisor adopt the encoder
+	// that outlived the daemon rather than leaving it unwatched.
+	a.supervisedSpec = nil
 	for _, id := range heldStreams(a.ReplicaDir) {
 		recordJSON, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), strconv.FormatInt(id, 10)+".json"))
 		if err != nil {
@@ -340,17 +395,23 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 			if err := a.registerStream(ctx, id, body); err != nil {
 				a.logf("cluster: fanout re-seed stream %d: %v", id, err)
 			}
+			continue
+		}
+		if spec, ok := d.transcodeSpec(); ok {
+			a.applyTranscode(ctx, id, spec)
 		}
 	}
 }
 
 // unseedFanoutRecord removes a stream's fanout registration — on a removal, or
-// a stream that stopped being a proxy. No-op unless SeedFanout; errors logged
-// by id and swallowed.
+// a stream that stopped being a proxy/transcode. Releases the supervisor first
+// (if it was a transcode), then unregisters the puller. No-op unless SeedFanout;
+// errors logged by id and swallowed.
 func (a *Agent) unseedFanoutRecord(id int64) {
 	if !a.SeedFanout {
 		return
 	}
+	a.releaseSupervision(id) // stop the encoder if this stream was a transcode
 	if err := a.unregisterStream(context.Background(), id); err != nil {
 		a.logf("cluster: fanout unregister stream %d: %v", id, err)
 	}
