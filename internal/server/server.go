@@ -1348,6 +1348,20 @@ func (m *Manager) Get(id string) *Stream {
 	return m.streams[id]
 }
 
+// Registered reports whether the node holds a pull config for id — the stream
+// exists and the daemon pulls it (cfg set), as opposed to unknown or externally
+// fed. A serve-only LB serves-and-starts such a stream on demand; an unknown one
+// still fails closed.
+func (m *Manager) Registered(id string) bool {
+	st := m.Get(id)
+	if st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.cfg != nil
+}
+
 // GetOrCreate returns the stream for id, creating it if necessary.
 func (m *Manager) GetOrCreate(id string) *Stream {
 	m.mu.Lock()
@@ -1855,14 +1869,42 @@ func normalizeBackend(b string) string {
 // teardown, so it is an auditable operator action, not a hidden switch. Any method
 // other than DELETE is rejected — this path never lists or mutates silently.
 func (m *Manager) serveControlAll(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+	switch r.Method {
+	case http.MethodGet:
+		// The registered (pullable) ids, for the serve-only agent's two-way
+		// reconcile (register every held proxy, clear everything else).
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string][]string{"streams": m.registeredIDs()})
+	case http.MethodDelete:
+		n := m.UnregisterAll()
+		dlog.Logf("ctl", "teardown all: unregistered %d stream(s) (DELETE /streams)", n)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int{"unregistered": n})
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
-	n := m.UnregisterAll()
-	dlog.Logf("ctl", "teardown all: unregistered %d stream(s) (DELETE /streams)", n)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]int{"unregistered": n})
+}
+
+// registeredIDs is the ids of streams the node pulls (cfg set). Snapshots the
+// registry under m.mu, then reads each stream's cfg under its own lock, so it
+// never holds both locks at once.
+func (m *Manager) registeredIDs() []string {
+	m.mu.Lock()
+	streams := make(map[string]*Stream, len(m.streams))
+	for id, st := range m.streams {
+		streams[id] = st
+	}
+	m.mu.Unlock()
+	ids := make([]string, 0, len(streams))
+	for id, st := range streams {
+		st.mu.Lock()
+		reg := st.cfg != nil
+		st.mu.Unlock()
+		if reg {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {

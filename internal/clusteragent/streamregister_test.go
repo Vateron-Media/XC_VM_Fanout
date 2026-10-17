@@ -267,6 +267,63 @@ func TestSeedHeldProxiesRegistersOnlyProxies(t *testing.T) {
 	}
 }
 
+// reconcileFanout registers held proxies the fanout lacks and clears fanout
+// registrations that are no longer held proxies, leaving matches alone.
+func TestReconcileFanoutRegistersMissingClearsStale(t *testing.T) {
+	var mu sync.Mutex
+	puts, dels := map[string]bool{}, map[string]bool{}
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/streams":
+			_ = json.NewEncoder(w).Encode(map[string][]string{"streams": {"7", "9"}}) // fanout holds 7, 9
+		case r.Method == http.MethodPut:
+			mu.Lock()
+			puts[strings.TrimPrefix(r.URL.Path, "/streams/")] = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			dels[strings.TrimPrefix(r.URL.Path, "/streams/")] = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	dir := t.TempDir()
+	sd := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(sd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	proxy, _ := os.ReadFile("testdata/runtime_directive_proxy.json")
+	_ = os.WriteFile(filepath.Join(sd, "7.json"), proxy, 0o600) // held proxy 7 (already in fanout)
+	_ = os.WriteFile(filepath.Join(sd, "8.json"), proxy, 0o600) // held proxy 8 (missing from fanout)
+
+	a := &Agent{FanoutCtl: sock, SeedFanout: true, FfmpegBin: "/f", ReplicaDir: dir}
+	a.reconcileFanout(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !puts["8"] {
+		t.Error("held proxy 8 missing from the fanout should be registered")
+	}
+	if puts["7"] {
+		t.Error("held proxy 7 already registered should not be re-PUT")
+	}
+	if !dels["9"] {
+		t.Error("fanout id 9 that is no longer a held proxy should be unregistered")
+	}
+	if dels["7"] {
+		t.Error("held proxy 7 must never be unregistered")
+	}
+}
+
 func TestParseTranscodeDirective(t *testing.T) {
 	data, err := os.ReadFile("testdata/runtime_directive_transcode.json")
 	if err != nil {

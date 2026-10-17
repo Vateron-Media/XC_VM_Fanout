@@ -66,6 +66,9 @@ type Node interface {
 	HandOverFile(w http.ResponseWriter, r *http.Request, id, uuid string, parts []server.FilePart, contentType string, limitPerc int, rate int64, rng string) bool
 	FedPlaylist(id string) string
 	Fed(id string) bool
+	// Registered reports whether the node holds a pull config for the stream
+	// (it can be started on demand), as opposed to unknown or externally fed.
+	Registered(id string) bool
 }
 
 // NewServer judges with the policy file at policyPath, serves live segments
@@ -188,9 +191,10 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 			}
 			return isStreamAlive(pid, stream)
 		},
-		OnDisk:   func(stream int) bool { return exists(p.Paths.Streams + strconv.Itoa(stream) + "_.m3u8") },
-		Playlist: func(stream int) string { return s.node.FedPlaylist(strconv.Itoa(stream)) },
-		Fed:      func(stream int) bool { return s.node.Fed(strconv.Itoa(stream)) },
+		OnDisk:     func(stream int) bool { return exists(p.Paths.Streams + strconv.Itoa(stream) + "_.m3u8") },
+		Playlist:   func(stream int) string { return s.node.FedPlaylist(strconv.Itoa(stream)) },
+		Fed:        func(stream int) bool { return s.node.Fed(strconv.Itoa(stream)) },
+		Registered: func(stream int) bool { return s.node.Registered(strconv.Itoa(stream)) },
 		Record: func(uuid string) (map[string]json.RawMessage, bool, bool) {
 			if p.Paths.AgentSock == "" {
 				return nil, false, false
@@ -503,6 +507,16 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil {
 			return "spool"
 		}
+	}
+	if ref.Warmup && !ref.TS {
+		// serve-only HLS: the stream is registered but idle. Route to fanout's own
+		// HLS handler so its touch() starts the puller; it answers "no segments
+		// yet" (404) and the player retries while the puller warms up.
+		in := r.Clone(r.Context())
+		in.URL = &url.URL{Path: "/hls/" + strconv.Itoa(ref.Stream) + "/index.m3u8"}
+		in.RequestURI = in.URL.RequestURI()
+		s.segments.ServeHTTP(w, in)
+		return ""
 	}
 	var body string
 	if !ref.TS {
