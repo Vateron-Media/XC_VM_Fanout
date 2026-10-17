@@ -508,6 +508,16 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 			return "spool"
 		}
 	}
+	if ref.Warmup && !ref.TS {
+		// serve-only HLS: the stream is registered but idle. Route to fanout's own
+		// HLS handler so its touch() starts the puller; it answers "no segments
+		// yet" (404) and the player retries while the puller warms up.
+		in := r.Clone(r.Context())
+		in.URL = &url.URL{Path: "/hls/" + strconv.Itoa(ref.Stream) + "/index.m3u8"}
+		in.RequestURI = in.URL.RequestURI()
+		s.segments.ServeHTTP(w, in)
+		return ""
+	}
 	var body string
 	if !ref.TS {
 		var err error
