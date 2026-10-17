@@ -191,6 +191,87 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 	}
 }
 
+// fanoutRegisteredIDs is the ids the fanout currently holds a pull config for
+// (GET /streams). Used by the reconcile to clear stale registrations.
+func (a *Agent) fanoutRegisteredIDs(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://fanout/streams", nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("clusteragent: fanout GET /streams: HTTP %d", res.StatusCode)
+	}
+	var out struct {
+		Streams []string `json:"streams"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Streams, nil
+}
+
+// reconcileFanout converges the fanout's registered set to exactly the held
+// proxies: it registers every held proxy the fanout lacks and unregisters every
+// id the fanout holds that is no longer a held proxy, leaving matches alone.
+// This closes the gap that pure event-driven seeding leaves — a failed
+// register/unregister, or a bulk drain, that no later record change would
+// retry. No-op unless SeedFanout with a control socket; holds streamsMu (like
+// seedHeldProxies) so it cannot interleave with apply; errors logged by id.
+func (a *Agent) reconcileFanout(ctx context.Context) {
+	if !a.SeedFanout || a.FanoutCtl == "" || a.ReplicaDir == "" {
+		return
+	}
+	a.streamsMu.Lock()
+	defer a.streamsMu.Unlock()
+
+	want := map[int64]streamRegisterBody{}
+	for _, id := range heldStreams(a.ReplicaDir) {
+		recordJSON, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), strconv.FormatInt(id, 10)+".json"))
+		if err != nil {
+			continue
+		}
+		if d, ok := parseRuntimeDirective(recordJSON); ok {
+			if body, reg := d.registerBody(a.FfmpegBin); reg {
+				want[id] = body
+			}
+		}
+	}
+
+	have, err := a.fanoutRegisteredIDs(ctx)
+	if err != nil {
+		a.logf("cluster: fanout reconcile: list: %v", err)
+		return
+	}
+	haveSet := map[int64]bool{}
+	for _, s := range have {
+		if id, e := strconv.ParseInt(s, 10, 64); e == nil {
+			haveSet[id] = true
+		}
+	}
+
+	for id, body := range want {
+		if !haveSet[id] {
+			if err := a.registerStream(ctx, id, body); err != nil {
+				a.logf("cluster: fanout reconcile: register %d: %v", id, err)
+			}
+		}
+	}
+	for id := range haveSet {
+		if _, ok := want[id]; !ok {
+			if err := a.unregisterStream(ctx, id); err != nil {
+				a.logf("cluster: fanout reconcile: unregister %d: %v", id, err)
+			}
+		}
+	}
+}
+
 // unseedFanoutRecord removes a stream's fanout registration — on a removal, or
 // a stream that stopped being a proxy. No-op unless SeedFanout; errors logged
 // by id and swallowed.
