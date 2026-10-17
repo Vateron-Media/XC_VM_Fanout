@@ -159,6 +159,14 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 	if !a.SeedFanout || a.ReplicaDir == "" {
 		return
 	}
+	// Serialize with the streams sync: apply() runs under streamsMu and may be
+	// removing a record (and DELETEing its registration) concurrently. Without
+	// the lock a stale register here could overtake that DELETE and leave an
+	// unassigned stream registered on the fanout. Held across the PUTs — they
+	// are local control-socket calls, each already bounded by a 5s timeout, and
+	// a fanout (re)start is rare.
+	a.streamsMu.Lock()
+	defer a.streamsMu.Unlock()
 	for _, id := range heldStreams(a.ReplicaDir) {
 		recordJSON, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), strconv.FormatInt(id, 10)+".json"))
 		if err != nil {
