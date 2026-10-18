@@ -116,7 +116,7 @@ type fakeFiles struct {
 	hoParts                       []server.FilePart
 	hoLimitPerc                   int
 	hoRate                        int64
-	hoRefuse                      bool // a part is not under a file root: return false
+	hoRefuse                      bool              // a part is not under a file root: return false
 	ensureRunning                 func(string) bool // nil -> defaults to Serveable
 	ensureRunningIDs              []string          // ids EnsureRunning was called with
 	serveable                     map[string]bool   // nil -> Serveable derives from playlists
