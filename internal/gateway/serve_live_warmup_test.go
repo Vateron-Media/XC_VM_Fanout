@@ -70,7 +70,20 @@ func TestServeOnlyWarmupStartsAndServes(t *testing.T) {
 	dir, path, _ := warmupPolicy(t, "segments+playlist", true)
 	startProducer(t, filepath.Join(dir, "streams"))
 	seg := &recordingHandler{}
-	node := &fakeFiles{serveable: map[string]bool{"12": true}, ensureRunning: func(string) bool { return true }}
+	// The stream is idle at judge time (empty playlist → warmup), and its first
+	// segment has finalized by the time serveLive polls for readiness.
+	calls := 0
+	node := &fakeFiles{
+		serveable:     map[string]bool{"12": true},
+		ensureRunning: func(string) bool { return true },
+		fedPlaylist: func(string) string {
+			calls++
+			if calls <= 1 {
+				return "" // judge sees an idle stream
+			}
+			return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n" // ready by serve time
+		},
+	}
 	s := NewServer(path, seg, node)
 
 	rec := warmupAsk(s)
@@ -86,6 +99,47 @@ func TestServeOnlyWarmupStartsAndServes(t *testing.T) {
 	}
 	if seg.hits != 1 || seg.uri != "/hls/12/index.m3u8" {
 		t.Fatalf("re-dispatch to fanout HLS: hits %d uri %q", seg.hits, seg.uri)
+	}
+}
+
+// withFastWarmupPlaylist lowers the HLS readiness-wait tunables so the
+// never-ready case is a fraction of a second. Process-global vars, so tests
+// using it must not call t.Parallel().
+func withFastWarmupPlaylist(t *testing.T) {
+	t.Helper()
+	oldWait, oldPoll := warmupPlaylistWait, warmupPlaylistPoll
+	warmupPlaylistWait, warmupPlaylistPoll = 150*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { warmupPlaylistWait, warmupPlaylistPoll = oldWait, oldPoll })
+}
+
+// EnsureRunning started the stream, but its first HLS segment never finalizes
+// within the bound: the gateway asks the client to retry (503) rather than pass
+// the HLS handler's "no segments yet" 404 on, uniform with the start timeout.
+func TestServeOnlyWarmupPlaylistNeverReadyReturns503(t *testing.T) {
+	withFastWarmupPlaylist(t)
+	dir, path, _ := warmupPolicy(t, "segments+playlist", true)
+	startProducer(t, filepath.Join(dir, "streams"))
+	seg := &recordingHandler{}
+	node := &fakeFiles{
+		serveable:     map[string]bool{"12": true},
+		ensureRunning: func(string) bool { return true },
+		fedPlaylist:   func(string) string { return "" }, // on air but no segment ever cut
+	}
+	s := NewServer(path, seg, node)
+
+	rec := warmupAsk(s)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("playlist never ready: code %d; want 503", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("503 must carry Retry-After")
+	}
+	if node.ensureRunningIDs == nil || node.ensureRunningIDs[0] != "12" {
+		t.Fatalf("EnsureRunning called with %v; want [12]", node.ensureRunningIDs)
+	}
+	if seg.hits != 0 {
+		t.Fatalf("a never-ready playlist must not re-dispatch to the HLS handler (hits %d)", seg.hits)
 	}
 }
 

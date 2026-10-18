@@ -157,3 +157,29 @@ func TestEnsureRunningExternallyFedCfgNilWaitsForData(t *testing.T) {
 		t.Fatal("touch must be a no-op for a cfg==nil externally-fed stream")
 	}
 }
+
+// Phase 4b invariant — MAIN start/stop vs viewer demand do not fight. MAIN's
+// stop of an LB stream is Unregister (the agent's DELETE /streams/<id>); a later
+// viewer-demand EnsureRunning must NOT restart it. This holds by construction
+// (Unregister removes the stream from the map and nulls cfg, unlike the
+// viewer-idle stop which keeps cfg for exactly this restart), and this pins it
+// against a future change to Unregister that would reopen the conflict.
+func TestEnsureRunningCannotRestartAfterMainStop(t *testing.T) {
+	withFastEnsure(t)
+	m := newEnsureManager(t)
+	m.Register("7", puller.Source{URLs: []string{"http://127.0.0.1:0/x.ts"}}, 0)
+	st := m.Get("7")
+	feedStream(st) // on air — a viewer could serve it now
+	if !st.onAir() {
+		t.Fatal("precondition: the stream is on air before the stop")
+	}
+
+	m.Unregister("7") // MAIN stop
+
+	if m.Get("7") != nil {
+		t.Fatal("MAIN stop must remove the stream, not leave it registered-idle")
+	}
+	if m.EnsureRunning("7") {
+		t.Fatal("a viewer must not restart a stream that MAIN stopped")
+	}
+}

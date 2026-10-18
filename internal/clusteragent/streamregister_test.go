@@ -18,6 +18,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/server"
 )
 
 // fanoutStub is a unix-socket HTTP server standing in for the fanout's control
@@ -615,5 +618,41 @@ func TestResolveSpecIgnoresFfmpegExpansion(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "%{localtime}") {
 		t.Fatalf("the expansion should be preserved: %s", out)
+	}
+}
+
+// Phase 4b end to end: MAIN's run/stop of an LB stream reaches a REAL fanout
+// Manager entirely through the Go agent — no fake, no PHP. A MAIN proxy
+// assignment (seedFanoutRecord → PUT /streams/<id>) registers the stream on the
+// Manager; the matching unassign (unseedFanoutRecord → DELETE /streams/<id>)
+// unregisters it. This also pins the agent↔Manager /streams body contract that
+// the fanoutStub tests cannot see.
+func TestSeedThenUnseedDrivesRealManagerRegisterUnregister(t *testing.T) {
+	m := server.NewManager(1<<20, 0, 2, 6, time.Second)
+	t.Cleanup(func() { m.UnregisterAll() })
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: m.ControlHandler()}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	a := &Agent{FanoutCtl: sock}
+	a.SeedFanout, a.FfmpegBin = true, "/f"
+	data, err := os.ReadFile("testdata/runtime_directive_proxy.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.seedFanoutRecord(7, data) // MAIN assigns a proxy stream
+	if m.Get("7") == nil {
+		t.Fatal("a MAIN assignment must register the stream on the Manager (run)")
+	}
+
+	a.unseedFanoutRecord(7) // MAIN unassigns
+	if m.Get("7") != nil {
+		t.Fatal("a MAIN unassign must unregister the stream on the Manager (stop)")
 	}
 }
