@@ -93,16 +93,18 @@ func (a *Agent) SetNodePaths(streams, logs, serverID, ffmpegGPU, ffprobe, binary
 var residualToken = regexp.MustCompile(`(?:^|[^%])(\{[a-z_]+\})`)
 
 // resolveSpec substitutes the placeholders in a portable transcode spec (4b-i)
-// with this node's values, the ingest socket and the generated key/IV. It fails
-// closed: a placeholder present in the spec whose value is empty (incomplete
-// node config), or any unknown token left over, is an error — a half-resolved
-// spec must never reach the supervisor.
-func resolveSpec(spec json.RawMessage, n agentNode, ingestSock, keyHex, ivHex string) ([]byte, error) {
+// with this node's values and the ingest socket. It fails closed: a placeholder
+// present in the spec whose value is empty (incomplete node config), or any
+// unknown token left over, is an error — a half-resolved spec must never reach
+// the supervisor. The HLS key/IV are NOT spec placeholders: the fanout (not
+// ffmpeg) encrypts, so the agent registers them via /ingest/ (setEnc), and the
+// spec's `encrypt` flag — not a token — says whether to.
+func resolveSpec(spec json.RawMessage, n agentNode, ingestSock string) ([]byte, error) {
 	s := string(spec)
 	for _, kv := range [][2]string{
 		{"{ingest_sock}", ingestSock}, {"{streams}", n.streams}, {"{logs}", n.logs},
 		{"{server_id}", n.serverID}, {"{ffmpeg_cpu}", n.ffmpegCpu}, {"{ffmpeg_gpu}", n.ffmpegGpu},
-		{"{ffprobe}", n.ffprobe}, {"{binary}", n.binary}, {"{key}", keyHex}, {"{iv}", ivHex},
+		{"{ffprobe}", n.ffprobe}, {"{binary}", n.binary},
 	} {
 		if strings.Contains(s, kv[0]) && kv[1] == "" {
 			return nil, fmt.Errorf("clusteragent: transcode spec needs %s but this node has no value for it", kv[0])
@@ -161,8 +163,15 @@ func (a *Agent) superviseStream(ctx context.Context, id int64, spec json.RawMess
 	if a.FanoutCtl == "" {
 		return nil
 	}
+	// The spec's `encrypt` flag (not a token) says whether this is encrypted HLS:
+	// generate a fresh key/IV and register them with the ingest (the fanout, not
+	// ffmpeg, encrypts). The key/IV never appear in the spec itself.
+	var enc struct {
+		Encrypt bool `json:"encrypt"`
+	}
+	_ = json.Unmarshal(spec, &enc)
 	var keyHex, ivHex string
-	if bytes.Contains(spec, []byte("{key}")) {
+	if enc.Encrypt {
 		var err error
 		if keyHex, err = randHex16(); err != nil {
 			return err
@@ -175,7 +184,7 @@ func (a *Agent) superviseStream(ctx context.Context, id int64, spec json.RawMess
 	if err != nil {
 		return err
 	}
-	resolved, err := resolveSpec(spec, a.node, sock, keyHex, ivHex)
+	resolved, err := resolveSpec(spec, a.node, sock)
 	if err != nil {
 		return err // fail closed: never hand a half-resolved spec to the supervisor
 	}

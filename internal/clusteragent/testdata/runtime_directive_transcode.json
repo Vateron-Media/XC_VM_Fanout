@@ -15,7 +15,7 @@
         "log_path": "{logs}stream_log.log",
         "server_id": "{server_id}",
         "adopt_match": "{streams}7_.m3u8",
-        "enc": {"key": "{key}", "iv": "{iv}"}
+        "encrypt": true
       }
     }
   }
