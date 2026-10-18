@@ -201,23 +201,40 @@ func TestFrontTerminatesTLS(t *testing.T) {
 
 func TestXcFanoutRoutedInProcess(t *testing.T) {
 	nginx := newNginxStub(t)
-	var fanoutPaths []string
+	seen := map[string]string{} // original request path -> rewritten path+query the handler saw
 	fanout := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fanoutPaths = append(fanoutPaths, r.URL.Path)
+		seen[r.Header.Get("X-Orig")] = r.URL.Path + queryOf(r)
 		_, _ = io.WriteString(w, "FANOUT")
 	})
 	front := NewServer(okHandler(), nginx.url, t.TempDir(), LoadTrustedProxies()).WithFanout(fanout)
-	for _, p := range []string{"/xc_fanout/abc", "/xc_fanout_hls/x.m3u8", "/xc_fanout_file/v.mp4"} {
+
+	// The front must apply nginx's rewrites before handing to the fanout handler,
+	// whose mux serves /live/, /hls/, /file/ — not /xc_fanout*.
+	cases := []struct{ req, want string }{
+		{"/xc_fanout/42", "/live/42"},
+		{"/xc_fanout_hls/7_3", "/hls/7/3.ts"},
+		{"/xc_fanout_file/9?c=uuid&m=movie", "/file/9?c=uuid&m=movie"},
+	}
+	for _, c := range cases {
 		rec := httptest.NewRecorder()
-		front.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		req := httptest.NewRequest(http.MethodGet, c.req, nil)
+		req.Header.Set("X-Orig", c.req)
+		front.ServeHTTP(rec, req)
 		if rec.Body.String() != "FANOUT" {
-			t.Fatalf("%s body=%q, want FANOUT", p, rec.Body.String())
+			t.Fatalf("%s body=%q, want FANOUT", c.req, rec.Body.String())
+		}
+		if seen[c.req] != c.want {
+			t.Fatalf("%s rewritten to %q, want %q", c.req, seen[c.req], c.want)
 		}
 	}
 	if nginx.path != "" {
 		t.Fatalf("a fanout route reached nginx (%q); it must be in-process", nginx.path)
 	}
-	if len(fanoutPaths) != 3 {
-		t.Fatalf("fanout handler saw %v, want 3 paths", fanoutPaths)
+}
+
+func queryOf(r *http.Request) string {
+	if r.URL.RawQuery == "" {
+		return ""
 	}
+	return "?" + r.URL.RawQuery
 }

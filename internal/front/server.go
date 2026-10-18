@@ -89,6 +89,57 @@ func isFanoutPath(p string) bool {
 	return false
 }
 
+// fanoutRewrite maps an /xc_fanout* request path to the fanout client handler's
+// own surface (/live/, /hls/, /file/), reproducing nginx's rewrites:
+//
+//	/xc_fanout/<rest>        -> /live/<rest>
+//	/xc_fanout_hls/<id>_<seq> -> /hls/<id>/<seq>.ts
+//	/xc_fanout_file/<id>     -> /file/<id>
+//
+// A path that does not fit the numeric _hls/_file forms is left unchanged (the
+// handler answers 404), as nginx's non-matching rewrite would.
+func fanoutRewrite(p string) string {
+	if rest, ok := strings.CutPrefix(p, "/xc_fanout_hls/"); ok {
+		if i := strings.IndexByte(rest, '_'); i > 0 {
+			if id, seq := rest[:i], rest[i+1:]; isDigits(id) && isDigits(seq) {
+				return "/hls/" + id + "/" + seq + ".ts"
+			}
+		}
+		return p
+	}
+	if rest, ok := strings.CutPrefix(p, "/xc_fanout_file/"); ok {
+		if isDigits(rest) {
+			return "/file/" + rest
+		}
+		return p
+	}
+	if rest, ok := strings.CutPrefix(p, "/xc_fanout/"); ok {
+		return "/live/" + rest
+	}
+	return p
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// serveFanout rewrites the /xc_fanout* path to the fanout handler's surface and
+// serves it in-process (query string preserved, as nginx's rewrite does).
+func (s *Server) serveFanout(w http.ResponseWriter, r *http.Request) {
+	fr := r.Clone(r.Context())
+	fr.URL = &url.URL{Path: fanoutRewrite(r.URL.Path), RawQuery: r.URL.RawQuery}
+	fr.RequestURI = ""
+	s.fanout.ServeHTTP(w, fr)
+}
+
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
 // backend, and serves the ACME challenge from webroot (certbot's -w directory).
 // trusted is the set_real_ip_from list the front uses to resolve the viewer's
@@ -228,7 +279,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.fanout != nil && isFanoutPath(r.URL.Path) {
-		s.fanout.ServeHTTP(w, r)
+		s.serveFanout(w, r)
 		return
 	}
 	if s.portal != "" && strings.HasPrefix(r.URL.Path, portalAssetsPrefix) {
