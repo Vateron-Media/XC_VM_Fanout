@@ -5,6 +5,8 @@
 package server
 
 import (
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,6 +96,35 @@ func TestEnsureRunningIdempotentForAlreadyOnAir(t *testing.T) {
 	}
 	if time.Since(start) >= ensureRunningTimeout {
 		t.Fatal("an on-air stream must return promptly, not wait")
+	}
+}
+
+// Review Focus #1 — the concurrent-warmup race: many viewers of the same idle
+// stream call EnsureRunning at once. The puller is launched exactly once
+// (touch()/startLocked() single-flight under s.mu), never once per caller.
+// startLocked logs "puller starting" once per launch, so the count is the
+// number of launches; a broken running-guard would show more than one.
+func TestEnsureRunningConcurrentCallersStartPullerOnce(t *testing.T) {
+	withFastEnsure(t)
+	logs := captureDebugLog(t)
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m.Register("7", puller.Source{URLs: []string{"http://127.0.0.1:0/x.ts"}}, 0)
+	st := m.Get("7")
+
+	const n = 16
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() { defer wg.Done(); m.EnsureRunning("7") }()
+	}
+	feedStream(st) // flip onAir so the callers return without each waiting the full bound
+	wg.Wait()
+
+	if !st.isRunning() {
+		t.Fatal("concurrent EnsureRunning must have started the puller")
+	}
+	if got := strings.Count(logs.String(), "puller starting"); got != 1 {
+		t.Fatalf("puller launched %d times under concurrency; want exactly 1", got)
 	}
 }
 
