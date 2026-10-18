@@ -56,88 +56,30 @@ const imagesPrefix = "/images/"
 
 var scriptExt = regexp.MustCompile(`(?i)\.(php\d*|phtml|phar)$`)
 
-// xcHlsPrefix is nginx's X-Accel sendfile location for HLS parts, served from
-// STREAMS_PATH. The front serves it in-process (ranged file serve).
-const xcHlsPrefix = "/xc_hls/"
-
 type Server struct {
 	gateway http.Handler
 	proxy   http.Handler
 	webroot string
 	trusted *TrustedProxies
 	limiter *rateLimiter
-	images  string       // storage/images root; empty leaves /images to the proxy
-	streams string       // STREAMS_PATH root for /xc_hls; empty leaves it to the proxy
-	fanout  http.Handler // in-process fanout daemon for /xc_fanout*; nil leaves it to the proxy
-	portal  string       // portal assets root for /portal/assets; empty leaves it to the proxy
+	images  string // storage/images root; empty leaves /images to the proxy
 }
 
-// portalAssetsPrefix is nginx's static /portal/assets location (css/js/images).
-const portalAssetsPrefix = "/portal/assets/"
+// internalPrefixes are nginx's `internal;` X-Accel targets — reachable only via
+// an X-Accel-Redirect, never by an external client. The Go gateway serves that
+// content in-process (its own segments handler, "without the hop"), so these
+// have no front route; a direct external request gets 404, exactly as nginx's
+// `internal;` returns for one. Serving them would hand out segments/files with
+// no token check.
+var internalPrefixes = []string{"/xc_hls/", "/xc_fanout/", "/xc_fanout_hls/", "/xc_fanout_file/"}
 
-// fanoutPrefixes are nginx's fanout-daemon locations: today proxied to the
-// daemon's unix socket, served in-process by the front when a fanout handler is
-// set.
-var fanoutPrefixes = []string{"/xc_fanout/", "/xc_fanout_hls/", "/xc_fanout_file/"}
-
-func isFanoutPath(p string) bool {
-	for _, prefix := range fanoutPrefixes {
+func isInternalPath(p string) bool {
+	for _, prefix := range internalPrefixes {
 		if strings.HasPrefix(p, prefix) {
 			return true
 		}
 	}
 	return false
-}
-
-// fanoutRewrite maps an /xc_fanout* request path to the fanout client handler's
-// own surface (/live/, /hls/, /file/), reproducing nginx's rewrites:
-//
-//	/xc_fanout/<rest>        -> /live/<rest>
-//	/xc_fanout_hls/<id>_<seq> -> /hls/<id>/<seq>.ts
-//	/xc_fanout_file/<id>     -> /file/<id>
-//
-// A path that does not fit the numeric _hls/_file forms is left unchanged (the
-// handler answers 404), as nginx's non-matching rewrite would.
-func fanoutRewrite(p string) string {
-	if rest, ok := strings.CutPrefix(p, "/xc_fanout_hls/"); ok {
-		if i := strings.IndexByte(rest, '_'); i > 0 {
-			if id, seq := rest[:i], rest[i+1:]; isDigits(id) && isDigits(seq) {
-				return "/hls/" + id + "/" + seq + ".ts"
-			}
-		}
-		return p
-	}
-	if rest, ok := strings.CutPrefix(p, "/xc_fanout_file/"); ok {
-		if isDigits(rest) {
-			return "/file/" + rest
-		}
-		return p
-	}
-	if rest, ok := strings.CutPrefix(p, "/xc_fanout/"); ok {
-		return "/live/" + rest
-	}
-	return p
-}
-
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// serveFanout rewrites the /xc_fanout* path to the fanout handler's surface and
-// serves it in-process (query string preserved, as nginx's rewrite does).
-func (s *Server) serveFanout(w http.ResponseWriter, r *http.Request) {
-	fr := r.Clone(r.Context())
-	fr.URL = &url.URL{Path: fanoutRewrite(r.URL.Path), RawQuery: r.URL.RawQuery}
-	fr.RequestURI = ""
-	s.fanout.ServeHTTP(w, fr)
 }
 
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
@@ -192,54 +134,6 @@ func (s *Server) WithImages(dir string) *Server {
 	return s
 }
 
-// WithFanout makes the front route /xc_fanout*, /xc_fanout_hls* and
-// /xc_fanout_file* to the in-process fanout daemon handler h instead of
-// proxying them to nginx. nil leaves them to the proxy. Returns the server for
-// chaining.
-func (s *Server) WithFanout(h http.Handler) *Server {
-	s.fanout = h
-	return s
-}
-
-// WithPortalAssets makes the front serve /portal/assets/ from dir in-process
-// instead of proxying it to nginx. Empty leaves it to the proxy. Returns the
-// server for chaining.
-func (s *Server) WithPortalAssets(dir string) *Server {
-	s.portal = dir
-	return s
-}
-
-// servePortalAssets serves a static portal asset, confined to the root, with
-// the content type inferred from the extension (ServeContent, empty type).
-func (s *Server) servePortalAssets(w http.ResponseWriter, r *http.Request) {
-	full, ok := confine(s.portal, strings.TrimPrefix(r.URL.Path, portalAssetsPrefix))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	serveFileRange(w, r, full, "")
-}
-
-// WithStreams makes the front serve /xc_hls/ from dir (STREAMS_PATH) in-process
-// instead of proxying it to nginx's X-Accel sendfile. Empty leaves it to the
-// proxy. Returns the server for chaining.
-func (s *Server) WithStreams(dir string) *Server {
-	s.streams = dir
-	return s
-}
-
-// serveXcHls serves an HLS part under /xc_hls/ from STREAMS_PATH, confined to
-// the root, with Range support — the in-process replacement for nginx's
-// X-Accel-Redirect sendfile.
-func (s *Server) serveXcHls(w http.ResponseWriter, r *http.Request) {
-	full, ok := confine(s.streams, strings.TrimPrefix(r.URL.Path, xcHlsPrefix))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	serveFileRange(w, r, full, contentTypeByExt(full))
-}
-
 // serveImages serves a file under /images/ from the image store, matching
 // nginx: no code execution (403), no auto-index.html (404), no directory
 // listing, and confined to the root.
@@ -274,16 +168,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveImages(w, r)
 		return
 	}
-	if s.streams != "" && strings.HasPrefix(r.URL.Path, xcHlsPrefix) {
-		s.serveXcHls(w, r)
-		return
-	}
-	if s.fanout != nil && isFanoutPath(r.URL.Path) {
-		s.serveFanout(w, r)
-		return
-	}
-	if s.portal != "" && strings.HasPrefix(r.URL.Path, portalAssetsPrefix) {
-		s.servePortalAssets(w, r)
+	// nginx's `internal;` X-Accel targets are never reachable by an external
+	// client; the gateway serves their content in-process. 404 a direct request
+	// rather than proxy or serve it (no token check lives on these paths).
+	if isInternalPath(r.URL.Path) {
+		http.NotFound(w, r)
 		return
 	}
 	if kind := serveKind(r.URL.Path); kind != "" {
