@@ -354,29 +354,33 @@ func TestResolveSpec(t *testing.T) {
 	spec, _ := d.transcodeSpec()
 	n := agentNode{streams: "/s/", logs: "/l/", serverID: "3", ffmpegCpu: "/ff", ffmpegGpu: "/ffg", ffprobe: "/fp", binary: "/bin"}
 
-	out, err := resolveSpec(spec, n, "/i/7.sock", "aabb", "ccdd")
+	out, err := resolveSpec(spec, n, "/i/7.sock")
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := string(out)
-	for _, tok := range []string{"{ingest_sock}", "{streams}", "{ffmpeg_cpu}", "{key}", "{iv}", "{server_id}", "{logs}"} {
+	for _, tok := range []string{"{ingest_sock}", "{streams}", "{ffmpeg_cpu}", "{server_id}", "{logs}"} {
 		if strings.Contains(s, tok) {
 			t.Fatalf("unresolved token %s in %s", tok, s)
 		}
 	}
-	if !strings.Contains(s, "unix:/i/7.sock") || !strings.Contains(s, "/s/7_.pid") || !strings.Contains(s, "aabb") {
+	if !strings.Contains(s, "unix:/i/7.sock") || !strings.Contains(s, "/s/7_.pid") {
 		t.Fatalf("values not substituted: %s", s)
+	}
+	// The HLS key/IV are not spec placeholders — they go to /ingest/, not here.
+	if strings.Contains(s, "{key}") || strings.Contains(s, "{iv}") {
+		t.Fatalf("key/iv must not be spec tokens: %s", s)
 	}
 }
 
 func TestResolveSpecResidualTokenErrors(t *testing.T) {
-	if _, err := resolveSpec(json.RawMessage(`{"cmd":"{bogus}"}`), agentNode{}, "", "", ""); err == nil {
+	if _, err := resolveSpec(json.RawMessage(`{"cmd":"{bogus}"}`), agentNode{}, ""); err == nil {
 		t.Fatal("an unresolved/unknown token must error (incomplete node config)")
 	}
 }
 
 func TestResolveSpecNoEnc(t *testing.T) {
-	out, err := resolveSpec(json.RawMessage(`{"cmd":"{ffmpeg_cpu} -i x {streams}1_.m3u8"}`), agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i", "", "")
+	out, err := resolveSpec(json.RawMessage(`{"cmd":"{ffmpeg_cpu} -i x {streams}1_.m3u8"}`), agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +616,7 @@ func TestResolveSpecIgnoresFfmpegExpansion(t *testing.T) {
 	// ffmpeg's %{...} expansion (e.g. a drawtext timestamp overlay) must not read
 	// as an unresolved token — else the transcode fails closed and never serves.
 	out, err := resolveSpec(json.RawMessage(`{"cmd":"{ffmpeg_cpu} -vf drawtext=text='%{localtime}' {streams}1_.m3u8"}`),
-		agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i", "", "")
+		agentNode{ffmpegCpu: "/ff", streams: "/s/"}, "/i")
 	if err != nil {
 		t.Fatalf("ffmpeg %%{...} expansion must not trip the residual check: %v", err)
 	}
