@@ -8,8 +8,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,17 +45,30 @@ func writeCert(t *testing.T, certPath, keyPath string) {
 	}
 }
 
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
 // A missing certificate is returned as an error, not a crash: the caller logs
 // it and leaves nginx serving.
 func TestServeFrontNonFatalOnBadCert(t *testing.T) {
-	if _, _, err := serveFront("127.0.0.1:0", http.NotFoundHandler(), "http://127.0.0.1:1", t.TempDir(),
-		filepath.Join(t.TempDir(), "absent.crt"), filepath.Join(t.TempDir(), "absent.key"), "", ""); err == nil {
+	dir := t.TempDir()
+	if _, err := serveFront(http.NotFoundHandler(), "http://127.0.0.1:1", dir,
+		filepath.Join(dir, "absent.crt"), filepath.Join(dir, "absent.key"), "", "",
+		filepath.Join(dir, "http.conf"), filepath.Join(dir, "https.conf")); err == nil {
 		t.Fatal("want an error for a missing certificate, got nil")
 	}
 }
 
-// Wired end to end: a serve route reaches the in-process gateway, everything
-// else is proxied to the nginx backend, over a real TLS connection.
+// Wired end to end: the front binds the node listen set, a serve route reaches
+// the in-process gateway, everything else is proxied to the nginx backend, over
+// a real TLS connection.
 func TestServeFrontServesAndProxies(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "NGINX")
@@ -69,36 +84,47 @@ func TestServeFrontServesAndProxies(t *testing.T) {
 	dir := t.TempDir()
 	cp, kp := filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key")
 	writeCert(t, cp, kp)
+	hp, sp := filepath.Join(dir, "http.conf"), filepath.Join(dir, "https.conf")
+	port := freePort(t)
+	if err := os.WriteFile(hp, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sp, []byte(fmt.Sprintf("listen %d ssl reuseport;", port)), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	srv, cleanup, err := serveFront("127.0.0.1:0", gw, backend.URL, dir, cp, kp, "", "")
+	stop, err := serveFront(gw, backend.URL, dir, cp, kp, "", "", hp, sp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = srv.Close(); cleanup() }()
+	defer stop()
 
 	client := &http.Client{
 		Timeout:   3 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // self-signed test cert
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, DisableKeepAlives: true}, //nolint:gosec // self-signed test cert
 	}
-	base := "https://" + srv.Addr
+	base := fmt.Sprintf("https://127.0.0.1:%d", port)
 
-	res, err := client.Get(base + "/vauth/tok")
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _ := io.ReadAll(res.Body)
-	res.Body.Close()
-	if string(b) != "GATEWAY" || gotOrig != "/vauth/tok" {
-		t.Fatalf("serve route: body=%q orig=%q", b, gotOrig)
+	body := func(path string) string {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			res, err := client.Get(base + path)
+			if err == nil {
+				b, _ := io.ReadAll(res.Body)
+				res.Body.Close()
+				return string(b)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("GET %s never served: %v", path, err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 
-	res, err = client.Get(base + "/player_api")
-	if err != nil {
-		t.Fatal(err)
+	if got := body("/vauth/tok"); got != "GATEWAY" || gotOrig != "/vauth/tok" {
+		t.Fatalf("serve route: body=%q orig=%q", got, gotOrig)
 	}
-	b, _ = io.ReadAll(res.Body)
-	res.Body.Close()
-	if string(b) != "NGINX" {
-		t.Fatalf("proxy: body=%q", b)
+	if got := body("/player_api"); got != "NGINX" {
+		t.Fatalf("proxy: body=%q", got)
 	}
 }

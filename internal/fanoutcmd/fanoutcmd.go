@@ -89,12 +89,14 @@ func Main(ver string) {
 	gw := flag.String("gw", "", "segment gateway unix socket (nginx-only, Phase 12), e.g. /home/xc_vm/bin/xc_fanout/sockets/gw.sock; empty = no gateway")
 	gwPolicy := flag.String("gw-policy", "/home/xc_vm/tmp/gateway/policy.json", "the panel's segment gateway policy (written every minute by cron:cache)")
 	gwState := flag.String("gw-state", "/home/xc_vm/bin/xc_fanout/gateway_shadow.json", "where the gateway keeps its shadow comparison with PHP across restarts; empty = in memory")
-	frontAddr := flag.String("front", "", "public HTTPS listen address for the single-binary LB front (serve-only, replaces nginx), e.g. :443; empty = no front (nginx serves)")
+	frontAddr := flag.String("front", "", "enable the single-binary LB front (serve-only, replaces nginx); any non-empty value enables it and the ports come from -front-ports-http/-https; empty = no front (nginx serves)")
 	frontCert := flag.String("front-cert", "/home/xc_vm/bin/nginx/conf/server.crt", "TLS certificate for -front (certbot's)")
 	frontKey := flag.String("front-key", "/home/xc_vm/bin/nginx/conf/server.key", "TLS private key for -front")
 	frontNginx := flag.String("front-nginx", "http://127.0.0.1:8080", "backend the front reverse-proxies non-serve requests to during the nginx transition")
 	frontWebroot := flag.String("front-webroot", "/home/xc_vm/certbot-webroot", "certbot webroot the front serves /.well-known/acme-challenge/ from")
 	frontRealip := flag.String("front-realip", "/home/xc_vm/bin/nginx/conf/realip_cdn.conf,/home/xc_vm/bin/nginx/conf/realip_cloudflare.conf,/home/xc_vm/bin/nginx/conf/realip_xc_vm.conf", "comma-separated nginx set_real_ip_from conf files the front trusts to resolve the viewer IP")
+	frontPortsHTTP := flag.String("front-ports-http", "/home/xc_vm/bin/nginx/conf/ports/http.conf", "nginx ports/http.conf the front reads its plain-HTTP listen ports from")
+	frontPortsHTTPS := flag.String("front-ports-https", "/home/xc_vm/bin/nginx/conf/ports/https.conf", "nginx ports/https.conf the front reads its TLS listen ports from")
 	frontImages := flag.String("front-images", "/home/xc_vm/storage/images/", "dir the front serves /images/ from in-process (nginx's storage/images alias); empty proxies /images to nginx")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
@@ -243,12 +245,12 @@ func Main(ver string) {
 	}
 	// The public HTTPS front (single-binary LB) is opt-in and non-fatal the same
 	// way: if it cannot start, nginx keeps serving the node.
-	frontSrv, cleanupFront := (*http.Server)(nil), func() {}
+	frontStop := func() {}
 	if *frontAddr != "" {
-		if srv, cleanup, err := serveFront(*frontAddr, gws, *frontNginx, *frontWebroot, *frontCert, *frontKey, *frontRealip, *frontImages); err != nil {
+		if stop, err := serveFront(gws, *frontNginx, *frontWebroot, *frontCert, *frontKey, *frontRealip, *frontImages, *frontPortsHTTP, *frontPortsHTTPS); err != nil {
 			log.Printf("front: %v; nginx keeps serving", err)
 		} else {
-			frontSrv, cleanupFront = srv, cleanup
+			frontStop = stop
 		}
 	}
 
@@ -289,13 +291,9 @@ func Main(ver string) {
 	<-ctx.Done()
 
 	// Drain the public front first so no new viewer arrives while the surfaces
-	// behind it are closing.
-	if frontSrv != nil {
-		fCtx, fCancel := context.WithTimeout(context.Background(), shutdownGrace)
-		_ = frontSrv.Shutdown(fCtx)
-		fCancel()
-	}
-	cleanupFront()
+	// behind it are closing (frontStop ends the port watch and drains every
+	// listener; it is a no-op when the front was not started).
+	frontStop()
 	if gwSrv != nil {
 		gwCtx, gwCancel := context.WithTimeout(context.Background(), shutdownGrace)
 		_ = gwSrv.Shutdown(gwCtx)

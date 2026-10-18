@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 )
 
 // soReusePort is SO_REUSEPORT on Linux (the node's only platform); the stdlib
@@ -107,7 +109,7 @@ func (m *Manager) start(s ListenSpec) error {
 	if s.TLS {
 		ln = tls.NewListener(ln, m.tlsCfg)
 	}
-	srv := &http.Server{Handler: m.handler}
+	srv := &http.Server{Handler: m.handler, ReadHeaderTimeout: defaults.HTTPReadHeaderTimeout}
 	m.entries[s.Port] = &listenerEntry{spec: s, srv: srv, ln: ln}
 	go srv.Serve(ln) //nolint:errcheck // Serve returns ErrServerClosed on Shutdown
 	return nil
