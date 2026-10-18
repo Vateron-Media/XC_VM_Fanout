@@ -66,8 +66,23 @@ type Server struct {
 	webroot string
 	trusted *TrustedProxies
 	limiter *rateLimiter
-	images  string // storage/images root; empty leaves /images to the proxy
-	streams string // STREAMS_PATH root for /xc_hls; empty leaves it to the proxy
+	images  string       // storage/images root; empty leaves /images to the proxy
+	streams string       // STREAMS_PATH root for /xc_hls; empty leaves it to the proxy
+	fanout  http.Handler // in-process fanout daemon for /xc_fanout*; nil leaves it to the proxy
+}
+
+// fanoutPrefixes are nginx's fanout-daemon locations: today proxied to the
+// daemon's unix socket, served in-process by the front when a fanout handler is
+// set.
+var fanoutPrefixes = []string{"/xc_fanout/", "/xc_fanout_hls/", "/xc_fanout_file/"}
+
+func isFanoutPath(p string) bool {
+	for _, prefix := range fanoutPrefixes {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
@@ -119,6 +134,15 @@ func clientIP(r *http.Request) string {
 // proxy. Returns the server for chaining.
 func (s *Server) WithImages(dir string) *Server {
 	s.images = dir
+	return s
+}
+
+// WithFanout makes the front route /xc_fanout*, /xc_fanout_hls* and
+// /xc_fanout_file* to the in-process fanout daemon handler h instead of
+// proxying them to nginx. nil leaves them to the proxy. Returns the server for
+// chaining.
+func (s *Server) WithFanout(h http.Handler) *Server {
+	s.fanout = h
 	return s
 }
 
@@ -178,6 +202,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.streams != "" && strings.HasPrefix(r.URL.Path, xcHlsPrefix) {
 		s.serveXcHls(w, r)
+		return
+	}
+	if s.fanout != nil && isFanoutPath(r.URL.Path) {
+		s.fanout.ServeHTTP(w, r)
 		return
 	}
 	if kind := serveKind(r.URL.Path); kind != "" {

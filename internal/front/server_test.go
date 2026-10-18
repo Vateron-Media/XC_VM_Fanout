@@ -198,3 +198,26 @@ func TestFrontTerminatesTLS(t *testing.T) {
 		t.Fatalf("TLS proxy: %q", body)
 	}
 }
+
+func TestXcFanoutRoutedInProcess(t *testing.T) {
+	nginx := newNginxStub(t)
+	var fanoutPaths []string
+	fanout := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fanoutPaths = append(fanoutPaths, r.URL.Path)
+		_, _ = io.WriteString(w, "FANOUT")
+	})
+	front := NewServer(okHandler(), nginx.url, t.TempDir(), LoadTrustedProxies()).WithFanout(fanout)
+	for _, p := range []string{"/xc_fanout/abc", "/xc_fanout_hls/x.m3u8", "/xc_fanout_file/v.mp4"} {
+		rec := httptest.NewRecorder()
+		front.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		if rec.Body.String() != "FANOUT" {
+			t.Fatalf("%s body=%q, want FANOUT", p, rec.Body.String())
+		}
+	}
+	if nginx.path != "" {
+		t.Fatalf("a fanout route reached nginx (%q); it must be in-process", nginx.path)
+	}
+	if len(fanoutPaths) != 3 {
+		t.Fatalf("fanout handler saw %v, want 3 paths", fanoutPaths)
+	}
+}
