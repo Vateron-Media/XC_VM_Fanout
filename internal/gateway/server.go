@@ -70,6 +70,11 @@ type Node interface {
 	// registered puller (started on demand) or an ingest-fed supervised transcode
 	// — so a serve-only gateway serves it in-process instead of deferring.
 	Serveable(id string) bool
+	// EnsureRunning starts the stream in-process if it is registered but idle and
+	// waits (bounded) for it to become ready. The serve-only serve path calls it
+	// in place of deferring a not-running stream to a PHP backend that does not
+	// exist. True once ready, false on timeout or an unknown stream.
+	EnsureRunning(id string) bool
 }
 
 // NewServer judges with the policy file at policyPath, serves live segments
@@ -395,6 +400,15 @@ func phpLocation(kind string) string {
 	return "@gw_segment_php"
 }
 
+// retryLater answers 503 Service Unavailable with Retry-After: 1 — a serve-only
+// warmup whose stream did not become ready within the bounded wait. The client
+// retries shortly, by when the puller should have data; a serve-only node has no
+// PHP backend to defer to.
+func retryLater(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
 // serveThumb answers thumb.php's happy path: the stream's thumbnail with the
 // headers thumb.php sends. A node with send_unique_header set never reaches
 // here (JudgeThumb hands those to PHP, which writes the per-response cookie),
@@ -509,15 +523,27 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 			return "spool"
 		}
 	}
-	if ref.Warmup && !ref.TS {
-		// serve-only HLS: the stream is registered but idle. Route to fanout's own
-		// HLS handler so its touch() starts the puller; it answers "no segments
-		// yet" (404) and the player retries while the puller warms up.
-		in := r.Clone(r.Context())
-		in.URL = &url.URL{Path: "/hls/" + strconv.Itoa(ref.Stream) + "/index.m3u8"}
-		in.RequestURI = in.URL.RequestURI()
-		s.segments.ServeHTTP(w, in)
-		return ""
+	if ref.Warmup {
+		// Serve-only LB: the stream is registered but idle. Start it in-process and
+		// wait (bounded) for it to become ready; a PHP backend to defer to does not
+		// exist, so if it never does, ask the client to retry rather than serve
+		// nothing.
+		if !s.node.EnsureRunning(strconv.Itoa(ref.Stream)) {
+			retryLater(w)
+			return ""
+		}
+		if !ref.TS {
+			// HLS: route to fanout's own HLS handler, now that the puller is running.
+			// It may still answer "no segments yet" (404) for the brief window until
+			// the first playlist segment exists; the player retries (the readiness
+			// sliver the design tolerates).
+			in := r.Clone(r.Context())
+			in.URL = &url.URL{Path: "/hls/" + strconv.Itoa(ref.Stream) + "/index.m3u8"}
+			in.RequestURI = in.URL.RequestURI()
+			s.segments.ServeHTTP(w, in)
+			return ""
+		}
+		// TS warmup: ready now — fall through to the TS serve arm (/live/<id>) below.
 	}
 	var body string
 	if !ref.TS {

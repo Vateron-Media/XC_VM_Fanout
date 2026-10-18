@@ -1377,6 +1377,50 @@ func (m *Manager) Serveable(id string) bool {
 	return st.cfg != nil || st.ingestLn != nil
 }
 
+// ensureRunningTimeout/ensureRunningPoll bound the on-demand start: how long
+// EnsureRunning waits for a just-started stream to produce, and how often it
+// re-checks. Vars (not consts) so tests can lower them.
+var (
+	ensureRunningTimeout = 3 * time.Second
+	ensureRunningPoll    = 75 * time.Millisecond
+)
+
+// EnsureRunning starts the stream in-process if it is registered but idle, then
+// waits (bounded) for it to go on air, so a serve-only LB with no PHP backend
+// can serve a not-running stream on demand instead of deferring. It drives the
+// registered-puller start (touch -> startLocked), NOT the Spec-requiring
+// /monitor/ Supervise path — the daemon never composes encoder commands.
+//
+// touch is idempotent and single-flighted: it starts a registered puller, and
+// is a no-op for an already-running stream or an externally-fed one (cfg == nil,
+// whose encoder feeds it); in the latter case EnsureRunning only waits for the
+// external data. Returns true once the stream is on air within the timeout,
+// false for an unknown id or a stream that never produces in time.
+func (m *Manager) EnsureRunning(id string) bool {
+	st := m.Get(id)
+	if st == nil {
+		return false
+	}
+	st.touch()
+	if st.onAir() {
+		return true
+	}
+	deadline := time.NewTimer(ensureRunningTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(ensureRunningPoll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if st.onAir() {
+				return true
+			}
+		case <-deadline.C:
+			return st.onAir()
+		}
+	}
+}
+
 // GetOrCreate returns the stream for id, creating it if necessary.
 func (m *Manager) GetOrCreate(id string) *Stream {
 	m.mu.Lock()
