@@ -233,3 +233,47 @@ func TestServeRouteIgnoresSpoofedXFF(t *testing.T) {
 		t.Fatalf("serve route used a spoofed XFF: X-XC-Client-IP=%q, want 203.0.113.9", gotIP)
 	}
 }
+
+func TestServeOnlyNoNginxReproxy(t *testing.T) {
+	// A serve-only front may run with no nginx backend. A gateway defer (which
+	// would re-proxy) and any non-serve route must return 502, never panic on a
+	// nil backend.
+	gwDefer := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Accel-Redirect", "@gw_vod_php") // a PHP defer
+	})
+	front := NewServer(gwDefer, nil, t.TempDir(), LoadTrustedProxies())
+
+	rec := httptest.NewRecorder()
+	front.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/vauth/x", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("serve-route defer with no backend: code=%d, want 502", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	front.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/something/else", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("non-serve route with no backend: code=%d, want 502", rec.Code)
+	}
+}
+
+func TestStatusLoopbackOnly(t *testing.T) {
+	nginx := newNginxStub(t)
+	front := NewServer(okHandler(), nginx.url, t.TempDir(), LoadTrustedProxies())
+
+	// A remote client is denied at the front (nginx's allow 127.0.0.1; deny all).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.RemoteAddr = "203.0.113.1:4444"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("remote /status: code=%d, want 403", rec.Code)
+	}
+
+	// A loopback caller passes the front and reaches the backend.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.RemoteAddr = "127.0.0.1:4444"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "NGINX:/status" {
+		t.Fatalf("loopback /status: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
