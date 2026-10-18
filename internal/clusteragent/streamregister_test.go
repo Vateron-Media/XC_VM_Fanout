@@ -656,3 +656,52 @@ func TestSeedThenUnseedDrivesRealManagerRegisterUnregister(t *testing.T) {
 		t.Fatal("a MAIN unassign must unregister the stream on the Manager (stop)")
 	}
 }
+
+func TestSeedFanoutRecordLoopbackRegistersRelayURL(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	a := st.agent()
+	a.SeedFanout = true
+	a.RelayKeyDir = t.TempDir()
+	k, err := LoadRelayKey(a.RelayKeyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.seedFanoutRecord(42, []byte(`{"data":{"runtime":{"kind":"loopback","parent_id":3}}}`))
+
+	m, p, body := st.seen()
+	if m != http.MethodPut || p != "/streams/42" {
+		t.Fatalf("got %s %s, want PUT /streams/42", m, p)
+	}
+	// The agent composes the node-local relay URL from its own key; the relay
+	// proxy signs the upstream to the parent (resolved from the stream record),
+	// so MAIN never ships a relay URL carrying a secret.
+	want := "http://" + RelayProxyAddr + "/relay/" + k + "/42.ts"
+	if !strings.Contains(string(body), want) {
+		t.Fatalf("body %s; want relay URL %s", body, want)
+	}
+}
+
+func TestSeedFanoutRecordLoopbackFailsClosedWithoutRelayDir(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	a := st.agent()
+	a.SeedFanout = true // RelayKeyDir stays "" — the relay proxy is off
+
+	a.seedFanoutRecord(42, []byte(`{"data":{"runtime":{"kind":"loopback","parent_id":3}}}`))
+
+	if m, p, _ := st.seen(); m != http.MethodDelete || p != "/streams/42" {
+		t.Fatalf("got %s %s; a loopback with no relay proxy must unregister (fail closed)", m, p)
+	}
+}
+
+func TestSeedFanoutRecordLoopbackFlipToOtherUnregisters(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	a := st.agent()
+	a.SeedFanout, a.RelayKeyDir = true, t.TempDir()
+
+	a.seedFanoutRecord(42, []byte(`{"data":{"runtime":{"kind":"other"}}}`))
+
+	if m, p, _ := st.seen(); m != http.MethodDelete || p != "/streams/42" {
+		t.Fatalf("got %s %s, want DELETE /streams/42 (a stream that is no longer loopback)", m, p)
+	}
+}

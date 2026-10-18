@@ -328,8 +328,39 @@ func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 			a.applyTranscode(context.Background(), id, spec)
 			return
 		}
+		if d.Kind == "loopback" {
+			a.registerLoopback(id)
+			return
+		}
 	}
 	a.unseedFanoutRecord(id)
+}
+
+// registerLoopback registers a loopback stream's node-local relay URL
+// (http://<RelayProxyAddr>/relay/<k>/<id>.ts) as the puller source: the puller
+// fetches it as a plain mp2t source and the relay proxy signs the upstream
+// connect to the parent (resolved per stream from the record) with MAIN's relay
+// ticket, so no relay secret is ever shipped in the directive. MAIN cannot
+// compose this URL — the key k is node-local. Fails closed (unregister) when the
+// relay proxy is off (no RelayKeyDir) or the key cannot be loaded, so the daemon
+// is never left pulling a broken URL.
+func (a *Agent) registerLoopback(id int64) {
+	if a.RelayKeyDir == "" {
+		a.logf("cluster: loopback stream %d: relay proxy off (no RelayKeyDir), not registering", id)
+		a.unseedFanoutRecord(id)
+		return
+	}
+	k, err := LoadRelayKey(a.RelayKeyDir)
+	if err != nil || k == "" {
+		a.logf("cluster: loopback stream %d: relay key unavailable: %v", id, err)
+		a.unseedFanoutRecord(id)
+		return
+	}
+	body := streamRegisterBody{URLs: []string{"http://" + RelayProxyAddr + "/relay/" + k + "/" + strconv.FormatInt(id, 10) + ".ts"}}
+	a.releaseSupervision(id) // a flip transcode->loopback: stop the encoder
+	if err := a.registerStream(context.Background(), id, body); err != nil {
+		a.logf("cluster: fanout register loopback %d: %v", id, err)
+	}
 }
 
 // applyTranscode hands a transcode stream to the supervisor, but only when its
