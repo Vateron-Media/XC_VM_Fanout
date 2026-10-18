@@ -160,3 +160,62 @@ func TestDrainLetsInflightFinish(t *testing.T) {
 		t.Fatalf("in-flight request got %q, want done (drain cut it)", body)
 	}
 }
+
+func TestReconcileDoesNotBlockOnDrain(t *testing.T) {
+	// A removed port with a live (stuck) connection must not hold up Reconcile:
+	// the drain runs outside the lock, in the background. With a long drain and a
+	// stuck handler, the old code blocked Reconcile for the whole drain.
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	})
+	m := NewManager(h, nil, 5*time.Second) // deliberately long drain
+	defer func() { close(release); m.Shutdown(context.Background()) }()
+	p1, p2 := freePort(t), freePort(t)
+	if err := m.Reconcile([]ListenSpec{{Port: p1}}); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = noKeepAlive.Get(fmt.Sprintf("http://127.0.0.1:%d/", p1)) }()
+	<-entered // a request is now stuck in the handler on p1
+
+	done := make(chan struct{})
+	go func() { _ = m.Reconcile([]ListenSpec{{Port: p2}}); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Reconcile blocked on the 5s drain of a stuck connection; drain must be outside the lock")
+	}
+}
+
+func TestReconcileRestartsOnSpecChange(t *testing.T) {
+	dir := t.TempDir()
+	cp, kp := dir+"/c", dir+"/k"
+	writeSelfSigned(t, cp, kp, "flip.example")
+	certs, err := NewCertReloader(cp, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(okHandler(), certs.TLSConfig(), time.Second)
+	defer m.Shutdown(context.Background())
+	p := freePort(t)
+
+	// Start plaintext, then flip the SAME port to TLS; the listener must restart
+	// so the port now speaks TLS (and no longer plaintext).
+	if err := m.Reconcile([]ListenSpec{{Port: p, TLS: false}}); err != nil {
+		t.Fatal(err)
+	}
+	if body := getBodyRetry(t, p); body != "ok" {
+		t.Fatalf("plaintext body=%q", body)
+	}
+	if err := m.Reconcile([]ListenSpec{{Port: p, TLS: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if cn := tlsPeerCN(t, p); cn != "flip.example" {
+		t.Fatalf("after flip to TLS, peer CN=%q, want flip.example", cn)
+	}
+}

@@ -22,8 +22,15 @@ func (s *Server) ServeManaged(certs *CertReloader, httpPortsPath, httpsPortsPath
 	if err != nil {
 		return nil, nil, err
 	}
+	// A partial bind (one port taken, the rest fine) must not orphan the started
+	// listeners: proceed if any came up, matching the watcher's behaviour and the
+	// spec's "one bad port is skipped, the rest keep serving". Only a total
+	// failure is fatal.
 	if err := mgr.Reconcile(specs); err != nil {
-		return nil, nil, err
+		if len(mgr.Ports()) == 0 {
+			return nil, nil, err
+		}
+		log.Printf("front: some listen ports failed to bind: %v (serving the rest)", err)
 	}
 	stopWatch := WatchPorts(httpPortsPath, httpsPortsPath, poll, func(set []ListenSpec) {
 		if err := mgr.Reconcile(set); err != nil {

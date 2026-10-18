@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -149,4 +150,39 @@ func mustURL(t *testing.T, s string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+func TestServeManagedProceedsOnPartialBind(t *testing.T) {
+	dir := t.TempDir()
+	cp, kp := filepath.Join(dir, "c"), filepath.Join(dir, "k")
+	writeSelfSigned(t, cp, kp, "lb.example")
+	certs, err := NewCertReloader(cp, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// p1 is held by a non-reuseport squatter, so the front's bind to it fails;
+	// p2 is free. ServeManaged must proceed (serve p2), not return a hard error
+	// that orphans the started listeners.
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	p1 := held.Addr().(*net.TCPAddr).Port
+	p2 := freePort(t)
+	srv := NewServer(okHandler(), mustURL(t, "http://127.0.0.1:1"), dir, LoadTrustedProxies())
+	hp, sp := filepath.Join(dir, "http.conf"), filepath.Join(dir, "https.conf")
+	writePorts(t, hp, sp, nil, []int{p1, p2})
+
+	mgr, stop, err := srv.ServeManaged(certs, hp, sp, 20*time.Millisecond, time.Second)
+	if err != nil {
+		t.Fatalf("ServeManaged returned a hard error on a partial bind: %v", err)
+	}
+	if mgr == nil || stop == nil {
+		t.Fatal("ServeManaged returned nil manager/stop on a partial bind")
+	}
+	defer stop()
+	if cn := tlsPeerCN(t, p2); cn != "lb.example" {
+		t.Fatalf("the free port %d did not come up: CN=%q", p2, cn)
+	}
 }

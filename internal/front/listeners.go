@@ -71,17 +71,29 @@ func reusePort(_, _ string, c syscall.RawConn) error {
 // the front never ends up listening on nothing (the last-good set stays).
 func (m *Manager) Reconcile(desired []ListenSpec) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	want := make(map[int]ListenSpec, len(desired))
 	for _, s := range desired {
 		want[s.Port] = s // dedup by port
 	}
 	if len(want) == 0 {
+		m.mu.Unlock()
 		return errors.New("front: refusing an empty listen set (keeping last-good)")
 	}
 
 	var errs []error
+	// Remove a port that is gone, or restart one whose spec changed (e.g. a TLS
+	// flip): close its listener now — under the lock, so it stops accepting at
+	// once and a restart never splits traffic with its replacement — and drain
+	// it in the background, below.
+	var removed []*listenerEntry
+	for port, e := range m.entries {
+		if w, ok := want[port]; !ok || w != e.spec {
+			_ = e.ln.Close()
+			removed = append(removed, e)
+			delete(m.entries, port)
+		}
+	}
 	for port, s := range want {
 		if _, ok := m.entries[port]; ok {
 			continue
@@ -90,11 +102,12 @@ func (m *Manager) Reconcile(desired []ListenSpec) error {
 			errs = append(errs, fmt.Errorf("port %d: %w", port, err))
 		}
 	}
-	for port, e := range m.entries {
-		if _, ok := want[port]; !ok {
-			m.stop(e)
-			delete(m.entries, port)
-		}
+	m.mu.Unlock()
+	// Drain removed listeners outside the lock, so a long-lived stream on a port
+	// going away never holds up management ops (Ports, a concurrent Reconcile, or
+	// Shutdown). Each drain is bounded by m.drain and self-terminates.
+	for _, e := range removed {
+		m.drainInBackground(e)
 	}
 	return errors.Join(errs...)
 }
@@ -115,11 +128,15 @@ func (m *Manager) start(s ListenSpec) error {
 	return nil
 }
 
-// stop drains one listener up to the drain deadline; the caller holds m.mu.
-func (m *Manager) stop(e *listenerEntry) {
-	ctx, cancel := context.WithTimeout(context.Background(), m.drain)
-	defer cancel()
-	_ = e.srv.Shutdown(ctx)
+// drainInBackground gracefully shuts a removed listener down off the lock,
+// bounded by m.drain; its listener is already closed so it accepts nothing new,
+// and its in-flight responses finish (or hit the deadline).
+func (m *Manager) drainInBackground(e *listenerEntry) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), m.drain)
+		defer cancel()
+		_ = e.srv.Shutdown(ctx)
+	}()
 }
 
 // Ports returns the live listen set, ordered by port.
@@ -134,16 +151,33 @@ func (m *Manager) Ports() []ListenSpec {
 	return out
 }
 
-// Shutdown drains every listener (used on daemon shutdown).
+// Shutdown drains every listener (used on daemon shutdown), concurrently and
+// off the lock, bounded by ctx.
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	var errs []error
+	entries := make([]*listenerEntry, 0, len(m.entries))
 	for port, e := range m.entries {
-		if err := e.srv.Shutdown(ctx); err != nil {
+		entries = append(entries, e)
+		delete(m.entries, port)
+	}
+	m.mu.Unlock()
+
+	errCh := make(chan error, len(entries))
+	var wg sync.WaitGroup
+	for _, e := range entries {
+		wg.Add(1)
+		go func(e *listenerEntry) {
+			defer wg.Done()
+			errCh <- e.srv.Shutdown(ctx)
+		}(e)
+	}
+	wg.Wait()
+	close(errCh)
+	var errs []error
+	for err := range errCh {
+		if err != nil {
 			errs = append(errs, err)
 		}
-		delete(m.entries, port)
 	}
 	return errors.Join(errs...)
 }
