@@ -70,6 +70,11 @@ type Node interface {
 	// registered puller (started on demand) or an ingest-fed supervised transcode
 	// — so a serve-only gateway serves it in-process instead of deferring.
 	Serveable(id string) bool
+	// EnsureRunning starts the stream in-process if it is registered but idle and
+	// waits (bounded) for it to become ready. The serve-only serve path calls it
+	// in place of deferring a not-running stream to a PHP backend that does not
+	// exist. True once ready, false on timeout or an unknown stream.
+	EnsureRunning(id string) bool
 }
 
 // NewServer judges with the policy file at policyPath, serves live segments
