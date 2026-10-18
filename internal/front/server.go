@@ -69,7 +69,11 @@ type Server struct {
 	images  string       // storage/images root; empty leaves /images to the proxy
 	streams string       // STREAMS_PATH root for /xc_hls; empty leaves it to the proxy
 	fanout  http.Handler // in-process fanout daemon for /xc_fanout*; nil leaves it to the proxy
+	portal  string       // portal assets root for /portal/assets; empty leaves it to the proxy
 }
+
+// portalAssetsPrefix is nginx's static /portal/assets location (css/js/images).
+const portalAssetsPrefix = "/portal/assets/"
 
 // fanoutPrefixes are nginx's fanout-daemon locations: today proxied to the
 // daemon's unix socket, served in-process by the front when a fanout handler is
@@ -146,6 +150,25 @@ func (s *Server) WithFanout(h http.Handler) *Server {
 	return s
 }
 
+// WithPortalAssets makes the front serve /portal/assets/ from dir in-process
+// instead of proxying it to nginx. Empty leaves it to the proxy. Returns the
+// server for chaining.
+func (s *Server) WithPortalAssets(dir string) *Server {
+	s.portal = dir
+	return s
+}
+
+// servePortalAssets serves a static portal asset, confined to the root, with
+// the content type inferred from the extension (ServeContent, empty type).
+func (s *Server) servePortalAssets(w http.ResponseWriter, r *http.Request) {
+	full, ok := confine(s.portal, strings.TrimPrefix(r.URL.Path, portalAssetsPrefix))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	serveFileRange(w, r, full, "")
+}
+
 // WithStreams makes the front serve /xc_hls/ from dir (STREAMS_PATH) in-process
 // instead of proxying it to nginx's X-Accel sendfile. Empty leaves it to the
 // proxy. Returns the server for chaining.
@@ -206,6 +229,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.fanout != nil && isFanoutPath(r.URL.Path) {
 		s.fanout.ServeHTTP(w, r)
+		return
+	}
+	if s.portal != "" && strings.HasPrefix(r.URL.Path, portalAssetsPrefix) {
+		s.servePortalAssets(w, r)
 		return
 	}
 	if kind := serveKind(r.URL.Path); kind != "" {

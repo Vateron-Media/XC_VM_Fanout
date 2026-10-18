@@ -80,3 +80,42 @@ func TestXcHlsNoTraversal(t *testing.T) {
 	b, _ := io.ReadAll(rec.Body)
 	_ = b
 }
+
+func portalServer(t *testing.T, dir string) *Server {
+	t.Helper()
+	return NewServer(okHandler(), mustURL(t, "http://127.0.0.1:1"), "", LoadTrustedProxies()).WithPortalAssets(dir)
+}
+
+func TestPortalAssetsServed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app.css"), []byte("body{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	portalServer(t, dir).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/portal/assets/app.css", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "body{}" {
+		t.Fatalf("body=%q", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/css") {
+		t.Fatalf("content-type=%q, want text/css", ct)
+	}
+}
+
+func TestPortalAssetsNoTraversal(t *testing.T) {
+	root := t.TempDir()
+	secret := filepath.Join(filepath.Dir(root), "psecret.txt")
+	if err := os.WriteFile(secret, []byte("PTOP"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(secret)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/portal/assets/x", nil)
+	req.URL.Path = "/portal/assets/../../psecret.txt"
+	portalServer(t, root).ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "PTOP") {
+		t.Fatalf("traversal leaked a file above the portal root: %q", rec.Body.String())
+	}
+}
