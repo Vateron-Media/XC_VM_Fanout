@@ -116,14 +116,30 @@ type fakeFiles struct {
 	hoParts                       []server.FilePart
 	hoLimitPerc                   int
 	hoRate                        int64
-	hoRefuse                      bool // a part is not under a file root: return false
+	hoRefuse                      bool              // a part is not under a file root: return false
+	ensureRunning                 func(string) bool // nil -> defaults to Serveable
+	ensureRunningIDs              []string          // ids EnsureRunning was called with
+	serveable                     map[string]bool   // nil -> Serveable derives from playlists
 }
 
 func (f *fakeFiles) FedPlaylist(id string) string { return f.playlists[id] }
 
 func (f *fakeFiles) Fed(id string) bool { return f.playlists[id] != "" }
 
-func (f *fakeFiles) Serveable(id string) bool { return f.playlists[id] != "" }
+func (f *fakeFiles) Serveable(id string) bool {
+	if f.serveable != nil {
+		return f.serveable[id]
+	}
+	return f.playlists[id] != ""
+}
+
+func (f *fakeFiles) EnsureRunning(id string) bool {
+	f.ensureRunningIDs = append(f.ensureRunningIDs, id)
+	if f.ensureRunning != nil {
+		return f.ensureRunning(id)
+	}
+	return f.Serveable(id)
+}
 
 func (f *fakeFiles) ServeFilePart(w http.ResponseWriter, _ *http.Request, path string, offset int64, contentType string) {
 	f.path, f.offset = path, offset
