@@ -216,3 +216,20 @@ func TestInternalPathsReturn404(t *testing.T) {
 		t.Fatalf("an internal path reached nginx (%q); it must 404 at the front", nginx.path)
 	}
 }
+
+func TestServeRouteIgnoresSpoofedXFF(t *testing.T) {
+	// With no trusted proxies, the front is the true edge: a serve route must key
+	// on the TCP peer and never on a client-supplied X-Forwarded-For.
+	var gotIP string
+	gw := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIP = r.Header.Get("X-XC-Client-IP")
+	})
+	front := NewServer(gw, newNginxStub(t).url, t.TempDir(), LoadTrustedProxies())
+	req := httptest.NewRequest(http.MethodGet, "/vauth/abc", nil)
+	req.RemoteAddr = "203.0.113.9:5555"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	front.ServeHTTP(httptest.NewRecorder(), req)
+	if gotIP != "203.0.113.9" {
+		t.Fatalf("serve route used a spoofed XFF: X-XC-Client-IP=%q, want 203.0.113.9", gotIP)
+	}
+}
