@@ -56,6 +56,10 @@ const imagesPrefix = "/images/"
 
 var scriptExt = regexp.MustCompile(`(?i)\.(php\d*|phtml|phar)$`)
 
+// xcHlsPrefix is nginx's X-Accel sendfile location for HLS parts, served from
+// STREAMS_PATH. The front serves it in-process (ranged file serve).
+const xcHlsPrefix = "/xc_hls/"
+
 type Server struct {
 	gateway http.Handler
 	proxy   http.Handler
@@ -63,6 +67,7 @@ type Server struct {
 	trusted *TrustedProxies
 	limiter *rateLimiter
 	images  string // storage/images root; empty leaves /images to the proxy
+	streams string // STREAMS_PATH root for /xc_hls; empty leaves it to the proxy
 }
 
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
@@ -117,6 +122,26 @@ func (s *Server) WithImages(dir string) *Server {
 	return s
 }
 
+// WithStreams makes the front serve /xc_hls/ from dir (STREAMS_PATH) in-process
+// instead of proxying it to nginx's X-Accel sendfile. Empty leaves it to the
+// proxy. Returns the server for chaining.
+func (s *Server) WithStreams(dir string) *Server {
+	s.streams = dir
+	return s
+}
+
+// serveXcHls serves an HLS part under /xc_hls/ from STREAMS_PATH, confined to
+// the root, with Range support — the in-process replacement for nginx's
+// X-Accel-Redirect sendfile.
+func (s *Server) serveXcHls(w http.ResponseWriter, r *http.Request) {
+	full, ok := confine(s.streams, strings.TrimPrefix(r.URL.Path, xcHlsPrefix))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	serveFileRange(w, r, full, contentTypeByExt(full))
+}
+
 // serveImages serves a file under /images/ from the image store, matching
 // nginx: no code execution (403), no auto-index.html (404), no directory
 // listing, and confined to the root.
@@ -149,6 +174,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.images != "" && strings.HasPrefix(r.URL.Path, imagesPrefix) {
 		s.serveImages(w, r)
+		return
+	}
+	if s.streams != "" && strings.HasPrefix(r.URL.Path, xcHlsPrefix) {
+		s.serveXcHls(w, r)
 		return
 	}
 	if kind := serveKind(r.URL.Path); kind != "" {
