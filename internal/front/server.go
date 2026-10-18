@@ -65,29 +65,69 @@ type Server struct {
 	images  string // storage/images root; empty leaves /images to the proxy
 }
 
+// internalPrefixes are nginx's `internal;` X-Accel targets — reachable only via
+// an X-Accel-Redirect, never by an external client. The Go gateway serves that
+// content in-process (its own segments handler, "without the hop"), so these
+// have no front route; a direct external request gets 404, exactly as nginx's
+// `internal;` returns for one. Serving them would hand out segments/files with
+// no token check.
+var internalPrefixes = []string{"/xc_hls/", "/xc_fanout/", "/xc_fanout_hls/", "/xc_fanout_file/"}
+
+func isInternalPath(p string) bool {
+	for _, prefix := range internalPrefixes {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// statusPath is nginx's local-only node status location (allow 127.0.0.1; deny
+// all). The front, as the edge, enforces that itself on the TCP peer.
+const statusPath = "/status"
+
 // NewServer answers serve routes from gateway, proxies the rest to the nginx
 // backend, and serves the ACME challenge from webroot (certbot's -w directory).
 // trusted is the set_real_ip_from list the front uses to resolve the viewer's
-// address (see TrustedProxies.RealIP).
+// address (see TrustedProxies.RealIP). A nil nginx URL means no backend (a
+// serve-only front with nginx gone): a request that would proxy gets 502.
 func NewServer(gateway http.Handler, nginx *url.URL, webroot string, trusted *TrustedProxies) *Server {
-	rp := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(nginx)
-			// The front is the edge and the authority on the viewer's address:
-			// resolve it and pass it as the only forwarded value, dropping any the
-			// client sent. nginx (trusting the front) reads it straight back.
-			ip := trusted.RealIP(pr.In)
-			pr.Out.Header.Set("X-Real-IP", ip)
-			pr.Out.Header.Set("X-Forwarded-For", ip)
-		},
-	}
-	return &Server{
+	s := &Server{
 		gateway: gateway,
-		proxy:   rp,
 		webroot: webroot,
 		trusted: trusted,
 		limiter: newRateLimiter(serveRate, serveBurst),
 	}
+	if nginx != nil {
+		s.proxy = &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(nginx)
+				// The front is the edge and the authority on the viewer's address:
+				// resolve it and pass it as the only forwarded value, dropping any the
+				// client sent. nginx (trusting the front) reads it straight back.
+				ip := trusted.RealIP(pr.In)
+				pr.Out.Header.Set("X-Real-IP", ip)
+				pr.Out.Header.Set("X-Forwarded-For", ip)
+			},
+		}
+	}
+	return s
+}
+
+// proxyOrError proxies to the nginx backend, or returns 502 when there is none
+// (a serve-only front with nginx gone).
+func (s *Server) proxyOrError(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		http.Error(w, "", http.StatusBadGateway)
+		return
+	}
+	s.proxy.ServeHTTP(w, r)
+}
+
+// isLoopback reports whether ip is a loopback address.
+func isLoopback(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsLoopback()
 }
 
 // serveACME answers certbot's http-01 challenge from the webroot. Only a single
@@ -151,11 +191,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveImages(w, r)
 		return
 	}
+	// nginx's `internal;` X-Accel targets are never reachable by an external
+	// client; the gateway serves their content in-process. 404 a direct request
+	// rather than proxy or serve it (no token check lives on these paths).
+	if isInternalPath(r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
+	// /status is local-only; the front enforces it on the TCP peer rather than
+	// delegating to a backend it reaches over loopback.
+	if r.URL.Path == statusPath && !isLoopback(clientIP(r)) {
+		http.Error(w, "", http.StatusForbidden)
+		return
+	}
 	if kind := serveKind(r.URL.Path); kind != "" {
 		s.serveStream(w, r, kind)
 		return
 	}
-	s.proxy.ServeHTTP(w, r)
+	s.proxyOrError(w, r)
 }
 
 // serveStream hands a viewer's serve request to the in-process gateway the way
@@ -178,7 +231,7 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, kind string
 	gi := &interceptor{rw: w, header: make(http.Header)}
 	s.gateway.ServeHTTP(gi, gr)
 	if gi.toPHP() {
-		s.proxy.ServeHTTP(w, r)
+		s.proxyOrError(w, r)
 	}
 }
 
