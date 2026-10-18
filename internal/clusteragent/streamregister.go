@@ -336,27 +336,38 @@ func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 	a.unseedFanoutRecord(id)
 }
 
-// registerLoopback registers a loopback stream's node-local relay URL
-// (http://<RelayProxyAddr>/relay/<k>/<id>.ts) as the puller source: the puller
-// fetches it as a plain mp2t source and the relay proxy signs the upstream
-// connect to the parent (resolved per stream from the record) with MAIN's relay
-// ticket, so no relay secret is ever shipped in the directive. MAIN cannot
-// compose this URL — the key k is node-local. Fails closed (unregister) when the
-// relay proxy is off (no RelayKeyDir) or the key cannot be loaded, so the daemon
-// is never left pulling a broken URL.
-func (a *Agent) registerLoopback(id int64) {
+// loopbackBody is the puller registration for a loopback stream: its node-local
+// relay URL (http://<RelayProxyAddr>/relay/<k>/<id>.ts), composed from the agent's
+// own relay key. The puller fetches it as a plain mp2t source and the relay proxy
+// signs the upstream connect to the parent (resolved per stream from the record)
+// with MAIN's relay ticket — so no relay secret is ever shipped in the directive;
+// MAIN cannot compose this URL because the key k is node-local. ok=false (fail
+// closed) when the relay proxy is off (no RelayKeyDir) or the key cannot be
+// loaded, so the stream is left unregistered rather than pulling a broken URL.
+// Silent: callers decide whether a miss is logged (register) or skipped quietly
+// (the 2-minute reconcile). The single composer every loopback call site shares,
+// so registration, re-seed and reconcile agree on the exact URL.
+func (a *Agent) loopbackBody(id int64) (streamRegisterBody, bool) {
 	if a.RelayKeyDir == "" {
-		a.logf("cluster: loopback stream %d: relay proxy off (no RelayKeyDir), not registering", id)
-		a.unseedFanoutRecord(id)
-		return
+		return streamRegisterBody{}, false
 	}
 	k, err := LoadRelayKey(a.RelayKeyDir)
 	if err != nil || k == "" {
-		a.logf("cluster: loopback stream %d: relay key unavailable: %v", id, err)
+		return streamRegisterBody{}, false
+	}
+	return streamRegisterBody{URLs: []string{"http://" + RelayProxyAddr + "/relay/" + k + "/" + strconv.FormatInt(id, 10) + ".ts"}}, true
+}
+
+// registerLoopback registers a loopback stream's relay URL with the puller, or
+// fails closed (unregister) when the relay proxy is off or the key is
+// unavailable, so the daemon is never left pulling a broken URL.
+func (a *Agent) registerLoopback(id int64) {
+	body, ok := a.loopbackBody(id)
+	if !ok {
+		a.logf("cluster: loopback stream %d: relay proxy off or key unavailable, not registering", id)
 		a.unseedFanoutRecord(id)
 		return
 	}
-	body := streamRegisterBody{URLs: []string{"http://" + RelayProxyAddr + "/relay/" + k + "/" + strconv.FormatInt(id, 10) + ".ts"}}
 	a.releaseSupervision(id) // a flip transcode->loopback: stop the encoder
 	if err := a.registerStream(context.Background(), id, body); err != nil {
 		a.logf("cluster: fanout register loopback %d: %v", id, err)
@@ -434,6 +445,14 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 		}
 		if spec, ok := d.transcodeSpec(); ok {
 			a.applyTranscode(ctx, id, spec)
+			continue
+		}
+		if d.Kind == "loopback" {
+			if body, ok := a.loopbackBody(id); ok {
+				if err := a.registerStream(ctx, id, body); err != nil {
+					a.logf("cluster: fanout re-seed loopback %d: %v", id, err)
+				}
+			}
 		}
 	}
 }
@@ -487,6 +506,13 @@ func (a *Agent) reconcileFanout(ctx context.Context) {
 		if d, ok := parseRuntimeDirective(recordJSON); ok {
 			if body, reg := d.registerBody(a.FfmpegBin); reg {
 				want[id] = body
+			} else if d.Kind == "loopback" {
+				// A loopback is a /streams puller registration too, so the reconcile
+				// must keep it (not tear it down as a non-proxy). Fail-closed when the
+				// key is unavailable → left out of want → unregistered, as intended.
+				if body, ok := a.loopbackBody(id); ok {
+					want[id] = body
+				}
 			}
 		}
 	}

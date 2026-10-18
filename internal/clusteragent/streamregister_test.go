@@ -705,3 +705,88 @@ func TestSeedFanoutRecordLoopbackFlipToOtherUnregisters(t *testing.T) {
 		t.Fatalf("got %s %s, want DELETE /streams/42 (a stream that is no longer loopback)", m, p)
 	}
 }
+
+// The 2-minute reconcile must treat a held loopback as wanted: keep a
+// correctly-registered one, register a missing one — not tear it down because it
+// is not a proxy. (A loopback is registered in the same /streams registry.)
+func TestReconcileFanoutKeepsAndRegistersLoopback(t *testing.T) {
+	var mu sync.Mutex
+	puts, dels := map[string]bool{}, map[string]bool{}
+	putBody := map[string][]byte{}
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/streams/")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/streams":
+			_ = json.NewEncoder(w).Encode(map[string][]string{"streams": {"7"}}) // fanout holds loopback 7
+		case r.Method == http.MethodPut:
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			puts[id] = true
+			putBody[id] = b
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			dels[id] = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	dir := t.TempDir()
+	sd := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(sd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lb := []byte(`{"data":{"runtime":{"kind":"loopback","parent_id":3}}}`)
+	_ = os.WriteFile(filepath.Join(sd, "7.json"), lb, 0o600) // held loopback 7 (already in fanout)
+	_ = os.WriteFile(filepath.Join(sd, "8.json"), lb, 0o600) // held loopback 8 (missing from fanout)
+
+	a := &Agent{FanoutCtl: sock, SeedFanout: true, FfmpegBin: "/f", ReplicaDir: dir, RelayKeyDir: t.TempDir()}
+	k, _ := LoadRelayKey(a.RelayKeyDir)
+	a.reconcileFanout(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if dels["7"] {
+		t.Error("a held loopback already registered must NOT be torn down by the reconcile")
+	}
+	if !puts["8"] {
+		t.Error("a held loopback missing from the fanout must be registered by the reconcile")
+	}
+	if want := "http://" + RelayProxyAddr + "/relay/" + k + "/8.ts"; !strings.Contains(string(putBody["8"]), want) {
+		t.Errorf("reconcile registered 8 with %s; want relay URL %s", putBody["8"], want)
+	}
+}
+
+// After a fanout restart the agent re-seeds held streams from the replica; a
+// held loopback must be re-registered too, not only proxies/transcodes.
+func TestSeedHeldReSeedsLoopback(t *testing.T) {
+	st := newFanoutStub(t, http.StatusNoContent)
+	dir := t.TempDir()
+	sd := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(sd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(sd, "7.json"), []byte(`{"data":{"runtime":{"kind":"loopback","parent_id":3}}}`), 0o600)
+	a := st.agent()
+	a.SeedFanout, a.ReplicaDir, a.RelayKeyDir = true, dir, t.TempDir()
+	k, _ := LoadRelayKey(a.RelayKeyDir)
+
+	a.seedHeldProxies(context.Background())
+
+	m, p, body := st.seen()
+	if m != http.MethodPut || p != "/streams/7" {
+		t.Fatalf("got %s %s, want PUT /streams/7 (re-seed the held loopback)", m, p)
+	}
+	if want := "http://" + RelayProxyAddr + "/relay/" + k + "/7.ts"; !strings.Contains(string(body), want) {
+		t.Fatalf("re-seeded 7 with %s; want relay URL %s", body, want)
+	}
+}
