@@ -14,12 +14,24 @@ import (
 )
 
 // withFastEnsure lowers the EnsureRunning tunables so the timeout case is a
-// fraction of a second, and restores them after the test.
+// fraction of a second, and restores them after the test. These are
+// process-global package vars, so tests using this helper must NOT call
+// t.Parallel().
 func withFastEnsure(t *testing.T) {
 	t.Helper()
 	oldTimeout, oldPoll := ensureRunningTimeout, ensureRunningPoll
 	ensureRunningTimeout, ensureRunningPoll = 500*time.Millisecond, 10*time.Millisecond
 	t.Cleanup(func() { ensureRunningTimeout, ensureRunningPoll = oldTimeout, oldPoll })
+}
+
+// newEnsureManager builds a Manager and tears every stream down at test end, so
+// a puller started against the unreachable test source does not keep retrying
+// past the test as a leaked goroutine.
+func newEnsureManager(t *testing.T) *Manager {
+	t.Helper()
+	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	t.Cleanup(func() { m.UnregisterAll() })
+	return m
 }
 
 func (s *Stream) isRunning() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.running }
@@ -28,7 +40,7 @@ func (s *Stream) isRunning() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.r
 // creating a stream or waiting out the timeout.
 func TestEnsureRunningUnknownIdReturnsFalseFast(t *testing.T) {
 	withFastEnsure(t)
-	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m := newEnsureManager(t)
 
 	start := time.Now()
 	if m.EnsureRunning("nope") {
@@ -46,7 +58,7 @@ func TestEnsureRunningUnknownIdReturnsFalseFast(t *testing.T) {
 // (touch) and waits until data flows, then reports ready.
 func TestEnsureRunningStartsRegisteredPullerAndWaits(t *testing.T) {
 	withFastEnsure(t)
-	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m := newEnsureManager(t)
 	// Unreachable source — the real puller produces nothing; we drive onAir by
 	// feeding the stream shortly after start, standing in for the puller's output.
 	m.Register("7", puller.Source{URLs: []string{"http://127.0.0.1:0/x.ts"}}, 0)
@@ -69,7 +81,7 @@ func TestEnsureRunningStartsRegisteredPullerAndWaits(t *testing.T) {
 // bound and reports not-ready, rather than blocking forever.
 func TestEnsureRunningTimesOutWhenNeverOnAir(t *testing.T) {
 	withFastEnsure(t)
-	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m := newEnsureManager(t)
 	m.Register("7", puller.Source{URLs: []string{"http://127.0.0.1:0/x.ts"}}, 0)
 
 	start := time.Now()
@@ -85,7 +97,7 @@ func TestEnsureRunningTimesOutWhenNeverOnAir(t *testing.T) {
 // disruptive restart).
 func TestEnsureRunningIdempotentForAlreadyOnAir(t *testing.T) {
 	withFastEnsure(t)
-	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m := newEnsureManager(t)
 	m.Register("7", puller.Source{URLs: []string{"http://127.0.0.1:0/x.ts"}}, 0)
 	st := m.Get("7")
 	feedStream(st) // already on air
@@ -107,7 +119,7 @@ func TestEnsureRunningIdempotentForAlreadyOnAir(t *testing.T) {
 func TestEnsureRunningConcurrentCallersStartPullerOnce(t *testing.T) {
 	withFastEnsure(t)
 	logs := captureDebugLog(t)
-	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m := newEnsureManager(t)
 	m.Register("7", puller.Source{URLs: []string{"http://127.0.0.1:0/x.ts"}}, 0)
 	st := m.Get("7")
 
@@ -133,7 +145,7 @@ func TestEnsureRunningConcurrentCallersStartPullerOnce(t *testing.T) {
 // reports ready once data arrives from the external feed.
 func TestEnsureRunningExternallyFedCfgNilWaitsForData(t *testing.T) {
 	withFastEnsure(t)
-	m := NewManager(1<<20, 0, 2, 6, time.Second)
+	m := newEnsureManager(t)
 	st := m.GetOrCreate("7") // created, no pull config (cfg == nil)
 
 	go func() { time.Sleep(30 * time.Millisecond); feedStream(st) }()
