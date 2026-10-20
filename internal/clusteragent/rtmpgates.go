@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
 // floodBlocked reports whether the peer IP carries a block_<ip> flood marker —
@@ -115,4 +117,146 @@ func (a *Agent) streamOnDemand(id string) bool {
 		return false
 	}
 	return w.Data.Server != nil && w.Data.Server.OnDemand == 1
+}
+
+// floodTick ports BruteforceGuard::checkFlood for the RTMP deny set: a per-IP
+// {requests,last_request} counter under FloodDir, written atomically (a random
+// temp, so it coexists with php-fpm's LOCK_EX writes of the same file during the
+// transition). Over the limit it touches block_<ip> and spools MAIN a P0
+// security.block_ip (unless the IP is already blocklisted). flood_limit 0/unset,
+// an allowed IP, a flood_ips_exclude IP, a non-IP, or no FloodDir → no-op.
+func (a *Agent) floodTick(ip string) {
+	data := a.replicaSettings()
+	lim, _ := settingInt(data["flood_limit"])
+	if lim == 0 {
+		return
+	}
+	if a.FloodDir == "" || net.ParseIP(ip) == nil {
+		return
+	}
+	if a.allowedIPs()[ip] {
+		return
+	}
+	for _, ex := range strings.Split(floodStr(data, "flood_ips_exclude"), ",") {
+		if ex != "" && ex == ip {
+			return
+		}
+	}
+	ipFile := filepath.Join(a.FloodDir, ip)
+	now := time.Now().Unix()
+	b, err := os.ReadFile(ipFile)
+	if err != nil {
+		a.floodWrite(ipFile, 0, now) // first sighting: requests 0
+		return
+	}
+	var row struct {
+		Requests    int64 `json:"requests"`
+		LastRequest int64 `json:"last_request"`
+	}
+	if json.Unmarshal(b, &row) != nil {
+		a.floodWrite(ipFile, 0, now)
+		return
+	}
+	secs, _ := settingInt(data["flood_seconds"])
+	if now-row.LastRequest <= secs { // within the window
+		row.Requests++
+		if lim > row.Requests {
+			a.floodWrite(ipFile, row.Requests, now)
+			return
+		}
+		// requests >= flood_limit → block
+		if !a.blockedIPs()[ip] {
+			_ = spoolP0(a.SpoolDir, []map[string]any{{"type": "security.block_ip", "d": map[string]any{"ip": ip, "reason": "FLOOD ATTACK"}}})
+		}
+		_ = os.WriteFile(filepath.Join(a.FloodDir, "block_"+ip), nil, 0o640)
+		_ = os.Remove(ipFile)
+		return
+	}
+	a.floodWrite(ipFile, 0, now) // window expired: reset to requests 0
+}
+
+func (a *Agent) floodWrite(ipFile string, requests, last int64) {
+	b, _ := json.Marshal(map[string]any{"requests": requests, "last_request": last})
+	_ = writeFile(ipFile, b, fileWrite{perm: 0o640}) // random temp → safe under concurrency
+}
+
+func floodStr(data map[string]any, key string) string {
+	s, _ := data[key].(string)
+	return s
+}
+
+// allowedIPs ports ServerRepository::getAllowedIPs: 127.0.0.1, plus every
+// server's server_ip, private_ip, valid-IP domain_name entries and whitelist_ips
+// (a JSON-array-encoded string — null/""/malformed is skipped), plus the CSV
+// allowed_ips_admin. The node's own server_ip is covered by the server loop.
+func (a *Agent) allowedIPs() map[string]bool {
+	set := map[string]bool{"127.0.0.1": true}
+	if a.ReplicaDir != "" {
+		if b, err := os.ReadFile(filepath.Join(a.ReplicaDir, "servers.json")); err == nil {
+			var doc struct {
+				Data struct {
+					Servers []struct {
+						ServerIP   string `json:"server_ip"`
+						PrivateIP  string `json:"private_ip"`
+						Whitelist  string `json:"whitelist_ips"`
+						DomainName string `json:"domain_name"`
+					} `json:"servers"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(b, &doc) == nil {
+				for _, s := range doc.Data.Servers {
+					if s.ServerIP != "" {
+						set[s.ServerIP] = true
+					}
+					if s.PrivateIP != "" {
+						set[s.PrivateIP] = true
+					}
+					for _, d := range strings.Split(s.DomainName, ",") {
+						if net.ParseIP(d) != nil {
+							set[d] = true
+						}
+					}
+					if s.Whitelist != "" {
+						var ips []string
+						if json.Unmarshal([]byte(s.Whitelist), &ips) == nil {
+							for _, ip := range ips {
+								set[ip] = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, ip := range strings.Split(floodStr(a.replicaSettings(), "allowed_ips_admin"), ",") {
+		if ip != "" {
+			set[ip] = true
+		}
+	}
+	return set
+}
+
+// blockedIPs is the materialised blocklist IP set (blocklist.json data.ip), the
+// port of BlocklistService::getBlockedIPs — the guard that keeps floodTick from
+// re-spooling a P0 for an IP MAIN already has blocklisted.
+func (a *Agent) blockedIPs() map[string]bool {
+	set := map[string]bool{}
+	if a.ReplicaDir == "" {
+		return set
+	}
+	b, err := os.ReadFile(filepath.Join(a.ReplicaDir, "blocklist.json"))
+	if err != nil {
+		return set
+	}
+	var doc struct {
+		Data struct {
+			IP []string `json:"ip"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(b, &doc) == nil {
+		for _, ip := range doc.Data.IP {
+			set[ip] = true
+		}
+	}
+	return set
 }

@@ -2,7 +2,6 @@ package clusteragent
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -122,26 +121,61 @@ func TestRtmpPlayLineAuth(t *testing.T) {
 	}
 }
 
-func TestRtmpPlayAuthFailedTicksFlood(t *testing.T) {
-	rig := newRtmpHandlerRig(t)
-	rig.auth = func(w http.ResponseWriter, reqCtx []byte) {
-		rig.f.box(w, reqCtx, map[string]any{"ok": false, "reason": "AUTH_FAILED"})
+func TestRtmpDenySetCountsTowardFlood(t *testing.T) {
+	// publish-gate, no-tcurl/app, and cred-array each tick; flood_limit 1 → block on the 2nd.
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"publish_gate", "addr=203.0.113.9&clientid=1&call=publish&name=100&password=wrong"},
+		{"no_tcurl", "addr=203.0.113.9&clientid=1&call=play&name=100&username=u&password=p"},
+		{"cred_array", "addr=203.0.113.9&clientid=1&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&username=v"},
 	}
-	if rec := rig.do("addr=203.0.113.9&clientid=8&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p", nil); rec.Code != 404 {
-		t.Fatalf("AUTH_FAILED: %d", rec.Code)
-	}
-	if rig.a.rtmpFloodCount("203.0.113.9") != 1 {
-		t.Fatal("AUTH_FAILED should tick the flood guard")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rig := newRtmpHandlerRig(t)
+			rig.a.FloodDir = t.TempDir()
+			rig.a.SpoolDir = t.TempDir()
+			floodSettings(t, rig.a.ReplicaDir, map[string]any{"flood_limit": 1, "flood_seconds": 100})
+			for i := 0; i < 2; i++ {
+				rig.do(c.query, nil)
+			}
+			if _, err := os.Stat(filepath.Join(rig.a.FloodDir, "block_203.0.113.9")); err != nil {
+				t.Fatalf("%s should count toward flood: %v", c.name, err)
+			}
+		})
 	}
 }
 
-func TestRtmpPlayRefusedNoFlood(t *testing.T) {
-	rig := newRtmpHandlerRig(t) // rig.auth nil → the fake MAIN refuses (a *Denial)
-	if rec := rig.do("addr=203.0.113.9&clientid=9&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p", nil); rec.Code != 404 {
-		t.Fatalf("REFUSED: %d", rec.Code)
+func TestRtmpAuthFailedCountsRefusedDoesNot(t *testing.T) {
+	line := "addr=203.0.113.9&clientid=1&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p"
+
+	// AUTH_FAILED ticks → blocks on the 2nd under flood_limit 1.
+	rig := newRtmpHandlerRig(t)
+	rig.a.FloodDir = t.TempDir()
+	rig.a.SpoolDir = t.TempDir()
+	floodSettings(t, rig.a.ReplicaDir, map[string]any{"flood_limit": 1, "flood_seconds": 100})
+	rig.auth = func(w http.ResponseWriter, reqCtx []byte) {
+		rig.f.box(w, reqCtx, map[string]any{"ok": false, "reason": "AUTH_FAILED"})
 	}
-	if rig.a.rtmpFloodCount("203.0.113.9") != 0 {
-		t.Fatal("a REFUSED must not tick the flood guard")
+	for i := 0; i < 2; i++ {
+		rig.do(line, nil)
+	}
+	if _, err := os.Stat(filepath.Join(rig.a.FloodDir, "block_203.0.113.9")); err != nil {
+		t.Fatal("AUTH_FAILED must count toward flood")
+	}
+
+	// A verified REFUSED and a parse-failure must NOT count.
+	rig2 := newRtmpHandlerRig(t) // default fake MAIN → a verified REFUSED
+	rig2.a.FloodDir = t.TempDir()
+	rig2.a.SpoolDir = t.TempDir()
+	floodSettings(t, rig2.a.ReplicaDir, map[string]any{"flood_limit": 1, "flood_seconds": 100})
+	for i := 0; i < 5; i++ {
+		rig2.do(line, nil)                             // REFUSED (non-counting)
+		rig2.do("call=play&call=publish&name=100", nil) // differing-dup → parse failure (non-counting)
+	}
+	if _, err := os.Stat(filepath.Join(rig2.a.FloodDir, "block_203.0.113.9")); err == nil {
+		t.Fatal("REFUSED and parse-failure must not count toward flood")
 	}
 }
 
@@ -194,19 +228,6 @@ func TestRtmpRestreamDetectPresence(t *testing.T) {
 	}
 	if rtmpRestreamDetect(httptest.NewRequest(http.MethodGet, "/stream/rtmp", nil)) {
 		t.Fatal("an absent header is not restream")
-	}
-}
-
-func TestRtmpFloodBounded(t *testing.T) {
-	a := &Agent{Logf: t.Logf}
-	for i := 0; i < rtmpFloodMax+100; i++ {
-		a.rtmpFlood(fmt.Sprintf("10.0.%d.%d", i/256, i%256))
-	}
-	a.rtmpFloodMu.Lock()
-	n := len(a.rtmpFloodN)
-	a.rtmpFloodMu.Unlock()
-	if n > rtmpFloodMax {
-		t.Fatalf("flood map grew to %d, cap %d", n, rtmpFloodMax)
 	}
 }
 
