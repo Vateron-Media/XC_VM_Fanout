@@ -101,6 +101,9 @@ func (a *Agent) dataPlaneHandler(w http.ResponseWriter, r *http.Request) bool {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/file_digest":
 		a.serveFileDigest(w, r)
 		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/xfile":
+		a.serveXFile(w, r)
+		return true
 	}
 	return false
 }

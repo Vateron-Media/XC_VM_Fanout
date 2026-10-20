@@ -3,8 +3,6 @@ package clusteragent
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -554,12 +552,7 @@ func interopDataPlane(t *testing.T) *dataPlaneRig {
 		t.Fatal("no relay ticket for stream 100")
 	}
 	// The ref the node's PHP puts in its URL (DataPlane::ref) is the one MAIN minted.
-	h := sha256.New()
-	h.Write([]byte("xcvm-file-ref-v1"))
-	h.Write(cc.U32(1))
-	h.Write(cc.U32(uint32(len(path))))
-	h.Write([]byte(path))
-	ref := hex.EncodeToString(h.Sum(nil))[:32]
+	ref := cc.FileRef(1, path)
 	if a.tickets().file(ref) == "" {
 		t.Fatalf("no file ticket for ref %s", ref)
 	}

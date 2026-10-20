@@ -20,6 +20,7 @@ import (
 //	/v1/conn/...         the connection registry (registry.go)
 //	POST /v1/nonce       a parent's one-shot nonce window (dataplane.go)
 //	POST /v1/file_digest an owner's signature over what it served (dataplane.go)
+//	GET  /xfile          the owner side of a cross-node file read (xfile.go)
 //	GET  /v1/status      the agent's own standing with MAIN (status.go)
 //
 // Only the ops in SocketOps pass. The socket is xc_vm's alone (0660, in the
