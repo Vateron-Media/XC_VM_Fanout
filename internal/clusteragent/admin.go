@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	cc "github.com/Vateron-Media/XC_VM_Fanout/internal/clustercrypto"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/viewertoken"
@@ -185,18 +187,122 @@ type adminAdmission struct {
 	tok      *adminTok // the decoded uitoken (kind admitUitoken), else nil
 }
 
-// viewerKeys reads the node's token keys (and ip_subnet_match / accept_legacy)
-// from the gateway policy file, for uitoken decode; ok is false when it is unset
-// or unreadable.
-func (a *Agent) viewerKeys() (keys viewertoken.Keys, acceptLegacy, subnetMatch, ok bool) {
+// adminPolicy is the subset of the gateway policy file the /admin handlers need:
+// the token keys (uitoken decode), ip_subnet_match, the media paths, the
+// per-server redirect base URLs (thumb's owner 302), and the vod throttle.
+type adminPolicy struct {
+	keys           viewertoken.Keys
+	acceptLegacy   bool
+	subnetMatch    bool
+	streamsPath    string
+	vodPath        string
+	archivePath    string
+	redirect       map[string][]string
+	vodLimitPerc   int
+	vodBitratePlus int
+}
+
+// adminPolicy reads and parses the gateway policy file; ok is false when it is
+// unset or unreadable (the uitoken/serving config is then unavailable).
+func (a *Agent) adminPolicy() (*adminPolicy, bool) {
 	if a.GatewayPolicyFile == "" {
-		return viewertoken.Keys{}, false, false, false
+		return nil, false
 	}
 	b, err := os.ReadFile(a.GatewayPolicyFile)
 	if err != nil {
+		return nil, false
+	}
+	keys, acceptLegacy, subnet, ok := parseViewerKeys(b)
+	if !ok {
+		return nil, false
+	}
+	var p struct {
+		Paths struct {
+			Streams string `json:"streams"`
+			Vod     string `json:"vod"`
+			Archive string `json:"archive"`
+		} `json:"paths"`
+		Redirect       map[string][]string `json:"redirect"`
+		VodLimitPerc   int                 `json:"vod_limit_perc"`
+		VodBitratePlus int                 `json:"vod_bitrate_plus"`
+	}
+	_ = json.Unmarshal(b, &p) // keys already parsed; paths/redirect are best-effort
+	return &adminPolicy{
+		keys: keys, acceptLegacy: acceptLegacy, subnetMatch: subnet,
+		streamsPath: p.Paths.Streams, vodPath: p.Paths.Vod, archivePath: p.Paths.Archive,
+		redirect: p.Redirect, vodLimitPerc: p.VodLimitPerc, vodBitratePlus: p.VodBitratePlus,
+	}, true
+}
+
+// viewerKeys reads the node's token keys (and ip_subnet_match / accept_legacy)
+// from the gateway policy file, for uitoken decode; ok is false when unavailable.
+func (a *Agent) viewerKeys() (keys viewertoken.Keys, acceptLegacy, subnetMatch, ok bool) {
+	p, ok := a.adminPolicy()
+	if !ok {
 		return viewertoken.Keys{}, false, false, false
 	}
-	return parseViewerKeys(b)
+	return p.keys, p.acceptLegacy, p.subnetMatch, true
+}
+
+// parsePositiveInt parses a decimal positive int64, or 0 when it is not one.
+func parsePositiveInt(s string) int64 {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// serveAdminThumb is Public/admin/thumb.php: a relay/uitoken-admitted thumbnail
+// read. It serves STREAMS_PATH/<id>_.jpg (fresh, <60s) when this node owns the
+// stream's vframes_server_id, else 302-redirects to the owning server; a
+// non-live/direct stream or any refusal is a 404. No password/loopback arm
+// (passwordOK=false). clientIP is the resolved address the front forwards.
+func (a *Agent) serveAdminThumb(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	clientIP := r.Header.Get("X-XC-Client-IP")
+	adm, ok := a.admitAdmin(parsePositiveInt(q.Get("stream")), r, clientIP, false, a.Client.MainNowMs())
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	pol, ok := a.adminPolicy()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	m, ok := a.streamMeta(strconv.FormatInt(adm.streamID, 10))
+	if !ok || m.TypeLive != 1 || m.DirectSource != 0 { // StreamSource::streamRow(id, live=true)
+		http.NotFound(w, r)
+		return
+	}
+	if m.VframesServerID == a.Client.State.ServerID {
+		path := filepath.Join(pol.streamsPath, strconv.FormatInt(adm.streamID, 10)+"_.jpg")
+		fi, err := os.Stat(path)
+		if err != nil || fi.IsDir() || time.Since(fi.ModTime()) >= 60*time.Second {
+			http.NotFound(w, r)
+			return
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpg")
+		w.Header().Set("Age", strconv.Itoa(int(time.Since(fi.ModTime()).Seconds())))
+		_, _ = w.Write(b)
+		return
+	}
+	bases := pol.redirect[strconv.FormatInt(m.VframesServerID, 10)]
+	if len(bases) == 0 || bases[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	loc := bases[0] + "admin/thumb?stream=" + strconv.FormatInt(adm.streamID, 10) +
+		"&aid=" + strconv.FormatInt(parsePositiveInt(q.Get("aid")), 10) +
+		"&uitoken=" + url.QueryEscape(q.Get("uitoken")) +
+		"&expires=" + strconv.FormatInt(parsePositiveInt(q.Get("expires")), 10)
+	http.Redirect(w, r, loc, http.StatusFound)
 }
 
 // admitAdmin runs the uitoken pre-check + RelayGuard::admit for an /admin handler,
