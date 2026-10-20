@@ -23,7 +23,7 @@ const (
 // re-binds when MAIN changes the ports. Opt-in and non-fatal — a bad cert or an
 // unparsable port set is returned as an error so the caller logs it and leaves
 // nginx serving. The returned stop ends the watch and drains every listener.
-func serveFront(gw http.Handler, nginxURL, webroot, certPath, keyPath, realipPaths, images, httpPortsPath, httpsPortsPath string) (func(), error) {
+func serveFront(gw http.Handler, nginxURL, webroot, certPath, keyPath, realipPaths, images, agentSock, httpPortsPath, httpsPortsPath string) (func(), error) {
 	certs, err := front.NewCertReloader(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("tls certificate: %w", err)
@@ -32,7 +32,7 @@ func serveFront(gw http.Handler, nginxURL, webroot, certPath, keyPath, realipPat
 	if err != nil || u.Host == "" {
 		return nil, fmt.Errorf("nginx backend url %q is not usable", nginxURL)
 	}
-	f := front.NewServer(gw, u, webroot, front.LoadTrustedProxies(splitCSV(realipPaths)...)).WithImages(images)
+	f := front.NewServer(gw, u, webroot, front.LoadTrustedProxies(splitCSV(realipPaths)...)).WithImages(images).WithAgentSocket(agentSock)
 	mgr, stop, err := f.ServeManaged(certs, httpPortsPath, httpsPortsPath, frontPortPoll, frontDrain)
 	if err != nil {
 		return nil, err

@@ -1,6 +1,7 @@
 package front
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -47,6 +48,10 @@ func serveKind(path string) string {
 const (
 	serveRate  = 20
 	serveBurst = 8
+	// xfileRate / xfileBurst mirror nginx's zone xfile on /xfile (50 r/s, burst
+	// 100), keyed on the raw TCP peer (node-to-node), refusing 429.
+	xfileRate  = 50
+	xfileBurst = 100
 )
 
 // imagesPrefix is nginx's static image location (alias storage/images). scriptExt
@@ -57,12 +62,14 @@ const imagesPrefix = "/images/"
 var scriptExt = regexp.MustCompile(`(?i)\.(php\d*|phtml|phar)$`)
 
 type Server struct {
-	gateway http.Handler
-	proxy   http.Handler
-	webroot string
-	trusted *TrustedProxies
-	limiter *rateLimiter
-	images  string // storage/images root; empty leaves /images to the proxy
+	gateway      http.Handler
+	proxy        http.Handler
+	webroot      string
+	trusted      *TrustedProxies
+	limiter      *rateLimiter
+	images       string       // storage/images root; empty leaves /images to the proxy
+	agentProxy   http.Handler // /xfile owner, reverse-proxied to the agent socket; nil leaves /xfile to the proxy
+	xfileLimiter *rateLimiter // the peer-keyed /xfile limiter (nginx zone xfile)
 }
 
 // internalPrefixes are nginx's `internal;` X-Accel targets — reachable only via
@@ -93,10 +100,11 @@ const statusPath = "/status"
 // serve-only front with nginx gone): a request that would proxy gets 502.
 func NewServer(gateway http.Handler, nginx *url.URL, webroot string, trusted *TrustedProxies) *Server {
 	s := &Server{
-		gateway: gateway,
-		webroot: webroot,
-		trusted: trusted,
-		limiter: newRateLimiter(serveRate, serveBurst),
+		gateway:      gateway,
+		webroot:      webroot,
+		trusted:      trusted,
+		limiter:      newRateLimiter(serveRate, serveBurst),
+		xfileLimiter: newRateLimiter(xfileRate, xfileBurst),
 	}
 	if nginx != nil {
 		s.proxy = &httputil.ReverseProxy{
@@ -204,11 +212,72 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "", http.StatusForbidden)
 		return
 	}
+	// /xfile is a public, owner-side cross-node file read. With an agent socket
+	// configured, the front proxies it there (peer-rate-limited); otherwise nginx
+	// still owns it during the transition.
+	if r.URL.Path == "/xfile" {
+		s.serveXFile(w, r)
+		return
+	}
 	if kind := serveKind(r.URL.Path); kind != "" {
 		s.serveStream(w, r, kind)
 		return
 	}
 	s.proxyOrError(w, r)
+}
+
+// serveXFile routes the public /xfile to the owner handler in the agent. The
+// limiter is keyed on the raw TCP peer (node-to-node, not the viewer real-IP)
+// and refuses 429, matching nginx's zone xfile. A dial failure (agent down or
+// not yet serving) falls back to nginx during the transition — an agent
+// *response*, even a 404, is authoritative and streams through unchanged. With
+// no agent socket configured, nginx still owns /xfile.
+func (s *Server) serveXFile(w http.ResponseWriter, r *http.Request) {
+	if s.agentProxy == nil {
+		s.proxyOrError(w, r)
+		return
+	}
+	if !s.xfileLimiter.allow(clientIP(r)) {
+		http.Error(w, "", http.StatusTooManyRequests) // nginx's limit_req_status 429
+		return
+	}
+	s.agentProxy.ServeHTTP(w, r)
+}
+
+// WithAgentSocket makes the front serve /xfile from the owner handler in the
+// agent at sock (the agent's local unix socket, which the gateway also dials),
+// instead of proxying it to nginx. The raw request-target is preserved verbatim
+// so the fetcher's relay-auth proof still verifies. An empty sock leaves /xfile
+// to the proxy. Returns the server for chaining.
+func (s *Server) WithAgentSocket(sock string) *Server {
+	if sock == "" {
+		return s
+	}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+		MaxIdleConnsPerHost: 8,
+	}
+	s.agentProxy = &httputil.ReverseProxy{
+		Transport: tr,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			// The agent verifies the proof over its raw r.RequestURI, so forward
+			// the target byte-for-byte: set RawQuery from the inbound request
+			// rather than letting the framework re-encode it.
+			pr.Out.URL.Scheme = "http"
+			pr.Out.URL.Host = "agent"
+			pr.Out.URL.Path = pr.In.URL.Path
+			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+		},
+		ErrorHandler: func(ew http.ResponseWriter, er *http.Request, err error) {
+			// Only a transport error (the agent could not be reached) lands here;
+			// an HTTP response from the agent is not an error. Fall back to nginx
+			// during the transition, else 502.
+			s.proxyOrError(ew, er)
+		},
+	}
+	return s
 }
 
 // serveStream hands a viewer's serve request to the in-process gateway the way
