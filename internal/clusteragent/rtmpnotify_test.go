@@ -171,7 +171,7 @@ func TestRtmpAuthFailedCountsRefusedDoesNot(t *testing.T) {
 	rig2.a.SpoolDir = t.TempDir()
 	floodSettings(t, rig2.a.ReplicaDir, map[string]any{"flood_limit": 1, "flood_seconds": 100})
 	for i := 0; i < 5; i++ {
-		rig2.do(line, nil)                             // REFUSED (non-counting)
+		rig2.do(line, nil)                              // REFUSED (non-counting)
 		rig2.do("call=play&call=publish&name=100", nil) // differing-dup → parse failure (non-counting)
 	}
 	if _, err := os.Stat(filepath.Join(rig2.a.FloodDir, "block_203.0.113.9")); err == nil {
