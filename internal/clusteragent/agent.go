@@ -129,6 +129,7 @@ type Agent struct {
 	xfileRoutes        *serverRoutes // last servers.json parse, ~5s TTL
 	xfileRouteMod      time.Time
 	xfileRouteAt       time.Time
+	xfileMetrics       xfileStats // /xfile serve/refusal counters (xfile.go)
 	digestN1Mu         sync.Mutex
 	digestN1           map[int64]time.Time // owners whose chunk digest named no request (relayproxy.go)
 	ticketsOnce        sync.Once           // the data plane's tickets (tickets.go)
