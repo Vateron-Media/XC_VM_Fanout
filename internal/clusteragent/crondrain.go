@@ -194,6 +194,124 @@ func (a *Agent) drainClientFile(path string) error {
 	return os.Remove(path)
 }
 
+var activityLogCols = []string{"server_id", "proxy_id", "user_id", "isp", "external_device", "stream_id", "date_start", "user_agent", "user_ip", "date_end", "container", "geoip_country_code", "divergence", "hmac_id", "hmac_identifier"}
+
+// activitySpool is the activity batch sink; a package var so a test can force a
+// refusal (the keep-on-refusal path).
+var activitySpool = func(a *Agent, rows []map[string]any) error {
+	return spoolP1(a.SpoolDir, logEvents("activity", activityLogCols, rows))
+}
+
+// drainActivity ports cron:activity: the activity spool, rename-claimed, with
+// keep-on-refusal. A pre-existing refused claim is drained first and, if refused
+// again, left in place (re-claiming would overwrite it).
+func (a *Agent) drainActivity() error {
+	rel, ok := acquireCronLock(cronLockPath(a.cronsDir(), `XcVm\Cli\CronJobs\ActivityCronJob`))
+	if !ok {
+		return nil
+	}
+	defer rel()
+	logFile := filepath.Join(a.logsTmpDir(), "activity")
+	claimed := logFile + ".import"
+	if _, err := os.Stat(claimed); err == nil {
+		if !a.drainActivityFile(claimed) {
+			return nil // refused claim stays; don't re-claim over it
+		}
+	}
+	if _, err := os.Stat(logFile); err == nil {
+		if os.Rename(logFile, claimed) == nil {
+			a.drainActivityFile(claimed)
+		}
+	}
+	return nil
+}
+
+// drainActivityFile spools a claimed activity file in IMPORT_BATCH/IMPORT_BYTES
+// batches. Returns true when fully drained+unlinked; false when a batch was
+// refused, leaving the file holding the refused batch and everything after it
+// (the committed prefix dropped), as ActivityCronJob::keepFrom does.
+func (a *Agent) drainActivityFile(path string) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	lines := nonEmptyLines(string(raw))
+	var batch []map[string]any
+	nbytes := 0
+	lastOK := -1 // index of the line that completed the last successful batch
+	keep := func(from int) bool {
+		rest := strings.Join(lines[from:], "\n")
+		if len(lines[from:]) > 0 {
+			rest += "\n"
+		}
+		tmp := path + ".rest"
+		if os.WriteFile(tmp, []byte(rest), 0o640) == nil {
+			_ = os.Rename(tmp, path)
+		}
+		return false
+	}
+	for i, ln := range lines {
+		dec, err := base64.StdEncoding.DecodeString(ln)
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(dec, &m) != nil || !activityValid(m) {
+			continue
+		}
+		batch = append(batch, m)
+		nbytes += len(ln)
+		if len(batch) >= logChunk || nbytes >= 4194304 { // IMPORT_BATCH / IMPORT_BYTES
+			if activitySpool(a, batch) != nil {
+				return keep(lastOK + 1)
+			}
+			lastOK, batch, nbytes = i, nil, 0
+		}
+	}
+	if len(batch) > 0 && activitySpool(a, batch) != nil {
+		return keep(lastOK + 1)
+	}
+	_ = os.Remove(path)
+	return true
+}
+
+// activityValid ports ActivityCronJob's row validation (PHP empty() semantics).
+func activityValid(m map[string]any) bool {
+	return !phpEmpty(m["server_id"]) &&
+		(!phpEmpty(m["user_id"]) || !phpEmpty(m["hmac_id"])) &&
+		!phpEmpty(m["stream_id"]) && !phpEmpty(m["user_ip"])
+}
+
+// phpEmpty mirrors PHP empty() for a JSON-decoded value.
+func phpEmpty(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return x == "" || x == "0"
+	case float64:
+		return x == 0
+	case bool:
+		return !x
+	case []any:
+		return len(x) == 0
+	case map[string]any:
+		return len(x) == 0
+	}
+	return false
+}
+
+// nonEmptyLines splits on newlines and drops blank/whitespace-only lines.
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
 // logInt ports PHP intval() for a JSON value.
 func logInt(v any) int64 {
 	switch x := v.(type) {

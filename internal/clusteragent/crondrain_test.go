@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"errors"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -123,6 +124,66 @@ func TestDrainLinesLogs(t *testing.T) {
 	}
 	if found["ip"] != "1.2.3.4" || found["date"] != "1700" || found["user_id"] != "7" {
 		t.Fatalf("key remap wrong: %+v", found) // user_ip→ip, time→date, every value stringified
+	}
+}
+
+func validActivity() map[string]any {
+	return map[string]any{"server_id": 3, "user_id": 7, "stream_id": 5, "user_ip": "1.2.3.4", "container": "ts", "date_start": 1700}
+}
+
+func TestDrainActivity(t *testing.T) {
+	a := newDrainAgent(t)
+	logFile := filepath.Join(a.logsTmpDir(), "activity")
+	body := b64line(validActivity()) +
+		b64line(map[string]any{"server_id": 3, "user_id": 7, "stream_id": 5}) // missing user_ip -> invalid, dropped
+	if err := os.WriteFile(logFile, []byte(body), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.drainActivity(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(logFile); err == nil {
+		t.Fatal("activity must be drained")
+	}
+	rows := 0
+	for _, ev := range readP1Events(t, a.SpoolDir) {
+		if ev["type"] != "log.activity" {
+			t.Fatalf("type %v", ev["type"])
+		}
+		rows += len(eventRows(ev))
+	}
+	if rows != 1 {
+		t.Fatalf("want 1 valid row (invalid dropped), got %d", rows)
+	}
+}
+
+func TestDrainActivityRefusalKeeps(t *testing.T) {
+	a := newDrainAgent(t)
+	logFile := filepath.Join(a.logsTmpDir(), "activity")
+	if err := os.WriteFile(logFile, []byte(b64line(validActivity())), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	orig := activitySpool
+	activitySpool = func(a *Agent, rows []map[string]any) error { return errors.New("refused") }
+	if err := a.drainActivity(); err != nil {
+		t.Fatal(err)
+	}
+	activitySpool = orig
+	if _, err := os.Stat(logFile + ".import"); err != nil {
+		t.Fatal("a refused batch must be kept as .import")
+	}
+	if _, err := os.Stat(logFile); err == nil {
+		t.Fatal("the original must have been claimed (renamed)")
+	}
+	// recovery: the sink works now -> the kept claim drains and is removed
+	if err := a.drainActivity(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(logFile + ".import"); err == nil {
+		t.Fatal(".import must drain on recovery")
+	}
+	if len(readP1Events(t, a.SpoolDir)) == 0 {
+		t.Fatal("recovery spooled nothing")
 	}
 }
 
