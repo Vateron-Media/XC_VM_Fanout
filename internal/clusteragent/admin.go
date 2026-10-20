@@ -305,6 +305,109 @@ func (a *Agent) serveAdminThumb(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, loc, http.StatusFound)
 }
 
+// vodExtRe is a safe VOD container extension (so <id>.<ext> cannot traverse).
+var vodExtRe = regexp.MustCompile(`^[a-z0-9]{1,6}$`)
+
+// containerMimeType is StreamUtils::containerMimeType: the VOD Content-Type from
+// the stream's target_container, independent of the URL extension.
+func containerMimeType(c string) string {
+	switch c {
+	case "mp4":
+		return "video/mp4"
+	case "mkv":
+		return "video/x-matroska"
+	case "avi":
+		return "video/x-msvideo"
+	case "3gp":
+		return "video/3gpp"
+	case "flv":
+		return "video/x-flv"
+	case "wmv":
+		return "video/x-ms-wmv"
+	case "mov":
+		return "video/quicktime"
+	case "ts":
+		return "video/mp2t"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// serveAdminVOD is Public/admin/vod.php: a relay/uitoken/password-admitted
+// byte-range relay of VOD_PATH/<id>.<ext>. The id (and, for a uitoken, the
+// container) come from the token; otherwise from the "{id}.{ext}" stream param.
+// Content-Type is the stream's target_container, independent of the URL ext.
+// ponytail: served at full speed — vod.php's vod_limit_perc/vod_bitrate_plus
+// bandwidth throttle is a follow-up, not ported here.
+func (a *Agent) serveAdminVOD(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	clientIP := r.Header.Get("X-XC-Client-IP")
+	stream := q.Get("stream")
+	adm, ok := a.admitAdmin(parsePositiveInt(vodIDPart(stream)), r, clientIP, true, a.Client.MainNowMs())
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	ext := vodExtPart(stream)
+	if adm.kind == admitUitoken && adm.tok != nil && adm.tok.Container != "" {
+		ext = adm.tok.Container
+	}
+	if !vodExtRe.MatchString(ext) {
+		http.NotFound(w, r)
+		return
+	}
+	pol, ok := a.adminPolicy()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	m, ok := a.streamMeta(strconv.FormatInt(adm.streamID, 10))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	path := filepath.Join(pol.vodPath, strconv.FormatInt(adm.streamID, 10)+"."+ext)
+	if !withinDir(pol.vodPath, path) {
+		http.NotFound(w, r)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", containerMimeType(m.TargetContainer))
+	http.ServeContent(w, r, path, fi.ModTime(), f) // handles Range → 206/416
+}
+
+// vodIDPart / vodExtPart split a vod stream param "{id}.{ext}".
+func vodIDPart(s string) string {
+	if i := strings.LastIndexByte(s, '.'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func vodExtPart(s string) string {
+	if i := strings.LastIndexByte(s, '.'); i >= 0 {
+		return s[i+1:]
+	}
+	return ""
+}
+
+// withinDir reports whether path stays inside dir once both are cleaned.
+func withinDir(dir, path string) bool {
+	d := filepath.Clean(dir)
+	p := filepath.Clean(path)
+	return p == d || strings.HasPrefix(p, d+string(filepath.Separator))
+}
+
 // admitAdmin runs the uitoken pre-check + RelayGuard::admit for an /admin handler,
 // faithful to the order Public/admin/*.php use. paramStreamID is the handler's
 // parse of its own stream param (the relay/password/loopback arms use it; the
