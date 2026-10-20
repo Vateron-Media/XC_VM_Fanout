@@ -81,3 +81,25 @@ func (a *Agent) allowRTMP(ip, want, given string) bool {
 	}
 	return flag == 1 && (e.Password == "" || secretMatches(e.Password, given))
 }
+
+// streamOnDemand reports whether the stream's per-node record marks it on-demand
+// (data.server.on_demand == 1), the gate rtmp.php applies before starting a
+// held-but-idle stream. A missing/unreadable record, a null data.server
+// (an archive/thumbnail-only hold), or on_demand != 1 → false (→ 404).
+func (a *Agent) streamOnDemand(id string) bool {
+	b, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), id+".json"))
+	if err != nil {
+		return false
+	}
+	var w struct {
+		Data struct {
+			Server *struct {
+				OnDemand int64 `json:"on_demand"`
+			} `json:"server"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(b, &w) != nil {
+		return false
+	}
+	return w.Data.Server != nil && w.Data.Server.OnDemand == 1
+}

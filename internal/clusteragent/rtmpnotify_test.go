@@ -251,3 +251,46 @@ func TestRtmpPlayRelayAllowedRTMPPull(t *testing.T) {
 		t.Fatalf("pull-listed relay play: %d", rec.Code)
 	}
 }
+
+func TestRtmpRelayOnDemandGate(t *testing.T) {
+	// relay-bypass arm, held+not-running stream 200
+	run := func(onDemand int) int {
+		rig := newRtmpHandlerRig(t)
+		writeStreamRecord(t, rig.a.ReplicaDir, "200", map[string]any{"server": map[string]any{"on_demand": onDemand}})
+		return rig.do("addr=1.2.3.4&clientid=1&call=play&name=200&password=s3cret", nil).Code // stream-pass relay
+	}
+	if run(1) != 200 {
+		t.Fatal("held+idle+on_demand=1 relay must start and admit")
+	}
+	if run(0) != 404 {
+		t.Fatal("held+idle+on_demand!=1 relay must 404")
+	}
+}
+
+func TestRtmpLineOnDemandGate(t *testing.T) {
+	run := func(onDemand int) int {
+		rig := newRtmpHandlerRig(t)
+		rig.okAuth()
+		writeStreamRecord(t, rig.a.ReplicaDir, "200", map[string]any{"server": map[string]any{"on_demand": onDemand}})
+		return rig.do("addr=1.2.3.4&clientid=1&call=play&name=200&tcurl=rtmp://h/live&app=live&username=u&password=p", nil).Code
+	}
+	if run(1) != 200 {
+		t.Fatal("held+idle+on_demand=1 line must start and admit")
+	}
+	if run(0) != 404 {
+		t.Fatal("held+idle+on_demand!=1 line must 404")
+	}
+}
+
+func TestRtmpPlayNotHeldUnchanged(t *testing.T) {
+	// name=999 → control socket 404 → not held; relay 200, line 404 (unchanged, rtmp.php:117)
+	rig := newRtmpHandlerRig(t)
+	if rig.do("addr=1.2.3.4&clientid=1&call=play&name=999&password=s3cret", nil).Code != 200 {
+		t.Fatal("not-held relay stays 200")
+	}
+	rig2 := newRtmpHandlerRig(t)
+	rig2.okAuth()
+	if rig2.do("addr=1.2.3.4&clientid=1&call=play&name=999&tcurl=rtmp://h/live&app=live&username=u&password=p", nil).Code != 404 {
+		t.Fatal("not-held line stays 404")
+	}
+}

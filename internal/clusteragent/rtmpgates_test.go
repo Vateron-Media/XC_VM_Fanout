@@ -48,3 +48,32 @@ func TestSecretMatches(t *testing.T) {
 		t.Fatal("non-empty known is a constant-time equal")
 	}
 }
+
+// writeStreamRecord writes a per-stream record at streams/<id>.json in the
+// on-disk {etag,ver,data} envelope checkStream produces, with data carried
+// through verbatim (so data.server survives, as MAIN signs it).
+func writeStreamRecord(t *testing.T, dir, id string, data map[string]any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "streams"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(map[string]any{"etag": "e", "ver": 1, "data": data})
+	if err := os.WriteFile(filepath.Join(dir, "streams", id+".json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStreamOnDemand(t *testing.T) {
+	a := &Agent{ReplicaDir: t.TempDir()}
+	writeStreamRecord(t, a.ReplicaDir, "200", map[string]any{"server": map[string]any{"on_demand": 1}})
+	writeStreamRecord(t, a.ReplicaDir, "201", map[string]any{"server": map[string]any{"on_demand": 0}})
+	writeStreamRecord(t, a.ReplicaDir, "202", map[string]any{"server": nil})
+	if !a.streamOnDemand("200") {
+		t.Fatal("on_demand=1 must be true")
+	}
+	for _, id := range []string{"201", "202", "999"} { // 999 = missing file
+		if a.streamOnDemand(id) {
+			t.Fatalf("%s must be not-on-demand", id)
+		}
+	}
+}

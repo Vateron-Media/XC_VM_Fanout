@@ -52,6 +52,10 @@ func (a *Agent) rtmpPlay(w http.ResponseWriter, r *http.Request, n *rtmpNotify) 
 	// carries no line and opens no record.
 	if a.passMatches(a.secret("live_streaming_pass"), q.Get("password")) || a.allowRTMP(n.Addr, "pull", q.Get("password")) {
 		if running, _, held := a.fanoutStreamStatus(r.Context(), n.Name); held && !running {
+			if !a.streamOnDemand(n.Name) {
+				a.rtmpDeny(w, "on_demand")
+				return
+			}
 			a.fanoutEnsure(r.Context(), n.Name)
 		}
 		a.rtmpMeter("play_relay")
@@ -87,6 +91,10 @@ func (a *Agent) rtmpPlay(w http.ResponseWriter, r *http.Request, n *rtmpNotify) 
 		return
 	}
 	if !running {
+		if !a.streamOnDemand(n.Name) {
+			a.rtmpDeny(w, "on_demand")
+			return
+		}
 		a.fanoutEnsure(r.Context(), n.Name)
 	}
 	if a.openRtmpRecord(r.Context(), n, reply, streamID) {
