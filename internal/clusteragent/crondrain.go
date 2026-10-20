@@ -30,7 +30,7 @@ func (a *Agent) RunChores(ctx context.Context) {
 }
 
 func (a *Agent) runChoresTick() {
-	for _, chore := range []func() error{a.drainStreamLogs, a.drainLinesLogs, a.drainActivity, a.drainErrors, a.sweepTmp} {
+	for _, chore := range []func() error{a.drainStreamLogs, a.drainLinesLogs, a.drainActivity, a.drainErrors, a.updateMaxmind, a.sweepTmp} {
 		if err := chore(); err != nil && a.Logf != nil {
 			a.Logf("cluster: chore: %v", err)
 		}
@@ -38,19 +38,15 @@ func (a *Agent) runChoresTick() {
 	a.touchNodeCrons()
 }
 
-// touchNodeCrons refreshes the node_crons marker's mtime each tick (the liveness
-// signal), reusing publish()'s os.Chtimes touch idiom for an unchanged file.
+// touchNodeCrons rewrites the node_crons marker each tick with the owned-cron set
+// (JSON {"crons":[...]}); its mtime is the liveness signal and its list is which
+// crons the node's crontab should drop (maxmind is conditional — see ownedCrons).
 func (a *Agent) touchNodeCrons() {
 	if a.NodeCronsFile == "" {
 		return
 	}
-	if _, err := os.Stat(a.NodeCronsFile); err == nil {
-		now := time.Now()
-		if os.Chtimes(a.NodeCronsFile, now, now) == nil {
-			return
-		}
-	}
-	_ = writeFile(a.NodeCronsFile, []byte("1"), fileWrite{perm: 0o640, noSync: true})
+	b, _ := json.Marshal(map[string]any{"crons": a.ownedCrons()})
+	_ = writeFile(a.NodeCronsFile, b, fileWrite{perm: 0o640, noSync: true})
 }
 
 // crondrain ports the node-local log-drain crons into the agent: read a
