@@ -47,6 +47,10 @@ type Agent struct {
 	TmpRoot string
 	// PlaylistDir is PLAYLIST_PATH, pruned by cron:tmp (crontmp.go); "" skips it.
 	PlaylistDir string
+	// NodeCronsFile is the liveness+ownership marker the chores loop touches each
+	// tick (<statedir>/node_crons); the node's crontab generation drops the ported
+	// crons while it is fresh. "" leaves the marker unwritten (PHP keeps the crons).
+	NodeCronsFile string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
@@ -664,6 +668,11 @@ func (a *Agent) Run(ctx context.Context) error {
 				}
 			}
 		}()
+	}
+	if a.TmpRoot != "" {
+		cctx, stopChores := context.WithCancel(ctx)
+		defer stopChores()
+		go a.RunChores(cctx)
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)

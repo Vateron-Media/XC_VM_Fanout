@@ -1,6 +1,7 @@
 package clusteragent
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,47 @@ import (
 	"strings"
 	"time"
 )
+
+// RunChores is the node-local cron loop: it runs the drains + the tmp sweep once
+// a minute (the cadence the PHP crontab used) and touches the node_crons marker
+// each tick so the node's crontab generation knows the agent owns these crons.
+func (a *Agent) RunChores(ctx context.Context) {
+	a.runChoresTick()
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.runChoresTick()
+		}
+	}
+}
+
+func (a *Agent) runChoresTick() {
+	for _, chore := range []func() error{a.drainStreamLogs, a.drainLinesLogs, a.drainActivity, a.drainErrors, a.sweepTmp} {
+		if err := chore(); err != nil && a.Logf != nil {
+			a.Logf("cluster: chore: %v", err)
+		}
+	}
+	a.touchNodeCrons()
+}
+
+// touchNodeCrons refreshes the node_crons marker's mtime each tick (the liveness
+// signal), reusing publish()'s os.Chtimes touch idiom for an unchanged file.
+func (a *Agent) touchNodeCrons() {
+	if a.NodeCronsFile == "" {
+		return
+	}
+	if _, err := os.Stat(a.NodeCronsFile); err == nil {
+		now := time.Now()
+		if os.Chtimes(a.NodeCronsFile, now, now) == nil {
+			return
+		}
+	}
+	_ = writeFile(a.NodeCronsFile, []byte("1"), fileWrite{perm: 0o640, noSync: true})
+}
 
 // crondrain ports the node-local log-drain crons into the agent: read a
 // node-local base64(json) log file, build the LogSink rows, and spool the same

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // readP1Events reads every event spooled under <spoolDir>/p1.
@@ -257,6 +258,35 @@ func TestDrainErrorsPanelKeepsOnFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(logFile); err != nil {
 		t.Fatal("error_log.log must be KEPT when the panel spool fails")
+	}
+}
+
+func TestRunChoresTickDrainsAndMarks(t *testing.T) {
+	a := newDrainAgent(t)
+	a.NodeCronsFile = filepath.Join(t.TempDir(), "node_crons")
+	if err := os.WriteFile(filepath.Join(a.logsTmpDir(), "stream_log.log"), []byte(streamLogLine(100, "A", "s", "1")), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	a.runChoresTick()
+	if _, err := os.Stat(filepath.Join(a.logsTmpDir(), "stream_log.log")); err == nil {
+		t.Fatal("a chores tick must drain stream_log.log")
+	}
+	if len(readP1Events(t, a.SpoolDir)) == 0 {
+		t.Fatal("a chores tick must spool the drained rows")
+	}
+	fi, err := os.Stat(a.NodeCronsFile)
+	if err != nil {
+		t.Fatal("a chores tick must write the node_crons marker")
+	}
+	if time.Since(fi.ModTime()) > 5*time.Second {
+		t.Fatal("marker must be fresh")
+	}
+	// a second tick with no input still refreshes the marker's mtime
+	ageFile(t, a.NodeCronsFile, 120)
+	a.runChoresTick()
+	fi2, _ := os.Stat(a.NodeCronsFile)
+	if time.Since(fi2.ModTime()) > 5*time.Second {
+		t.Fatal("an idle tick must still refresh the marker")
 	}
 }
 
