@@ -77,6 +77,9 @@ func TestAdminThumbOwnerServesJpg(t *testing.T) {
 	if rec.Code != 200 || rec.Body.String() != "JPEGDATA" || rec.Header().Get("Content-Type") != "image/jpg" {
 		t.Fatalf("owner thumb: code=%d ct=%q body=%q", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
 	}
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("owner thumb missing nosniff: %q", rec.Header().Get("X-Content-Type-Options"))
+	}
 }
 
 func TestAdminThumbStale404(t *testing.T) {

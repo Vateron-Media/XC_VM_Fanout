@@ -289,7 +289,9 @@ func (a *Agent) serveAdminThumb(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "image/jpg")
+		w.Header().Set("X-Content-Type-Options", "nosniff") // never let a browser sniff the thumbnail as HTML
 		w.Header().Set("Age", strconv.Itoa(int(time.Since(fi.ModTime()).Seconds())))
+		// nosemgrep: go.net.xss.no-direct-write-to-responsewriter-taint.no-direct-write-to-responsewriter-taint -- b is the node's own <id>_.jpg (id is an int64), served as image/jpg with nosniff; it is not attacker-controlled content.
 		_, _ = w.Write(b)
 		return
 	}
@@ -302,6 +304,7 @@ func (a *Agent) serveAdminThumb(w http.ResponseWriter, r *http.Request) {
 		"&aid=" + strconv.FormatInt(parsePositiveInt(q.Get("aid")), 10) +
 		"&uitoken=" + url.QueryEscape(q.Get("uitoken")) +
 		"&expires=" + strconv.FormatInt(parsePositiveInt(q.Get("expires")), 10)
+	// nosemgrep: go.lang.security.injection.open-redirect.open-redirect -- the target host/scheme come from bases[0], the MAIN-signed policy redirect map keyed by server id (a trusted allowlist), not from the request; the appended query (int ids + an escaped uitoken) cannot change the host.
 	http.Redirect(w, r, loc, http.StatusFound)
 }
 
@@ -371,6 +374,7 @@ func (a *Agent) serveAdminVOD(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// nosemgrep: go.net.path-traversal.net-http-path-traversal-taint.net-http-path-traversal-taint -- the name is <int64 id>.<ext> where ext already passed vodExtRe (^[a-z0-9]{1,6}$); no separator or ".." can reach it, and withinDir re-confirms containment below.
 	path := filepath.Join(pol.vodPath, strconv.FormatInt(adm.streamID, 10)+"."+ext)
 	if !withinDir(pol.vodPath, path) {
 		http.NotFound(w, r)
@@ -409,6 +413,7 @@ func vodExtPart(s string) string {
 // withinDir reports whether path stays inside dir once both are cleaned.
 func withinDir(dir, path string) bool {
 	d := filepath.Clean(dir)
+	// nosemgrep: go.lang.security.filepath-clean-misuse.filepath-clean-misuse -- not used as the sanitizer; this is a containment assertion over an already-allowlisted <int64>.<[a-z0-9]{1,6}> name. SecureJoin would add a forbidden external dependency (the module is stdlib-only).
 	p := filepath.Clean(path)
 	return p == d || strings.HasPrefix(p, d+string(filepath.Separator))
 }
