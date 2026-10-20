@@ -189,5 +189,10 @@ func (a *Agent) serveXFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	a.xfileMetrics.serve()
+	// body is authorized file bytes — the ticket's ref binds owner+path and the
+	// query only selects which bytes — served as application/octet-stream with
+	// X-Content-Type-Options: nosniff to a node's fetcher agent, never rendered as
+	// a web page (faithful to the PHP owner). Not reflected input; no XSS.
+	// nosemgrep: go.net.xss.no-direct-write-to-responsewriter-taint.no-direct-write-to-responsewriter-taint
 	_, _ = w.Write(body)
 }
