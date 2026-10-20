@@ -2,12 +2,45 @@ package clusteragent
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+// A last-yes must drop MAIN's mint (adm/prf) so a cached-yes viewer served while
+// MAIN is unreachable is admitted by the agent's offline policy (which counts
+// for max_connections), not by the stale adm claim — matching rtmp.php, whose
+// RtmpOffline reply carries no token.
+func TestLastYesDropsTheMint(t *testing.T) {
+	_, st := newFake(t)
+	st.MainURLs = []string{"http://127.0.0.1:1/cluster/v1/"} // unreachable
+	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
+	a.state.Store("active")
+	creds := map[string]string{"username": "u"}
+	key := rtmpYesKey(100, "203.0.113.9", false, creds)
+	a.rtmpYes.keep(key, rtmpAuthReply{OK: true, User: rtmpUser{ID: 7, MaxConnections: 1},
+		Token: &rtmpMint{AdmUUID: "au1", Adm: &rtmpAdm{Exp: time.Now().Unix() + 600, Sid: 3}, Prf: &rtmpPrf{Iat: time.Now().Unix(), P: strings.Repeat("ab", 16)}}})
+	rep := a.rtmpAsk(context.Background(), 100, "203.0.113.9", false, "uuid1", creds)
+	if !rep.OK {
+		t.Fatal("the cached yes should serve while MAIN is unreachable")
+	}
+	if rep.Token != nil {
+		t.Fatal("a last-yes must drop MAIN's mint (adm) so the offline policy governs the limit")
+	}
+}
+
+func TestLastYesBounded(t *testing.T) {
+	var c rtmpLastYes
+	for i := 0; i < rtmpLastYesMax+100; i++ {
+		c.keep(fmt.Sprintf("k%d", i), rtmpAuthReply{OK: true})
+	}
+	if len(c.m) > rtmpLastYesMax {
+		t.Fatalf("cache grew to %d, cap %d", len(c.m), rtmpLastYesMax)
+	}
+}
 
 // The last-yes cache keeps MAIN's last rtmp_auth yes and serves it only while
 // the node could play a new viewer: fresh (within TTL), the line not expired,

@@ -2,6 +2,7 @@ package clusteragent
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -180,5 +181,31 @@ func TestRtmpParseFailure(t *testing.T) {
 	rig := newRtmpHandlerRig(t)
 	if rec := rig.do("call=play&call=publish&name=100", nil); rec.Code != 404 {
 		t.Fatalf("a differing-duplicate call must 404: %d", rec.Code)
+	}
+}
+
+// rtmp.php keys restream-detect on the header's PRESENCE (any value), so a
+// present-but-empty header still means restream.
+func TestRtmpRestreamDetectPresence(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/stream/rtmp", nil)
+	r.Header.Set("X-XC_VM-DETECT", "")
+	if !rtmpRestreamDetect(r) {
+		t.Fatal("a present (even empty) X-XC_VM-DETECT means restream")
+	}
+	if rtmpRestreamDetect(httptest.NewRequest(http.MethodGet, "/stream/rtmp", nil)) {
+		t.Fatal("an absent header is not restream")
+	}
+}
+
+func TestRtmpFloodBounded(t *testing.T) {
+	a := &Agent{Logf: t.Logf}
+	for i := 0; i < rtmpFloodMax+100; i++ {
+		a.rtmpFlood(fmt.Sprintf("10.0.%d.%d", i/256, i%256))
+	}
+	a.rtmpFloodMu.Lock()
+	n := len(a.rtmpFloodN)
+	a.rtmpFloodMu.Unlock()
+	if n > rtmpFloodMax {
+		t.Fatalf("flood map grew to %d, cap %d", n, rtmpFloodMax)
 	}
 }

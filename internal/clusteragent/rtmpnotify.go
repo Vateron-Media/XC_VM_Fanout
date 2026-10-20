@@ -112,8 +112,13 @@ func rtmpCreds(q url.Values) (map[string]string, bool) {
 	return map[string]string{"username": q.Get("username"), "password": q.Get("password")}, true
 }
 
+// rtmpFloodMax caps the per-IP failed-auth counter map so it cannot grow
+// without bound (the counter is best-effort observability; the ban is deferred).
+const rtmpFloodMax = 10000
+
 func rtmpRestreamDetect(r *http.Request) bool {
-	return r.Header.Get("X-XC_VM-DETECT") != ""
+	// rtmp.php keys on the header's presence, any value.
+	return len(r.Header.Values("X-XC_VM-DETECT")) > 0
 }
 
 // passMatches ports ViewerKey::passMatches for the LB: a constant-time compare
@@ -171,6 +176,9 @@ func (a *Agent) rtmpFlood(ip string) {
 	a.rtmpFloodMu.Lock()
 	if a.rtmpFloodN == nil {
 		a.rtmpFloodN = map[string]int{}
+	}
+	if _, seen := a.rtmpFloodN[ip]; !seen && len(a.rtmpFloodN) >= rtmpFloodMax {
+		a.rtmpFloodN = map[string]int{} // bound: reset rather than grow without limit
 	}
 	a.rtmpFloodN[ip]++
 	n := a.rtmpFloodN[ip]

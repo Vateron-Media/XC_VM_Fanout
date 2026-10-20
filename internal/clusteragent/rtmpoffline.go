@@ -51,8 +51,12 @@ type rtmpAuthReply struct {
 }
 
 // rtmpLastYesTTL is how long MAIN's last yes may stand in while MAIN is
-// unreachable (the panel's RtmpOffline::TTL).
-const rtmpLastYesTTL = 600 * time.Second
+// unreachable (the panel's RtmpOffline::TTL). rtmpLastYesMax caps the cache so a
+// long-lived agent on a busy LB cannot grow it without bound.
+const (
+	rtmpLastYesTTL = 600 * time.Second
+	rtmpLastYesMax = 10000
+)
 
 type rtmpYesEntry struct {
 	reply rtmpAuthReply
@@ -76,10 +80,29 @@ func (c *rtmpLastYes) clock() time.Time {
 }
 
 func (c *rtmpLastYes) keep(key string, r rtmpAuthReply) {
+	// A last-yes drops MAIN's mint: a viewer served from the cache while MAIN is
+	// unreachable must be governed by the agent's offline policy (which counts
+	// against max_connections), not by the stale adm claim (rtmp.php's RtmpOffline
+	// reply carries no token). The caller's fresh reply keeps its adm.
+	r.Token = nil
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.m == nil {
 		c.m = map[string]rtmpYesEntry{}
+	}
+	if len(c.m) >= rtmpLastYesMax {
+		now := c.clock()
+		for k, e := range c.m {
+			if now.Sub(e.at) > rtmpLastYesTTL {
+				delete(c.m, k)
+			}
+		}
+		for k := range c.m { // hard cap if everything is still fresh
+			if len(c.m) < rtmpLastYesMax {
+				break
+			}
+			delete(c.m, k)
+		}
 	}
 	c.m[key] = rtmpYesEntry{reply: r, at: c.clock()}
 }
