@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	cc "github.com/Vateron-Media/XC_VM_Fanout/internal/clustercrypto"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/viewertoken"
 )
 
 // Relay admission headers (RelayGuard::TICKET / ::AUTH) the downstream child's Go
@@ -164,4 +165,81 @@ func (a *Agent) admitLoopback(streamID int64, tok, clientIP string, now int64) b
 		return false
 	}
 	return verifyLoopbackToken(key, streamID, tok, now)
+}
+
+// admitKind is how an /admin request was admitted.
+type admitKind int
+
+const (
+	admitNone admitKind = iota
+	admitUitoken
+	admitRelayKind
+	admitPasswordKind
+	admitLoopbackKind
+)
+
+// adminAdmission is the outcome of admitAdmin.
+type adminAdmission struct {
+	kind     admitKind
+	streamID int64     // the stream the caller is admitted for (the uitoken's, else the handler's param)
+	tok      *adminTok // the decoded uitoken (kind admitUitoken), else nil
+}
+
+// viewerKeys reads the node's token keys (and ip_subnet_match / accept_legacy)
+// from the gateway policy file, for uitoken decode; ok is false when it is unset
+// or unreadable.
+func (a *Agent) viewerKeys() (keys viewertoken.Keys, acceptLegacy, subnetMatch, ok bool) {
+	if a.GatewayPolicyFile == "" {
+		return viewertoken.Keys{}, false, false, false
+	}
+	b, err := os.ReadFile(a.GatewayPolicyFile)
+	if err != nil {
+		return viewertoken.Keys{}, false, false, false
+	}
+	return parseViewerKeys(b)
+}
+
+// admitAdmin runs the uitoken pre-check + RelayGuard::admit for an /admin handler,
+// faithful to the order Public/admin/*.php use. paramStreamID is the handler's
+// parse of its own stream param (the relay/password/loopback arms use it; the
+// uitoken arm takes the stream from the token). clientIP is the resolved caller
+// address the front forwards. passwordOK is false for thumb (relay or uitoken
+// only). nowMs is MAIN's clock. ok=false is an opaque refusal (→ 404).
+func (a *Agent) admitAdmin(paramStreamID int64, r *http.Request, clientIP string, passwordOK bool, nowMs int64) (adminAdmission, bool) {
+	q := r.URL.Query()
+	// A present uitoken is decided on its own — valid admits, invalid refuses; it
+	// never falls back to the RelayGuard arms (the handlers check it first).
+	if ui := q.Get("uitoken"); ui != "" {
+		keys, acceptLegacy, subnet, ok := a.viewerKeys()
+		if !ok {
+			return adminAdmission{}, false
+		}
+		at, ok := decodeAdminToken(ui, keys, acceptLegacy, nowMs/1000)
+		if !ok || !at.valid(subnet, clientIP, nowMs/1000) {
+			return adminAdmission{}, false
+		}
+		return adminAdmission{kind: admitUitoken, streamID: int64(at.StreamID), tok: at}, true
+	}
+	// Relay credentials present → the relay arm alone (a bad ticket never degrades
+	// to the password).
+	if r.Header.Get(relayTicketHeader) != "" || r.Header.Get(relayAuthHeader) != "" {
+		if paramStreamID > 0 && a.admitRelay(paramStreamID, r, nowMs) {
+			return adminAdmission{kind: admitRelayKind, streamID: paramStreamID}, true
+		}
+		return adminAdmission{}, false
+	}
+	if !passwordOK {
+		return adminAdmission{}, false
+	}
+	pw := q.Get("password")
+	if strings.HasPrefix(pw, "lb1-") {
+		if paramStreamID > 0 && a.admitLoopback(paramStreamID, pw, clientIP, nowMs/1000) {
+			return adminAdmission{kind: admitLoopbackKind, streamID: paramStreamID}, true
+		}
+		return adminAdmission{}, false
+	}
+	if paramStreamID > 0 && a.admitPassword(pw, clientIP) {
+		return adminAdmission{kind: admitPasswordKind, streamID: paramStreamID}, true
+	}
+	return adminAdmission{}, false
 }
