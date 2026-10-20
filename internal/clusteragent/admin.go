@@ -191,15 +191,16 @@ type adminAdmission struct {
 // the token keys (uitoken decode), ip_subnet_match, the media paths, the
 // per-server redirect base URLs (thumb's owner 302), and the vod throttle.
 type adminPolicy struct {
-	keys           viewertoken.Keys
-	acceptLegacy   bool
-	subnetMatch    bool
-	streamsPath    string
-	vodPath        string
-	archivePath    string
-	redirect       map[string][]string
-	vodLimitPerc   int
-	vodBitratePlus int
+	keys            viewertoken.Keys
+	acceptLegacy    bool
+	subnetMatch     bool
+	streamsPath     string
+	vodPath         string
+	archivePath     string
+	redirect        map[string][]string
+	vodLimitPerc    int
+	vodBitratePlus  int
+	defaultTimezone string
 }
 
 // adminPolicy reads and parses the gateway policy file; ok is false when it is
@@ -222,15 +223,17 @@ func (a *Agent) adminPolicy() (*adminPolicy, bool) {
 			Vod     string `json:"vod"`
 			Archive string `json:"archive"`
 		} `json:"paths"`
-		Redirect       map[string][]string `json:"redirect"`
-		VodLimitPerc   int                 `json:"vod_limit_perc"`
-		VodBitratePlus int                 `json:"vod_bitrate_plus"`
+		Redirect        map[string][]string `json:"redirect"`
+		VodLimitPerc    int                 `json:"vod_limit_perc"`
+		VodBitratePlus  int                 `json:"vod_bitrate_plus"`
+		DefaultTimezone string              `json:"default_timezone"`
 	}
 	_ = json.Unmarshal(b, &p) // keys already parsed; paths/redirect are best-effort
 	return &adminPolicy{
 		keys: keys, acceptLegacy: acceptLegacy, subnetMatch: subnet,
 		streamsPath: p.Paths.Streams, vodPath: p.Paths.Vod, archivePath: p.Paths.Archive,
 		redirect: p.Redirect, vodLimitPerc: p.VodLimitPerc, vodBitratePlus: p.VodBitratePlus,
+		defaultTimezone: p.DefaultTimezone,
 	}, true
 }
 
