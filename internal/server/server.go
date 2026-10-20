@@ -1972,6 +1972,18 @@ func (m *Manager) serveControl(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// POST /streams/<id>/ensure brings a registered-but-idle stream up on
+	// demand (the /stream/rtmp auth endpoint has no viewer-segment fetch to
+	// trigger the start the way HLS/TS serve paths do).
+	if sid, ok := strings.CutSuffix(id, "/ensure"); ok {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"running": m.EnsureRunning(sid)})
+		return
+	}
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
 		var c streamConfig

@@ -492,6 +492,54 @@ func (a *Agent) fanoutRegisteredIDs(ctx context.Context) ([]string, error) {
 	return out.Streams, nil
 }
 
+// fanoutStreamStatus asks the fanout whether a stream is running and on air
+// (GET /streams/<id>); ok is false for an unknown stream or an unreachable
+// fanout. The /stream/rtmp handler uses it to decide an on-demand start.
+func (a *Agent) fanoutStreamStatus(ctx context.Context, id string) (running, hasData, ok bool) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://fanout/streams/"+id, nil)
+	if err != nil {
+		return false, false, false
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return false, false, false
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return false, false, false
+	}
+	var s struct {
+		Running bool `json:"running"`
+		HasData bool `json:"has_data"`
+	}
+	if json.NewDecoder(res.Body).Decode(&s) != nil {
+		return false, false, false
+	}
+	return s.Running, s.HasData, true
+}
+
+// fanoutEnsure asks the fanout to bring a registered-but-idle stream up on
+// demand (POST /streams/<id>/ensure, driving Manager.EnsureRunning). Best
+// effort: a failure is logged, not fatal.
+func (a *Agent) fanoutEnsure(ctx context.Context, id string) {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://fanout/streams/"+id+"/ensure", nil)
+	if err != nil {
+		return
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		if a.Logf != nil {
+			a.Logf("rtmp: fanout ensure %s: %v", id, err)
+		}
+		return
+	}
+	res.Body.Close()
+}
+
 // reconcileFanout converges the fanout's registered set to exactly the held
 // proxies: it registers every held proxy the fanout lacks and unregisters every
 // id the fanout holds that is no longer a held proxy, leaving matches alone.
