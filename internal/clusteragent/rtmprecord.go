@@ -13,6 +13,7 @@ import (
 // ConnectionTracker::rtmpUuid. nginx numbers its clients from 1 per process, so
 // the server id is part of it; the md5 only names the record, it protects nothing.
 func rtmpUUID(serverID int64, clientID string) string {
+	// nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	return fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%d/%s", serverID, clientID))))
 }
 
