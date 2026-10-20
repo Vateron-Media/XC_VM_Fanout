@@ -229,7 +229,36 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveStream(w, r, kind)
 		return
 	}
+	// /admin/<kind> are cross-node relay-source pulls answered by the agent (it
+	// holds the keys the admission arms need). Only the paths the agent serves are
+	// routed here; the rest still reach nginx during the transition.
+	if adminAgentPath(r.URL.Path) {
+		s.serveAdmin(w, r)
+		return
+	}
 	s.proxyOrError(w, r)
+}
+
+// adminAgentPath reports whether an /admin path is one the agent serves in-process
+// now (the serving handlers land slice by slice; the rest stay nginx's).
+func adminAgentPath(p string) bool {
+	return p == "/admin/thumb" || p == "/admin/vod"
+}
+
+// serveAdmin routes an /admin relay-source request to the agent, rate-limited on
+// the resolved client IP like nginx's zone one. With no agent socket it falls
+// back to nginx during the transition; a dial failure does too (the agentProxy
+// ErrorHandler). The agent does the admission (it holds the node keys).
+func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request) {
+	if s.agentProxy == nil {
+		s.proxyOrError(w, r)
+		return
+	}
+	if !s.limiter.allow(s.trusted.RealIP(r)) {
+		http.Error(w, "", http.StatusServiceUnavailable) // nginx's limit_req default status
+		return
+	}
+	s.agentProxy.ServeHTTP(w, r)
 }
 
 // serveXFile routes the public /xfile to the owner handler in the agent. The
@@ -294,6 +323,10 @@ func (s *Server) WithAgentSocket(sock string) *Server {
 			pr.Out.URL.Host = "agent"
 			pr.Out.URL.Path = pr.In.URL.Path
 			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+			// The front is the authority on the caller's address: resolve it and
+			// forward the only trusted copy (dropping any the client set), so the
+			// agent's /admin uitoken/password/loopback arms key on the real peer.
+			pr.Out.Header.Set("X-XC-Client-IP", s.trusted.RealIP(pr.In))
 		},
 		ErrorHandler: func(ew http.ResponseWriter, er *http.Request, err error) {
 			// Only a transport error (the agent could not be reached) lands here;

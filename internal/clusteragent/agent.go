@@ -51,6 +51,14 @@ type Agent struct {
 	// tick (<statedir>/node_crons); the node's crontab generation drops the ported
 	// crons while it is fresh. "" leaves the marker unwritten (PHP keeps the crons).
 	NodeCronsFile string
+	// LoopbackKeyFile is config/cluster/loopback.key — the node's own key that
+	// signs the lb1- loopback tokens the local recorder presents to /admin
+	// (admin.go); "" leaves the loopback admission arm off.
+	LoopbackKeyFile string
+	// GatewayPolicyFile is the gateway policy file (the -gw-policy path the gateway
+	// loads, written by cron:cache) the agent reads the viewer token keys from to
+	// decode /admin uitokens (admin.go); "" leaves the uitoken admission arm off.
+	GatewayPolicyFile string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
