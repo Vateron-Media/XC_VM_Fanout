@@ -584,6 +584,27 @@ func spoolP0(dir string, events []map[string]any) error {
 	return writeFile(filepath.Join(p0, name), body, fileWrite{perm: 0o640, noSync: true})
 }
 
+// spoolP1 writes events as one P1 spool file (the log lane), a sibling of
+// spoolP0; the existing p1 RunEvents goroutine ships them to MAIN.
+func spoolP1(dir string, events []map[string]any) error {
+	var body []byte
+	now := time.Now().UnixMilli()
+	for _, e := range events {
+		e["t"] = now
+		line, err := json.Marshal(e)
+		if err != nil {
+			return err
+		}
+		body = append(append(body, line...), '\n')
+	}
+	p1 := filepath.Join(dir, "p1")
+	if err := os.MkdirAll(p1, 0o750); err != nil {
+		return err
+	}
+	name := fmt.Sprintf("%019d-agent-%04x.ndjson", monotonicNs(), rand.Intn(0x10000))
+	return writeFile(filepath.Join(p1, name), body, fileWrite{perm: 0o640, noSync: true})
+}
+
 // connHandler serves /v1/conn on the local socket.
 func (r *Registry) connHandler(w http.ResponseWriter, req *http.Request) {
 	arrived := time.Now()

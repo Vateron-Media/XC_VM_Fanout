@@ -41,6 +41,12 @@ type Agent struct {
 	// brute-force guard reads and writes (match PHP's FLOOD_TMP_PATH, rtmpgates.go);
 	// "" leaves the RTMP flood ban off.
 	FloodDir string
+	// TmpRoot is the node's TMP_PATH (<home>/tmp/); the node-chores loop
+	// (crondrain.go, crontmp.go) derives LOGS_TMP_PATH/CRONS_TMP_PATH/… from it.
+	// "" leaves the ported crons off.
+	TmpRoot string
+	// PlaylistDir is PLAYLIST_PATH, pruned by cron:tmp (crontmp.go); "" skips it.
+	PlaylistDir string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
