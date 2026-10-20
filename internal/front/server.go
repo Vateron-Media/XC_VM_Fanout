@@ -219,6 +219,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveXFile(w, r)
 		return
 	}
+	// /stream/rtmp is nginx_rtmp's loopback auth-notify callback; the agent
+	// answers it (allow/deny), or nginx during the transition.
+	if r.URL.Path == "/stream/rtmp" {
+		s.serveRtmpNotify(w, r)
+		return
+	}
 	if kind := serveKind(r.URL.Path); kind != "" {
 		s.serveStream(w, r, kind)
 		return
@@ -239,6 +245,25 @@ func (s *Server) serveXFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.xfileLimiter.allow(clientIP(r)) {
 		http.Error(w, "", http.StatusTooManyRequests) // nginx's limit_req_status 429
+		return
+	}
+	s.agentProxy.ServeHTTP(w, r)
+}
+
+// serveRtmpNotify routes nginx_rtmp's /stream/rtmp auth-notify callback to the
+// agent. The callback is loopback-only (nginx_rtmp runs on this box; rtmp.php
+// required REMOTE_ADDR==127.0.0.1), so a non-loopback peer is refused here. With
+// an agent socket the request is proxied there (raw query preserved; a dial
+// failure falls back to nginx via the proxy's ErrorHandler); without one nginx
+// still owns /stream/rtmp during the transition. No rate limiter — the only
+// caller is the local nginx_rtmp.
+func (s *Server) serveRtmpNotify(w http.ResponseWriter, r *http.Request) {
+	if !isLoopback(clientIP(r)) {
+		http.NotFound(w, r)
+		return
+	}
+	if s.agentProxy == nil {
+		s.proxyOrError(w, r)
 		return
 	}
 	s.agentProxy.ServeHTTP(w, r)
