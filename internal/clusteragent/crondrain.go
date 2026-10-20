@@ -143,6 +143,57 @@ func (a *Agent) drainStreamLogs() error {
 	return os.Remove(logFile) // unconditional, as StreamsLogsCronJob
 }
 
+// lines_logs: the spool keys (LinesLogsCronJob::KEYS) map positionally onto the
+// client columns (action→client_status, user_ip→ip, time→date), every value
+// (string), missing→"".
+var linesLogKeys = []string{"stream_id", "user_id", "action", "query_string", "user_agent", "user_ip", "extra_data", "time"}
+var clientLogCols = []string{"stream_id", "user_id", "client_status", "query_string", "user_agent", "ip", "extra_data", "date"}
+
+// drainLinesLogs ports cron:lines_logs: client_request.log, rename-claimed to
+// .import (a pre-existing claim first, at-least-once), → log.client.
+func (a *Agent) drainLinesLogs() error {
+	rel, ok := acquireCronLock(cronLockPath(a.cronsDir(), `XcVm\Cli\CronJobs\LinesLogsCronJob`))
+	if !ok {
+		return nil
+	}
+	defer rel()
+	logFile := filepath.Join(a.logsTmpDir(), "client_request.log")
+	claimed := logFile + ".import"
+	if _, err := os.Stat(claimed); err == nil {
+		if err := a.drainClientFile(claimed); err != nil {
+			return err
+		}
+	}
+	if _, err := os.Stat(logFile); err == nil {
+		if os.Rename(logFile, claimed) == nil {
+			return a.drainClientFile(claimed)
+		}
+	}
+	return nil
+}
+
+// drainClientFile spools one claimed client_request spool and unlinks it.
+func (a *Agent) drainClientFile(path string) error {
+	lines, present, err := readLogLines(path)
+	if err != nil || !present {
+		return err
+	}
+	rows := make([]map[string]any, 0, len(lines))
+	for _, m := range lines {
+		row := map[string]any{}
+		for i, col := range clientLogCols {
+			row[col] = logStr(m[linesLogKeys[i]])
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) > 0 {
+		if err := spoolP1(a.SpoolDir, logEvents("client", clientLogCols, rows)); err != nil && a.Logf != nil {
+			a.Logf("cluster: lines_logs spool: %v", err)
+		}
+	}
+	return os.Remove(path)
+}
+
 // logInt ports PHP intval() for a JSON value.
 func logInt(v any) int64 {
 	switch x := v.(type) {

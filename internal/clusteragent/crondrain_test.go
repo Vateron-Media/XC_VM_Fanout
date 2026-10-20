@@ -82,6 +82,50 @@ func TestDrainStreamLogs(t *testing.T) {
 	}
 }
 
+func b64line(m map[string]any) string {
+	j, _ := json.Marshal(m)
+	return base64.StdEncoding.EncodeToString(j) + "\n"
+}
+
+func TestDrainLinesLogs(t *testing.T) {
+	a := newDrainAgent(t)
+	logFile := filepath.Join(a.logsTmpDir(), "client_request.log")
+	// a pre-existing claim is drained first
+	if err := os.WriteFile(logFile+".import", []byte(b64line(map[string]any{"stream_id": 9, "action": "OLD", "user_ip": "9.9.9.9", "time": "1"})), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logFile, []byte(b64line(map[string]any{"stream_id": 5, "user_id": 7, "action": "PLAY", "query_string": "q", "user_agent": "UA", "user_ip": "1.2.3.4", "extra_data": "x", "time": "1700"})), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.drainLinesLogs(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(logFile); err == nil {
+		t.Fatal("client_request.log must be claimed+drained")
+	}
+	if _, err := os.Stat(logFile + ".import"); err == nil {
+		t.Fatal(".import must be drained+removed")
+	}
+	var found map[string]any
+	for _, ev := range readP1Events(t, a.SpoolDir) {
+		if ev["type"] != "log.client" {
+			t.Fatalf("unexpected event type %v", ev["type"])
+		}
+		for _, r := range eventRows(ev) {
+			row := r.(map[string]any)
+			if row["client_status"] == "PLAY" {
+				found = row
+			}
+		}
+	}
+	if found == nil {
+		t.Fatal("the PLAY row did not reach a log.client event")
+	}
+	if found["ip"] != "1.2.3.4" || found["date"] != "1700" || found["user_id"] != "7" {
+		t.Fatalf("key remap wrong: %+v", found) // user_ip→ip, time→date, every value stringified
+	}
+}
+
 func TestLogEventsChunk(t *testing.T) {
 	rows := make([]map[string]any, 1001)
 	for i := range rows {
