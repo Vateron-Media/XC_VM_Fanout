@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,7 +80,7 @@ func TestRtmpAskReachable(t *testing.T) {
 			"ok":           true,
 			"user":         map[string]any{"id": 7, "max_connections": 2, "con_isp_name": "isp", "exp_date": time.Now().Unix() + 3600},
 			"country_code": "US",
-			"token":        map[string]any{"uuid": "u1", "adm": "a1", "adm_uuid": "au1", "prf": "p1"},
+			"token":        map[string]any{"uuid": "u1", "adm": map[string]any{"exp": time.Now().Unix() + 600, "sid": 3}, "adm_uuid": "au1", "prf": map[string]any{"iat": time.Now().Unix(), "p": strings.Repeat("ab", 16)}},
 		})
 	}
 	srv := httptest.NewServer(f)
@@ -90,7 +91,7 @@ func TestRtmpAskReachable(t *testing.T) {
 	key := rtmpYesKey(100, "203.0.113.9", false, creds)
 
 	rep := a.rtmpAsk(ctx, 100, "203.0.113.9", false, "uuid1", creds)
-	if !rep.OK || rep.User.ID != 7 || rep.Token == nil || rep.Token.Prf != "p1" {
+	if !rep.OK || rep.User.ID != 7 || rep.Token == nil || rep.Token.AdmUUID != "au1" || rep.Token.Prf == nil {
 		t.Fatalf("ok branch: %+v", rep)
 	}
 	if a.rtmpYes.answer(key, a.Client.MainNowMs()) == nil {

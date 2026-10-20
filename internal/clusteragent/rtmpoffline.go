@@ -21,11 +21,25 @@ type rtmpUser struct {
 	ExpDate        int64  `json:"exp_date"`
 }
 
+// rtmpMint is MAIN's admission mint on the rtmp_auth reply: the reserved uuid,
+// the admission claim adm {exp,sid}, and the proof prf {iat,p} — the node mirrors
+// adm + a mint string (adm_uuid.prf.iat.prf.p) into the viewer record so the
+// agent admits without a second conn_admit call.
+type rtmpAdm struct {
+	Exp int64 `json:"exp"`
+	Sid int64 `json:"sid"`
+}
+
+type rtmpPrf struct {
+	Iat int64  `json:"iat"`
+	P   string `json:"p"`
+}
+
 type rtmpMint struct {
-	UUID    string `json:"uuid"`
-	Adm     string `json:"adm"`
-	AdmUUID string `json:"adm_uuid"`
-	Prf     string `json:"prf"`
+	UUID    string   `json:"uuid"`
+	Adm     *rtmpAdm `json:"adm"`
+	AdmUUID string   `json:"adm_uuid"`
+	Prf     *rtmpPrf `json:"prf"`
 }
 
 type rtmpAuthReply struct {
