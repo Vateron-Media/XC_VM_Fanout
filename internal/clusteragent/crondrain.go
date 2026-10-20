@@ -3,10 +3,12 @@ package clusteragent
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // crondrain ports the node-local log-drain crons into the agent: read a
@@ -310,6 +312,192 @@ func nonEmptyLines(s string) []string {
 		}
 	}
 	return out
+}
+
+var streamErrorCols = []string{"stream_id", "server_id", "date", "error"}
+var panelErrorCols = []string{"server_id", "type", "log_message", "log_extra", "line", "date", "file", "env", "version", "unique"}
+
+// errIgnorePhrases is ErrorsCronJob's ignore list (lowercase; matched case-insensitively).
+var errIgnorePhrases = []string{
+	"the user-agent option is deprecated", "last message repeated", "deprecated",
+	"packets poorly interleaved", "invalid timestamps", "timescale not set",
+	"frame size not set", "non-monotonous dts in output stream", "invalid dts",
+	"no trailing crlf", "failed to parse extradata", "truncated", "missing picture",
+	"non-existing pps", "clipping", "out of range",
+	"cannot use rename on non file protocol", "end of file", "stream ends prematurely",
+}
+
+// errPanelSpool is the panel_error batch sink; a package var so a test can force
+// a refusal (the keep-on-failure path).
+var errPanelSpool = func(a *Agent, rows []map[string]any) error {
+	return spoolP1(a.SpoolDir, logEvents("panel_error", panelErrorCols, rows))
+}
+
+// drainErrors ports cron:errors: stream .errors files under STREAMS_PATH (→
+// log.stream_error, gated by stream_logs_save; the files are unlinked
+// regardless) and error_log.log (→ log.panel_error, deduped; unlinked only on a
+// successful spool), under the ErrorsCronJob lock.
+func (a *Agent) drainErrors() error {
+	rel, ok := acquireCronLock(cronLockPath(a.cronsDir(), `XcVm\Cli\CronJobs\ErrorsCronJob`))
+	if !ok {
+		return nil
+	}
+	defer rel()
+	save := !phpEmpty(a.replicaSettings()["stream_logs_save"])
+
+	var serows []map[string]any
+	if dir := a.node.streams; dir != "" {
+		ents, _ := os.ReadDir(dir)
+		for _, e := range ents {
+			if e.IsDir() || filepath.Ext(e.Name()) != ".errors" {
+				continue
+			}
+			sid := leadingInt(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())))
+			if sid <= 0 {
+				continue
+			}
+			full := filepath.Join(dir, e.Name())
+			b, _ := os.ReadFile(full)
+			for _, ln := range splitErrLines(string(b)) {
+				ln = strings.TrimSpace(ln)
+				if ln == "" || errIgnored(ln) {
+					continue
+				}
+				if save {
+					serows = append(serows, map[string]any{"stream_id": int64(sid), "server_id": a.Client.State.ServerID, "date": time.Now().Unix(), "error": ln})
+				}
+			}
+			_ = os.Remove(full) // unconditional, as ErrorsCronJob
+		}
+	}
+	if save && len(serows) > 0 {
+		if err := spoolP1(a.SpoolDir, logEvents("stream_error", streamErrorCols, serows)); err != nil && a.Logf != nil {
+			a.Logf("cluster: stream_error spool: %v", err)
+		}
+	}
+
+	logFile := filepath.Join(a.logsTmpDir(), "error_log.log")
+	if rows := a.parsePanelLog(logFile); len(rows) > 0 {
+		if errPanelSpool(a, rows) == nil {
+			_ = os.Remove(logFile)
+		}
+	}
+	return nil
+}
+
+// parsePanelLog ports ErrorsCronJob::parseLog: dedup by md5(server_id.type.
+// message.extra.file.line), skip transient-mysql messages, sqlValue empties→null.
+func (a *Agent) parsePanelLog(path string) []map[string]any {
+	lines, present, err := readLogLines(path)
+	if err != nil || !present {
+		return nil
+	}
+	seen := map[string]bool{}
+	var rows []map[string]any
+	for _, m := range lines {
+		msg := coalesceStr(m["log_message"], m["message"])
+		extra := coalesceStr(m["log_extra"], m["extra"])
+		typ := strOr(m["type"], "unknown")
+		line := intOrDefault(m["line"], 0)
+		date := intOrDefault(m["time"], time.Now().Unix())
+		file := strOr(m["file"], "")
+		env := strOr(m["env"], "cli") // php_sapi_name() of the draining process
+		version := strOr(m["version"], "")
+		sid := a.Client.State.ServerID
+		if v, ok := m["server_id"]; ok && isNumeric(v) {
+			sid = logInt(v)
+		}
+		lc := strings.ToLower(msg)
+		if strings.Contains(lc, "server has gone away") || strings.Contains(lc, "socket error on read socket") || strings.Contains(lc, "connection lost") {
+			continue
+		}
+		hash := md5hex(fmt.Sprintf("%d%s%s%s%s%d", sid, typ, msg, extra, file, line))
+		if seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		rows = append(rows, map[string]any{
+			"server_id":   sid,
+			"type":        emptyNull(typ),
+			"log_message": emptyNull(msg),
+			"log_extra":   emptyNull(extra),
+			"line":        line,
+			"date":        date,
+			"file":        emptyNull(file),
+			"env":         emptyNull(env),
+			"version":     emptyNull(version),
+			"unique":      hash,
+		})
+	}
+	return rows
+}
+
+func errIgnored(s string) bool {
+	lc := strings.ToLower(s)
+	for _, p := range errIgnorePhrases {
+		if strings.Contains(lc, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitErrLines(s string) []string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.Split(s, "\n")
+}
+
+// leadingInt ports PHP (int)"<digits>..." for a filename stem.
+func leadingInt(s string) int {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	n, _ := strconv.Atoi(s[:i])
+	return n
+}
+
+func isNumeric(v any) bool {
+	switch x := v.(type) {
+	case float64:
+		return true
+	case string:
+		_, err := strconv.ParseFloat(x, 64)
+		return err == nil
+	}
+	return false
+}
+
+func coalesceStr(a, b any) string {
+	if a != nil {
+		return logStr(a)
+	}
+	if b != nil {
+		return logStr(b)
+	}
+	return ""
+}
+
+func strOr(v any, def string) string {
+	if v == nil {
+		return def
+	}
+	return logStr(v)
+}
+
+func intOrDefault(v any, def int64) int64 {
+	if v == nil {
+		return def
+	}
+	return logInt(v)
+}
+
+func emptyNull(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // logInt ports PHP intval() for a JSON value.

@@ -44,7 +44,7 @@ func streamLogLine(streamID int, action, source, tm string) string {
 func newDrainAgent(t *testing.T) *Agent {
 	t.Helper()
 	_, st := newFake(t) // ServerID = 3
-	a := &Agent{Client: NewClient(st, "t"), SpoolDir: t.TempDir(), TmpRoot: t.TempDir(), Logf: t.Logf}
+	a := &Agent{Client: NewClient(st, "t"), SpoolDir: t.TempDir(), TmpRoot: t.TempDir(), ReplicaDir: t.TempDir(), Logf: t.Logf}
 	if err := os.MkdirAll(a.logsTmpDir(), 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +184,79 @@ func TestDrainActivityRefusalKeeps(t *testing.T) {
 	}
 	if len(readP1Events(t, a.SpoolDir)) == 0 {
 		t.Fatal("recovery spooled nothing")
+	}
+}
+
+func TestDrainErrorsStream(t *testing.T) {
+	run := func(save int) (unlinked bool, rows int) {
+		a := newDrainAgent(t)
+		a.node.streams = t.TempDir()
+		floodSettings(t, a.ReplicaDir, map[string]any{"stream_logs_save": save})
+		ef := filepath.Join(a.node.streams, "5.errors")
+		if err := os.WriteFile(ef, []byte("boom\ndeprecated thing\n\n"), 0o640); err != nil { // 'deprecated' is ignore-listed, blank skipped
+			t.Fatal(err)
+		}
+		if err := a.drainErrors(); err != nil {
+			t.Fatal(err)
+		}
+		_, statErr := os.Stat(ef)
+		for _, ev := range readP1Events(t, a.SpoolDir) {
+			if ev["type"] == "log.stream_error" {
+				rows += len(eventRows(ev))
+			}
+		}
+		return os.IsNotExist(statErr), rows
+	}
+	if u, r := run(1); !u || r != 1 {
+		t.Fatalf("save on: unlinked=%v rows=%d (want true,1)", u, r)
+	}
+	if u, r := run(0); !u || r != 0 {
+		t.Fatalf("save off: unlinked=%v rows=%d (want true,0 — file consumed, nothing spooled)", u, r)
+	}
+}
+
+func TestDrainErrorsPanel(t *testing.T) {
+	a := newDrainAgent(t)
+	floodSettings(t, a.ReplicaDir, map[string]any{})
+	logFile := filepath.Join(a.logsTmpDir(), "error_log.log")
+	dup := map[string]any{"type": "E_WARNING", "message": "boom", "file": "x.php", "line": 10}
+	body := b64line(dup) + b64line(dup) + // identical -> dedup to 1
+		b64line(map[string]any{"message": "MySQL server has gone away"}) // transient -> skipped
+	if err := os.WriteFile(logFile, []byte(body), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.drainErrors(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(logFile); err == nil {
+		t.Fatal("error_log.log must be unlinked after a successful panel spool")
+	}
+	rows := 0
+	for _, ev := range readP1Events(t, a.SpoolDir) {
+		if ev["type"] == "log.panel_error" {
+			rows += len(eventRows(ev))
+		}
+	}
+	if rows != 1 {
+		t.Fatalf("want 1 panel row (dedup + transient skip), got %d", rows)
+	}
+}
+
+func TestDrainErrorsPanelKeepsOnFailure(t *testing.T) {
+	a := newDrainAgent(t)
+	floodSettings(t, a.ReplicaDir, map[string]any{})
+	logFile := filepath.Join(a.logsTmpDir(), "error_log.log")
+	if err := os.WriteFile(logFile, []byte(b64line(map[string]any{"message": "boom"})), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	orig := errPanelSpool
+	errPanelSpool = func(a *Agent, rows []map[string]any) error { return errors.New("refused") }
+	defer func() { errPanelSpool = orig }()
+	if err := a.drainErrors(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(logFile); err != nil {
+		t.Fatal("error_log.log must be KEPT when the panel spool fails")
 	}
 }
 
