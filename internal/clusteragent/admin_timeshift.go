@@ -110,6 +110,7 @@ func (a *Agent) serveAdminTimeshift(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		// nosemgrep: go.net.path-traversal.net-http-path-traversal-taint.net-http-path-traversal-taint -- segment is sanitized (sanitizeSegmentName strips / and \) and the path is confined by withinDir to archiveDir (archivePath/<int64 id>); no traversal input reaches os.Open.
 		f, err := os.Open(path)
 		if err != nil {
 			http.NotFound(w, r)
