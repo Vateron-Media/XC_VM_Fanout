@@ -33,7 +33,8 @@ func (a *Agent) serveRtmpNotify(w http.ResponseWriter, r *http.Request) {
 		a.rtmpMeter("play_done")
 		w.WriteHeader(http.StatusOK)
 	case n.Call == "publish":
-		if a.passMatches(a.secret("live_streaming_pass"), r.URL.Query().Get("password")) {
+		pw := r.URL.Query().Get("password")
+		if a.passMatches(a.secret("live_streaming_pass"), pw) || a.allowRTMP(n.Addr, "push", pw) {
 			a.rtmpMeter("publish")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -46,9 +47,10 @@ func (a *Agent) serveRtmpNotify(w http.ResponseWriter, r *http.Request) {
 
 func (a *Agent) rtmpPlay(w http.ResponseWriter, r *http.Request, n *rtmpNotify) {
 	q := r.URL.Query()
-	// Relay bypass: the stream password (the allowed-RTMP pull list is empty on
-	// a serve-only LB). A relay carries no line and opens no record.
-	if a.passMatches(a.secret("live_streaming_pass"), q.Get("password")) {
+	// Relay bypass: the stream password, or the allowed-RTMP pull list (an IP in
+	// the list with pull=1 and its per-entry password, rtmp.php:69). A relay
+	// carries no line and opens no record.
+	if a.passMatches(a.secret("live_streaming_pass"), q.Get("password")) || a.allowRTMP(n.Addr, "pull", q.Get("password")) {
 		if running, _, held := a.fanoutStreamStatus(r.Context(), n.Name); held && !running {
 			a.fanoutEnsure(r.Context(), n.Name)
 		}

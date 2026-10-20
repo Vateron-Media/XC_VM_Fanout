@@ -209,3 +209,45 @@ func TestRtmpFloodBounded(t *testing.T) {
 		t.Fatalf("flood map grew to %d, cap %d", n, rtmpFloodMax)
 	}
 }
+
+func TestRtmpPublishAllowedRTMPNoStreamPass(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "", "push": 1, "pull": 0}}})
+	rec := rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100", nil) // no password
+	if rec.Code != 200 {
+		t.Fatalf("push-listed publish without stream pass: %d", rec.Code)
+	}
+}
+
+func TestRtmpPublishAllowedRTMPEntryPassword(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "pub-pw", "push": 1, "pull": 0}}})
+	if rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100&password=pub-pw", nil).Code != 200 {
+		t.Fatal("correct entry password must admit")
+	}
+	if rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100&password=wrong", nil).Code != 404 {
+		t.Fatal("wrong entry password must deny")
+	}
+}
+
+func TestRtmpPublishPushFlagRequired(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "", "push": 0, "pull": 1}}})
+	if rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100", nil).Code != 404 {
+		t.Fatal("pull-only entry must not admit a publish")
+	}
+}
+
+func TestRtmpPlayRelayAllowedRTMPPull(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "", "push": 0, "pull": 1}}})
+	// relay-bypass arm: play with no line creds, pull-listed IP, running stream 100
+	rec := rig.do("addr=203.0.113.5&clientid=1&call=play&name=100", nil)
+	if rec.Code != 200 {
+		t.Fatalf("pull-listed relay play: %d", rec.Code)
+	}
+}

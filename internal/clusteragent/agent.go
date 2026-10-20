@@ -135,6 +135,9 @@ type Agent struct {
 	rtmpStats          map[string]uint64
 	rtmpFloodMu        sync.Mutex // per-IP failed-auth counter (rtmpnotify.go)
 	rtmpFloodN         map[string]int
+	rtmpAllowMu        sync.Mutex // allowed-RTMP list cache, blocklist.json-mtime refreshed (rtmpgates.go)
+	rtmpAllowMod       time.Time
+	rtmpAllowCache     map[string]rtmpAllow
 	digestN1Mu         sync.Mutex
 	digestN1           map[int64]time.Time // owners whose chunk digest named no request (relayproxy.go)
 	ticketsOnce        sync.Once           // the data plane's tickets (tickets.go)
