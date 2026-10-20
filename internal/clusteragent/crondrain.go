@@ -12,40 +12,84 @@ import (
 	"time"
 )
 
-// RunChores is the node-local cron loop: it runs the drains + the tmp sweep once
-// a minute (the cadence the PHP crontab used) and touches the node_crons marker
-// each tick so the node's crontab generation knows the agent owns these crons.
+// FlowLogs is NodeFlows::LOGS — the node spools its logs to MAIN (a serve-only
+// LB). The chores only run, and the crontab is only filtered, while it is on;
+// on a node that inserts locally (MAIN, LOGS off) the agent owns nothing.
+const FlowLogs = 4
+
+const (
+	// choreTouchInterval keeps the node_crons marker fresh well under the PHP
+	// side's NODE_CRONS_FRESH_SEC (30s), so a live agent is never judged stale.
+	choreTouchInterval = 5 * time.Second
+	// choreRunInterval is the drain/sweep cadence (what the PHP crontab used).
+	choreRunInterval = time.Minute
+)
+
+// RunChores is the node-local cron loop: it drains + sweeps on the ~minute
+// cadence the PHP crontab used, but touches the node_crons liveness marker much
+// more often (choreTouchInterval) so the node-side crontab gate never mistakes a
+// live agent for a dead one.
 func (a *Agent) RunChores(ctx context.Context) {
-	a.runChoresTick()
-	t := time.NewTicker(time.Minute)
+	a.runChores()
+	a.touchNodeCrons()
+	t := time.NewTicker(choreTouchInterval)
 	defer t.Stop()
+	elapsed := time.Duration(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			a.runChoresTick()
+			a.touchNodeCrons()
+			if elapsed += choreTouchInterval; elapsed >= choreRunInterval {
+				elapsed = 0
+				a.runChores()
+			}
 		}
 	}
 }
 
-func (a *Agent) runChoresTick() {
-	for _, chore := range []func() error{a.drainStreamLogs, a.drainLinesLogs, a.drainActivity, a.drainErrors, a.updateMaxmind, a.sweepTmp} {
+// runChores runs the log drains + the tmp sweep, only on a log-owning node (LOGS
+// flow on). Off that posture the agent leaves the crons to PHP (which would
+// SQL-insert, not spool), so the single-owner invariant holds relative to the flow.
+func (a *Agent) runChores() {
+	if a.flows.Load()&FlowLogs == 0 {
+		return
+	}
+	for _, chore := range []func() error{a.drainStreamLogs, a.drainLinesLogs, a.drainActivity, a.drainErrors, a.sweepTmp} {
 		if err := chore(); err != nil && a.Logf != nil {
 			a.Logf("cluster: chore: %v", err)
 		}
 	}
+}
+
+// runChoresTick is one full cycle (work + marker) — used at startup and by tests.
+func (a *Agent) runChoresTick() {
+	a.runChores()
 	a.touchNodeCrons()
 }
 
-// touchNodeCrons rewrites the node_crons marker each tick with the owned-cron set
-// (JSON {"crons":[...]}); its mtime is the liveness signal and its list is which
-// crons the node's crontab should drop (maxmind is conditional — see ownedCrons).
+// ownedCrons is the set of node crons the agent owns (and drains) — the log
+// drains + tmp, only while the LOGS flow is on. Empty otherwise, so the node
+// keeps its PHP crons. maxmind is absent: its license key is not shipped to a
+// node, so it cannot be agent-owned and stays a PHP cron.
+func (a *Agent) ownedCrons() []string {
+	if a.flows.Load()&FlowLogs == 0 {
+		return nil
+	}
+	return []string{"streams_logs", "lines_logs", "activity", "errors", "tmp"}
+}
+
+// touchNodeCrons rewrites the node_crons marker with the owned-cron set (JSON
+// {"crons":[...]}); its mtime is the liveness signal. When the agent owns none
+// (LOGS off), it writes nothing so the marker goes stale and the node keeps its
+// PHP crons — never a gap with no owner.
 func (a *Agent) touchNodeCrons() {
-	if a.NodeCronsFile == "" {
+	owned := a.ownedCrons()
+	if a.NodeCronsFile == "" || len(owned) == 0 {
 		return
 	}
-	b, _ := json.Marshal(map[string]any{"crons": a.ownedCrons()})
+	b, _ := json.Marshal(map[string]any{"crons": owned})
 	_ = writeFile(a.NodeCronsFile, b, fileWrite{perm: 0o640, noSync: true})
 }
 

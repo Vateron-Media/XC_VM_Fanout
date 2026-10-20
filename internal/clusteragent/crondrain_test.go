@@ -46,6 +46,7 @@ func newDrainAgent(t *testing.T) *Agent {
 	t.Helper()
 	_, st := newFake(t) // ServerID = 3
 	a := &Agent{Client: NewClient(st, "t"), SpoolDir: t.TempDir(), TmpRoot: t.TempDir(), ReplicaDir: t.TempDir(), Logf: t.Logf}
+	a.flows.Store(FlowLogs) // a serve-only LB spools logs to MAIN; the chores are gated on this
 	if err := os.MkdirAll(a.logsTmpDir(), 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +288,50 @@ func TestRunChoresTickDrainsAndMarks(t *testing.T) {
 	fi2, _ := os.Stat(a.NodeCronsFile)
 	if time.Since(fi2.ModTime()) > 5*time.Second {
 		t.Fatal("an idle tick must still refresh the marker")
+	}
+}
+
+func TestChoresGatedOnLogsFlow(t *testing.T) {
+	a := newDrainAgent(t)
+	a.NodeCronsFile = filepath.Join(t.TempDir(), "node_crons")
+	logFile := filepath.Join(a.logsTmpDir(), "stream_log.log")
+
+	a.flows.Store(0) // LOGS off -> not a log-owning node
+	if err := os.WriteFile(logFile, []byte(streamLogLine(100, "A", "s", "1")), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	a.runChoresTick()
+	if _, err := os.Stat(logFile); err != nil {
+		t.Fatal("LOGS off must not drain the log file")
+	}
+	if _, err := os.Stat(a.NodeCronsFile); err == nil {
+		t.Fatal("LOGS off must not write the ownership marker")
+	}
+	if len(a.ownedCrons()) != 0 {
+		t.Fatalf("LOGS off: owns nothing, got %v", a.ownedCrons())
+	}
+
+	a.flows.Store(FlowLogs) // LOGS on -> owns + drains + marks
+	a.runChoresTick()
+	if _, err := os.Stat(logFile); err == nil {
+		t.Fatal("LOGS on must drain the log file")
+	}
+	if _, err := os.Stat(a.NodeCronsFile); err != nil {
+		t.Fatal("LOGS on must write the ownership marker")
+	}
+	if got := a.ownedCrons(); len(got) != 5 {
+		t.Fatalf("LOGS on: owns the 5 ported crons, got %v", got)
+	}
+}
+
+// The marker must be refreshed far more often than the PHP side's
+// NODE_CRONS_FRESH_SEC (30s) window, else the gate judges a live agent stale.
+func TestChoreTouchCadenceUnderFreshWindow(t *testing.T) {
+	if choreTouchInterval > 10*time.Second {
+		t.Fatalf("choreTouchInterval %s must stay well under the 30s freshness window", choreTouchInterval)
+	}
+	if choreTouchInterval >= choreRunInterval {
+		t.Fatal("the marker touch must be more frequent than the drain/sweep run")
 	}
 }
 
