@@ -243,3 +243,55 @@ func (a *Agent) admitAdmin(paramStreamID int64, r *http.Request, clientIP string
 	}
 	return adminAdmission{}, false
 }
+
+// streamMeta is the per-stream fields the /admin handlers read from the node's
+// replica record (replica/streams/<id>.json), beyond streamOnDemand's on_demand:
+// target_container (vod MIME), vframes_server_id (thumb owner), direct_source and
+// type.live (the StreamSource row gates). Absent sub-blocks leave their fields 0/"".
+type streamMeta struct {
+	OnDemand        int64
+	TargetContainer string
+	VframesServerID int64
+	DirectSource    int64
+	TypeLive        int64
+}
+
+// streamMeta reads the stream's replica record; ok is false when it is
+// missing/unreadable (→ 404, as StreamSource would with no row).
+func (a *Agent) streamMeta(id string) (streamMeta, bool) {
+	b, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), id+".json"))
+	if err != nil {
+		return streamMeta{}, false
+	}
+	var w struct {
+		Data struct {
+			Stream *struct {
+				TargetContainer string `json:"target_container"`
+				VframesServerID int64  `json:"vframes_server_id"`
+				DirectSource    int64  `json:"direct_source"`
+			} `json:"stream"`
+			Server *struct {
+				OnDemand int64 `json:"on_demand"`
+			} `json:"server"`
+			Type *struct {
+				Live int64 `json:"live"`
+			} `json:"type"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(b, &w) != nil {
+		return streamMeta{}, false
+	}
+	var m streamMeta
+	if w.Data.Server != nil {
+		m.OnDemand = w.Data.Server.OnDemand
+	}
+	if w.Data.Stream != nil {
+		m.TargetContainer = w.Data.Stream.TargetContainer
+		m.VframesServerID = w.Data.Stream.VframesServerID
+		m.DirectSource = w.Data.Stream.DirectSource
+	}
+	if w.Data.Type != nil {
+		m.TypeLive = w.Data.Type.Live
+	}
+	return m, true
+}
