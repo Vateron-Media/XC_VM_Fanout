@@ -213,7 +213,14 @@ func TestXFileAuthBypass(t *testing.T) {
 		rg := newOwnerRig(t)
 		path, _ := rg.writeContent(t, "movie.mkv", 100)
 		wire, _ := rg.ticketFor(path)
-		forged := wire[:len(wire)-2] + "AA" // flip the signature tail
+		// Corrupt the first char of the signed doc. A fixed last-char tweak can
+		// be a no-op (the final b64 char carries only 2 significant bits), so
+		// changing the doc's first byte is the reliable tamper → sig won't verify.
+		repl := byte('A')
+		if wire[0] == 'A' {
+			repl = 'B'
+		}
+		forged := string(repl) + wire[1:]
 		assert404(t, rg.do(rg.req(t, forged, "o=0&n=10", freshNonce(t))))
 	})
 	t.Run("wrong owner_sid", func(t *testing.T) {

@@ -104,6 +104,9 @@ func (a *Agent) dataPlaneHandler(w http.ResponseWriter, r *http.Request) bool {
 	case r.Method == http.MethodGet && r.URL.Path == "/xfile":
 		a.serveXFile(w, r)
 		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/stream/rtmp":
+		a.serveRtmpNotify(w, r)
+		return true
 	}
 	return false
 }

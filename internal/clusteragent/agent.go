@@ -129,7 +129,12 @@ type Agent struct {
 	xfileRoutes        *serverRoutes // last servers.json parse, ~5s TTL
 	xfileRouteMod      time.Time
 	xfileRouteAt       time.Time
-	xfileMetrics       xfileStats // /xfile serve/refusal counters (xfile.go)
+	xfileMetrics       xfileStats  // /xfile serve/refusal counters (xfile.go)
+	rtmpYes            rtmpLastYes // /stream/rtmp last-yes grace cache (rtmpoffline.go)
+	rtmpStatsMu        sync.Mutex  // /stream/rtmp decision counters by label (rtmpnotify.go)
+	rtmpStats          map[string]uint64
+	rtmpFloodMu        sync.Mutex // per-IP failed-auth counter (rtmpnotify.go)
+	rtmpFloodN         map[string]int
 	digestN1Mu         sync.Mutex
 	digestN1           map[int64]time.Time // owners whose chunk digest named no request (relayproxy.go)
 	ticketsOnce        sync.Once           // the data plane's tickets (tickets.go)

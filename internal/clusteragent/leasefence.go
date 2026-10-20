@@ -111,6 +111,32 @@ func (a *Agent) leaseFenced() (fenced bool, why string) {
 	return true, "the lease ran out and its drain is over"
 }
 
+// refusesNewSessions is the panel's NodeLease::refusesNewSessions: the node's
+// lease state is not SERVING, i.e. the lease is in or past its drain window on
+// MAIN's clock (DRAINING from exp, FENCED from exp+drain), with lb_lease_fence
+// on. It is the "do not START a new viewer" verdict — broader than leaseFenced
+// (which is the "drop existing viewers" verdict, only once the drain is over).
+// RtmpOffline consults it before serving a cached last-yes; the node-active and
+// offline-policy checks are made separately by the caller.
+func (a *Agent) refusesNewSessions() bool {
+	if a.mode.Load() < 1 {
+		return false
+	}
+	on, _, ok := a.leaseFenceSettings()
+	if !ok || !on {
+		return false
+	}
+	l := a.Client.State.leaseState()
+	if l.Exp <= 0 {
+		return false
+	}
+	mainMs := a.Client.clock.nowMs()
+	if mainMs <= 0 {
+		return false
+	}
+	return mainMs/1000 >= l.Exp
+}
+
 // leaseFenceTick drops the fanout's viewers while the lease fence stands.
 // It runs on RunFence's tick, whether MAIN answers or not.
 func (a *Agent) leaseFenceTick() {
