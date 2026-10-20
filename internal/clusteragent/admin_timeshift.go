@@ -205,33 +205,21 @@ func (a *Agent) serveTimeshiftConcat(w http.ResponseWriter, r *http.Request, que
 			bad()
 			return
 		}
-		rs, re := int64(0), end
-		switch {
-		case spec == "" || spec == "-":
-			// degenerate; fall through as the full body
-		case strings.HasPrefix(spec, "-"):
-			n, err := strconv.ParseInt(spec[1:], 10, 64)
-			if err != nil {
-				bad()
-				return
-			}
-			rs = size - n
-		default:
+		// Parse exactly as timeshift.php does (so the served bytes match the
+		// oracle, and the start can never go negative): a leading "-" is NOT an
+		// RFC suffix — explode('-', spec) makes start=spec[0] ((int) "" = 0) and
+		// end=spec[1] when numeric else size. A bare "-" is start=size (→ 416).
+		var rs, re int64
+		if spec == "-" {
+			rs, re = size, size-1
+		} else {
 			ps := strings.SplitN(spec, "-", 2)
-			v, err := strconv.ParseInt(ps[0], 10, 64)
-			if err != nil {
-				bad()
-				return
-			}
-			rs = v
-			if len(ps) == 2 && ps[1] != "" {
+			rs = parsePositiveInt(ps[0]) // "" / non-numeric / negative → 0, like PHP's (int) cast
+			re = size
+			if len(ps) == 2 {
 				if e, err := strconv.ParseInt(ps[1], 10, 64); err == nil {
 					re = e
-				} else {
-					re = size
 				}
-			} else {
-				re = size
 			}
 		}
 		if end < re {

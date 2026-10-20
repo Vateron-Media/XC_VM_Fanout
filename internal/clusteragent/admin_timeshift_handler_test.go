@@ -162,6 +162,51 @@ func TestTimeshiftTSByteRangePassword(t *testing.T) {
 	}
 }
 
+// tsPwdRange drives the ts arm (password admission) with a Range header.
+func (rg *tsRig) tsPwdRange(t *testing.T, duration int, rangeHdr string) *httptest.ResponseRecorder {
+	t.Helper()
+	u := fmt.Sprintf("/admin/timeshift?stream=42&extension=ts&start=%d&duration=%d&password=s3cr3t", rg.ts, duration)
+	r := httptest.NewRequest(http.MethodGet, u, nil)
+	r.Header.Set("X-XC-Client-IP", rg.clientIP)
+	if rangeHdr != "" {
+		r.Header.Set("Range", rangeHdr)
+	}
+	rec := httptest.NewRecorder()
+	rg.a.serveAdminTimeshift(rec, r)
+	return rec
+}
+
+// timeshift.php parses a leading-"-" range as start=0 (explode('-',"-N") → ["","N"]),
+// NOT an RFC suffix. Faithful port: bytes=-N serves 0..N (clamped to size-1).
+func TestTimeshiftTSLeadingDashRange(t *testing.T) {
+	rg := newTSRig(t)
+	rg.writeMinutes(t, "AAAA", "BBBB", "CCCC") // AAAABBBBCCCC (12 bytes)
+	rec := rg.tsPwdRange(t, 3, "bytes=-4")
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != "AAAAB" || rec.Header().Get("Content-Range") != "bytes 0-4/12" {
+		t.Fatalf("bytes=-4 (PHP 0..4): code=%d body=%q cr=%q", rec.Code, rec.Body.String(), rec.Header().Get("Content-Range"))
+	}
+}
+
+// An over-size N must not produce a negative start / malformed 206: it clamps to the full body.
+func TestTimeshiftTSOversizeSuffix(t *testing.T) {
+	rg := newTSRig(t)
+	rg.writeMinutes(t, "AAAA", "BBBB", "CCCC")
+	rec := rg.tsPwdRange(t, 3, "bytes=-100")
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != "AAAABBBBCCCC" || rec.Header().Get("Content-Range") != "bytes 0-11/12" {
+		t.Fatalf("bytes=-100: code=%d body=%q cr=%q (want full body, no negative start)", rec.Code, rec.Body.String(), rec.Header().Get("Content-Range"))
+	}
+}
+
+// A bare "bytes=-" is unsatisfiable in PHP (start=size) → 416.
+func TestTimeshiftTSBareDash416(t *testing.T) {
+	rg := newTSRig(t)
+	rg.writeMinutes(t, "AAAA", "BBBB", "CCCC")
+	rec := rg.tsPwdRange(t, 3, "bytes=-")
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("bytes=- : code=%d, want 416", rec.Code)
+	}
+}
+
 func TestTimeshiftTSFullBodyPassword(t *testing.T) {
 	rg := newTSRig(t)
 	rg.writeMinutes(t, "AAAA", "BBBB", "CCCC")
