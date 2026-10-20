@@ -138,7 +138,7 @@ func loopbackMAC(key []byte, streamID, exp int64) string {
 // verifyLoopbackToken is LoopbackToken::verify: a well-formed lb1-<exp>-<mac>
 // that has not expired and whose MAC matches under the node's loopback key.
 func verifyLoopbackToken(key []byte, streamID int64, tok string, now int64) bool {
-	if streamID <= 0 || len(key) == 0 {
+	if streamID <= 0 || len(key) != 32 { // LoopbackToken::key requires exactly 32 bytes
 		return false
 	}
 	m := loopbackTokenRe.FindStringSubmatch(tok)
@@ -349,8 +349,13 @@ func (a *Agent) serveAdminVOD(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ext := vodExtPart(stream)
-	if adm.kind == admitUitoken && adm.tok != nil && adm.tok.Container != "" {
-		ext = adm.tok.Container
+	if adm.kind == admitUitoken {
+		// PHP derives the vod ext solely from the token (stream = id.container);
+		// never let the client's stream param influence the served path.
+		ext = ""
+		if adm.tok != nil {
+			ext = adm.tok.Container
+		}
 	}
 	if !vodExtRe.MatchString(ext) {
 		http.NotFound(w, r)
