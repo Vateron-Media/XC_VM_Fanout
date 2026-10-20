@@ -37,6 +37,10 @@ type Agent struct {
 	// SpoolDir is where the node's PHP spools events for MAIN (events.go);
 	// "" leaves the event lanes off.
 	SpoolDir string
+	// FloodDir holds the per-IP RTMP flood counters and block_<ip> markers the
+	// brute-force guard reads and writes (match PHP's FLOOD_TMP_PATH, rtmpgates.go);
+	// "" leaves the RTMP flood ban off.
+	FloodDir string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
@@ -133,8 +137,9 @@ type Agent struct {
 	rtmpYes            rtmpLastYes // /stream/rtmp last-yes grace cache (rtmpoffline.go)
 	rtmpStatsMu        sync.Mutex  // /stream/rtmp decision counters by label (rtmpnotify.go)
 	rtmpStats          map[string]uint64
-	rtmpFloodMu        sync.Mutex // per-IP failed-auth counter (rtmpnotify.go)
-	rtmpFloodN         map[string]int
+	rtmpAllowMu        sync.Mutex // allowed-RTMP list cache, blocklist.json-mtime refreshed (rtmpgates.go)
+	rtmpAllowMod       time.Time
+	rtmpAllowCache     map[string]rtmpAllow
 	digestN1Mu         sync.Mutex
 	digestN1           map[int64]time.Time // owners whose chunk digest named no request (relayproxy.go)
 	ticketsOnce        sync.Once           // the data plane's tickets (tickets.go)

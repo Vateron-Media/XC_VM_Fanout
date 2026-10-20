@@ -2,7 +2,6 @@ package clusteragent
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -122,26 +121,61 @@ func TestRtmpPlayLineAuth(t *testing.T) {
 	}
 }
 
-func TestRtmpPlayAuthFailedTicksFlood(t *testing.T) {
-	rig := newRtmpHandlerRig(t)
-	rig.auth = func(w http.ResponseWriter, reqCtx []byte) {
-		rig.f.box(w, reqCtx, map[string]any{"ok": false, "reason": "AUTH_FAILED"})
+func TestRtmpDenySetCountsTowardFlood(t *testing.T) {
+	// publish-gate, no-tcurl/app, and cred-array each tick; flood_limit 1 → block on the 2nd.
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"publish_gate", "addr=203.0.113.9&clientid=1&call=publish&name=100&password=wrong"},
+		{"no_tcurl", "addr=203.0.113.9&clientid=1&call=play&name=100&username=u&password=p"},
+		{"cred_array", "addr=203.0.113.9&clientid=1&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&username=v"},
 	}
-	if rec := rig.do("addr=203.0.113.9&clientid=8&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p", nil); rec.Code != 404 {
-		t.Fatalf("AUTH_FAILED: %d", rec.Code)
-	}
-	if rig.a.rtmpFloodCount("203.0.113.9") != 1 {
-		t.Fatal("AUTH_FAILED should tick the flood guard")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rig := newRtmpHandlerRig(t)
+			rig.a.FloodDir = t.TempDir()
+			rig.a.SpoolDir = t.TempDir()
+			floodSettings(t, rig.a.ReplicaDir, map[string]any{"flood_limit": 1, "flood_seconds": 100})
+			for i := 0; i < 2; i++ {
+				rig.do(c.query, nil)
+			}
+			if _, err := os.Stat(filepath.Join(rig.a.FloodDir, "block_203.0.113.9")); err != nil {
+				t.Fatalf("%s should count toward flood: %v", c.name, err)
+			}
+		})
 	}
 }
 
-func TestRtmpPlayRefusedNoFlood(t *testing.T) {
-	rig := newRtmpHandlerRig(t) // rig.auth nil → the fake MAIN refuses (a *Denial)
-	if rec := rig.do("addr=203.0.113.9&clientid=9&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p", nil); rec.Code != 404 {
-		t.Fatalf("REFUSED: %d", rec.Code)
+func TestRtmpAuthFailedCountsRefusedDoesNot(t *testing.T) {
+	line := "addr=203.0.113.9&clientid=1&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p"
+
+	// AUTH_FAILED ticks → blocks on the 2nd under flood_limit 1.
+	rig := newRtmpHandlerRig(t)
+	rig.a.FloodDir = t.TempDir()
+	rig.a.SpoolDir = t.TempDir()
+	floodSettings(t, rig.a.ReplicaDir, map[string]any{"flood_limit": 1, "flood_seconds": 100})
+	rig.auth = func(w http.ResponseWriter, reqCtx []byte) {
+		rig.f.box(w, reqCtx, map[string]any{"ok": false, "reason": "AUTH_FAILED"})
 	}
-	if rig.a.rtmpFloodCount("203.0.113.9") != 0 {
-		t.Fatal("a REFUSED must not tick the flood guard")
+	for i := 0; i < 2; i++ {
+		rig.do(line, nil)
+	}
+	if _, err := os.Stat(filepath.Join(rig.a.FloodDir, "block_203.0.113.9")); err != nil {
+		t.Fatal("AUTH_FAILED must count toward flood")
+	}
+
+	// A verified REFUSED and a parse-failure must NOT count.
+	rig2 := newRtmpHandlerRig(t) // default fake MAIN → a verified REFUSED
+	rig2.a.FloodDir = t.TempDir()
+	rig2.a.SpoolDir = t.TempDir()
+	floodSettings(t, rig2.a.ReplicaDir, map[string]any{"flood_limit": 1, "flood_seconds": 100})
+	for i := 0; i < 5; i++ {
+		rig2.do(line, nil)                              // REFUSED (non-counting)
+		rig2.do("call=play&call=publish&name=100", nil) // differing-dup → parse failure (non-counting)
+	}
+	if _, err := os.Stat(filepath.Join(rig2.a.FloodDir, "block_203.0.113.9")); err == nil {
+		t.Fatal("REFUSED and parse-failure must not count toward flood")
 	}
 }
 
@@ -197,15 +231,111 @@ func TestRtmpRestreamDetectPresence(t *testing.T) {
 	}
 }
 
-func TestRtmpFloodBounded(t *testing.T) {
-	a := &Agent{Logf: t.Logf}
-	for i := 0; i < rtmpFloodMax+100; i++ {
-		a.rtmpFlood(fmt.Sprintf("10.0.%d.%d", i/256, i%256))
+func TestRtmpPublishAllowedRTMPNoStreamPass(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "", "push": 1, "pull": 0}}})
+	rec := rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100", nil) // no password
+	if rec.Code != 200 {
+		t.Fatalf("push-listed publish without stream pass: %d", rec.Code)
 	}
-	a.rtmpFloodMu.Lock()
-	n := len(a.rtmpFloodN)
-	a.rtmpFloodMu.Unlock()
-	if n > rtmpFloodMax {
-		t.Fatalf("flood map grew to %d, cap %d", n, rtmpFloodMax)
+}
+
+func TestRtmpPublishAllowedRTMPEntryPassword(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "pub-pw", "push": 1, "pull": 0}}})
+	if rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100&password=pub-pw", nil).Code != 200 {
+		t.Fatal("correct entry password must admit")
+	}
+	if rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100&password=wrong", nil).Code != 404 {
+		t.Fatal("wrong entry password must deny")
+	}
+}
+
+func TestRtmpPublishPushFlagRequired(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "", "push": 0, "pull": 1}}})
+	if rig.do("addr=203.0.113.5&clientid=1&call=publish&name=100", nil).Code != 404 {
+		t.Fatal("pull-only entry must not admit a publish")
+	}
+}
+
+func TestRtmpPlayRelayAllowedRTMPPull(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	writeBlocklist(t, rig.a.ReplicaDir, map[string]any{"ip": []string{},
+		"rtmp": []map[string]any{{"id": 1, "ip": "203.0.113.5", "password": "", "push": 0, "pull": 1}}})
+	// relay-bypass arm: play with no line creds, pull-listed IP, running stream 100
+	rec := rig.do("addr=203.0.113.5&clientid=1&call=play&name=100", nil)
+	if rec.Code != 200 {
+		t.Fatalf("pull-listed relay play: %d", rec.Code)
+	}
+}
+
+func TestRtmpRelayOnDemandGate(t *testing.T) {
+	// relay-bypass arm, held+not-running stream 200
+	run := func(onDemand int) int {
+		rig := newRtmpHandlerRig(t)
+		writeStreamRecord(t, rig.a.ReplicaDir, "200", map[string]any{"server": map[string]any{"on_demand": onDemand}})
+		return rig.do("addr=1.2.3.4&clientid=1&call=play&name=200&password=s3cret", nil).Code // stream-pass relay
+	}
+	if run(1) != 200 {
+		t.Fatal("held+idle+on_demand=1 relay must start and admit")
+	}
+	if run(0) != 404 {
+		t.Fatal("held+idle+on_demand!=1 relay must 404")
+	}
+}
+
+func TestRtmpLineOnDemandGate(t *testing.T) {
+	run := func(onDemand int) int {
+		rig := newRtmpHandlerRig(t)
+		rig.okAuth()
+		writeStreamRecord(t, rig.a.ReplicaDir, "200", map[string]any{"server": map[string]any{"on_demand": onDemand}})
+		return rig.do("addr=1.2.3.4&clientid=1&call=play&name=200&tcurl=rtmp://h/live&app=live&username=u&password=p", nil).Code
+	}
+	if run(1) != 200 {
+		t.Fatal("held+idle+on_demand=1 line must start and admit")
+	}
+	if run(0) != 404 {
+		t.Fatal("held+idle+on_demand!=1 line must 404")
+	}
+}
+
+func TestRtmpPlayNotHeldUnchanged(t *testing.T) {
+	// name=999 → control socket 404 → not held; relay 200, line 404 (unchanged, rtmp.php:117)
+	rig := newRtmpHandlerRig(t)
+	if rig.do("addr=1.2.3.4&clientid=1&call=play&name=999&password=s3cret", nil).Code != 200 {
+		t.Fatal("not-held relay stays 200")
+	}
+	rig2 := newRtmpHandlerRig(t)
+	rig2.okAuth()
+	if rig2.do("addr=1.2.3.4&clientid=1&call=play&name=999&tcurl=rtmp://h/live&app=live&username=u&password=p", nil).Code != 404 {
+		t.Fatal("not-held line stays 404")
+	}
+}
+
+func TestRtmpBlockedIPRefusedAtTop(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	rig.a.FloodDir = t.TempDir()
+	rig.okAuth() // would admit if reached
+	if err := os.WriteFile(filepath.Join(rig.a.FloodDir, "block_203.0.113.9"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := rig.do("addr=203.0.113.9&clientid=7&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p", nil)
+	if rec.Code != 404 {
+		t.Fatalf("blocked IP must be refused: %d", rec.Code)
+	}
+	if rig.a.Registry.Get(rtmpUUID(3, "7")) != nil {
+		t.Fatal("blocked IP must not reach auth / open a record")
+	}
+}
+
+func TestRtmpBlockedInvalidIPNoCrash(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	rig.a.FloodDir = t.TempDir()
+	if rig.do("addr=not-an-ip&clientid=7&call=publish&name=100&password=s3cret", nil).Code == 0 {
+		t.Fatal("a non-IP addr must not crash the handler")
 	}
 }

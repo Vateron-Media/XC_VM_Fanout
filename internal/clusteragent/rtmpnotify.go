@@ -20,6 +20,11 @@ func (a *Agent) serveRtmpNotify(w http.ResponseWriter, r *http.Request) {
 		a.rtmpDeny(w, "parse")
 		return
 	}
+	// A flooder already carrying a block_<ip> marker is refused before any auth.
+	if a.floodBlocked(n.Addr) {
+		a.rtmpDeny(w, "blocked")
+		return
+	}
 	// The panel's own ffmpeg FLV output publishing into nginx_rtmp is admitted
 	// without auth (addr 127.0.0.1 + publish).
 	if n.Addr == "127.0.0.1" && n.Call == "publish" {
@@ -33,12 +38,13 @@ func (a *Agent) serveRtmpNotify(w http.ResponseWriter, r *http.Request) {
 		a.rtmpMeter("play_done")
 		w.WriteHeader(http.StatusOK)
 	case n.Call == "publish":
-		if a.passMatches(a.secret("live_streaming_pass"), r.URL.Query().Get("password")) {
+		pw := r.URL.Query().Get("password")
+		if a.passMatches(a.secret("live_streaming_pass"), pw) || a.allowRTMP(n.Addr, "push", pw) {
 			a.rtmpMeter("publish")
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		a.rtmpDeny(w, "publish gate")
+		a.rtmpFloodDeny(w, "publish gate", n.Addr)
 	default: // play (viewer)
 		a.rtmpPlay(w, r, n)
 	}
@@ -46,10 +52,15 @@ func (a *Agent) serveRtmpNotify(w http.ResponseWriter, r *http.Request) {
 
 func (a *Agent) rtmpPlay(w http.ResponseWriter, r *http.Request, n *rtmpNotify) {
 	q := r.URL.Query()
-	// Relay bypass: the stream password (the allowed-RTMP pull list is empty on
-	// a serve-only LB). A relay carries no line and opens no record.
-	if a.passMatches(a.secret("live_streaming_pass"), q.Get("password")) {
+	// Relay bypass: the stream password, or the allowed-RTMP pull list (an IP in
+	// the list with pull=1 and its per-entry password, rtmp.php:69). A relay
+	// carries no line and opens no record.
+	if a.passMatches(a.secret("live_streaming_pass"), q.Get("password")) || a.allowRTMP(n.Addr, "pull", q.Get("password")) {
 		if running, _, held := a.fanoutStreamStatus(r.Context(), n.Name); held && !running {
+			if !a.streamOnDemand(n.Name) {
+				a.rtmpDeny(w, "on_demand")
+				return
+			}
 			a.fanoutEnsure(r.Context(), n.Name)
 		}
 		a.rtmpMeter("play_relay")
@@ -58,12 +69,12 @@ func (a *Agent) rtmpPlay(w http.ResponseWriter, r *http.Request, n *rtmpNotify) 
 	}
 	// A line: tcurl + app are required, and a credential may not be an array.
 	if q.Get("tcurl") == "" || q.Get("app") == "" {
-		a.rtmpDeny(w, "no tcurl/app")
+		a.rtmpFloodDeny(w, "no tcurl/app", n.Addr)
 		return
 	}
 	creds, ok := rtmpCreds(q)
 	if !ok {
-		a.rtmpDeny(w, "cred array")
+		a.rtmpFloodDeny(w, "cred array", n.Addr)
 		return
 	}
 	streamID, _ := strconv.ParseInt(n.Name, 10, 64)
@@ -71,7 +82,8 @@ func (a *Agent) rtmpPlay(w http.ResponseWriter, r *http.Request, n *rtmpNotify) 
 	reply := a.rtmpAsk(r.Context(), streamID, n.Addr, rtmpRestreamDetect(r), uuid, creds)
 	if !reply.OK {
 		if reply.Reason == "AUTH_FAILED" {
-			a.rtmpFlood(n.Addr)
+			a.rtmpFloodDeny(w, "line "+reply.Reason, n.Addr)
+			return
 		}
 		a.rtmpDeny(w, "line "+reply.Reason)
 		return
@@ -85,6 +97,10 @@ func (a *Agent) rtmpPlay(w http.ResponseWriter, r *http.Request, n *rtmpNotify) 
 		return
 	}
 	if !running {
+		if !a.streamOnDemand(n.Name) {
+			a.rtmpDeny(w, "on_demand")
+			return
+		}
 		a.fanoutEnsure(r.Context(), n.Name)
 	}
 	if a.openRtmpRecord(r.Context(), n, reply, streamID) {
@@ -111,10 +127,6 @@ func rtmpCreds(q url.Values) (map[string]string, bool) {
 	}
 	return map[string]string{"username": q.Get("username"), "password": q.Get("password")}, true
 }
-
-// rtmpFloodMax caps the per-IP failed-auth counter map so it cannot grow
-// without bound (the counter is best-effort observability; the ban is deferred).
-const rtmpFloodMax = 10000
 
 func rtmpRestreamDetect(r *http.Request) bool {
 	// rtmp.php keys on the header's presence, any value.
@@ -170,26 +182,12 @@ func (a *Agent) rtmpMeter(label string) {
 	a.rtmpStatsMu.Unlock()
 }
 
-// rtmpFlood ticks a per-IP failed-auth counter (the panel's BruteforceGuard
-// records the failure; the file-based ban is deferred — see the design).
-func (a *Agent) rtmpFlood(ip string) {
-	a.rtmpFloodMu.Lock()
-	if a.rtmpFloodN == nil {
-		a.rtmpFloodN = map[string]int{}
-	}
-	if _, seen := a.rtmpFloodN[ip]; !seen && len(a.rtmpFloodN) >= rtmpFloodMax {
-		a.rtmpFloodN = map[string]int{} // bound: reset rather than grow without limit
-	}
-	a.rtmpFloodN[ip]++
-	n := a.rtmpFloodN[ip]
-	a.rtmpFloodMu.Unlock()
-	if a.Logf != nil {
-		a.Logf("rtmp: auth failed from %s (%d)", ip, n)
-	}
-}
-
-func (a *Agent) rtmpFloodCount(ip string) int {
-	a.rtmpFloodMu.Lock()
-	defer a.rtmpFloodMu.Unlock()
-	return a.rtmpFloodN[ip]
+// rtmpFloodDeny is a deny that counts toward the brute-force ban — rtmp.php's
+// $rDeny set: a failed publish gate, a line with no tcurl/app, a cred array, and
+// a line AUTH_FAILED. It ticks the file-backed flood counter (which may write
+// the block_<ip> marker and spool MAIN a security.block_ip), then 404s. REFUSED/
+// NO_ANSWER and parse failures stay on plain rtmpDeny and do not count.
+func (a *Agent) rtmpFloodDeny(w http.ResponseWriter, reason, ip string) {
+	a.floodTick(ip)
+	a.rtmpDeny(w, reason)
 }
