@@ -294,3 +294,27 @@ func TestRtmpPlayNotHeldUnchanged(t *testing.T) {
 		t.Fatal("not-held line stays 404")
 	}
 }
+
+func TestRtmpBlockedIPRefusedAtTop(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	rig.a.FloodDir = t.TempDir()
+	rig.okAuth() // would admit if reached
+	if err := os.WriteFile(filepath.Join(rig.a.FloodDir, "block_203.0.113.9"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := rig.do("addr=203.0.113.9&clientid=7&call=play&name=100&tcurl=rtmp://h/live&app=live&username=u&password=p", nil)
+	if rec.Code != 404 {
+		t.Fatalf("blocked IP must be refused: %d", rec.Code)
+	}
+	if rig.a.Registry.Get(rtmpUUID(3, "7")) != nil {
+		t.Fatal("blocked IP must not reach auth / open a record")
+	}
+}
+
+func TestRtmpBlockedInvalidIPNoCrash(t *testing.T) {
+	rig := newRtmpHandlerRig(t)
+	rig.a.FloodDir = t.TempDir()
+	if rig.do("addr=not-an-ip&clientid=7&call=publish&name=100&password=s3cret", nil).Code == 0 {
+		t.Fatal("a non-IP addr must not crash the handler")
+	}
+}

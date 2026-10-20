@@ -37,6 +37,10 @@ type Agent struct {
 	// SpoolDir is where the node's PHP spools events for MAIN (events.go);
 	// "" leaves the event lanes off.
 	SpoolDir string
+	// FloodDir holds the per-IP RTMP flood counters and block_<ip> markers the
+	// brute-force guard reads and writes (match PHP's FLOOD_TMP_PATH, rtmpgates.go);
+	// "" leaves the RTMP flood ban off.
+	FloodDir string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string

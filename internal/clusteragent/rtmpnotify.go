@@ -20,6 +20,11 @@ func (a *Agent) serveRtmpNotify(w http.ResponseWriter, r *http.Request) {
 		a.rtmpDeny(w, "parse")
 		return
 	}
+	// A flooder already carrying a block_<ip> marker is refused before any auth.
+	if a.floodBlocked(n.Addr) {
+		a.rtmpDeny(w, "blocked")
+		return
+	}
 	// The panel's own ffmpeg FLV output publishing into nginx_rtmp is admitted
 	// without auth (addr 127.0.0.1 + publish).
 	if n.Addr == "127.0.0.1" && n.Call == "publish" {

@@ -3,9 +3,22 @@ package clusteragent
 import (
 	"crypto/hmac"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 )
+
+// floodBlocked reports whether the peer IP carries a block_<ip> flood marker —
+// the RTMP mirror of the gateway's FloodProtectionStage / judge.go BootstrapRefuses
+// (clusteragent does not import gateway, so the trivial check is re-implemented).
+// A non-IP addr or an unset FloodDir is never blocked.
+func (a *Agent) floodBlocked(ip string) bool {
+	if a.FloodDir == "" || net.ParseIP(ip) == nil {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(a.FloodDir, "block_"+ip))
+	return err == nil
+}
 
 // rtmpAllow is one allowed-RTMP row (rtmp_ips), as it rides in blocklist.json's
 // data.rtmp: push/pull are 0/1 ints on disk (the PHP consumer re-casts to bool).
