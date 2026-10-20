@@ -100,12 +100,12 @@ func (a *Agent) touchNodeCrons() {
 // a still-scheduled PHP cron and the agent never drain one file at once.
 
 // Node tmp-subdir helpers, derived from TmpRoot (TMP_PATH), per ConstantsInitializer.
-func (a *Agent) logsTmpDir() string      { return filepath.Join(a.TmpRoot, "logs") }
-func (a *Agent) cronsDir() string        { return filepath.Join(a.TmpRoot, "crons") }
-func (a *Agent) floodTmpDir() string     { return filepath.Join(a.TmpRoot, "flood") }
-func (a *Agent) signalsTmpDir() string   { return filepath.Join(a.TmpRoot, "signals") }
+func (a *Agent) logsTmpDir() string       { return filepath.Join(a.TmpRoot, "logs") }
+func (a *Agent) cronsDir() string         { return filepath.Join(a.TmpRoot, "crons") }
+func (a *Agent) floodTmpDir() string      { return filepath.Join(a.TmpRoot, "flood") }
+func (a *Agent) signalsTmpDir() string    { return filepath.Join(a.TmpRoot, "signals") }
 func (a *Agent) divergenceTmpDir() string { return filepath.Join(a.TmpRoot, "divergence") }
-func (a *Agent) ministraTmpDir() string  { return filepath.Join(a.TmpRoot, "ministra") }
+func (a *Agent) ministraTmpDir() string   { return filepath.Join(a.TmpRoot, "ministra") }
 
 const (
 	logChunk      = 1000    // LogSink::CHUNK

@@ -34,9 +34,9 @@ func TestSweepTmp(t *testing.T) {
 	floodSettings(t, a.ReplicaDir, map[string]any{"cache_playlists": 3600})
 
 	// top-level TMP_PATH files
-	touchAt(t, filepath.Join(a.TmpRoot, "stale.txt"), 601)         // swept (>= 600)
-	touchAt(t, filepath.Join(a.TmpRoot, "fresh.txt"), 599)         // kept (< 600)
-	touchAt(t, filepath.Join(a.TmpRoot, "ministra_abc"), 99999)    // kept (ministra_, any age)
+	touchAt(t, filepath.Join(a.TmpRoot, "stale.txt"), 601)            // swept (>= 600)
+	touchAt(t, filepath.Join(a.TmpRoot, "fresh.txt"), 599)            // kept (< 600)
+	touchAt(t, filepath.Join(a.TmpRoot, "ministra_abc"), 99999)       // kept (ministra_, any age)
 	touchAt(t, filepath.Join(a.TmpRoot, "fanout_binary_check"), 1000) // kept (KEEP 172800)
 	// a live pinned lock (old mtime) is kept; a stale dead-pid lock is swept
 	live := cronLockPath(a.cronsDir(), "X")
@@ -52,7 +52,7 @@ func TestSweepTmp(t *testing.T) {
 	}
 	ageFile(t, dead, 700)
 	// FLOOD: a fresh block marker survives, a stale one is swept
-	touchAt(t, filepath.Join(a.floodTmpDir(), "block_1.2.3.4"), 10) // fresh -> kept (Gate 3 state)
+	touchAt(t, filepath.Join(a.floodTmpDir(), "block_1.2.3.4"), 10)  // fresh -> kept (Gate 3 state)
 	touchAt(t, filepath.Join(a.floodTmpDir(), "block_5.5.5.5"), 700) // stale -> swept
 	// playlist prune by cache_playlists (3600)
 	touchAt(t, filepath.Join(a.PlaylistDir, "old.m3u"), 7200) // pruned

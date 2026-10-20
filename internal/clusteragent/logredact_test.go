@@ -4,7 +4,7 @@ import "testing"
 
 func TestRedactLog(t *testing.T) {
 	cases := map[string]string{
-		"user=alice&password=secret&x=1": "user=***&password=***&x=1",
+		"user=alice&password=secret&x=1":  "user=***&password=***&x=1",
 		"rtsp://bob:pw@host/live":         "rtsp://***@host/live",
 		"http://h/live/alice/secret/1.ts": "http://h/live/***/***/1.ts",
 		"nothing to mask":                 "nothing to mask",

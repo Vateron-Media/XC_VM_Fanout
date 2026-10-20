@@ -1,9 +1,9 @@
 package clusteragent
 
 import (
-	"errors"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
