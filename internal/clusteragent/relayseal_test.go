@@ -179,3 +179,67 @@ func TestASealingOwnersFileIsReadSealedChunkByChunk(t *testing.T) {
 		t.Fatal("an unsealed chunk from a sealing owner was taken")
 	}
 }
+
+// writeRelayFrames (the owner-side producer) must produce frames the fetcher's
+// reader (copyRelayFrames) opens back to the exact plaintext, at every
+// boundary: empty body is zero frames, and a length that is an exact multiple
+// of the frame size emits no trailing empty frame.
+func TestWriteRelayFramesRoundTrip(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 32)
+	for _, size := range []int{0, 1, relayFrameMax - 1, relayFrameMax, relayFrameMax + 1, 3*relayFrameMax + 123} {
+		plain := make([]byte, size)
+		if _, err := rand.Read(plain); err != nil {
+			t.Fatal(err)
+		}
+		var framed bytes.Buffer
+		if err := writeRelayFrames(&framed, plain, key); err != nil {
+			t.Fatalf("size %d: write: %v", size, err)
+		}
+		if size == 0 && framed.Len() != 0 {
+			t.Fatalf("empty plaintext produced %d bytes, want 0 frames", framed.Len())
+		}
+		var out bytes.Buffer
+		if err := copyRelayFrames(&out, &framed, key); err != nil {
+			t.Fatalf("size %d: read back: %v", size, err)
+		}
+		if !bytes.Equal(out.Bytes(), plain) {
+			t.Fatalf("size %d: round-trip mismatch (got %d bytes)", size, out.Len())
+		}
+	}
+}
+
+// openFileSealKey opens the ?rk= session key the fetcher sealed to this node's
+// box key under fileSealContext(owner, tid), purpose "relay".
+func TestOpenFileSealKey(t *testing.T) {
+	_, st := newFake(t)
+	sk, pub, err := cc.NewX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.NodeBoxSk = sk
+	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
+
+	key := bytes.Repeat([]byte{9}, 32)
+	owner, tid := int64(3), "tid_abc"
+	sealed, err := cc.Seal(pub, "relay", fileSealContext(owner, tid), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b64 := base64.RawURLEncoding.EncodeToString(sealed)
+
+	got, err := a.openFileSealKey(b64, owner, tid)
+	if err != nil {
+		t.Fatalf("openFileSealKey: %v", err)
+	}
+	if !bytes.Equal(got, key) {
+		t.Fatal("opened key does not match the sealed key")
+	}
+	// A key sealed under a different context (tid) must not open here.
+	if _, err := a.openFileSealKey(b64, owner, "other-tid"); err == nil {
+		t.Fatal("a key sealed under a different context opened")
+	}
+	// Garbage base64 must error, not panic.
+	if _, err := a.openFileSealKey("!!!not-b64!!!", owner, tid); err == nil {
+		t.Fatal("invalid base64 accepted")
+	}
+}
