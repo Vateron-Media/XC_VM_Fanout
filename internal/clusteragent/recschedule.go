@@ -72,6 +72,12 @@ func (s *workerSet) has(id int64) bool {
 	return ok
 }
 
+func (s *workerSet) len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.workers)
+}
+
 // stopAllExcept cancels and drops every worker whose id is not in keep.
 func (s *workerSet) stopAllExcept(keep map[int64]bool) {
 	s.mu.Lock()
@@ -207,4 +213,20 @@ func (a *Agent) reconcileArchiveWorkers(ctx context.Context) error {
 	}
 	archivers.stopAllExcept(wanted)
 	return nil
+}
+
+// runRecordingSchedulers runs the recordings scheduler and the archive reconcile
+// once, on a stream-serving node (FlowStreams). Ticked by RunChores; ctx ties the
+// worker goroutines to the agent's lifetime. Off that flow it leaves recording to
+// nothing (a serve-only LB with STREAMS is where recording runs).
+func (a *Agent) runRecordingSchedulers(ctx context.Context) {
+	if a.flows.Load()&FlowStreams == 0 {
+		return
+	}
+	if err := a.scheduleRecordings(ctx); err != nil && a.Logf != nil {
+		a.Logf("cluster: recordings: %v", err)
+	}
+	if err := a.reconcileArchiveWorkers(ctx); err != nil && a.Logf != nil {
+		a.Logf("cluster: archive reconcile: %v", err)
+	}
 }

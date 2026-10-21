@@ -31,6 +31,7 @@ const (
 // live agent for a dead one.
 func (a *Agent) RunChores(ctx context.Context) {
 	a.runChores()
+	a.runRecordingSchedulers(ctx)
 	a.touchNodeCrons()
 	t := time.NewTicker(choreTouchInterval)
 	defer t.Stop()
@@ -44,6 +45,7 @@ func (a *Agent) RunChores(ctx context.Context) {
 			if elapsed += choreTouchInterval; elapsed >= choreRunInterval {
 				elapsed = 0
 				a.runChores()
+				a.runRecordingSchedulers(ctx)
 			}
 		}
 	}

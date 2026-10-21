@@ -239,3 +239,19 @@ func TestReconcileStopsVanished(t *testing.T) {
 	rg.a.reconcileArchiveWorkers(context.Background())
 	archiveWaitFor(t, func() bool { return !arcs.has(42) }, 2*time.Second)
 }
+
+func TestRunRecordingSchedulers(t *testing.T) {
+	rg := newSchedRig(t, &liveFanout{id: "42", running: false})
+	recs, arcs := rg.a.recSets()
+
+	rg.a.runRecordingSchedulers(context.Background()) // FlowStreams off → no-op
+	if recs.len() != 0 || arcs.len() != 0 {
+		t.Fatal("gate off: no workers expected")
+	}
+
+	rg.a.flows.Store(FlowStreams)                     // on, but the replica has nothing for this node
+	rg.a.runRecordingSchedulers(context.Background()) // must not panic; no workers
+	if recs.len() != 0 || arcs.len() != 0 {
+		t.Fatalf("empty replica: recs=%d arcs=%d, want 0", recs.len(), arcs.len())
+	}
+}
