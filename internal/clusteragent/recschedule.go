@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // workerSet owns the recording/archive goroutines by an int64 key (recording id
@@ -134,4 +135,37 @@ func shouldStartRecording(r recording, serverID, now int64) bool {
 		return false
 	}
 	return true
+}
+
+// recSets lazily creates the recorder and archive worker sets.
+func (a *Agent) recSets() (recorders, archivers *workerSet) {
+	a.recInit.Do(func() {
+		a.recorders = newWorkerSet()
+		a.archivers = newWorkerSet()
+	})
+	return a.recorders, a.archivers
+}
+
+// scheduleRecordings is cron:vod (VodCronJob): under its lock, start a recorder
+// goroutine for every due recording the node holds, de-duplicated by the
+// recorder worker set. A chore on the RunChores tick.
+func (a *Agent) scheduleRecordings(ctx context.Context) error {
+	rel, ok := acquireCronLock(cronLockPath(a.cronsDir(), `XcVm\Cli\CronJobs\VodCronJob`))
+	if !ok {
+		return nil
+	}
+	defer rel()
+	recorders, _ := a.recSets()
+	now := time.Now().Unix()
+	srv := a.Client.State.ServerID
+	for _, sid := range heldStreams(a.ReplicaDir) {
+		for _, rec := range a.streamRecordings(strconv.FormatInt(sid, 10)) {
+			if !shouldStartRecording(rec, srv, now) {
+				continue
+			}
+			rec := rec
+			recorders.start(ctx, rec.ID, func(c context.Context) { a.runRecording(c, rec) })
+		}
+	}
+	return nil
 }

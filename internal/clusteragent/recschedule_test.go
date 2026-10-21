@@ -2,11 +2,32 @@ package clusteragent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// recWriteStreamRecord writes stream 42's replica record with the given
+// recordings[] JSON body plus the stream fields capture needs.
+func recWriteStreamRecord(t *testing.T, rg *liveRig, recordingsJSON string) {
+	t.Helper()
+	rec := `{"data":{"stream":{"direct_source":0},"type":{"live":1},"server":{"on_demand":1},"recordings":[` + recordingsJSON + `]}}`
+	if err := os.WriteFile(filepath.Join(streamsDir(rg.dir), "42.json"), []byte(rec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func recState1Count(t *testing.T, spoolDir string) int {
+	n := 0
+	for _, s := range spooledRecStates(t, spoolDir) {
+		if s == 1 {
+			n++
+		}
+	}
+	return n
+}
 
 func TestStreamRecordingsParses(t *testing.T) {
 	dir := t.TempDir()
@@ -87,4 +108,67 @@ func TestWorkerSetStopCancels(t *testing.T) {
 		t.Fatal("stop did not cancel the worker")
 	}
 	archiveWaitFor(t, func() bool { return !s.has(9) }, time.Second)
+}
+
+func newSchedRig(t *testing.T, lf *liveFanout) *liveRig {
+	rg := newLiveRig(t, lf)
+	recWithLoopback(t, rg)
+	recSetArchivePath(t, rg)
+	rg.a.SpoolDir = t.TempDir()
+	rg.a.TmpRoot = t.TempDir()
+	return rg
+}
+
+func TestScheduleStartsDueRecording(t *testing.T) {
+	rg := newSchedRig(t, &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("LIVE")})
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error {
+		return os.WriteFile(args[len(args)-1], []byte("MP4"), 0o644)
+	})
+	now := time.Now().Unix()
+	recWriteStreamRecord(t, rg, fmt.Sprintf(`{"id":55,"start":%d,"end":%d,"source_id":3,"archive":0,"status":0}`, now-10, now+3600))
+	if err := rg.a.scheduleRecordings(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	archiveWaitFor(t, func() bool {
+		s := spooledRecStates(t, rg.a.SpoolDir)
+		return len(s) == 2 && s[0] == 1 && s[1] == 2
+	}, 3*time.Second)
+	recs, _ := rg.a.recSets()
+	archiveWaitFor(t, func() bool { return !recs.has(55) }, 2*time.Second)
+}
+
+func TestScheduleSkipsNotDue(t *testing.T) {
+	rg := newSchedRig(t, &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("LIVE")})
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error {
+		t.Error("recorder ran for a not-due recording")
+		return nil
+	})
+	now := time.Now().Unix()
+	recWriteStreamRecord(t, rg, fmt.Sprintf(
+		`{"id":55,"start":%d,"end":%d,"source_id":3,"archive":0,"status":2},{"id":56,"start":%d,"end":%d,"source_id":5,"archive":0,"status":0}`,
+		now-10, now+3600, now-10, now+3600)) // status 2 (done) + other node
+	rg.a.scheduleRecordings(context.Background())
+	time.Sleep(150 * time.Millisecond)
+	if s := spooledRecStates(t, rg.a.SpoolDir); len(s) != 0 {
+		t.Fatalf("not-due: spooled states %v, want none", s)
+	}
+}
+
+func TestScheduleNoDoubleStart(t *testing.T) {
+	rg := newSchedRig(t, &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("LIVE"), liveBlock: true})
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error {
+		return os.WriteFile(args[len(args)-1], []byte("MP4"), 0o644)
+	})
+	now := time.Now().Unix()
+	recWriteStreamRecord(t, rg, fmt.Sprintf(`{"id":55,"start":%d,"end":%d,"source_id":3,"archive":0,"status":0}`, now-10, now+3600))
+	recs, _ := rg.a.recSets()
+	rg.a.scheduleRecordings(context.Background())
+	archiveWaitFor(t, func() bool { return recs.has(55) }, 2*time.Second) // first worker in-flight (capture blocked)
+	rg.a.scheduleRecordings(context.Background())                         // must not start a duplicate
+	time.Sleep(150 * time.Millisecond)
+	if n := recState1Count(t, rg.a.SpoolDir); n != 1 {
+		t.Fatalf("state-1 events = %d, want 1 (dedup across two schedule ticks)", n)
+	}
+	recs.stop(55)
+	archiveWaitFor(t, func() bool { return !recs.has(55) }, 2*time.Second) // let the worker finish before TempDir cleanup
 }
