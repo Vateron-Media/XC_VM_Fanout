@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -106,4 +107,105 @@ func hlsHasSegment(playlist []byte) bool {
 		}
 	}
 	return false
+}
+
+// serveAdminLive is the /admin/live dispatcher (live.php lines 37–342): admit
+// (slice-1 admitAdmin, password allowed), force m3u8 for a uitoken, refuse a
+// relay pulling m3u8, require the stream's replica record, run the readiness
+// gate (answering odstart as bare "1"/"0"), then serve the TS relay or the
+// admin HLS.
+func (a *Agent) serveAdminLive(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	adm, ok := a.admitAdmin(parsePositiveInt(q.Get("stream")), r, r.Header.Get("X-XC-Client-IP"), true, a.Client.MainNowMs())
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	ext := q.Get("extension")
+	if adm.kind == admitUitoken {
+		ext = "m3u8" // the panel's uitoken path always serves the playlist
+	}
+	if adm.kind == admitRelayKind && ext == "m3u8" {
+		http.NotFound(w, r) // a relay pulls TS only; the playlist's segment URLs carry the password
+		return
+	}
+	id := strconv.FormatInt(adm.streamID, 10)
+	if _, ok := a.streamMeta(id); !ok {
+		http.NotFound(w, r) // StreamSource row required
+		return
+	}
+	wantHLS := ext == "m3u8"
+	ready := a.adminLiveReady(r.Context(), id, wantHLS)
+	if q.Has("odstart") {
+		if ready {
+			_, _ = io.WriteString(w, "1")
+		} else {
+			_, _ = io.WriteString(w, "0")
+		}
+		return
+	}
+	if !ready {
+		http.NotFound(w, r)
+		return
+	}
+	if wantHLS {
+		a.serveAdminLiveHLS(w, r, adm, id)
+		return
+	}
+	a.serveAdminLiveTS(w, r, adm, id)
+}
+
+// serveAdminLiveTS proxies the Manager's continuous live TS (GET /live/<id>) to
+// the admitted caller — live.php's default (ts) arm. The viewer uuid (c) is
+// omitted so the Manager records no connection and spools no limit: admin is a
+// source read, never a counted viewer. A RELAY admission carrying ?rk= gets the
+// body AES-256-GCM-framed (streamRelaySealed) under X-XCVM-Relay-Seal: v1.
+func (a *Agent) serveAdminLiveTS(w http.ResponseWriter, r *http.Request, adm adminAdmission, id string) {
+	// prebuffer: requested (query flag or X-XC_VM-PREBUFFER header) → the
+	// Manager's default join burst (param omitted); else prebuffer=0 (current
+	// GOP) — faithful to live.php's "prebuffer present → seg_time burst, else 0".
+	path := "/live/" + id
+	if !adminPrebufferRequested(r) {
+		path += "?prebuffer=0"
+	}
+	resp, err := a.fanoutRequest(r.Context(), http.MethodGet, path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		http.NotFound(w, r)
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "video/mp2t")
+	h.Set("X-Accel-Buffering", "no")
+	if adm.kind == admitRelayKind {
+		if rk := r.URL.Query().Get(relaySealParam); rk != "" {
+			key, err := a.openLiveSealKey(rk, adm.streamID)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			h.Set(relaySealHeader, relaySealVersion)
+			w.WriteHeader(http.StatusOK)
+			_ = streamRelaySealed(w, resp.Body, key)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	flushCopy(w, resp.Body)
+}
+
+// adminPrebufferRequested is live.php's prebuffer trigger: the prebuffer query
+// param or an X-XC_VM-PREBUFFER request header.
+func adminPrebufferRequested(r *http.Request) bool {
+	return r.URL.Query().Has("prebuffer") || r.Header.Get("X-XC_VM-PREBUFFER") != ""
+}
+
+// serveAdminLiveHLS serves the admin HLS playlist + named segments (the uitoken/
+// password m3u8 arm). Implemented in Task 4.
+func (a *Agent) serveAdminLiveHLS(w http.ResponseWriter, r *http.Request, adm adminAdmission, id string) {
+	http.NotFound(w, r)
 }
