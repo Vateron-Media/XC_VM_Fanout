@@ -196,6 +196,26 @@ func TestRunRecordingLiveSuccess(t *testing.T) {
 	}
 }
 
+// Parity: the mp4 is built from exactly the bytes the viewer /admin/live would
+// serve — ffmpeg's input .ts equals the fanout live body.
+func TestRunRecordingParityFfmpegInput(t *testing.T) {
+	body := []byte("PARITY-LIVE-BYTES")
+	rg := newLiveRig(t, &liveFanout{id: "42", running: true, hasData: true, liveBody: body})
+	recWithLoopback(t, rg)
+	recSetArchivePath(t, rg)
+	rg.a.SpoolDir = t.TempDir()
+	var ffIn []byte
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error {
+		ffIn, _ = os.ReadFile(args[1]) // args: -i <ts> -c:v copy -c:a copy <out>
+		return os.WriteFile(args[len(args)-1], []byte("MP4"), 0o644)
+	})
+	now := time.Now().Unix()
+	rg.a.runRecording(context.Background(), recording{ID: 3, StreamID: 42, Start: now - 10, End: now + 1})
+	if !bytes.Equal(ffIn, body) {
+		t.Fatalf("ffmpeg input = %q, want the fanout body %q", ffIn, body)
+	}
+}
+
 func TestRunRecordingNotAiring(t *testing.T) {
 	rg := newLiveRig(t, &liveFanout{id: "42"})
 	recWithLoopback(t, rg)
