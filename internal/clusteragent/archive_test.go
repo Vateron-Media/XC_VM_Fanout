@@ -222,6 +222,29 @@ func TestArchiveRunForwardGap(t *testing.T) {
 	cancel()
 }
 
+// Parity: a minute the worker assembles equals the source segments concatenated
+// in order, and its .offset is "0" (faithful to StreamUtils::findKeyframe).
+func TestArchiveRunParity(t *testing.T) {
+	dir, arch := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(dir, "42_.m3u8"), []byte("#EXTM3U\n"), 0o644)
+	segs := []string{"seg-zero-", "seg-one--", "seg-two--"}
+	for i, c := range segs {
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("42_%d.ts", i)), []byte(c), 0o644)
+	}
+	os.WriteFile(filepath.Join(dir, "42_3.ts"), []byte("tail"), 0o644) // successor → seg 2 completes
+	clk := time.Date(2026, 10, 21, 8, 15, 0, 0, time.UTC)
+	j := newArchiveJob(dir, arch, clk, func() bool { return true })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go j.run(ctx)
+	minute := filepath.Join(arch, "2026-10-21:08-15.ts")
+	want := strings.Join(segs, "")
+	archiveWaitFor(t, func() bool { b, _ := os.ReadFile(minute); return string(b) == want }, 3*time.Second)
+	cancel()
+	// .offset is written when the minute is closed (run's deferred close on exit).
+	archiveWaitFor(t, func() bool { b, err := os.ReadFile(minute + ".offset"); return err == nil && string(b) == "0" }, 2*time.Second)
+}
+
 func TestArchiveRunStopsWhenNotRunning(t *testing.T) {
 	dir, arch := t.TempDir(), t.TempDir()
 	os.WriteFile(filepath.Join(dir, "42_.m3u8"), []byte("#EXTM3U\n"), 0o644)
