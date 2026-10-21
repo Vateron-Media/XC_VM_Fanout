@@ -262,6 +262,7 @@ func parsePositiveInt(s string) int64 {
 // non-live/direct stream or any refusal is a 404. No password/loopback arm
 // (passwordOK=false). clientIP is the resolved address the front forwards.
 func (a *Agent) serveAdminThumb(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*") // thumb.php:24 — unconditional (incl. 404/302); the admin preview loads this cross-origin
 	q := r.URL.Query()
 	clientIP := r.Header.Get("X-XC-Client-IP")
 	adm, ok := a.admitAdmin(parsePositiveInt(q.Get("stream")), r, clientIP, false, a.Client.MainNowMs())
@@ -346,6 +347,7 @@ func containerMimeType(c string) string {
 // ponytail: served at full speed — vod.php's vod_limit_perc/vod_bitrate_plus
 // bandwidth throttle is a follow-up, not ported here.
 func (a *Agent) serveAdminVOD(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*") // vod.php:23 — unconditional (incl. 404/416); the admin preview loads this cross-origin
 	q := r.URL.Query()
 	clientIP := r.Header.Get("X-XC-Client-IP")
 	stream := q.Get("stream")
