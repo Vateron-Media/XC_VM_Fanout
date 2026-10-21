@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // acmePrefix is certbot's http-01 challenge path; it must keep working through
@@ -74,6 +75,7 @@ type Server struct {
 	streams      string       // STREAMS_PATH root for /progress writes; empty leaves /progress to the proxy
 	agentProxy   http.Handler // /xfile owner, reverse-proxied to the agent socket; nil leaves /xfile to the proxy
 	xfileLimiter *rateLimiter // the peer-keyed /xfile limiter (nginx zone xfile)
+	reqCount     atomic.Int64 // total requests served, reported by /nginx_status (nginx stub_status request count)
 }
 
 // internalPrefixes are nginx's `internal;` X-Accel targets — reachable only via
@@ -126,11 +128,25 @@ func NewServer(gateway http.Handler, nginx *url.URL, webroot string, trusted *Tr
 	return s
 }
 
-// proxyOrError proxies to the nginx backend, or returns 502 when there is none
-// (a serve-only front with nginx gone).
+// proxyOrError proxies to the nginx backend, or returns 502 when there is none.
+// Its callers are the paths that *expected* a backend (an X-Accel defer, an
+// /xfile or /stream/rtmp fallback); with nginx gone those are a misconfiguration,
+// so 502 is right. The unknown-route fall-through uses proxyOrNotFound instead.
 func (s *Server) proxyOrError(w http.ResponseWriter, r *http.Request) {
 	if s.proxy == nil {
 		http.Error(w, "", http.StatusBadGateway)
+		return
+	}
+	s.proxy.ServeHTTP(w, r)
+}
+
+// proxyOrNotFound is the unknown-route fall-through: proxy to the backend when
+// there is one, else 404 — a path the front does not route is one nginx itself
+// answers 404 (location ~ \.php$, @extensionless-php, a try_files miss), so a
+// nil backend returns the same 404, not a 502.
+func (s *Server) proxyOrNotFound(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		http.NotFound(w, r)
 		return
 	}
 	s.proxy.ServeHTTP(w, r)
@@ -270,7 +286,48 @@ func (s *Server) serveImages(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, full)
 }
 
+var (
+	legacyStreamRe = regexp.MustCompile(`^/stream/(key|segment|live|vod|timeshift|thumb|subtitle|rtmp)\.php$`)
+	legacyAdminRe  = regexp.MustCompile(`^/admin/(live|timeshift|thumb|vod)\.php$`)
+)
+
+// legacyPHP maps the LB nginx's legacy .php URL forms to its responses:
+// /streaming/rtmp.php, /stream/<kind>.php, /admin/<kind>.php and /progress.php
+// → StatusFound to the canonical path (nginx `return 302`); /portal.php,
+// /c/portal.php and any other *.php → StatusNotFound (nginx `return 404` /
+// `location ~ \.php$`). Returns ("", 0) for a non-.php path, which falls
+// through. Matches on the path only; the caller reattaches the query (`?$args`).
+func legacyPHP(path string) (string, int) {
+	switch path {
+	case "/streaming/rtmp.php":
+		return "/stream/rtmp", http.StatusFound
+	case "/progress.php":
+		return "/progress", http.StatusFound
+	case "/portal.php", "/c/portal.php":
+		return "", http.StatusNotFound
+	}
+	if m := legacyStreamRe.FindStringSubmatch(path); m != nil {
+		return "/stream/" + m[1], http.StatusFound
+	}
+	if m := legacyAdminRe.FindStringSubmatch(path); m != nil {
+		return "/admin/" + m[1], http.StatusFound
+	}
+	if strings.HasSuffix(path, ".php") {
+		return "", http.StatusNotFound
+	}
+	return "", 0
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Count every accepted request (nginx stub_status's request counter);
+	// /nginx_status reports it for the node watchdog's request-count probe.
+	s.reqCount.Add(1)
+	// nginx's server-level `if ($request_method !~ ^(GET|POST)$) return 200;` —
+	// a benign empty 200 for any other method, ahead of all routing.
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, acmePrefix) {
 		s.serveACME(w, r)
 		return
@@ -299,6 +356,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	// /nginx_status is nginx's stub_status (local-only: allow 127.0.0.1; deny all).
+	// With no nginx the front answers it from its own request counter, in the
+	// stub_status format the node watchdog parses (SystemInfo::nginxRequestCount
+	// reads field [2] of line [2]: "<accepts> <handled> <requests>").
+	if r.URL.Path == "/nginx_status" {
+		if !isLoopback(clientIP(r)) {
+			http.Error(w, "", http.StatusForbidden)
+			return
+		}
+		n := strconv.FormatInt(s.reqCount.Load(), 10)
+		_, _ = io.WriteString(w, "Active connections: 1 \nserver accepts handled requests\n "+n+" "+n+" "+n+" \nReading: 0 Writing: 1 Waiting: 0 \n")
+		return
+	}
 	// /xfile is a public, owner-side cross-node file read. With an agent socket
 	// configured, the front proxies it there (peer-rate-limited); otherwise nginx
 	// still owns it during the transition.
@@ -319,6 +389,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveProgress(w, r)
 		return
 	}
+	// nginx's legacy .php contract (relative 302 to the canonical path, or 404),
+	// served in-process so it holds with no backend (absolute_redirect off → the
+	// Location is path-only, hence relative).
+	if target, status := legacyPHP(r.URL.Path); status != 0 {
+		if status == http.StatusNotFound {
+			http.NotFound(w, r)
+			return
+		}
+		loc := target
+		if r.URL.RawQuery != "" {
+			loc += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, loc, http.StatusFound)
+		return
+	}
 	if kind := serveKind(r.URL.Path); kind != "" {
 		s.serveStream(w, r, kind)
 		return
@@ -330,7 +415,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveAdmin(w, r)
 		return
 	}
-	s.proxyOrError(w, r)
+	s.proxyOrNotFound(w, r)
 }
 
 // adminAgentPath reports whether an /admin path is one the agent serves in-process
