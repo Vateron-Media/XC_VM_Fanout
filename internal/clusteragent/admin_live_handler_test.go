@@ -185,3 +185,17 @@ func TestAdminLiveHLSUitokenForcesM3u8(t *testing.T) {
 		t.Fatalf("uitoken+extension=ts: code=%d ct=%q (want the m3u8 playlist)", rec.Code, rec.Header().Get("Content-Type"))
 	}
 }
+
+// --- Task 5: route wiring (dataplane) ---
+
+func TestDataplaneRoutesAdminLive(t *testing.T) {
+	lf := &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("DP-TS")}
+	rg := newLiveRig(t, lf)
+	rec := httptest.NewRecorder()
+	if !rg.a.dataPlaneHandler(rec, rg.relayReq(t, "/admin/live?stream=42&extension=ts")) {
+		t.Fatal("dataPlaneHandler did not handle GET /admin/live")
+	}
+	if rec.Code != 200 || rec.Body.String() != "DP-TS" {
+		t.Fatalf("routed live: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
