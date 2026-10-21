@@ -85,7 +85,10 @@ func (a *Agent) captureRecording(ctx context.Context, rec recording, dst io.Writ
 	if a.LoopbackKeyFile != "" {
 		key, _ = os.ReadFile(a.LoopbackKeyFile)
 	}
-	tok := issueLoopbackToken(key, rec.StreamID, time.Now().Unix()+86400) // LoopbackToken::TTL (24h), now-based — NOT tied to rec.End, else a past-programme catch-up mints an expired token. "" with no/invalid key → 404.
+	// The 32-byte lb1- key (config/cluster/loopback.key) MUST be provisioned by the
+	// install flow: with no/invalid key the token is "" and every recording 404s
+	// here (there is no live_streaming_pass fallback, unlike RecordCommand::loopbackPass).
+	tok := issueLoopbackToken(key, rec.StreamID, time.Now().Unix()+86400) // LoopbackToken::TTL (24h), now-based — NOT tied to rec.End, else a past-programme catch-up mints an expired token.
 	id := strconv.FormatInt(rec.StreamID, 10)
 	var target string
 	if rec.Archive {
@@ -122,6 +125,10 @@ func (a *Agent) captureRecording(ctx context.Context, rec recording, dst io.Writ
 var (
 	recorderFfmpeg = "ffmpeg"
 
+	// icon is forwarded as-is; MAIN's RecordingFinalizer regex-validates it
+	// (s:<sid>:/images/<md5>.jpg) and drops a raw URL, so DVR VODs currently get no
+	// cover art. Porting RecordCommand::downloadAndSaveImage needs a new images path
+	// in adminPolicy — a follow-up.
 	recorderComplete = func(a *Agent, ctx context.Context, recID int64, icon string) (int64, error) {
 		var out struct {
 			StreamID int64 `json:"stream_id"`
@@ -172,6 +179,13 @@ func (a *Agent) spoolRecordingState(id int64, status int) {
 // is not airing and not an archive job fails without a VOD; otherwise it marks
 // the recording started, captures to ARCHIVE_PATH/<id>.ts, and on a non-empty
 // capture finalizes it into a VOD (done), else fails. The .ts is always removed.
+//
+// Two deliberate narrowings vs RecordCommand: (1) an archive (catch-up) recording
+// assumes its minute files are already written — the slice-3 scheduler starts an
+// archive worker only once now >= End+65 (RecordCommand's in-worker end+65 wait),
+// so the worker does not wait; (2) a live source that drops mid-window finalizes
+// whatever was captured as done, without PHP's broken-pipe reconnect (the
+// Manager's /live is a continuous in-memory stream).
 func (a *Agent) runRecording(ctx context.Context, rec recording) {
 	pol, ok := a.adminPolicy()
 	if !ok {
