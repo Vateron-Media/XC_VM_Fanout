@@ -242,7 +242,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // adminAgentPath reports whether an /admin path is one the agent serves in-process
 // now (the serving handlers land slice by slice; the rest stay nginx's).
 func adminAgentPath(p string) bool {
-	return p == "/admin/thumb" || p == "/admin/vod"
+	return p == "/admin/thumb" || p == "/admin/vod" || p == "/admin/timeshift"
 }
 
 // serveAdmin routes an /admin relay-source request to the agent, rate-limited on

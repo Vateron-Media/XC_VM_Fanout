@@ -113,6 +113,9 @@ func (a *Agent) dataPlaneHandler(w http.ResponseWriter, r *http.Request) bool {
 	case r.Method == http.MethodGet && r.URL.Path == "/admin/vod":
 		a.serveAdminVOD(w, r)
 		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/timeshift":
+		a.serveAdminTimeshift(w, r)
+		return true
 	}
 	return false
 }
