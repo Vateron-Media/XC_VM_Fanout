@@ -268,12 +268,22 @@ func TestStatusLoopbackOnly(t *testing.T) {
 		t.Fatalf("remote /status: code=%d, want 403", rec.Code)
 	}
 
-	// A loopback caller passes the front and reaches the backend.
+	// A spoofed X-Forwarded-For from a remote peer must NOT pass the guard.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.RemoteAddr = "203.0.113.1:4444"
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed-XFF /status: code=%d, want 403", rec.Code)
+	}
+
+	// A loopback caller is answered natively (200, empty body) — NOT proxied.
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/status", nil)
 	req.RemoteAddr = "127.0.0.1:4444"
 	front.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || rec.Body.String() != "NGINX:/status" {
-		t.Fatalf("loopback /status: code=%d body=%q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || rec.Body.String() != "" {
+		t.Fatalf("loopback /status: code=%d body=%q, want 200 empty", rec.Code, rec.Body.String())
 	}
 }

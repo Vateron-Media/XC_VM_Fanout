@@ -206,10 +206,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// /status is local-only; the front enforces it on the TCP peer rather than
-	// delegating to a backend it reaches over loopback.
-	if r.URL.Path == statusPath && !isLoopback(clientIP(r)) {
-		http.Error(w, "", http.StatusForbidden)
+	// /status is local-only and answered in-process: the front enforces the
+	// loopback peer (nginx's allow 127.0.0.1; deny all) and then returns 200
+	// itself — the front being up is the liveness signal the fpm_status
+	// diagnostic reads. Faithful to PHP, whose status handler bootstraps and
+	// exits with an empty 200 (exempt from the fail-closed gate). No proxy hop.
+	if r.URL.Path == statusPath {
+		if !isLoopback(clientIP(r)) {
+			http.Error(w, "", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	// /xfile is a public, owner-side cross-node file read. With an agent socket
