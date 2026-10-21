@@ -1,9 +1,12 @@
 package clusteragent
 
 import (
+	"context"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
+	"time"
 )
 
 // recorder.go ports the PHP DVR recorder (Cli/Commands/RecordCommand.php,
@@ -51,5 +54,60 @@ func (s *recordSink) Write(b []byte) (int, error) {
 	if s.status == 0 {
 		s.status = http.StatusOK // an implicit 200, as net/http does on first write
 	}
+	if s.status != http.StatusOK {
+		return len(b), nil // discard a non-200 body (e.g. the 404 text) — PHP's fopen fails on a 4xx, writing nothing
+	}
 	return s.w.Write(b)
+}
+
+// recording is one scheduled DVR recording (RECORDING_FIELDS from the replica),
+// resolved by the slice-3 scheduler and handed to the worker.
+type recording struct {
+	ID         int64
+	StreamID   int64
+	Start, End int64 // unix seconds
+	Archive    bool  // a catch-up recording (pull /admin/timeshift) vs a live one
+	StreamIcon string
+}
+
+// captureRecording captures rec's bytes to dst by calling the node's own ported
+// /admin handler in-process, admitted with a freshly minted lb1- loopback token
+// (RecordCommand's loopback source pull). Live → /admin/live bounded by rec.End
+// (the Manager's /live is a continuous in-memory stream, so one ctx-deadline
+// pass captures the window — no PHP broken-pipe reconnect). Catch-up →
+// /admin/timeshift over [start, start+duration), one bounded pass. Returns the
+// serve status (404 = admission/serve refused, nothing captured).
+func (a *Agent) captureRecording(ctx context.Context, rec recording, dst io.Writer) int {
+	var key []byte
+	if a.LoopbackKeyFile != "" {
+		key, _ = os.ReadFile(a.LoopbackKeyFile)
+	}
+	tok := issueLoopbackToken(key, rec.StreamID, rec.End+300) // "" with no/invalid key → 404 (refused)
+	id := strconv.FormatInt(rec.StreamID, 10)
+	var target string
+	if rec.Archive {
+		dur := (rec.End - rec.Start) / 60
+		target = "/admin/timeshift?stream=" + id + "&extension=ts&start=" + strconv.FormatInt(rec.Start, 10) +
+			"&duration=" + strconv.FormatInt(dur, 10) + "&password=" + tok
+	} else {
+		target = "/admin/live?stream=" + id + "&extension=ts&password=" + tok
+	}
+	cctx := ctx
+	if !rec.Archive {
+		var cancel context.CancelFunc
+		cctx, cancel = context.WithDeadline(ctx, time.Unix(rec.End, 0))
+		defer cancel()
+	}
+	r, err := http.NewRequestWithContext(cctx, http.MethodGet, target, nil)
+	if err != nil {
+		return 0
+	}
+	r.Header.Set("X-XC-Client-IP", "127.0.0.1")
+	sink := newRecordSink(dst)
+	if rec.Archive {
+		a.serveAdminTimeshift(sink, r)
+	} else {
+		a.serveAdminLive(sink, r)
+	}
+	return sink.status
 }
