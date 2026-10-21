@@ -248,6 +248,12 @@ func (a *Agent) serveAdminLiveHLS(w http.ResponseWriter, r *http.Request, adm ad
 	h := w.Header()
 	h.Set("Content-Type", "application/vnd.apple.mpegurl")
 	h.Set("Content-Length", strconv.Itoa(len(out)))
+	// Served as application/vnd.apple.mpegurl (not HTML, no script execution). The
+	// only request-derived value reflected is the uitoken, already a sealed token
+	// that passed admission (an undecodable one 404s before here) and is opaque
+	// base64url; the password is policy-sourced, not from the request. Same
+	// false-positive the gateway playlist suppresses (gateway/server.go).
+	// nosemgrep: go.net.xss.no-direct-write-to-responsewriter-taint.no-direct-write-to-responsewriter-taint
 	_, _ = w.Write(out)
 }
 
