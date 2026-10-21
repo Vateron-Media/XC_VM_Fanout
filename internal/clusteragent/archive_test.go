@@ -98,3 +98,51 @@ func TestPruneArchiveIgnoresOffsetInCount(t *testing.T) {
 		t.Fatalf("segments after prune=%d, want 3 (.offset must not count toward the limit)", segs)
 	}
 }
+
+func TestMinuteWriterRotates(t *testing.T) {
+	dir := t.TempDir()
+	clk := time.Date(2026, 10, 21, 12, 0, 30, 0, time.UTC)
+	w := newMinuteWriter(dir, func() time.Time { return clk })
+	if err := w.write([]byte("AAAA")); err != nil { // minute 12-00
+		t.Fatal(err)
+	}
+	clk = clk.Add(time.Minute) // cross into 12-01
+	if err := w.write([]byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	n0 := filepath.Join(dir, "2026-10-21:12-00.ts")
+	n1 := filepath.Join(dir, "2026-10-21:12-01.ts")
+	if b, _ := os.ReadFile(n0); string(b) != "AAAA" {
+		t.Fatalf("minute 12-00 = %q, want AAAA", b)
+	}
+	if b, _ := os.ReadFile(n1); string(b) != "BBBB" {
+		t.Fatalf("minute 12-01 = %q, want BBBB", b)
+	}
+	for _, n := range []string{n0, n1} {
+		if b, err := os.ReadFile(n + ".offset"); err != nil || string(b) != "0" {
+			t.Fatalf("%s.offset = %q err=%v, want 0", filepath.Base(n), b, err)
+		}
+	}
+}
+
+func TestMinuteWriterDiscardsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	clk := time.Date(2026, 10, 21, 12, 0, 30, 0, time.UTC)
+	w := newMinuteWriter(dir, func() time.Time { return clk })
+	w.write([]byte("AAAA"))        // 12-00
+	clk = clk.Add(2 * time.Minute) // skip 12-01 entirely
+	w.write([]byte("CCCC"))        // 12-02
+	w.close()
+	if _, err := os.Stat(filepath.Join(dir, "2026-10-21:12-01.ts")); !os.IsNotExist(err) {
+		t.Fatalf("an empty minute (12-01) must produce no file, got err=%v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "2026-10-21:12-00.ts")); string(b) != "AAAA" {
+		t.Fatalf("12-00 = %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "2026-10-21:12-02.ts")); string(b) != "CCCC" {
+		t.Fatalf("12-02 = %q", b)
+	}
+}

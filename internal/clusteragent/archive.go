@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -65,3 +66,64 @@ func pruneArchive(dir string, limit int) error {
 	}
 	return nil
 }
+
+// minuteWriter appends bytes into the current UTC-minute file in dir, rotating
+// on the wall-clock minute (ArchiveCommand's inner loop): when the minute
+// changes it closes the old file — writing <file>.offset = findKeyframe(file) —
+// and opens the new one. Files are opened lazily on the first byte of a minute,
+// so a minute with no bytes leaves no stub (PHP's "discard empty"). The caller
+// writes in chunks, so rotation is chunk-granular, as in PHP.
+type minuteWriter struct {
+	dir      string
+	now      func() time.Time
+	cur      *os.File
+	curName  string
+	curBytes int64
+}
+
+func newMinuteWriter(dir string, now func() time.Time) *minuteWriter {
+	return &minuteWriter{dir: dir, now: now}
+}
+
+func (w *minuteWriter) write(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+	name := archiveMinuteName(w.now().Unix())
+	if w.cur == nil || name != w.curName {
+		if err := w.closeCur(); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(filepath.Join(w.dir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		w.cur, w.curName, w.curBytes = f, name, 0
+	}
+	n, err := w.cur.Write(b)
+	w.curBytes += int64(n)
+	return err
+}
+
+// closeCur flushes and closes the open minute file: an empty one (no bytes
+// written) is removed, else its .offset companion is written. No-op when none
+// is open.
+func (w *minuteWriter) closeCur() error {
+	if w.cur == nil {
+		return nil
+	}
+	path := filepath.Join(w.dir, w.curName)
+	_ = w.cur.Sync()
+	err := w.cur.Close()
+	w.cur = nil
+	if w.curBytes == 0 {
+		_ = os.Remove(path)
+		return err
+	}
+	if werr := os.WriteFile(path+".offset", []byte(strconv.FormatInt(findKeyframe(path), 10)), 0o644); werr != nil && err == nil {
+		err = werr
+	}
+	return err
+}
+
+func (w *minuteWriter) close() error { return w.closeCur() }
