@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/iotest"
 
 	cc "github.com/Vateron-Media/XC_VM_Fanout/internal/clustercrypto"
 )
@@ -205,6 +206,82 @@ func TestWriteRelayFramesRoundTrip(t *testing.T) {
 		if !bytes.Equal(out.Bytes(), plain) {
 			t.Fatalf("size %d: round-trip mismatch (got %d bytes)", size, out.Len())
 		}
+	}
+}
+
+// streamRelaySealed is the live (unbounded) analog of writeRelayFrames: the TS
+// relay body framed continuously, read back by the fetcher's copyRelayFrames,
+// with the GCM counter monotonic across the WHOLE stream.
+func TestStreamRelaySealedRoundTrip(t *testing.T) {
+	key := bytes.Repeat([]byte{3}, 32)
+	for _, size := range []int{1, relayFrameMax - 1, relayFrameMax, relayFrameMax + 1, 3*relayFrameMax + 7} {
+		plain := make([]byte, size)
+		if _, err := rand.Read(plain); err != nil {
+			t.Fatal(err)
+		}
+		var framed bytes.Buffer
+		if err := streamRelaySealed(&framed, bytes.NewReader(plain), key); err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		var out bytes.Buffer
+		if err := copyRelayFrames(&out, &framed, key); err != nil {
+			t.Fatalf("size %d: read back: %v", size, err)
+		}
+		if !bytes.Equal(out.Bytes(), plain) {
+			t.Fatalf("size %d: round-trip mismatch (got %d bytes)", size, out.Len())
+		}
+	}
+}
+
+// Many small reads must still produce frames with a contiguous counter — a
+// per-chunk writeRelayFrames would reset the counter to 0 each call and desync
+// the reader at the second frame.
+func TestStreamRelaySealedShortReads(t *testing.T) {
+	key := bytes.Repeat([]byte{5}, 32)
+	plain := bytes.Repeat([]byte("mpeg-ts-"), 500) // 4000 bytes, many one-byte reads
+	var framed bytes.Buffer
+	if err := streamRelaySealed(&framed, iotest.OneByteReader(bytes.NewReader(plain)), key); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := copyRelayFrames(&out, &framed, key); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), plain) {
+		t.Fatalf("short-read round-trip mismatch: %d vs %d bytes", out.Len(), len(plain))
+	}
+}
+
+// openLiveSealKey opens the ?rk= key a child sealed to this node's box key under
+// relaySealContext(this node's server id, stream), purpose "relay".
+func TestOpenLiveSealKey(t *testing.T) {
+	_, st := newFake(t) // ServerID 3
+	sk, pub, err := cc.NewX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.NodeBoxSk = sk
+	a := &Agent{Client: NewClient(st, "t"), Logf: t.Logf}
+
+	key := bytes.Repeat([]byte{9}, 32)
+	id := int64(77)
+	sealed, err := cc.Seal(pub, "relay", relaySealContext(3, id), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b64 := base64.RawURLEncoding.EncodeToString(sealed)
+
+	got, err := a.openLiveSealKey(b64, id)
+	if err != nil || !bytes.Equal(got, key) {
+		t.Fatalf("openLiveSealKey: err=%v match=%v", err, bytes.Equal(got, key))
+	}
+	// A key sealed for a different stream (context) must not open here.
+	if _, err := a.openLiveSealKey(b64, 78); err == nil {
+		t.Fatal("a key sealed for another stream opened")
+	}
+	// Garbage base64 must error, not panic.
+	if _, err := a.openLiveSealKey("!!!not-b64!!!", id); err == nil {
+		t.Fatal("invalid base64 accepted")
 	}
 }
 
