@@ -25,6 +25,11 @@ type Agent struct {
 	Interval  time.Duration
 	Telemetry func() map[string]any
 	Logf      func(format string, args ...any)
+	// recorders/archivers own the slice-3 recording and archive goroutines
+	// (recschedule.go), keyed by recording id / stream id; lazy-init via recSets.
+	recorders *workerSet
+	archivers *workerSet
+	recInit   sync.Once
 	// FlowsFile receives the node's mode and flow bits from MAIN's replies,
 	// for the LB's PHP (Core\Cluster\NodeFlows); "" writes nothing.
 	FlowsFile string

@@ -473,11 +473,13 @@ func (a *Agent) admitAdmin(paramStreamID int64, r *http.Request, clientIP string
 // target_container (vod MIME), vframes_server_id (thumb owner), direct_source and
 // type.live (the StreamSource row gates). Absent sub-blocks leave their fields 0/"".
 type streamMeta struct {
-	OnDemand        int64
-	TargetContainer string
-	VframesServerID int64
-	DirectSource    int64
-	TypeLive        int64
+	OnDemand          int64
+	TargetContainer   string
+	VframesServerID   int64
+	DirectSource      int64
+	TypeLive          int64
+	TvArchiveServerID int64
+	TvArchiveDuration int64
 }
 
 // streamMeta reads the stream's replica record; ok is false when it is
@@ -490,9 +492,11 @@ func (a *Agent) streamMeta(id string) (streamMeta, bool) {
 	var w struct {
 		Data struct {
 			Stream *struct {
-				TargetContainer string `json:"target_container"`
-				VframesServerID int64  `json:"vframes_server_id"`
-				DirectSource    int64  `json:"direct_source"`
+				TargetContainer   string `json:"target_container"`
+				VframesServerID   int64  `json:"vframes_server_id"`
+				DirectSource      int64  `json:"direct_source"`
+				TvArchiveServerID int64  `json:"tv_archive_server_id"`
+				TvArchiveDuration int64  `json:"tv_archive_duration"`
 			} `json:"stream"`
 			Server *struct {
 				OnDemand int64 `json:"on_demand"`
@@ -513,6 +517,8 @@ func (a *Agent) streamMeta(id string) (streamMeta, bool) {
 		m.TargetContainer = w.Data.Stream.TargetContainer
 		m.VframesServerID = w.Data.Stream.VframesServerID
 		m.DirectSource = w.Data.Stream.DirectSource
+		m.TvArchiveServerID = w.Data.Stream.TvArchiveServerID
+		m.TvArchiveDuration = w.Data.Stream.TvArchiveDuration
 	}
 	if w.Data.Type != nil {
 		m.TypeLive = w.Data.Type.Live

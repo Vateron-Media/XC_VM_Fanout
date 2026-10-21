@@ -71,6 +71,8 @@ type recording struct {
 	Start, End int64 // unix seconds
 	Archive    bool  // a catch-up recording (pull /admin/timeshift) vs a live one
 	StreamIcon string
+	SourceID   int64 // the node scheduled to record it (recordings.source_id)
+	Status     int   // recordings.status (1 recording, 2 done; the scheduler skips those)
 }
 
 // captureRecording captures rec's bytes to dst by calling the node's own ported
@@ -170,8 +172,10 @@ func (a *Agent) finalizeRecording(ctx context.Context, rec recording, tsPath str
 
 // spoolRecordingState reports a recording's status to MAIN as a P0 recording.state
 // event (ContentSink::recordingState on a CONTENT-flow node): 1 recording, 2 done,
-// 3 failed.
+// 3 failed. It also persists the status locally (recStatusDir) so the scheduler
+// does not re-record it before MAIN's replica catches up.
 func (a *Agent) spoolRecordingState(id int64, status int) {
+	a.markRecordingStatus(id, status)
 	_ = spoolP0(a.SpoolDir, []map[string]any{{"type": "recording.state", "d": map[string]any{"id": id, "status": status}}})
 }
 
