@@ -67,6 +67,7 @@ type tsSeg struct {
 // (ARCHIVE_PATH/<id>/<Y-m-d:H-i>.ts across [start, start+duration)) and answers
 // either the VOD playlist (m3u8) or the concatenated byte-range stream (ts).
 func (a *Agent) serveAdminTimeshift(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*") // timeshift.php:23 — unconditional (incl. 404/416); the admin preview loads this cross-origin
 	q := r.URL.Query()
 	clientIP := r.Header.Get("X-XC-Client-IP")
 	adm, ok := a.admitAdmin(parsePositiveInt(q.Get("stream")), r, clientIP, true, a.Client.MainNowMs())

@@ -163,6 +163,71 @@ func writeRelayFrames(w io.Writer, plaintext, key []byte) error {
 	return nil
 }
 
+// streamRelaySealed frames r into a continuous AES-256-GCM relay stream on w —
+// the owner side of copyRelayFrames for a live, unbounded body (the /admin/live
+// TS relay). One frame per read, flushed, with the GCM counter MONOTONIC across
+// the whole stream: a per-chunk writeRelayFrames would reset the counter to 0
+// on each call and desync the fetcher's reader, so the framing is inlined here
+// with a single counter that advances only on a frame actually written (a
+// 0-byte read emits nothing). Ends at r's EOF.
+func streamRelaySealed(w io.Writer, r io.Reader, key []byte) error {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	fl, _ := w.(http.Flusher)
+	nonce := make([]byte, gcm.NonceSize())
+	var hdr [4]byte
+	buf := make([]byte, relayFrameMax)
+	counter := uint64(0)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			binary.BigEndian.PutUint64(nonce[4:], counter)
+			ct := gcm.Seal(nil, nonce, buf[:n], relayAAD)
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(ct)))
+			if _, err := w.Write(hdr[:]); err != nil {
+				return err
+			}
+			if _, err := w.Write(ct); err != nil {
+				return err
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+			counter++
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return nil
+			}
+			return rerr
+		}
+	}
+}
+
+// openLiveSealKey opens the ?rk= session key a child sealed to this node's box
+// key for a live relay: purpose "relay", context relaySealContext(this node's
+// server id, stream) — the live analog of openFileSealKey.
+func (a *Agent) openLiveSealKey(sealedB64 string, streamID int64) ([]byte, error) {
+	blob, err := base64.RawURLEncoding.DecodeString(sealedB64)
+	if err != nil {
+		return nil, err
+	}
+	key, err := cc.Open(a.Client.State.NodeBoxSk, relaySealPurpose, relaySealContext(a.Client.State.ServerID, streamID), blob)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, errors.New("relay-seal key is not 32 bytes")
+	}
+	return key, nil
+}
+
 // openFileSealKey opens the ?rk= session key a fetcher sealed to this node's
 // box key for a file chunk: purpose "relay", context fileSealContext(owner,
 // tid). Errors on a bad base64, a seal that does not open, or a key that is
