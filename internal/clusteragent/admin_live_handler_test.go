@@ -186,6 +186,38 @@ func TestAdminLiveHLSUitokenForcesM3u8(t *testing.T) {
 	}
 }
 
+// --- Task 6: parity vectors ---
+
+// A relay/password pull of a stream that is down and NOT on-demand is 404 — the
+// source never force-starts it (live.php line 126), and no ensure is attempted.
+func TestAdminLiveDownNotOnDemand404(t *testing.T) {
+	lf := &liveFanout{id: "42"} // down, not startable
+	rg := newLiveRig(t, lf)
+	rg.writeStream(t, 0) // not on-demand
+	rec := httptest.NewRecorder()
+	rg.a.serveAdminLive(rec, rg.relayReq(t, "/admin/live?stream=42&extension=ts"))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("down non-on-demand: code=%d, want 404", rec.Code)
+	}
+	if lf.ensures() != 0 {
+		t.Fatalf("a down non-on-demand stream must not be ensured (got %d)", lf.ensures())
+	}
+}
+
+// A password admission (not a uitoken) with extension=m3u8 reaches the admin-HLS
+// arm and the playlist carries the stream+password segment URLs.
+func TestAdminLivePasswordHLS(t *testing.T) {
+	rg := newLiveRig(t, liveHLSFanout())
+	rec := httptest.NewRecorder()
+	rg.a.serveAdminLive(rec, rg.pwdReq(t, "/admin/live?stream=42&extension=m3u8&password=s3cr3t"))
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/vnd.apple.mpegurl" {
+		t.Fatalf("password hls: code=%d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(rec.Body.String(), "&stream=42&segment=5&password=s3cr3t") {
+		t.Fatalf("password playlist not rewritten with password URLs:\n%s", rec.Body.String())
+	}
+}
+
 // --- Task 5: route wiring (dataplane) ---
 
 func TestDataplaneRoutesAdminLive(t *testing.T) {
