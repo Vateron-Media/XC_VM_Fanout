@@ -71,6 +71,8 @@ type recording struct {
 	Start, End int64 // unix seconds
 	Archive    bool  // a catch-up recording (pull /admin/timeshift) vs a live one
 	StreamIcon string
+	SourceID   int64 // the node scheduled to record it (recordings.source_id)
+	Status     int   // recordings.status (1 recording, 2 done; the scheduler skips those)
 }
 
 // captureRecording captures rec's bytes to dst by calling the node's own ported
