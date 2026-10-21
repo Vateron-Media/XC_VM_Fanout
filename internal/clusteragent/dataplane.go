@@ -101,6 +101,24 @@ func (a *Agent) dataPlaneHandler(w http.ResponseWriter, r *http.Request) bool {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/file_digest":
 		a.serveFileDigest(w, r)
 		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/xfile":
+		a.serveXFile(w, r)
+		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/stream/rtmp":
+		a.serveRtmpNotify(w, r)
+		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/thumb":
+		a.serveAdminThumb(w, r)
+		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/vod":
+		a.serveAdminVOD(w, r)
+		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/timeshift":
+		a.serveAdminTimeshift(w, r)
+		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/live":
+		a.serveAdminLive(w, r)
+		return true
 	}
 	return false
 }

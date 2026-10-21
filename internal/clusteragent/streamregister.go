@@ -337,8 +337,50 @@ func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 			a.applyTranscode(context.Background(), id, spec)
 			return
 		}
+		if d.Kind == "loopback" {
+			a.registerLoopback(id)
+			return
+		}
 	}
 	a.unseedFanoutRecord(id)
+}
+
+// loopbackBody is the puller registration for a loopback stream: its node-local
+// relay URL (http://<RelayProxyAddr>/relay/<k>/<id>.ts), composed from the agent's
+// own relay key. The puller fetches it as a plain mp2t source and the relay proxy
+// signs the upstream connect to the parent (resolved per stream from the record)
+// with MAIN's relay ticket — so no relay secret is ever shipped in the directive;
+// MAIN cannot compose this URL because the key k is node-local. ok=false (fail
+// closed) when the relay proxy is off (no RelayKeyDir) or the key cannot be
+// loaded, so the stream is left unregistered rather than pulling a broken URL.
+// Silent: callers decide whether a miss is logged (register) or skipped quietly
+// (the 2-minute reconcile). The single composer every loopback call site shares,
+// so registration, re-seed and reconcile agree on the exact URL.
+func (a *Agent) loopbackBody(id int64) (streamRegisterBody, bool) {
+	if a.RelayKeyDir == "" {
+		return streamRegisterBody{}, false
+	}
+	k, err := LoadRelayKey(a.RelayKeyDir)
+	if err != nil || k == "" {
+		return streamRegisterBody{}, false
+	}
+	return streamRegisterBody{URLs: []string{"http://" + RelayProxyAddr + "/relay/" + k + "/" + strconv.FormatInt(id, 10) + ".ts"}}, true
+}
+
+// registerLoopback registers a loopback stream's relay URL with the puller, or
+// fails closed (unregister) when the relay proxy is off or the key is
+// unavailable, so the daemon is never left pulling a broken URL.
+func (a *Agent) registerLoopback(id int64) {
+	body, ok := a.loopbackBody(id)
+	if !ok {
+		a.logf("cluster: loopback stream %d: relay proxy off or key unavailable, not registering", id)
+		a.unseedFanoutRecord(id)
+		return
+	}
+	a.releaseSupervision(id) // a flip transcode->loopback: stop the encoder
+	if err := a.registerStream(context.Background(), id, body); err != nil {
+		a.logf("cluster: fanout register loopback %d: %v", id, err)
+	}
 }
 
 // applyTranscode hands a transcode stream to the supervisor, but only when its
@@ -412,6 +454,14 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 		}
 		if spec, ok := d.transcodeSpec(); ok {
 			a.applyTranscode(ctx, id, spec)
+			continue
+		}
+		if d.Kind == "loopback" {
+			if body, ok := a.loopbackBody(id); ok {
+				if err := a.registerStream(ctx, id, body); err != nil {
+					a.logf("cluster: fanout re-seed loopback %d: %v", id, err)
+				}
+			}
 		}
 	}
 }
@@ -442,6 +492,54 @@ func (a *Agent) fanoutRegisteredIDs(ctx context.Context) ([]string, error) {
 	return out.Streams, nil
 }
 
+// fanoutStreamStatus asks the fanout whether a stream is running and on air
+// (GET /streams/<id>); ok is false for an unknown stream or an unreachable
+// fanout. The /stream/rtmp handler uses it to decide an on-demand start.
+func (a *Agent) fanoutStreamStatus(ctx context.Context, id string) (running, hasData, ok bool) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://fanout/streams/"+id, nil)
+	if err != nil {
+		return false, false, false
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		return false, false, false
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return false, false, false
+	}
+	var s struct {
+		Running bool `json:"running"`
+		HasData bool `json:"has_data"`
+	}
+	if json.NewDecoder(res.Body).Decode(&s) != nil {
+		return false, false, false
+	}
+	return s.Running, s.HasData, true
+}
+
+// fanoutEnsure asks the fanout to bring a registered-but-idle stream up on
+// demand (POST /streams/<id>/ensure, driving Manager.EnsureRunning). Best
+// effort: a failure is logged, not fatal.
+func (a *Agent) fanoutEnsure(ctx context.Context, id string) {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://fanout/streams/"+id+"/ensure", nil)
+	if err != nil {
+		return
+	}
+	res, err := fanoutClient(a.FanoutCtl).Do(req)
+	if err != nil {
+		if a.Logf != nil {
+			a.Logf("rtmp: fanout ensure %s: %v", id, err)
+		}
+		return
+	}
+	res.Body.Close()
+}
+
 // reconcileFanout converges the fanout's registered set to exactly the held
 // proxies: it registers every held proxy the fanout lacks and unregisters every
 // id the fanout holds that is no longer a held proxy, leaving matches alone.
@@ -465,6 +563,13 @@ func (a *Agent) reconcileFanout(ctx context.Context) {
 		if d, ok := parseRuntimeDirective(recordJSON); ok {
 			if body, reg := d.registerBody(a.FfmpegBin); reg {
 				want[id] = body
+			} else if d.Kind == "loopback" {
+				// A loopback is a /streams puller registration too, so the reconcile
+				// must keep it (not tear it down as a non-proxy). Fail-closed when the
+				// key is unavailable → left out of want → unregistered, as intended.
+				if body, ok := a.loopbackBody(id); ok {
+					want[id] = body
+				}
 			}
 		}
 	}

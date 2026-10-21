@@ -25,6 +25,11 @@ type Agent struct {
 	Interval  time.Duration
 	Telemetry func() map[string]any
 	Logf      func(format string, args ...any)
+	// recorders/archivers own the slice-3 recording and archive goroutines
+	// (recschedule.go), keyed by recording id / stream id; lazy-init via recSets.
+	recorders *workerSet
+	archivers *workerSet
+	recInit   sync.Once
 	// FlowsFile receives the node's mode and flow bits from MAIN's replies,
 	// for the LB's PHP (Core\Cluster\NodeFlows); "" writes nothing.
 	FlowsFile string
@@ -37,6 +42,28 @@ type Agent struct {
 	// SpoolDir is where the node's PHP spools events for MAIN (events.go);
 	// "" leaves the event lanes off.
 	SpoolDir string
+	// FloodDir holds the per-IP RTMP flood counters and block_<ip> markers the
+	// brute-force guard reads and writes (match PHP's FLOOD_TMP_PATH, rtmpgates.go);
+	// "" leaves the RTMP flood ban off.
+	FloodDir string
+	// TmpRoot is the node's TMP_PATH (<home>/tmp/); the node-chores loop
+	// (crondrain.go, crontmp.go) derives LOGS_TMP_PATH/CRONS_TMP_PATH/… from it.
+	// "" leaves the ported crons off.
+	TmpRoot string
+	// PlaylistDir is PLAYLIST_PATH, pruned by cron:tmp (crontmp.go); "" skips it.
+	PlaylistDir string
+	// NodeCronsFile is the liveness+ownership marker the chores loop touches each
+	// tick (<statedir>/node_crons); the node's crontab generation drops the ported
+	// crons while it is fresh. "" leaves the marker unwritten (PHP keeps the crons).
+	NodeCronsFile string
+	// LoopbackKeyFile is config/cluster/loopback.key — the node's own key that
+	// signs the lb1- loopback tokens the local recorder presents to /admin
+	// (admin.go); "" leaves the loopback admission arm off.
+	LoopbackKeyFile string
+	// GatewayPolicyFile is the gateway policy file (the -gw-policy path the gateway
+	// loads, written by cron:cache) the agent reads the viewer token keys from to
+	// decode /admin uitokens (admin.go); "" leaves the uitoken admission arm off.
+	GatewayPolicyFile string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
@@ -125,6 +152,17 @@ type Agent struct {
 	httpsFailing       atomic.Bool  // HTTPS fails under https_required (policy.go)
 	nonceOnce          sync.Once    // the data plane's nonce window (dataplane.go)
 	nonces             *nonceCache
+	xfileRouteMu       sync.Mutex    // the /xfile fetcher-resolution cache (xfile_fetcher.go)
+	xfileRoutes        *serverRoutes // last servers.json parse, ~5s TTL
+	xfileRouteMod      time.Time
+	xfileRouteAt       time.Time
+	xfileMetrics       xfileStats  // /xfile serve/refusal counters (xfile.go)
+	rtmpYes            rtmpLastYes // /stream/rtmp last-yes grace cache (rtmpoffline.go)
+	rtmpStatsMu        sync.Mutex  // /stream/rtmp decision counters by label (rtmpnotify.go)
+	rtmpStats          map[string]uint64
+	rtmpAllowMu        sync.Mutex // allowed-RTMP list cache, blocklist.json-mtime refreshed (rtmpgates.go)
+	rtmpAllowMod       time.Time
+	rtmpAllowCache     map[string]rtmpAllow
 	digestN1Mu         sync.Mutex
 	digestN1           map[int64]time.Time // owners whose chunk digest named no request (relayproxy.go)
 	ticketsOnce        sync.Once           // the data plane's tickets (tickets.go)
@@ -643,6 +681,11 @@ func (a *Agent) Run(ctx context.Context) error {
 				}
 			}
 		}()
+	}
+	if a.TmpRoot != "" {
+		cctx, stopChores := context.WithCancel(ctx)
+		defer stopChores()
+		go a.RunChores(cctx)
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)

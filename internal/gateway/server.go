@@ -400,6 +400,14 @@ func phpLocation(kind string) string {
 	return "@gw_segment_php"
 }
 
+// warmupPlaylistWait/warmupPlaylistPoll bound how long serveLive waits for the
+// first HLS segment to finalize after the puller is on air, before giving up
+// with a 503. Vars (not consts) so tests can lower them.
+var (
+	warmupPlaylistWait = 2 * time.Second
+	warmupPlaylistPoll = 100 * time.Millisecond
+)
+
 // retryLater answers 503 Service Unavailable with Retry-After: 1 — a serve-only
 // warmup whose stream did not become ready within the bounded wait. The client
 // retries shortly, by when the puller should have data; a serve-only node has no
@@ -407,6 +415,23 @@ func phpLocation(kind string) string {
 func retryLater(w http.ResponseWriter) {
 	w.Header().Set("Retry-After", "1")
 	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
+// waitHLSPlaylist reports whether the stream's HLS playlist has segments yet,
+// polling node.FedPlaylist up to warmupPlaylistWait. It covers the brief
+// readiness sliver between the puller going on air (what EnsureRunning waits
+// for) and the first segment being cut.
+func (s *Server) waitHLSPlaylist(id string) bool {
+	deadline := time.Now().Add(warmupPlaylistWait)
+	for {
+		if s.node.FedPlaylist(id) != "" {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(warmupPlaylistPoll)
+	}
 }
 
 // serveThumb answers thumb.php's happy path: the stream's thumbnail with the
@@ -533,10 +558,15 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 			return ""
 		}
 		if !ref.TS {
-			// HLS: route to fanout's own HLS handler, now that the puller is running.
-			// It may still answer "no segments yet" (404) for the brief window until
-			// the first playlist segment exists; the player retries (the readiness
-			// sliver the design tolerates).
+			// HLS: EnsureRunning waited for data to flow, but the first segment may
+			// not be finalized yet. Wait (bounded) for the playlist to have segments,
+			// then route to fanout's own HLS handler to serve it; if it never
+			// finalizes, 503 Retry-After — uniform with the start timeout — rather
+			// than passing the handler's "no segments yet" 404 on to the client.
+			if !s.waitHLSPlaylist(strconv.Itoa(ref.Stream)) {
+				retryLater(w)
+				return ""
+			}
 			in := r.Clone(r.Context())
 			in.URL = &url.URL{Path: "/hls/" + strconv.Itoa(ref.Stream) + "/index.m3u8"}
 			in.RequestURI = in.URL.RequestURI()

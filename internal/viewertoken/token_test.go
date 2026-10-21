@@ -1,4 +1,4 @@
-package gateway
+package viewertoken
 
 import (
 	"encoding/hex"
