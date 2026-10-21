@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // acmePrefix is certbot's http-01 challenge path; it must keep working through
@@ -74,6 +75,7 @@ type Server struct {
 	streams      string       // STREAMS_PATH root for /progress writes; empty leaves /progress to the proxy
 	agentProxy   http.Handler // /xfile owner, reverse-proxied to the agent socket; nil leaves /xfile to the proxy
 	xfileLimiter *rateLimiter // the peer-keyed /xfile limiter (nginx zone xfile)
+	reqCount     atomic.Int64 // total requests served, reported by /nginx_status (nginx stub_status request count)
 }
 
 // internalPrefixes are nginx's `internal;` X-Accel targets — reachable only via
@@ -317,6 +319,9 @@ func legacyPHP(path string) (string, int) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Count every accepted request (nginx stub_status's request counter);
+	// /nginx_status reports it for the node watchdog's request-count probe.
+	s.reqCount.Add(1)
 	// nginx's server-level `if ($request_method !~ ^(GET|POST)$) return 200;` —
 	// a benign empty 200 for any other method, ahead of all routing.
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
@@ -349,6 +354,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// /nginx_status is nginx's stub_status (local-only: allow 127.0.0.1; deny all).
+	// With no nginx the front answers it from its own request counter, in the
+	// stub_status format the node watchdog parses (SystemInfo::nginxRequestCount
+	// reads field [2] of line [2]: "<accepts> <handled> <requests>").
+	if r.URL.Path == "/nginx_status" {
+		if !isLoopback(clientIP(r)) {
+			http.Error(w, "", http.StatusForbidden)
+			return
+		}
+		n := strconv.FormatInt(s.reqCount.Load(), 10)
+		_, _ = io.WriteString(w, "Active connections: 1 \nserver accepts handled requests\n "+n+" "+n+" "+n+" \nReading: 0 Writing: 1 Waiting: 0 \n")
 		return
 	}
 	// /xfile is a public, owner-side cross-node file read. With an agent socket

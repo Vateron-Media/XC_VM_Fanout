@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -440,5 +441,37 @@ func TestLegacyPhpRedirects(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("%s: code=%d, want 404", p, rec.Code)
 		}
+	}
+}
+
+func TestNginxStatusStub(t *testing.T) {
+	front := NewServer(http.NotFoundHandler(), nil, t.TempDir(), LoadTrustedProxies())
+	// Remote peer denied (nginx's allow 127.0.0.1; deny all).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nginx_status", nil)
+	req.RemoteAddr = "203.0.113.1:9"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("remote /nginx_status: code=%d, want 403", rec.Code)
+	}
+	// Loopback: a stub_status body whose line[2] field[2] is numeric — what
+	// SystemInfo::nginxRequestCount reads (explode(' ', line[2])[2]).
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/nginx_status", nil)
+	req.RemoteAddr = "127.0.0.1:9"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback /nginx_status: code=%d, want 200", rec.Code)
+	}
+	lines := strings.Split(strings.TrimRight(rec.Body.String(), "\n"), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("stub body has %d lines: %q", len(lines), rec.Body.String())
+	}
+	fields := strings.Fields(lines[2])
+	if len(fields) < 3 {
+		t.Fatalf("line[2] = %q, want 3 fields", lines[2])
+	}
+	if _, err := strconv.Atoi(fields[2]); err != nil {
+		t.Fatalf("requests field %q not numeric: %v", fields[2], err)
 	}
 }
