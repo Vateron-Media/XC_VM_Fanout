@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -152,9 +153,42 @@ func (a *Agent) recSets() (recorders, archivers *workerSet) {
 	return a.recorders, a.archivers
 }
 
+// recStatusDir holds the node's local recording-status markers — the Go twin of
+// StreamRuntime's recordings/<id>.json. A finished recording is marked here the
+// instant it completes, so the next tick does not re-record it in the window
+// before MAIN's replica reflects the new status (the replica carries MAIN's
+// lagging view, filtered on nothing). Survives a process restart, as PHP's does.
+func (a *Agent) recStatusDir() string { return filepath.Join(a.TmpRoot, "recordings") }
+
+func (a *Agent) markRecordingStatus(id int64, status int) {
+	if a.TmpRoot == "" {
+		return
+	}
+	if err := os.MkdirAll(a.recStatusDir(), 0o750); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(a.recStatusDir(), strconv.FormatInt(id, 10)), []byte(strconv.Itoa(status)), 0o640)
+}
+
+// localRecordingStatus is StreamRuntime::recordingStatus: the node's own last
+// status for a recording, or (_, false) when it has none.
+func (a *Agent) localRecordingStatus(id int64) (int, bool) {
+	b, err := os.ReadFile(filepath.Join(a.recStatusDir(), strconv.FormatInt(id, 10)))
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // scheduleRecordings is cron:vod (VodCronJob): under its lock, start a recorder
 // goroutine for every due recording the node holds, de-duplicated by the
-// recorder worker set. A chore on the RunChores tick.
+// recorder worker set. A chore on the RunChores tick. The node's local status
+// (recStatusDir) wins over the replica's lagging one, as NodeStreams::recordingsDue
+// prefers StreamRuntime::recordingStatus.
 func (a *Agent) scheduleRecordings(ctx context.Context) error {
 	rel, ok := acquireCronLock(cronLockPath(a.cronsDir(), `XcVm\Cli\CronJobs\VodCronJob`))
 	if !ok {
@@ -166,6 +200,9 @@ func (a *Agent) scheduleRecordings(ctx context.Context) error {
 	srv := a.Client.State.ServerID
 	for _, sid := range heldStreams(a.ReplicaDir) {
 		for _, rec := range a.streamRecordings(strconv.FormatInt(sid, 10)) {
+			if ls, ok := a.localRecordingStatus(rec.ID); ok {
+				rec.Status = ls // the node's own status wins over the replica's lagging one
+			}
 			if !shouldStartRecording(rec, srv, now) {
 				continue
 			}

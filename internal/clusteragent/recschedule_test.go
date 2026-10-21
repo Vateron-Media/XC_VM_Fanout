@@ -95,6 +95,7 @@ func TestWorkerSetDedups(t *testing.T) {
 		t.Fatal("start after completion should succeed")
 	}
 	<-done
+	archiveWaitFor(t, func() bool { return !s.has(7) }, time.Second) // await cleanup for consistency
 }
 
 func TestWorkerSetStopCancels(t *testing.T) {
@@ -238,6 +239,37 @@ func TestReconcileStopsVanished(t *testing.T) {
 	lf.mu.Unlock()
 	rg.a.reconcileArchiveWorkers(context.Background())
 	archiveWaitFor(t, func() bool { return !arcs.has(42) }, 2*time.Second)
+}
+
+func TestLocalRecordingStatusRoundTrips(t *testing.T) {
+	a := &Agent{TmpRoot: t.TempDir()}
+	if _, ok := a.localRecordingStatus(55); ok {
+		t.Fatal("no marker yet, want (_, false)")
+	}
+	a.markRecordingStatus(55, 2)
+	if s, ok := a.localRecordingStatus(55); !ok || s != 2 {
+		t.Fatalf("localRecordingStatus = %d,%v want 2,true", s, ok)
+	}
+}
+
+// Critical regression: a finished archive recording must not be re-recorded on
+// the next tick just because the replica status still lags — the node's local
+// status (StreamRuntime::recordingStatus) wins.
+func TestScheduleHonorsLocalDoneStatus(t *testing.T) {
+	rg := newSchedRig(t, &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("X")})
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error {
+		t.Error("re-recorded a locally-done recording")
+		return nil
+	})
+	now := time.Now().Unix()
+	start := ((now - 3600) / 60) * 60 // an archive recording whose window + 65s has passed
+	recWriteStreamRecord(t, rg, fmt.Sprintf(`{"id":55,"start":%d,"end":%d,"source_id":3,"archive":1,"status":0}`, start, start+120))
+	rg.a.markRecordingStatus(55, 2) // the node already finished it; the replica still shows status 0
+	rg.a.scheduleRecordings(context.Background())
+	time.Sleep(150 * time.Millisecond)
+	if n := recState1Count(t, rg.a.SpoolDir); n != 0 {
+		t.Fatalf("locally-done recording re-recorded (%d state-1 events)", n)
+	}
 }
 
 func TestRunRecordingSchedulers(t *testing.T) {

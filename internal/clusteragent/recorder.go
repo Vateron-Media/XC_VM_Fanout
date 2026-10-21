@@ -172,8 +172,10 @@ func (a *Agent) finalizeRecording(ctx context.Context, rec recording, tsPath str
 
 // spoolRecordingState reports a recording's status to MAIN as a P0 recording.state
 // event (ContentSink::recordingState on a CONTENT-flow node): 1 recording, 2 done,
-// 3 failed.
+// 3 failed. It also persists the status locally (recStatusDir) so the scheduler
+// does not re-record it before MAIN's replica catches up.
 func (a *Agent) spoolRecordingState(id int64, status int) {
+	a.markRecordingStatus(id, status)
 	_ = spoolP0(a.SpoolDir, []map[string]any{{"type": "recording.state", "d": map[string]any{"id": id, "status": status}}})
 }
 
