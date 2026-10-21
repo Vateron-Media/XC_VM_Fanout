@@ -2,6 +2,8 @@ package clusteragent
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,5 +146,92 @@ func TestMinuteWriterDiscardsEmpty(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "2026-10-21:12-02.ts")); string(b) != "CCCC" {
 		t.Fatalf("12-02 = %q", b)
+	}
+}
+
+func archiveWaitFor(t *testing.T, cond func() bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %s", timeout)
+}
+
+func newArchiveJob(dir, arch string, clk time.Time, running func() bool) *archiveJob {
+	return &archiveJob{
+		streamID: 42, streamsDir: dir, archiveDir: arch, durationDays: 1,
+		now: func() time.Time { return clk }, running: running, logf: func(string, ...any) {},
+		poll: 10 * time.Millisecond, stall: 300 * time.Millisecond,
+	}
+}
+
+func TestArchiveRunAppendsCompletedSegments(t *testing.T) {
+	dir, arch := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(dir, "42_.m3u8"), []byte("#EXTM3U\n"), 0o644) // no refs → start at 0
+	for i, c := range []string{"AAAA", "BBBB", "CCCC", "DDDD"} {
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("42_%d.ts", i)), []byte(c), 0o644)
+	}
+	clk := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	j := newArchiveJob(dir, arch, clk, func() bool { return true })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go j.run(ctx)
+	minute := filepath.Join(arch, "2026-10-21:12-00.ts")
+	// seg 0,1,2 are complete (have a successor); seg 3 (DDDD) has no _4 → excluded.
+	archiveWaitFor(t, func() bool { b, _ := os.ReadFile(minute); return string(b) == "AAAABBBBCCCC" }, 3*time.Second)
+	cancel()
+	if b, _ := os.ReadFile(minute); string(b) != "AAAABBBBCCCC" {
+		t.Fatalf("minute = %q, want AAAABBBBCCCC", b)
+	}
+}
+
+func TestArchiveRunWaitsForNext(t *testing.T) {
+	dir, arch := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(dir, "42_.m3u8"), []byte("#EXTM3U\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "42_0.ts"), []byte("AAAA"), 0o644) // no _1 → seg 0 incomplete
+	clk := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	j := newArchiveJob(dir, arch, clk, func() bool { return true })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	j.run(ctx) // exits on the 300ms stall, nothing appended
+	if _, err := os.Stat(filepath.Join(arch, "2026-10-21:12-00.ts")); !os.IsNotExist(err) {
+		t.Fatalf("no complete segment → no minute file, got err=%v", err)
+	}
+}
+
+func TestArchiveRunForwardGap(t *testing.T) {
+	dir, arch := t.TempDir(), t.TempDir()
+	pl := filepath.Join(dir, "42_.m3u8")
+	os.WriteFile(pl, []byte("#EXTM3U\n"), 0o644) // start at 0, nothing present yet
+	clk := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	j := newArchiveJob(dir, arch, clk, func() bool { return true })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go j.run(ctx)
+	time.Sleep(50 * time.Millisecond) // let it park waiting at seg 0
+	// forward jump: segments purged ahead, playlist now lists _5; _5 and _6 present.
+	os.WriteFile(filepath.Join(dir, "42_5.ts"), []byte("FFFF"), 0o644)
+	os.WriteFile(filepath.Join(dir, "42_6.ts"), []byte("IIII"), 0o644)
+	os.WriteFile(pl, []byte("#EXTM3U\n#EXTINF:6,\n42_5.ts\n"), 0o644)
+	minute := filepath.Join(arch, "2026-10-21:12-00.ts")
+	archiveWaitFor(t, func() bool { b, _ := os.ReadFile(minute); return string(b) == "FFFF" }, 2*time.Second)
+	cancel()
+}
+
+func TestArchiveRunStopsWhenNotRunning(t *testing.T) {
+	dir, arch := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(dir, "42_.m3u8"), []byte("#EXTM3U\n"), 0o644)
+	clk := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	j := newArchiveJob(dir, arch, clk, func() bool { return false }) // not running
+	done := make(chan error, 1)
+	go func() { done <- j.run(context.Background()) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("run did not stop when running()=false")
 	}
 }

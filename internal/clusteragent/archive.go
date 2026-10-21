@@ -1,8 +1,12 @@
 package clusteragent
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -127,3 +131,134 @@ func (w *minuteWriter) closeCur() error {
 }
 
 func (w *minuteWriter) close() error { return w.closeCur() }
+
+// archiveJob records one running stream's on-disk HLS into minute files — the
+// agent's port of ArchiveCommand's body. now/running are injected (so the loop
+// is testable without a live stream); poll/stall default to 50ms / 300s (PHP's
+// no-progress bound). The agent owns the goroutine's lifecycle (a later slice),
+// replacing PHP's PID marker + process-title kill.
+type archiveJob struct {
+	streamID     int64
+	streamsDir   string // STREAMS_PATH
+	archiveDir   string // ARCHIVE_PATH/<id>
+	durationDays int    // tv_archive_duration
+	now          func() time.Time
+	running      func() bool
+	logf         func(string, ...any)
+	poll         time.Duration
+	stall        time.Duration
+}
+
+var playlistSegRe = regexp.MustCompile(`_(\d+)\.ts`)
+
+// lastPlaylistSeg is PHP's `end(preg_match_all('/_(\d+)\.ts/'))`: the last
+// segment number listed in the playlist, or -1 when none/unreadable.
+func lastPlaylistSeg(playlist string) int {
+	b, err := os.ReadFile(playlist)
+	if err != nil {
+		return -1
+	}
+	m := playlistSegRe.FindAllStringSubmatch(string(b), -1)
+	if len(m) == 0 {
+		return -1
+	}
+	n, _ := strconv.Atoi(m[len(m)-1][1])
+	return n
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// run follows STREAMS_PATH/<id>_<N>.ts (complete once <id>_<N+1>.ts exists),
+// appending each through a minuteWriter, until the stream stops, the playlist
+// disappears, ctx ends, or no progress for `stall`. It starts one past the last
+// segment the playlist lists (avoiding a partial), and follows a forward gap
+// (purge/skip) or a backward reset (restart) by re-reading the playlist.
+func (j *archiveJob) run(ctx context.Context) error {
+	if j.now == nil {
+		j.now = time.Now
+	}
+	if j.running == nil {
+		j.running = func() bool { return true }
+	}
+	if j.logf == nil {
+		j.logf = func(string, ...any) {}
+	}
+	poll := j.poll
+	if poll == 0 {
+		poll = 50 * time.Millisecond
+	}
+	stall := j.stall
+	if stall == 0 {
+		stall = 300 * time.Second
+	}
+	if err := os.MkdirAll(j.archiveDir, 0o755); err != nil {
+		return err
+	}
+	playlist := filepath.Join(j.streamsDir, fmt.Sprintf("%d_.m3u8", j.streamID))
+	seg := lastPlaylistSeg(playlist) + 1 // -1+1=0 when none listed
+	limit := j.durationDays * 24 * 60
+	w := newMinuteWriter(j.archiveDir, j.now)
+	defer w.close()
+	lastPrune, lastProgress := j.now(), j.now()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !j.running() || !fileExists(playlist) {
+			return nil
+		}
+		if j.now().Sub(lastPrune) >= time.Hour {
+			_ = pruneArchive(j.archiveDir, limit)
+			lastPrune = j.now()
+		}
+		segFile := filepath.Join(j.streamsDir, fmt.Sprintf("%d_%d.ts", j.streamID, seg))
+		nextFile := filepath.Join(j.streamsDir, fmt.Sprintf("%d_%d.ts", j.streamID, seg+1))
+		if !fileExists(segFile) || !fileExists(nextFile) {
+			if fresh := lastPlaylistSeg(playlist); fresh >= 0 && (fresh > seg+1 || fresh < seg-1) {
+				seg = fresh // forward gap or backward restart: follow the source counter
+				lastProgress = j.now()
+				continue
+			}
+			if j.now().Sub(lastProgress) >= stall {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(poll):
+			}
+			continue
+		}
+		if err := j.appendSegment(segFile, w); err != nil {
+			return err
+		}
+		seg++
+		lastProgress = j.now()
+	}
+}
+
+// appendSegment streams a completed source segment into the minute writer in
+// 64 KiB chunks (rotation is chunk-granular, as in PHP). A segment pruned
+// between the existence check and open is skipped (nil), and the caller advances.
+func (j *archiveJob) appendSegment(path string, w *minuteWriter) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	buf := make([]byte, 65536)
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			if werr := w.write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return nil
+			}
+			return rerr
+		}
+	}
+}
