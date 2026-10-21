@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,16 @@ import (
 	"testing"
 	"time"
 )
+
+// recFakeExternals swaps the MAIN recording_complete call and the ffmpeg runner
+// for fakes, restoring them when the test ends.
+func recFakeExternals(t *testing.T, vodID int64, vodErr error, run func(ctx context.Context, name string, args ...string) error) {
+	t.Helper()
+	oldC, oldR := recorderComplete, recorderRun
+	t.Cleanup(func() { recorderComplete, recorderRun = oldC, oldR })
+	recorderComplete = func(a *Agent, ctx context.Context, recID int64, icon string) (int64, error) { return vodID, vodErr }
+	recorderRun = run
+}
 
 // recWithLoopback adds a 32-byte loopback key file to a liveRig so the lb1-
 // admission arm is live, and returns the key.
@@ -84,6 +95,55 @@ func TestCaptureBadKeyRefused(t *testing.T) {
 	st := rg.a.captureRecording(context.Background(), recording{ID: 7, StreamID: 42, Start: now, End: now + 1}, &buf)
 	if st != http.StatusNotFound || buf.Len() != 0 {
 		t.Fatalf("no key: status=%d body=%q, want 404 + empty", st, buf.String())
+	}
+}
+
+func TestFinalizeCreatesVod(t *testing.T) {
+	rg := newLiveRig(t, &liveFanout{id: "42"})
+	_, vod := recSetArchivePath(t, rg)
+	var gotArgs []string
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error {
+		gotArgs = append([]string{name}, args...)
+		return os.WriteFile(args[len(args)-1], []byte("MP4"), 0o644) // fake ffmpeg writes the output
+	})
+	ts := filepath.Join(t.TempDir(), "rec.ts")
+	os.WriteFile(ts, []byte("TSDATA"), 0o644)
+	vodID, err := rg.a.finalizeRecording(context.Background(), recording{ID: 3, StreamID: 42}, ts)
+	if err != nil || vodID != 7 {
+		t.Fatalf("finalize: vodID=%d err=%v", vodID, err)
+	}
+	if _, err := os.Stat(filepath.Join(vod, "7.mp4")); err != nil {
+		t.Fatalf("mp4 not at vod/7.mp4: %v", err)
+	}
+	joined := strings.Join(gotArgs, " ")
+	if !strings.Contains(joined, "-c:v copy") || !strings.Contains(joined, "-c:a copy") {
+		t.Fatalf("ffmpeg args missing copy codecs: %v", gotArgs)
+	}
+}
+
+func TestFinalizeVodZeroFails(t *testing.T) {
+	rg := newLiveRig(t, &liveFanout{id: "42"})
+	recSetArchivePath(t, rg)
+	ran := false
+	recFakeExternals(t, 0, nil, func(ctx context.Context, name string, args ...string) error { ran = true; return nil })
+	ts := filepath.Join(t.TempDir(), "rec.ts")
+	os.WriteFile(ts, []byte("X"), 0o644)
+	if _, err := rg.a.finalizeRecording(context.Background(), recording{ID: 3, StreamID: 42}, ts); err == nil {
+		t.Fatal("vod id 0 should fail")
+	}
+	if ran {
+		t.Fatal("ffmpeg must not run when MAIN made no VOD")
+	}
+}
+
+func TestFinalizeFfmpegFails(t *testing.T) {
+	rg := newLiveRig(t, &liveFanout{id: "42"})
+	recSetArchivePath(t, rg)
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error { return errors.New("ffmpeg boom") })
+	ts := filepath.Join(t.TempDir(), "rec.ts")
+	os.WriteFile(ts, []byte("X"), 0o644)
+	if _, err := rg.a.finalizeRecording(context.Background(), recording{ID: 3, StreamID: 42}, ts); err == nil {
+		t.Fatal("ffmpeg failure should propagate")
 	}
 }
 

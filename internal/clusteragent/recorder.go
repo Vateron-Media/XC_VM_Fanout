@@ -2,9 +2,12 @@ package clusteragent
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -110,4 +113,50 @@ func (a *Agent) captureRecording(ctx context.Context, rec recording, dst io.Writ
 		a.serveAdminLive(sink, r)
 	}
 	return sink.status
+}
+
+// recorderFfmpeg is the ffmpeg binary the recorder runs for the TS→MP4 copy;
+// the node's real path is wired by config (slice 3). recorderComplete and
+// recorderRun are the two external calls (MAIN op, ffmpeg), package vars so
+// tests fake them.
+var (
+	recorderFfmpeg = "ffmpeg"
+
+	recorderComplete = func(a *Agent, ctx context.Context, recID int64, icon string) (int64, error) {
+		var out struct {
+			StreamID int64 `json:"stream_id"`
+		}
+		err := a.Client.Call(ctx, "recording_complete", map[string]any{"recording_id": recID, "stream_icon": icon}, &out, false)
+		return out.StreamID, err
+	}
+
+	recorderRun = func(ctx context.Context, name string, args ...string) error {
+		return exec.CommandContext(ctx, name, args...).Run()
+	}
+)
+
+// finalizeRecording ports RecordCommand::processRecording: ask MAIN to create
+// the VOD row (recording_complete → its stream id), then ffmpeg -c copy the
+// captured .ts into VOD_PATH/<vod>.mp4. A VOD id ≤ 0 (MAIN made none) or an
+// ffmpeg that produces no file is a failure.
+func (a *Agent) finalizeRecording(ctx context.Context, rec recording, tsPath string) (int64, error) {
+	vodID, err := recorderComplete(a, ctx, rec.ID, rec.StreamIcon)
+	if err != nil {
+		return 0, err
+	}
+	if vodID <= 0 {
+		return 0, errors.New("recorder: MAIN created no VOD row")
+	}
+	pol, ok := a.adminPolicy()
+	if !ok {
+		return 0, errors.New("recorder: no gateway policy")
+	}
+	out := filepath.Join(pol.vodPath, strconv.FormatInt(vodID, 10)+".mp4")
+	if err := recorderRun(ctx, recorderFfmpeg, "-i", tsPath, "-c:v", "copy", "-c:a", "copy", out); err != nil {
+		return 0, err
+	}
+	if st, err := os.Stat(out); err != nil || st.Size() <= 0 {
+		return 0, errors.New("recorder: ffmpeg produced no mp4")
+	}
+	return vodID, nil
 }
