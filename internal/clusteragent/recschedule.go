@@ -57,12 +57,14 @@ func (s *workerSet) start(parent context.Context, id int64, fn func(ctx context.
 	return true
 }
 
+// stop cancels id's worker but does NOT drop it — the goroutine's own cleanup
+// removes it when it actually returns, so has(id) stays true until the worker has
+// fully finished (its writes done), which callers wait on before teardown.
 func (s *workerSet) stop(id int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.workers[id]; ok {
 		e.cancel()
-		delete(s.workers, id)
 	}
 }
 
@@ -79,14 +81,14 @@ func (s *workerSet) len() int {
 	return len(s.workers)
 }
 
-// stopAllExcept cancels and drops every worker whose id is not in keep.
+// stopAllExcept cancels every worker whose id is not in keep; each goroutine's
+// own cleanup drops it once it returns (so has stays true until it has finished).
 func (s *workerSet) stopAllExcept(keep map[int64]bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, e := range s.workers {
 		if !keep[id] {
 			e.cancel()
-			delete(s.workers, id)
 		}
 	}
 }
