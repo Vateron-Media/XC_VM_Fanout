@@ -179,11 +179,13 @@ func TestArchiveRunAppendsCompletedSegments(t *testing.T) {
 	j := newArchiveJob(dir, arch, clk, func() bool { return true })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go j.run(ctx)
+	done := make(chan struct{})
+	go func() { j.run(ctx); close(done) }()
 	minute := filepath.Join(arch, "2026-10-21:12-00.ts")
 	// seg 0,1,2 are complete (have a successor); seg 3 (DDDD) has no _4 → excluded.
 	archiveWaitFor(t, func() bool { b, _ := os.ReadFile(minute); return string(b) == "AAAABBBBCCCC" }, 3*time.Second)
 	cancel()
+	<-done // run() must stop writing before TempDir cleanup, else "directory not empty"
 	if b, _ := os.ReadFile(minute); string(b) != "AAAABBBBCCCC" {
 		t.Fatalf("minute = %q, want AAAABBBBCCCC", b)
 	}
@@ -211,7 +213,8 @@ func TestArchiveRunForwardGap(t *testing.T) {
 	j := newArchiveJob(dir, arch, clk, func() bool { return true })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go j.run(ctx)
+	done := make(chan struct{})
+	go func() { j.run(ctx); close(done) }()
 	time.Sleep(50 * time.Millisecond) // let it park waiting at seg 0
 	// forward jump: segments purged ahead, playlist now lists _5; _5 and _6 present.
 	os.WriteFile(filepath.Join(dir, "42_5.ts"), []byte("FFFF"), 0o644)
@@ -220,6 +223,7 @@ func TestArchiveRunForwardGap(t *testing.T) {
 	minute := filepath.Join(arch, "2026-10-21:12-00.ts")
 	archiveWaitFor(t, func() bool { b, _ := os.ReadFile(minute); return string(b) == "FFFF" }, 2*time.Second)
 	cancel()
+	<-done // run() must stop writing before TempDir cleanup
 }
 
 // Parity: a minute the worker assembles equals the source segments concatenated
@@ -236,13 +240,16 @@ func TestArchiveRunParity(t *testing.T) {
 	j := newArchiveJob(dir, arch, clk, func() bool { return true })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go j.run(ctx)
+	done := make(chan struct{})
+	go func() { j.run(ctx); close(done) }()
 	minute := filepath.Join(arch, "2026-10-21:08-15.ts")
 	want := strings.Join(segs, "")
 	archiveWaitFor(t, func() bool { b, _ := os.ReadFile(minute); return string(b) == want }, 3*time.Second)
 	cancel()
-	// .offset is written when the minute is closed (run's deferred close on exit).
-	archiveWaitFor(t, func() bool { b, err := os.ReadFile(minute + ".offset"); return err == nil && string(b) == "0" }, 2*time.Second)
+	<-done // run()'s deferred close writes .offset; wait before asserting + cleanup
+	if b, err := os.ReadFile(minute + ".offset"); err != nil || string(b) != "0" {
+		t.Fatalf("minute .offset = %q err=%v, want 0", b, err)
+	}
 }
 
 func TestArchiveRunStopsWhenNotRunning(t *testing.T) {
