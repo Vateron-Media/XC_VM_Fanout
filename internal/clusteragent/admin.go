@@ -191,15 +191,16 @@ type adminAdmission struct {
 // the token keys (uitoken decode), ip_subnet_match, the media paths, the
 // per-server redirect base URLs (thumb's owner 302), and the vod throttle.
 type adminPolicy struct {
-	keys           viewertoken.Keys
-	acceptLegacy   bool
-	subnetMatch    bool
-	streamsPath    string
-	vodPath        string
-	archivePath    string
-	redirect       map[string][]string
-	vodLimitPerc   int
-	vodBitratePlus int
+	keys            viewertoken.Keys
+	acceptLegacy    bool
+	subnetMatch     bool
+	streamsPath     string
+	vodPath         string
+	archivePath     string
+	redirect        map[string][]string
+	vodLimitPerc    int
+	vodBitratePlus  int
+	defaultTimezone string
 }
 
 // adminPolicy reads and parses the gateway policy file; ok is false when it is
@@ -222,15 +223,17 @@ func (a *Agent) adminPolicy() (*adminPolicy, bool) {
 			Vod     string `json:"vod"`
 			Archive string `json:"archive"`
 		} `json:"paths"`
-		Redirect       map[string][]string `json:"redirect"`
-		VodLimitPerc   int                 `json:"vod_limit_perc"`
-		VodBitratePlus int                 `json:"vod_bitrate_plus"`
+		Redirect        map[string][]string `json:"redirect"`
+		VodLimitPerc    int                 `json:"vod_limit_perc"`
+		VodBitratePlus  int                 `json:"vod_bitrate_plus"`
+		DefaultTimezone string              `json:"default_timezone"`
 	}
 	_ = json.Unmarshal(b, &p) // keys already parsed; paths/redirect are best-effort
 	return &adminPolicy{
 		keys: keys, acceptLegacy: acceptLegacy, subnetMatch: subnet,
 		streamsPath: p.Paths.Streams, vodPath: p.Paths.Vod, archivePath: p.Paths.Archive,
 		redirect: p.Redirect, vodLimitPerc: p.VodLimitPerc, vodBitratePlus: p.VodBitratePlus,
+		defaultTimezone: p.DefaultTimezone,
 	}, true
 }
 
@@ -259,6 +262,7 @@ func parsePositiveInt(s string) int64 {
 // non-live/direct stream or any refusal is a 404. No password/loopback arm
 // (passwordOK=false). clientIP is the resolved address the front forwards.
 func (a *Agent) serveAdminThumb(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*") // thumb.php:24 — unconditional (incl. 404/302); the admin preview loads this cross-origin
 	q := r.URL.Query()
 	clientIP := r.Header.Get("X-XC-Client-IP")
 	adm, ok := a.admitAdmin(parsePositiveInt(q.Get("stream")), r, clientIP, false, a.Client.MainNowMs())
@@ -343,6 +347,7 @@ func containerMimeType(c string) string {
 // ponytail: served at full speed — vod.php's vod_limit_perc/vod_bitrate_plus
 // bandwidth throttle is a follow-up, not ported here.
 func (a *Agent) serveAdminVOD(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*") // vod.php:23 — unconditional (incl. 404/416); the admin preview loads this cross-origin
 	q := r.URL.Query()
 	clientIP := r.Header.Get("X-XC-Client-IP")
 	stream := q.Get("stream")

@@ -32,6 +32,29 @@ func TestFrontRoutesAdminThumbToAgentWithRealIP(t *testing.T) {
 	}
 }
 
+// The front routes /admin/live to the agent too, with the same real-IP forwarding.
+func TestFrontProxiesAdminLive(t *testing.T) {
+	var gotPath, gotIP string
+	sock := startUnixAgent(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotIP = r.URL.Path, r.Header.Get("X-XC-Client-IP")
+		_, _ = io.WriteString(w, "AGENT")
+	}))
+	s := NewServer(okHandler(), newNginxStub(t).url, t.TempDir(), LoadTrustedProxies()).WithAgentSocket(sock)
+
+	r := httptest.NewRequest(http.MethodGet, "/admin/live?stream=42&extension=ts", nil)
+	r.RemoteAddr = "203.0.113.9:5555"
+	r.Header.Set("X-XC-Client-IP", "9.9.9.9") // spoofed by the caller
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, r)
+
+	if rec.Body.String() != "AGENT" || gotPath != "/admin/live" {
+		t.Fatalf("admin/live not routed to the agent: body=%q path=%q", rec.Body.String(), gotPath)
+	}
+	if gotIP != "203.0.113.9" {
+		t.Fatalf("front forwarded X-XC-Client-IP=%q, want the real peer 203.0.113.9 (spoof dropped)", gotIP)
+	}
+}
+
 // With no agent socket, /admin/thumb falls back to nginx during the transition.
 func TestFrontAdminFallsBackToNginxWithoutAgent(t *testing.T) {
 	nginx := newNginxStub(t)
