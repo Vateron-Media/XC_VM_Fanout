@@ -98,6 +98,7 @@ func Main(ver string) {
 	frontPortsHTTP := flag.String("front-ports-http", "/home/xc_vm/bin/nginx/conf/ports/http.conf", "nginx ports/http.conf the front reads its plain-HTTP listen ports from")
 	frontPortsHTTPS := flag.String("front-ports-https", "/home/xc_vm/bin/nginx/conf/ports/https.conf", "nginx ports/https.conf the front reads its TLS listen ports from")
 	frontImages := flag.String("front-images", "/home/xc_vm/storage/images/", "dir the front serves /images/ from in-process (nginx's storage/images alias); empty proxies /images to nginx")
+	frontStreams := flag.String("front-streams", "/home/xc_vm/content/streams/", "STREAMS_PATH dir the front writes /progress files (<id>_.progress) under; empty leaves /progress to nginx")
 	frontAgentSock := flag.String("front-agent-sock", "", "agent unix socket the front proxies /xfile to (the Go owner side); empty leaves /xfile to nginx during the transition")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
@@ -248,7 +249,7 @@ func Main(ver string) {
 	// way: if it cannot start, nginx keeps serving the node.
 	frontStop := func() {}
 	if *frontAddr != "" {
-		if stop, err := serveFront(gws, *frontNginx, *frontWebroot, *frontCert, *frontKey, *frontRealip, *frontImages, *frontAgentSock, *frontPortsHTTP, *frontPortsHTTPS); err != nil {
+		if stop, err := serveFront(gws, *frontNginx, *frontWebroot, *frontCert, *frontKey, *frontRealip, *frontImages, *frontStreams, *frontAgentSock, *frontPortsHTTP, *frontPortsHTTPS); err != nil {
 			log.Printf("front: %v; nginx keeps serving", err)
 		} else {
 			frontStop = stop

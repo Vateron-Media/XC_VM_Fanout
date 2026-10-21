@@ -2,6 +2,8 @@ package front
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -10,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -68,6 +71,7 @@ type Server struct {
 	trusted      *TrustedProxies
 	limiter      *rateLimiter
 	images       string       // storage/images root; empty leaves /images to the proxy
+	streams      string       // STREAMS_PATH root for /progress writes; empty leaves /progress to the proxy
 	agentProxy   http.Handler // /xfile owner, reverse-proxied to the agent socket; nil leaves /xfile to the proxy
 	xfileLimiter *rateLimiter // the peer-keyed /xfile limiter (nginx zone xfile)
 }
@@ -165,6 +169,82 @@ func (s *Server) WithImages(dir string) *Server {
 	return s
 }
 
+// WithStreams makes the front answer /progress in-process, writing the ffmpeg
+// progress file under dir (STREAMS_PATH, nginx's /xc_hls alias). An empty dir
+// leaves /progress to the proxy during the transition. Returns the server for
+// chaining.
+func (s *Server) WithStreams(dir string) *Server {
+	s.streams = dir
+	return s
+}
+
+// atoiPrefix is PHP intval: the leading run of an optional sign and digits, else
+// 0. It keeps a client-supplied stream_id from ever reaching the filename as
+// anything but an integer (no path traversal).
+func atoiPrefix(s string) int {
+	s = strings.TrimSpace(s)
+	i := 0
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	j := i
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	if j == i {
+		return 0
+	}
+	n, err := strconv.Atoi(s[:j])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// serveProgress is a faithful port of Public/progress/index.php: a loopback-only
+// writer that records an ffmpeg progress block for a stream. It requires a
+// loopback peer, a stream_id, and a non-empty body; anything else is 404
+// (PHP generate404()). The body is key=value lines; each is split on the first
+// '=', key and value trimmed, blank/'='-less lines dropped, and the resulting
+// map is written as JSON to <streams>/<id>_.progress in one shot (matching
+// file_put_contents, so the streams cron never json_decodes a torn file).
+func (s *Server) serveProgress(w http.ResponseWriter, r *http.Request) {
+	if s.streams == "" {
+		s.proxyOrError(w, r)
+		return
+	}
+	sid := r.URL.Query().Get("stream_id")
+	if !isLoopback(clientIP(r)) || sid == "" {
+		http.NotFound(w, r)
+		return
+	}
+	// nginx capped the body at client_max_body_size 8m; the front is the edge now.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+	// PHP trims the whole body, then 404s when it is empty — so a blank or
+	// whitespace-only POST never clobbers an existing <id>_.progress with an
+	// empty object; it leaves the last real progress in place.
+	text := strings.TrimSpace(string(body))
+	if err != nil || text == "" {
+		http.NotFound(w, r)
+		return
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(text, "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	path := filepath.Join(s.streams, strconv.Itoa(atoiPrefix(sid))+"_.progress")
+	_ = os.WriteFile(path, b, 0o644)
+}
+
 // serveImages serves a file under /images/ from the image store, matching
 // nginx: no code execution (403), no auto-index.html (404), no directory
 // listing, and confined to the root.
@@ -206,10 +286,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// /status is local-only; the front enforces it on the TCP peer rather than
-	// delegating to a backend it reaches over loopback.
-	if r.URL.Path == statusPath && !isLoopback(clientIP(r)) {
-		http.Error(w, "", http.StatusForbidden)
+	// /status is local-only and answered in-process: the front enforces the
+	// loopback peer (nginx's allow 127.0.0.1; deny all) and then returns 200
+	// itself — the front being up is the liveness signal the fpm_status
+	// diagnostic reads. Faithful to PHP, whose status handler bootstraps and
+	// exits with an empty 200 (exempt from the fail-closed gate). No proxy hop.
+	if r.URL.Path == statusPath {
+		if !isLoopback(clientIP(r)) {
+			http.Error(w, "", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	// /xfile is a public, owner-side cross-node file read. With an agent socket
@@ -223,6 +310,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// answers it (allow/deny), or nginx during the transition.
 	if r.URL.Path == "/stream/rtmp" {
 		s.serveRtmpNotify(w, r)
+		return
+	}
+	// /progress is nginx_rtmp/ffmpeg's loopback-only progress sink; the front
+	// writes the <id>_.progress file the streams cron reads (faithful to
+	// Public/progress/index.php), or nginx owns it when no streams dir is set.
+	if r.URL.Path == "/progress" {
+		s.serveProgress(w, r)
 		return
 	}
 	if kind := serveKind(r.URL.Path); kind != "" {
