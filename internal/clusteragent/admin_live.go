@@ -115,6 +115,7 @@ func hlsHasSegment(playlist []byte) bool {
 // gate (answering odstart as bare "1"/"0"), then serve the TS relay or the
 // admin HLS.
 func (a *Agent) serveAdminLive(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*") // live.php:27 — unconditional (incl. 404s); the admin preview loads this cross-origin
 	q := r.URL.Query()
 	adm, ok := a.admitAdmin(parsePositiveInt(q.Get("stream")), r, r.Header.Get("X-XC-Client-IP"), true, a.Client.MainNowMs())
 	if !ok {

@@ -218,6 +218,37 @@ func TestAdminLivePasswordHLS(t *testing.T) {
 	}
 }
 
+// live.php:27 sets Access-Control-Allow-Origin: * on every response; the admin
+// browser preview (player.php) loads /admin/live cross-origin via video.js, so
+// the header must be present on the playlist, the TS, and the 404.
+func TestAdminLiveCORS(t *testing.T) {
+	// TS relay
+	lf := &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("TS")}
+	rg := newLiveRig(t, lf)
+	rec := httptest.NewRecorder()
+	rg.a.serveAdminLive(rec, rg.relayReq(t, "/admin/live?stream=42&extension=ts"))
+	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("ts: ACAO=%q, want *", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	// HLS playlist (uitoken)
+	rg2 := newLiveRig(t, liveHLSFanout())
+	rec2 := httptest.NewRecorder()
+	rg2.a.serveAdminLive(rec2, rg2.uitokenReq(t, 42, ""))
+	if rec2.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("hls: ACAO=%q, want *", rec2.Header().Get("Access-Control-Allow-Origin"))
+	}
+	// 404 (no admission) still carries the header, like live.php's generate404.
+	lf3 := &liveFanout{id: "42", running: true, hasData: true}
+	rg3 := newLiveRig(t, lf3)
+	r := httptest.NewRequest(http.MethodGet, "/admin/live?stream=42&extension=ts", nil)
+	r.Header.Set("X-XC-Client-IP", "198.51.100.9")
+	rec3 := httptest.NewRecorder()
+	rg3.a.serveAdminLive(rec3, r)
+	if rec3.Code != http.StatusNotFound || rec3.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("404: code=%d ACAO=%q, want 404 + *", rec3.Code, rec3.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
 // --- Task 5: route wiring (dataplane) ---
 
 func TestDataplaneRoutesAdminLive(t *testing.T) {
