@@ -60,7 +60,7 @@ func freePort(t *testing.T) int {
 func TestServeFrontNonFatalOnBadCert(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := serveFront(http.NotFoundHandler(), "http://127.0.0.1:1", dir,
-		filepath.Join(dir, "absent.crt"), filepath.Join(dir, "absent.key"), "", "", "",
+		filepath.Join(dir, "absent.crt"), filepath.Join(dir, "absent.key"), "", "", "", "",
 		filepath.Join(dir, "http.conf"), filepath.Join(dir, "https.conf")); err == nil {
 		t.Fatal("want an error for a missing certificate, got nil")
 	}
@@ -93,7 +93,7 @@ func TestServeFrontServesAndProxies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stop, err := serveFront(gw, backend.URL, dir, cp, kp, "", "", "", hp, sp)
+	stop, err := serveFront(gw, backend.URL, dir, cp, kp, "", "", "", "", hp, sp)
 	if err != nil {
 		t.Fatal(err)
 	}
