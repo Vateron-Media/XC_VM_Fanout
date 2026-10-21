@@ -358,3 +358,28 @@ func TestProgressStreamIDInteger(t *testing.T) {
 		t.Fatalf("want 0_.progress written in-dir, got err=%v", err)
 	}
 }
+
+func TestProgressWhitespaceBodyPreservesFile(t *testing.T) {
+	streams := t.TempDir()
+	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, t.TempDir(), LoadTrustedProxies()).WithStreams(streams + "/")
+
+	// An existing progress file with real content.
+	existing := []byte(`{"frame":"99","progress":"continue"}`)
+	if err := os.WriteFile(filepath.Join(streams, "12_.progress"), existing, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A whitespace-only POST must 404 and leave the file untouched (PHP trims the
+	// body then 404s on empty — it never clobbers the file with an empty object).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/progress?stream_id=12", strings.NewReader("\n   \n"))
+	req.RemoteAddr = "127.0.0.1:9"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("whitespace body: code=%d, want 404", rec.Code)
+	}
+	got, err := os.ReadFile(filepath.Join(streams, "12_.progress"))
+	if err != nil || string(got) != string(existing) {
+		t.Fatalf("progress file clobbered: err=%v content=%q, want %q", err, got, existing)
+	}
+}

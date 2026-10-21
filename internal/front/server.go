@@ -220,12 +220,16 @@ func (s *Server) serveProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	// nginx capped the body at client_max_body_size 8m; the front is the edge now.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
-	if err != nil || len(body) == 0 {
+	// PHP trims the whole body, then 404s when it is empty — so a blank or
+	// whitespace-only POST never clobbers an existing <id>_.progress with an
+	// empty object; it leaves the last real progress in place.
+	text := strings.TrimSpace(string(body))
+	if err != nil || text == "" {
 		http.NotFound(w, r)
 		return
 	}
 	out := map[string]string{}
-	for _, line := range strings.Split(string(body), "\n") {
+	for _, line := range strings.Split(text, "\n") {
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
