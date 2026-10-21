@@ -284,6 +284,38 @@ func (s *Server) serveImages(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, full)
 }
 
+var (
+	legacyStreamRe = regexp.MustCompile(`^/stream/(key|segment|live|vod|timeshift|thumb|subtitle|rtmp)\.php$`)
+	legacyAdminRe  = regexp.MustCompile(`^/admin/(live|timeshift|thumb|vod)\.php$`)
+)
+
+// legacyPHP maps the LB nginx's legacy .php URL forms to its responses:
+// /streaming/rtmp.php, /stream/<kind>.php, /admin/<kind>.php and /progress.php
+// → StatusFound to the canonical path (nginx `return 302`); /portal.php,
+// /c/portal.php and any other *.php → StatusNotFound (nginx `return 404` /
+// `location ~ \.php$`). Returns ("", 0) for a non-.php path, which falls
+// through. Matches on the path only; the caller reattaches the query (`?$args`).
+func legacyPHP(path string) (string, int) {
+	switch path {
+	case "/streaming/rtmp.php":
+		return "/stream/rtmp", http.StatusFound
+	case "/progress.php":
+		return "/progress", http.StatusFound
+	case "/portal.php", "/c/portal.php":
+		return "", http.StatusNotFound
+	}
+	if m := legacyStreamRe.FindStringSubmatch(path); m != nil {
+		return "/stream/" + m[1], http.StatusFound
+	}
+	if m := legacyAdminRe.FindStringSubmatch(path); m != nil {
+		return "/admin/" + m[1], http.StatusFound
+	}
+	if strings.HasSuffix(path, ".php") {
+		return "", http.StatusNotFound
+	}
+	return "", 0
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// nginx's server-level `if ($request_method !~ ^(GET|POST)$) return 200;` —
 	// a benign empty 200 for any other method, ahead of all routing.
@@ -337,6 +369,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Public/progress/index.php), or nginx owns it when no streams dir is set.
 	if r.URL.Path == "/progress" {
 		s.serveProgress(w, r)
+		return
+	}
+	// nginx's legacy .php contract (relative 302 to the canonical path, or 404),
+	// served in-process so it holds with no backend (absolute_redirect off → the
+	// Location is path-only, hence relative).
+	if target, status := legacyPHP(r.URL.Path); status != 0 {
+		if status == http.StatusNotFound {
+			http.NotFound(w, r)
+			return
+		}
+		loc := target
+		if r.URL.RawQuery != "" {
+			loc += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, loc, http.StatusFound)
 		return
 	}
 	if kind := serveKind(r.URL.Path); kind != "" {

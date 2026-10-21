@@ -408,3 +408,37 @@ func TestNonGetPostReturns200(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyPhpRedirects(t *testing.T) {
+	front := NewServer(http.NotFoundHandler(), nil, t.TempDir(), LoadTrustedProxies())
+	redirects := map[string]string{
+		"/stream/live.php?token=abc": "/stream/live?token=abc",
+		"/stream/key.php?token=z":    "/stream/key?token=z",
+		"/admin/vod.php?a=1&b=2":     "/admin/vod?a=1&b=2",
+		"/streaming/rtmp.php?x=1":    "/stream/rtmp?x=1",
+		"/progress.php?stream_id=12": "/progress?stream_id=12",
+		"/stream/segment.php":        "/stream/segment", // no query
+	}
+	for in, want := range redirects {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, in, nil)
+		req.RemoteAddr = "127.0.0.1:9"
+		front.ServeHTTP(rec, req)
+		loc := rec.Header().Get("Location")
+		if rec.Code != http.StatusFound || loc != want {
+			t.Fatalf("%s: code=%d loc=%q, want 302 %q", in, rec.Code, loc, want)
+		}
+		if strings.Contains(loc, "://") { // absolute_redirect off → relative
+			t.Fatalf("%s: Location %q is absolute; nginx emits relative", in, loc)
+		}
+	}
+	for _, p := range []string{"/portal.php", "/c/portal.php", "/whatever.php"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.RemoteAddr = "127.0.0.1:9"
+		front.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s: code=%d, want 404", p, rec.Code)
+		}
+	}
+}
