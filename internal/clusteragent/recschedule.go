@@ -47,3 +47,21 @@ func (a *Agent) streamRecordings(id string) []recording {
 	}
 	return out
 }
+
+// shouldStartRecording is NodeStreams::recordingsDue plus the archive start-gate:
+// the recording is scheduled on this node, not already recording/done, and either
+// airing now or an archive (catch-up) job — and an archive job is held until
+// now >= end+65 so every archive minute file has been written.
+func shouldStartRecording(r recording, serverID, now int64) bool {
+	if r.SourceID != serverID || r.Status == 1 || r.Status == 2 {
+		return false
+	}
+	airing := r.Start <= now && now < r.End
+	if !airing && !r.Archive {
+		return false
+	}
+	if r.Archive && now < r.End+65 {
+		return false
+	}
+	return true
+}

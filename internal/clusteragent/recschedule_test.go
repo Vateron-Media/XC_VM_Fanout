@@ -32,3 +32,26 @@ func TestStreamRecordingsParses(t *testing.T) {
 		t.Fatalf("streamMeta tv_archive: ok=%v sid=%d dur=%d", ok, m.TvArchiveServerID, m.TvArchiveDuration)
 	}
 }
+
+func TestShouldStartRecording(t *testing.T) {
+	const now, srv = int64(10000), int64(3)
+	cases := []struct {
+		name string
+		r    recording
+		want bool
+	}{
+		{"airing live", recording{SourceID: srv, Start: 9000, End: 11000}, true},
+		{"past live", recording{SourceID: srv, Start: 1000, End: 2000}, false},
+		{"future live", recording{SourceID: srv, Start: 20000, End: 21000}, false},
+		{"archive after end+65", recording{SourceID: srv, Archive: true, Start: 1000, End: now - 100}, true},
+		{"archive within end+65", recording{SourceID: srv, Archive: true, Start: 1000, End: now - 10}, false},
+		{"status recording", recording{SourceID: srv, Start: 9000, End: 11000, Status: 1}, false},
+		{"status done", recording{SourceID: srv, Start: 9000, End: 11000, Status: 2}, false},
+		{"other node", recording{SourceID: 5, Start: 9000, End: 11000}, false},
+	}
+	for _, c := range cases {
+		if got := shouldStartRecording(c.r, srv, now); got != c.want {
+			t.Errorf("%s: shouldStartRecording = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
