@@ -35,6 +35,7 @@ type liveFanout struct {
 	ensured   int
 	liveQuery string
 	liveBody  []byte
+	liveBlock bool // hold /live until the request ctx is cancelled (a continuous stream)
 	playlist  []byte
 	segments  map[string][]byte // seq → bytes
 }
@@ -75,8 +76,17 @@ func newLiveFanout(t *testing.T, lf *liveFanout) string {
 			_ = json.NewEncoder(w).Encode(map[string]bool{"running": lf.running, "has_data": lf.hasData})
 		case r.Method == http.MethodGet && strings.HasPrefix(p, "/live/"):
 			lf.liveQuery = r.URL.RawQuery
+			block := lf.liveBlock
 			w.Header().Set("Content-Type", "video/mp2t")
 			_, _ = w.Write(lf.liveBody)
+			if block { // a continuous stream: flush the body, then hold (lock released) until the request ctx is cancelled
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
+				lf.mu.Unlock()
+				<-r.Context().Done()
+				lf.mu.Lock()
+			}
 		case r.Method == http.MethodGet && p == "/hls/"+lf.id+"/index.m3u8":
 			if lf.playlist == nil {
 				http.NotFound(w, r)

@@ -138,6 +138,28 @@ func TestCaptureCatchupPastProgramme(t *testing.T) {
 	}
 }
 
+// The live capture must stop at rec.End (the ctx deadline). With a fanout that
+// holds the /live connection open, the capture returns only if the deadline is
+// wired — a mis-wire would hang here.
+func TestCaptureLiveStopsAtEnd(t *testing.T) {
+	lf := &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("TS"), liveBlock: true}
+	rg := newLiveRig(t, lf)
+	recWithLoopback(t, rg)
+	var buf bytes.Buffer
+	start := time.Now()
+	st := rg.a.captureRecording(context.Background(), recording{ID: 7, StreamID: 42, Start: start.Unix(), End: start.Unix() + 2}, &buf)
+	elapsed := time.Since(start)
+	if st != http.StatusOK {
+		t.Fatalf("status=%d, want 200", st)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("live capture did not stop at end (took %v) — the ctx deadline is not bounding it", elapsed)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("TS")) {
+		t.Fatalf("capture got %q, want the body written before the deadline", buf.String())
+	}
+}
+
 func TestCaptureBadKeyRefused(t *testing.T) {
 	lf := &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("X")}
 	rg := newLiveRig(t, lf)
