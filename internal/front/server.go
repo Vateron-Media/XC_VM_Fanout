@@ -126,11 +126,25 @@ func NewServer(gateway http.Handler, nginx *url.URL, webroot string, trusted *Tr
 	return s
 }
 
-// proxyOrError proxies to the nginx backend, or returns 502 when there is none
-// (a serve-only front with nginx gone).
+// proxyOrError proxies to the nginx backend, or returns 502 when there is none.
+// Its callers are the paths that *expected* a backend (an X-Accel defer, an
+// /xfile or /stream/rtmp fallback); with nginx gone those are a misconfiguration,
+// so 502 is right. The unknown-route fall-through uses proxyOrNotFound instead.
 func (s *Server) proxyOrError(w http.ResponseWriter, r *http.Request) {
 	if s.proxy == nil {
 		http.Error(w, "", http.StatusBadGateway)
+		return
+	}
+	s.proxy.ServeHTTP(w, r)
+}
+
+// proxyOrNotFound is the unknown-route fall-through: proxy to the backend when
+// there is one, else 404 — a path the front does not route is one nginx itself
+// answers 404 (location ~ \.php$, @extensionless-php, a try_files miss), so a
+// nil backend returns the same 404, not a 502.
+func (s *Server) proxyOrNotFound(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		http.NotFound(w, r)
 		return
 	}
 	s.proxy.ServeHTTP(w, r)
@@ -271,6 +285,12 @@ func (s *Server) serveImages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// nginx's server-level `if ($request_method !~ ^(GET|POST)$) return 200;` —
+	// a benign empty 200 for any other method, ahead of all routing.
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, acmePrefix) {
 		s.serveACME(w, r)
 		return
@@ -330,7 +350,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveAdmin(w, r)
 		return
 	}
-	s.proxyOrError(w, r)
+	s.proxyOrNotFound(w, r)
 }
 
 // adminAgentPath reports whether an /admin path is one the agent serves in-process
