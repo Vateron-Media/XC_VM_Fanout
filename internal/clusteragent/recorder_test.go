@@ -116,6 +116,28 @@ func TestCaptureCatchupConcatenatesArchive(t *testing.T) {
 	}
 }
 
+// The dominant catch-up case: a programme that aired in the past. The loopback
+// token's expiry must be now-based (LoopbackToken::TTL), not tied to rec.End, or
+// a past End mints an already-expired token and admission 404s.
+func TestCaptureCatchupPastProgramme(t *testing.T) {
+	lf := &liveFanout{id: "42", running: true, hasData: true}
+	rg := newLiveRig(t, lf)
+	recWithLoopback(t, rg)
+	arch, _ := recSetArchivePath(t, rg)
+	start := ((time.Now().Unix() - 3600) / 60) * 60 // aired ~an hour ago
+	dir := filepath.Join(arch, "42")
+	os.MkdirAll(dir, 0o755)
+	for i, c := range []string{"AAAA", "BBBB"} {
+		name := time.Unix(start+int64(i)*60, 0).UTC().Format("2006-01-02:15-04") + ".ts"
+		os.WriteFile(filepath.Join(dir, name), []byte(c), 0o644)
+	}
+	var buf bytes.Buffer
+	st := rg.a.captureRecording(context.Background(), recording{ID: 7, StreamID: 42, Start: start, End: start + 120, Archive: true}, &buf)
+	if st != http.StatusOK || buf.String() != "AAAABBBB" {
+		t.Fatalf("past-programme catch-up: status=%d body=%q, want 200 + AAAABBBB", st, buf.String())
+	}
+}
+
 func TestCaptureBadKeyRefused(t *testing.T) {
 	lf := &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("X")}
 	rg := newLiveRig(t, lf)

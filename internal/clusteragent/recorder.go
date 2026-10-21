@@ -85,7 +85,7 @@ func (a *Agent) captureRecording(ctx context.Context, rec recording, dst io.Writ
 	if a.LoopbackKeyFile != "" {
 		key, _ = os.ReadFile(a.LoopbackKeyFile)
 	}
-	tok := issueLoopbackToken(key, rec.StreamID, rec.End+300) // "" with no/invalid key → 404 (refused)
+	tok := issueLoopbackToken(key, rec.StreamID, time.Now().Unix()+86400) // LoopbackToken::TTL (24h), now-based — NOT tied to rec.End, else a past-programme catch-up mints an expired token. "" with no/invalid key → 404.
 	id := strconv.FormatInt(rec.StreamID, 10)
 	var target string
 	if rec.Archive {
