@@ -7,11 +7,81 @@ package clusteragent
 // on this node. It replaces PHP's cron:vod spawn and StreamProcess's archive spawn.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 )
+
+// workerSet owns the recording/archive goroutines by an int64 key (recording id
+// or stream id), replacing PHP's PID markers: it dedups (one worker per key),
+// removes a worker when it returns, and cancels on stop/reconcile.
+type workerEntry struct{ cancel context.CancelFunc }
+
+type workerSet struct {
+	mu      sync.Mutex
+	workers map[int64]*workerEntry
+}
+
+func newWorkerSet() *workerSet { return &workerSet{workers: map[int64]*workerEntry{}} }
+
+// start runs fn(ctx) in a goroutine keyed by id; false (no double-start) when a
+// worker for id is already in flight. The goroutine removes id on return — but
+// only if the map still holds this entry, so a stop()+restart cannot be undone
+// by the old goroutine's cleanup.
+func (s *workerSet) start(parent context.Context, id int64, fn func(ctx context.Context)) bool {
+	s.mu.Lock()
+	if _, ok := s.workers[id]; ok {
+		s.mu.Unlock()
+		return false
+	}
+	ctx, cancel := context.WithCancel(parent)
+	e := &workerEntry{cancel: cancel}
+	s.workers[id] = e
+	s.mu.Unlock()
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			if s.workers[id] == e {
+				delete(s.workers, id)
+			}
+			cancel()
+			s.mu.Unlock()
+		}()
+		fn(ctx)
+	}()
+	return true
+}
+
+func (s *workerSet) stop(id int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.workers[id]; ok {
+		e.cancel()
+		delete(s.workers, id)
+	}
+}
+
+func (s *workerSet) has(id int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.workers[id]
+	return ok
+}
+
+// stopAllExcept cancels and drops every worker whose id is not in keep.
+func (s *workerSet) stopAllExcept(keep map[int64]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, e := range s.workers {
+		if !keep[id] {
+			e.cancel()
+			delete(s.workers, id)
+		}
+	}
+}
 
 // streamRecordings reads the recordings scheduled on this node for stream id
 // (the replica record's data.recordings[], RECORDING_FIELDS), mapping each to a

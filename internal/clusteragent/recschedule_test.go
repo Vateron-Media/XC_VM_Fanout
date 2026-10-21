@@ -1,9 +1,11 @@
 package clusteragent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStreamRecordingsParses(t *testing.T) {
@@ -54,4 +56,35 @@ func TestShouldStartRecording(t *testing.T) {
 			t.Errorf("%s: shouldStartRecording = %v, want %v", c.name, got, c.want)
 		}
 	}
+}
+
+func TestWorkerSetDedups(t *testing.T) {
+	s := newWorkerSet()
+	started, release := make(chan struct{}), make(chan struct{})
+	ok1 := s.start(context.Background(), 7, func(ctx context.Context) { close(started); <-release })
+	<-started
+	ok2 := s.start(context.Background(), 7, func(ctx context.Context) { t.Error("second start ran for an in-flight id") })
+	if !ok1 || ok2 {
+		t.Fatalf("start1=%v start2=%v, want true,false", ok1, ok2)
+	}
+	close(release) // worker 1 finishes → removes itself
+	archiveWaitFor(t, func() bool { return !s.has(7) }, time.Second)
+	done := make(chan struct{})
+	if !s.start(context.Background(), 7, func(ctx context.Context) { close(done) }) {
+		t.Fatal("start after completion should succeed")
+	}
+	<-done
+}
+
+func TestWorkerSetStopCancels(t *testing.T) {
+	s := newWorkerSet()
+	done := make(chan struct{})
+	s.start(context.Background(), 9, func(ctx context.Context) { <-ctx.Done(); close(done) })
+	s.stop(9)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not cancel the worker")
+	}
+	archiveWaitFor(t, func() bool { return !s.has(9) }, time.Second)
 }
