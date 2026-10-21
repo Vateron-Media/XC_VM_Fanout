@@ -172,3 +172,70 @@ func TestScheduleNoDoubleStart(t *testing.T) {
 	recs.stop(55)
 	archiveWaitFor(t, func() bool { return !recs.has(55) }, 2*time.Second) // let the worker finish before TempDir cleanup
 }
+
+// recWriteArchiveStream writes stream 42's record with tv_archive_server_id set.
+func recWriteArchiveStream(t *testing.T, rg *liveRig, tvArchiveServerID int64) {
+	t.Helper()
+	rec := fmt.Sprintf(`{"data":{"stream":{"tv_archive_server_id":%d,"tv_archive_duration":1},"type":{"live":1}}}`, tvArchiveServerID)
+	if err := os.WriteFile(filepath.Join(streamsDir(rg.dir), "42.json"), []byte(rec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// recKeepArchiveAlive writes an empty playlist so a started archiveJob parks in
+// its segment-wait loop (instead of exiting on a missing playlist).
+func recKeepArchiveAlive(t *testing.T, rg *liveRig) {
+	t.Helper()
+	pol, ok := rg.a.adminPolicy()
+	if !ok {
+		t.Fatal("no policy")
+	}
+	if err := os.WriteFile(filepath.Join(pol.streamsPath, "42_.m3u8"), []byte("#EXTM3U\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileStartsArchiveForOwnedRunningStream(t *testing.T) {
+	rg := newSchedRig(t, &liveFanout{id: "42", running: true, hasData: true})
+	recWriteArchiveStream(t, rg, 3) // this node (ServerID 3) owns the archive
+	recKeepArchiveAlive(t, rg)
+	rg.a.reconcileArchiveWorkers(context.Background())
+	_, arcs := rg.a.recSets()
+	archiveWaitFor(t, func() bool { return arcs.has(42) }, 2*time.Second)
+	arcs.stop(42)
+	archiveWaitFor(t, func() bool { return !arcs.has(42) }, 2*time.Second)
+}
+
+func TestReconcileSkipsOtherNodeOrDown(t *testing.T) {
+	rg := newSchedRig(t, &liveFanout{id: "42", running: true, hasData: true})
+	recWriteArchiveStream(t, rg, 5) // another node's archive
+	recKeepArchiveAlive(t, rg)
+	rg.a.reconcileArchiveWorkers(context.Background())
+	if _, arcs := rg.a.recSets(); arcs.has(42) {
+		t.Fatal("archive worker started for another node's stream")
+	}
+
+	rg2 := newSchedRig(t, &liveFanout{id: "42", running: false}) // owned but down
+	recWriteArchiveStream(t, rg2, 3)
+	recKeepArchiveAlive(t, rg2)
+	rg2.a.reconcileArchiveWorkers(context.Background())
+	if _, arcs := rg2.a.recSets(); arcs.has(42) {
+		t.Fatal("archive worker started for a down stream")
+	}
+}
+
+func TestReconcileStopsVanished(t *testing.T) {
+	lf := &liveFanout{id: "42", running: true, hasData: true}
+	rg := newSchedRig(t, lf)
+	recWriteArchiveStream(t, rg, 3)
+	recKeepArchiveAlive(t, rg)
+	rg.a.reconcileArchiveWorkers(context.Background())
+	_, arcs := rg.a.recSets()
+	archiveWaitFor(t, func() bool { return arcs.has(42) }, 2*time.Second)
+
+	lf.mu.Lock()
+	lf.running = false // the stream stops
+	lf.mu.Unlock()
+	rg.a.reconcileArchiveWorkers(context.Background())
+	archiveWaitFor(t, func() bool { return !arcs.has(42) }, 2*time.Second)
+}

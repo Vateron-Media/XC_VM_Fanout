@@ -169,3 +169,42 @@ func (a *Agent) scheduleRecordings(ctx context.Context) error {
 	}
 	return nil
 }
+
+// reconcileArchiveWorkers (StreamProcess's archive spawn, moved to the agent):
+// ensure an archiveJob goroutine for each held stream whose tv_archive_server_id
+// is this node and that the fanout reports running; cancel the workers for
+// streams no longer wanted. A chore on the RunChores tick.
+func (a *Agent) reconcileArchiveWorkers(ctx context.Context) error {
+	pol, ok := a.adminPolicy()
+	if !ok {
+		return nil
+	}
+	_, archivers := a.recSets()
+	srv := a.Client.State.ServerID
+	wanted := map[int64]bool{}
+	for _, sid := range heldStreams(a.ReplicaDir) {
+		id := strconv.FormatInt(sid, 10)
+		meta, ok := a.streamMeta(id)
+		if !ok || meta.TvArchiveServerID != srv {
+			continue
+		}
+		if running, _, ok := a.fanoutStreamStatus(ctx, id); !ok || !running {
+			continue
+		}
+		wanted[sid] = true
+		sid, dur := sid, int(meta.TvArchiveDuration)
+		archivers.start(ctx, sid, func(c context.Context) {
+			j := &archiveJob{
+				streamID:     sid,
+				streamsDir:   pol.streamsPath,
+				archiveDir:   filepath.Join(pol.archivePath, strconv.FormatInt(sid, 10)),
+				durationDays: dur,
+				logf:         a.logf,
+				running:      func() bool { r, _, ok := a.fanoutStreamStatus(c, strconv.FormatInt(sid, 10)); return ok && r },
+			}
+			j.run(c)
+		})
+	}
+	archivers.stopAllExcept(wanted)
+	return nil
+}
