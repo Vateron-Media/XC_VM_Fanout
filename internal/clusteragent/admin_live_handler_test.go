@@ -113,3 +113,75 @@ func TestAdminLiveNoAdmission404(t *testing.T) {
 		t.Fatalf("no admission: code=%d, want 404", rec.Code)
 	}
 }
+
+// --- Task 4: admin-HLS arm (playlist rewrite + named segment) ---
+
+func TestRewriteAdminHLSUitoken(t *testing.T) {
+	pl := []byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:6.000,\n5.ts\n#EXTINF:6.000,\n6.ts\n")
+	out := string(rewriteAdminHLS(pl, 42, "UITOK", ""))
+	if !strings.Contains(out, "/admin/live?extension=m3u8&segment=5&uitoken=UITOK") ||
+		!strings.Contains(out, "/admin/live?extension=m3u8&segment=6&uitoken=UITOK") {
+		t.Fatalf("uitoken rewrite:\n%s", out)
+	}
+	if !strings.Contains(out, "#EXT-X-TARGETDURATION:6") || !strings.Contains(out, "#EXTINF:6.000,") || strings.Contains(out, "\n5.ts\n") {
+		t.Fatalf("tags kept / old segment lines gone — failed:\n%s", out)
+	}
+}
+
+func TestRewriteAdminHLSPassword(t *testing.T) {
+	pl := []byte("#EXTM3U\n#EXTINF:6.000,\n9.ts\n")
+	out := string(rewriteAdminHLS(pl, 42, "", "s3cr3t"))
+	if !strings.Contains(out, "/admin/live?extension=m3u8&stream=42&segment=9&password=s3cr3t") {
+		t.Fatalf("password rewrite:\n%s", out)
+	}
+}
+
+func liveHLSFanout() *liveFanout {
+	return &liveFanout{
+		id: "42", running: true, hasData: true,
+		playlist: []byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:6.000,\n5.ts\n#EXTINF:6.000,\n6.ts\n"),
+		segments: map[string][]byte{"7": []byte("SEG-SEVEN")},
+	}
+}
+
+func TestAdminLiveHLSServesRewritten(t *testing.T) {
+	rg := newLiveRig(t, liveHLSFanout())
+	rec := httptest.NewRecorder()
+	rg.a.serveAdminLive(rec, rg.uitokenReq(t, 42, ""))
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/vnd.apple.mpegurl" {
+		t.Fatalf("admin hls: code=%d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "/admin/live?extension=m3u8&segment=5&uitoken=") ||
+		!strings.Contains(body, "/admin/live?extension=m3u8&segment=6&uitoken=") {
+		t.Fatalf("playlist not rewritten:\n%s", body)
+	}
+}
+
+func TestAdminLiveHLSSegmentProxied(t *testing.T) {
+	rg := newLiveRig(t, liveHLSFanout())
+	rec := httptest.NewRecorder()
+	rg.a.serveAdminLive(rec, rg.uitokenReq(t, 42, "&segment=7"))
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "video/mp2t" || rec.Body.String() != "SEG-SEVEN" {
+		t.Fatalf("hls segment: code=%d ct=%q body=%q", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+	}
+}
+
+func TestAdminLiveHLSSegmentNonNumeric404(t *testing.T) {
+	rg := newLiveRig(t, liveHLSFanout())
+	rec := httptest.NewRecorder()
+	rg.a.serveAdminLive(rec, rg.uitokenReq(t, 42, "&segment=..%2f..%2fsecrets.json"))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-numeric segment: code=%d, want 404", rec.Code)
+	}
+}
+
+func TestAdminLiveHLSUitokenForcesM3u8(t *testing.T) {
+	rg := newLiveRig(t, liveHLSFanout())
+	rec := httptest.NewRecorder()
+	// a uitoken request asking for extension=ts must still get the HLS playlist.
+	rg.a.serveAdminLive(rec, rg.uitokenReq(t, 42, "&extension=ts"))
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/vnd.apple.mpegurl" {
+		t.Fatalf("uitoken+extension=ts: code=%d ct=%q (want the m3u8 playlist)", rec.Code, rec.Header().Get("Content-Type"))
+	}
+}

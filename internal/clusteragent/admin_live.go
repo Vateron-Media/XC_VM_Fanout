@@ -204,8 +204,81 @@ func adminPrebufferRequested(r *http.Request) bool {
 	return r.URL.Query().Has("prebuffer") || r.Header.Get("X-XC_VM-PREBUFFER") != ""
 }
 
-// serveAdminLiveHLS serves the admin HLS playlist + named segments (the uitoken/
-// password m3u8 arm). Implemented in Task 4.
+// serveAdminLiveHLS is live.php's m3u8 arm (uitoken/password): with no segment,
+// the fanout's live playlist rewritten so each segment URL points back at
+// /admin/live (carrying the uitoken, or the stream+password); with a segment,
+// that one HLS sequence proxied from the Manager (GET /hls/<id>/<seq>.ts). The
+// segment value is an integer sequence only — anything else is refused, so no
+// path but a numeric seq ever reaches the fanout.
 func (a *Agent) serveAdminLiveHLS(w http.ResponseWriter, r *http.Request, adm adminAdmission, id string) {
-	http.NotFound(w, r)
+	q := r.URL.Query()
+	if seg := q.Get("segment"); seg != "" {
+		if !isAllDigits(seg) {
+			http.NotFound(w, r)
+			return
+		}
+		resp, err := a.fanoutRequest(r.Context(), http.MethodGet, "/hls/"+id+"/"+seg+".ts")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.WriteHeader(http.StatusOK)
+		flushCopy(w, resp.Body)
+		return
+	}
+	pl, ok := a.adminHLSPlaylist(r.Context(), id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	var uitoken, password string
+	if adm.kind == admitUitoken {
+		uitoken = q.Get("uitoken")
+	} else {
+		password = a.secret("live_streaming_pass")
+	}
+	out := rewriteAdminHLS(pl, adm.streamID, uitoken, password)
+	h := w.Header()
+	h.Set("Content-Type", "application/vnd.apple.mpegurl")
+	h.Set("Content-Length", strconv.Itoa(len(out)))
+	_, _ = w.Write(out)
+}
+
+// rewriteAdminHLS is StreamUtils::generateAdminHLS: each media segment line
+// (<seq>.ts) becomes a /admin/live URL carrying the uitoken, or the stream +
+// password (the slice-2 timeshift m3u8 shape); every #EXT tag passes through.
+func rewriteAdminHLS(playlist []byte, id int64, uitoken, password string) []byte {
+	lines := strings.Split(string(playlist), "\n")
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") || !strings.HasSuffix(t, ".ts") {
+			continue
+		}
+		seq := strings.TrimSuffix(t, ".ts")
+		if uitoken != "" {
+			lines[i] = "/admin/live?extension=m3u8&segment=" + seq + "&uitoken=" + uitoken
+		} else {
+			lines[i] = "/admin/live?extension=m3u8&stream=" + strconv.FormatInt(id, 10) + "&segment=" + seq + "&password=" + password
+		}
+	}
+	return []byte(strings.Join(lines, "\n"))
+}
+
+// isAllDigits reports whether s is a non-empty run of ASCII digits (an HLS seq).
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
