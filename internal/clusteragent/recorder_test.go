@@ -4,16 +4,46 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 )
+
+// spooledRecStates reads the recording.state statuses the recorder spooled, in
+// chronological order (p0 files are named by a monotonic clock).
+func spooledRecStates(t *testing.T, spoolDir string) []int {
+	t.Helper()
+	ents, _ := os.ReadDir(filepath.Join(spoolDir, "p0"))
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name() < ents[j].Name() })
+	var out []int
+	for _, e := range ents {
+		b, _ := os.ReadFile(filepath.Join(spoolDir, "p0", e.Name()))
+		for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if line == "" {
+				continue
+			}
+			var ev struct {
+				Type string `json:"type"`
+				D    struct {
+					Status int `json:"status"`
+				} `json:"d"`
+			}
+			if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "recording.state" {
+				out = append(out, ev.D.Status)
+			}
+		}
+	}
+	return out
+}
 
 // recFakeExternals swaps the MAIN recording_complete call and the ffmpeg runner
 // for fakes, restoring them when the test ends.
@@ -144,6 +174,59 @@ func TestFinalizeFfmpegFails(t *testing.T) {
 	os.WriteFile(ts, []byte("X"), 0o644)
 	if _, err := rg.a.finalizeRecording(context.Background(), recording{ID: 3, StreamID: 42}, ts); err == nil {
 		t.Fatal("ffmpeg failure should propagate")
+	}
+}
+
+func TestRunRecordingLiveSuccess(t *testing.T) {
+	lf := &liveFanout{id: "42", running: true, hasData: true, liveBody: []byte("LIVE-TS")}
+	rg := newLiveRig(t, lf)
+	recWithLoopback(t, rg)
+	_, vod := recSetArchivePath(t, rg)
+	rg.a.SpoolDir = t.TempDir()
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error {
+		return os.WriteFile(args[len(args)-1], []byte("MP4"), 0o644)
+	})
+	now := time.Now().Unix()
+	rg.a.runRecording(context.Background(), recording{ID: 3, StreamID: 42, Start: now - 10, End: now + 1})
+	if got := spooledRecStates(t, rg.a.SpoolDir); !reflect.DeepEqual(got, []int{1, 2}) {
+		t.Fatalf("state events = %v, want [1 2]", got)
+	}
+	if _, err := os.Stat(filepath.Join(vod, "7.mp4")); err != nil {
+		t.Fatalf("mp4 not created: %v", err)
+	}
+}
+
+func TestRunRecordingNotAiring(t *testing.T) {
+	rg := newLiveRig(t, &liveFanout{id: "42"})
+	recWithLoopback(t, rg)
+	recSetArchivePath(t, rg)
+	rg.a.SpoolDir = t.TempDir()
+	ran := false
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error { ran = true; return nil })
+	now := time.Now().Unix()
+	rg.a.runRecording(context.Background(), recording{ID: 3, StreamID: 42, Start: now - 3600, End: now - 1800}) // window passed, not archive
+	if got := spooledRecStates(t, rg.a.SpoolDir); !reflect.DeepEqual(got, []int{3}) {
+		t.Fatalf("state events = %v, want [3]", got)
+	}
+	if ran {
+		t.Fatal("ffmpeg must not run for a non-airing recording")
+	}
+}
+
+func TestRunRecordingEmptyCapture(t *testing.T) {
+	rg := newLiveRig(t, &liveFanout{id: "42", running: true, hasData: true}) // no liveBody → empty capture
+	recWithLoopback(t, rg)
+	recSetArchivePath(t, rg)
+	rg.a.SpoolDir = t.TempDir()
+	ran := false
+	recFakeExternals(t, 7, nil, func(ctx context.Context, name string, args ...string) error { ran = true; return nil })
+	now := time.Now().Unix()
+	rg.a.runRecording(context.Background(), recording{ID: 3, StreamID: 42, Start: now - 10, End: now + 1})
+	if got := spooledRecStates(t, rg.a.SpoolDir); !reflect.DeepEqual(got, []int{1, 3}) {
+		t.Fatalf("state events = %v, want [1 3]", got)
+	}
+	if ran {
+		t.Fatal("ffmpeg must not run for an empty capture")
 	}
 }
 

@@ -160,3 +160,49 @@ func (a *Agent) finalizeRecording(ctx context.Context, rec recording, tsPath str
 	}
 	return vodID, nil
 }
+
+// spoolRecordingState reports a recording's status to MAIN as a P0 recording.state
+// event (ContentSink::recordingState on a CONTENT-flow node): 1 recording, 2 done,
+// 3 failed.
+func (a *Agent) spoolRecordingState(id int64, status int) {
+	_ = spoolP0(a.SpoolDir, []map[string]any{{"type": "recording.state", "d": map[string]any{"id": id, "status": status}}})
+}
+
+// runRecording is the worker's body (RecordCommand::execute): a programme that
+// is not airing and not an archive job fails without a VOD; otherwise it marks
+// the recording started, captures to ARCHIVE_PATH/<id>.ts, and on a non-empty
+// capture finalizes it into a VOD (done), else fails. The .ts is always removed.
+func (a *Agent) runRecording(ctx context.Context, rec recording) {
+	pol, ok := a.adminPolicy()
+	if !ok {
+		return
+	}
+	tsPath := filepath.Join(pol.archivePath, strconv.FormatInt(rec.ID, 10)+".ts")
+	now := time.Now().Unix()
+	if !rec.Archive && (rec.Start-60 > now || now > rec.End) {
+		a.spoolRecordingState(rec.ID, 3) // not currently airing (RecordCommand lines 79–84)
+		_ = os.Remove(tsPath)
+		return
+	}
+	a.spoolRecordingState(rec.ID, 1)
+	f, err := os.Create(tsPath)
+	if err != nil {
+		a.spoolRecordingState(rec.ID, 3)
+		return
+	}
+	st := a.captureRecording(ctx, rec, f)
+	_ = f.Close()
+	fi, serr := os.Stat(tsPath)
+	if st != http.StatusOK || serr != nil || fi.Size() == 0 {
+		a.spoolRecordingState(rec.ID, 3)
+		_ = os.Remove(tsPath)
+		return
+	}
+	if _, err := a.finalizeRecording(ctx, rec, tsPath); err != nil {
+		a.spoolRecordingState(rec.ID, 3)
+		_ = os.Remove(tsPath)
+		return
+	}
+	a.spoolRecordingState(rec.ID, 2)
+	_ = os.Remove(tsPath)
+}
