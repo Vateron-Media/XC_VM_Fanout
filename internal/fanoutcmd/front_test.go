@@ -60,7 +60,7 @@ func freePort(t *testing.T) int {
 func TestServeFrontNonFatalOnBadCert(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := serveFront(http.NotFoundHandler(), "http://127.0.0.1:1", dir,
-		filepath.Join(dir, "absent.crt"), filepath.Join(dir, "absent.key"), "", "", "",
+		filepath.Join(dir, "absent.crt"), filepath.Join(dir, "absent.key"), "", "", "", "",
 		filepath.Join(dir, "http.conf"), filepath.Join(dir, "https.conf")); err == nil {
 		t.Fatal("want an error for a missing certificate, got nil")
 	}
@@ -93,7 +93,7 @@ func TestServeFrontServesAndProxies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stop, err := serveFront(gw, backend.URL, dir, cp, kp, "", "", "", hp, sp)
+	stop, err := serveFront(gw, backend.URL, dir, cp, kp, "", "", "", "", hp, sp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,5 +126,48 @@ func TestServeFrontServesAndProxies(t *testing.T) {
 	}
 	if got := body("/player_api"); got != "NGINX" {
 		t.Fatalf("proxy: body=%q", got)
+	}
+}
+
+func TestServeFrontEmptyNginxAccepted(t *testing.T) {
+	gw := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "GATEWAY") })
+	dir := t.TempDir()
+	cp, kp := filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key")
+	writeCert(t, cp, kp)
+	hp, sp := filepath.Join(dir, "http.conf"), filepath.Join(dir, "https.conf")
+	port := freePort(t)
+	if err := os.WriteFile(hp, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sp, []byte(fmt.Sprintf("listen %d ssl reuseport;", port)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// An empty -front-nginx must be accepted (no backend) and the front must start.
+	stop, err := serveFront(gw, "", dir, cp, kp, "", "", "", "", hp, sp)
+	if err != nil {
+		t.Fatalf("empty -front-nginx rejected: %v", err)
+	}
+	defer stop()
+
+	client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, DisableKeepAlives: true}, //nolint:gosec // self-signed test cert
+	}
+	base := fmt.Sprintf("https://127.0.0.1:%d", port)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		res, err := client.Get(base + "/does-not-exist")
+		if err == nil {
+			res.Body.Close()
+			if res.StatusCode != http.StatusNotFound {
+				t.Fatalf("no-backend unknown path over the wire: code=%d, want 404", res.StatusCode)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("front never came up with an empty backend: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

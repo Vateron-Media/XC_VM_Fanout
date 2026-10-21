@@ -2,6 +2,7 @@ package front
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -9,6 +10,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -235,9 +239,10 @@ func TestServeRouteIgnoresSpoofedXFF(t *testing.T) {
 }
 
 func TestServeOnlyNoNginxReproxy(t *testing.T) {
-	// A serve-only front may run with no nginx backend. A gateway defer (which
-	// would re-proxy) and any non-serve route must return 502, never panic on a
-	// nil backend.
+	// A serve-only front may run with no nginx backend, never panicking on a nil
+	// one. A gateway defer (which *expected* to re-proxy to nginx) is a
+	// misconfiguration with nginx gone → 502; an unknown route is one nginx
+	// itself answers 404 → 404 (nginx parity), not 502.
 	gwDefer := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Accel-Redirect", "@gw_vod_php") // a PHP defer
 	})
@@ -250,8 +255,8 @@ func TestServeOnlyNoNginxReproxy(t *testing.T) {
 	}
 	rec = httptest.NewRecorder()
 	front.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/something/else", nil))
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("non-serve route with no backend: code=%d, want 502", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown route with no backend: code=%d, want 404 (nginx parity)", rec.Code)
 	}
 }
 
@@ -268,12 +273,205 @@ func TestStatusLoopbackOnly(t *testing.T) {
 		t.Fatalf("remote /status: code=%d, want 403", rec.Code)
 	}
 
-	// A loopback caller passes the front and reaches the backend.
+	// A spoofed X-Forwarded-For from a remote peer must NOT pass the guard.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.RemoteAddr = "203.0.113.1:4444"
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed-XFF /status: code=%d, want 403", rec.Code)
+	}
+
+	// A loopback caller is answered natively (200, empty body) — NOT proxied.
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/status", nil)
 	req.RemoteAddr = "127.0.0.1:4444"
 	front.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || rec.Body.String() != "NGINX:/status" {
-		t.Fatalf("loopback /status: code=%d body=%q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || rec.Body.String() != "" {
+		t.Fatalf("loopback /status: code=%d body=%q, want 200 empty", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProgressWritesFile(t *testing.T) {
+	streams := t.TempDir()
+	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, t.TempDir(), LoadTrustedProxies()).WithStreams(streams + "/")
+
+	body := "frame=42\nfps=25.0\nbitrate= 1200.0kbits/s\nprogress=continue\n\n"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/progress?stream_id=12", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:5555"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("progress: code=%d, want 200", rec.Code)
+	}
+	b, err := os.ReadFile(filepath.Join(streams, "12_.progress"))
+	if err != nil {
+		t.Fatalf("read progress file: %v", err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("progress JSON: %v (%q)", err, b)
+	}
+	want := map[string]string{"frame": "42", "fps": "25.0", "bitrate": "1200.0kbits/s", "progress": "continue"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("progress map = %v, want %v", got, want)
+	}
+}
+
+func TestProgressRejected(t *testing.T) {
+	streams := t.TempDir()
+	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, t.TempDir(), LoadTrustedProxies()).WithStreams(streams + "/")
+	cases := []struct {
+		name, addr, xff, target, body string
+	}{
+		{"remote peer", "203.0.113.1:9", "", "/progress?stream_id=12", "frame=1\n"},
+		{"spoofed xff", "203.0.113.1:9", "127.0.0.1", "/progress?stream_id=12", "frame=1\n"},
+		{"missing stream_id", "127.0.0.1:9", "", "/progress", "frame=1\n"},
+		{"empty body", "127.0.0.1:9", "", "/progress?stream_id=12", ""},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, c.target, strings.NewReader(c.body))
+		req.RemoteAddr = c.addr
+		if c.xff != "" {
+			req.Header.Set("X-Forwarded-For", c.xff)
+		}
+		front.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s: code=%d, want 404", c.name, rec.Code)
+		}
+	}
+	// No file was created for the rejected calls.
+	if entries, _ := os.ReadDir(streams); len(entries) != 0 {
+		t.Fatalf("rejected progress wrote files: %v", entries)
+	}
+}
+
+func TestProgressStreamIDInteger(t *testing.T) {
+	streams := t.TempDir()
+	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, t.TempDir(), LoadTrustedProxies()).WithStreams(streams + "/")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/progress?stream_id=../../etc/passwd", strings.NewReader("frame=1\n"))
+	req.RemoteAddr = "127.0.0.1:9"
+	front.ServeHTTP(rec, req)
+	// intval("../../etc/passwd") == 0 → the only file written is 0_.progress, in-dir.
+	if _, err := os.Stat(filepath.Join(streams, "0_.progress")); err != nil {
+		t.Fatalf("want 0_.progress written in-dir, got err=%v", err)
+	}
+}
+
+func TestProgressWhitespaceBodyPreservesFile(t *testing.T) {
+	streams := t.TempDir()
+	front := NewServer(http.NotFoundHandler(), newNginxStub(t).url, t.TempDir(), LoadTrustedProxies()).WithStreams(streams + "/")
+
+	// An existing progress file with real content.
+	existing := []byte(`{"frame":"99","progress":"continue"}`)
+	if err := os.WriteFile(filepath.Join(streams, "12_.progress"), existing, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A whitespace-only POST must 404 and leave the file untouched (PHP trims the
+	// body then 404s on empty — it never clobbers the file with an empty object).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/progress?stream_id=12", strings.NewReader("\n   \n"))
+	req.RemoteAddr = "127.0.0.1:9"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("whitespace body: code=%d, want 404", rec.Code)
+	}
+	got, err := os.ReadFile(filepath.Join(streams, "12_.progress"))
+	if err != nil || string(got) != string(existing) {
+		t.Fatalf("progress file clobbered: err=%v content=%q, want %q", err, got, existing)
+	}
+}
+
+func TestNoBackendUnknownPathIs404(t *testing.T) {
+	front := NewServer(http.NotFoundHandler(), nil, t.TempDir(), LoadTrustedProxies())
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/does-not-exist", nil)
+	req.RemoteAddr = "127.0.0.1:9"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("no-backend unknown path: code=%d, want 404", rec.Code)
+	}
+}
+
+func TestNonGetPostReturns200(t *testing.T) {
+	front := NewServer(http.NotFoundHandler(), nil, t.TempDir(), LoadTrustedProxies())
+	for _, m := range []string{http.MethodOptions, http.MethodPut, http.MethodDelete} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(m, "/auth/sometoken", nil) // even a serve route
+		req.RemoteAddr = "203.0.113.9:9"
+		front.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Fatalf("%s: code=%d len=%d, want 200 empty", m, rec.Code, rec.Body.Len())
+		}
+	}
+}
+
+func TestLegacyPhpRedirects(t *testing.T) {
+	front := NewServer(http.NotFoundHandler(), nil, t.TempDir(), LoadTrustedProxies())
+	redirects := map[string]string{
+		"/stream/live.php?token=abc": "/stream/live?token=abc",
+		"/stream/key.php?token=z":    "/stream/key?token=z",
+		"/admin/vod.php?a=1&b=2":     "/admin/vod?a=1&b=2",
+		"/streaming/rtmp.php?x=1":    "/stream/rtmp?x=1",
+		"/progress.php?stream_id=12": "/progress?stream_id=12",
+		"/stream/segment.php":        "/stream/segment", // no query
+	}
+	for in, want := range redirects {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, in, nil)
+		req.RemoteAddr = "127.0.0.1:9"
+		front.ServeHTTP(rec, req)
+		loc := rec.Header().Get("Location")
+		if rec.Code != http.StatusFound || loc != want {
+			t.Fatalf("%s: code=%d loc=%q, want 302 %q", in, rec.Code, loc, want)
+		}
+		if strings.Contains(loc, "://") { // absolute_redirect off → relative
+			t.Fatalf("%s: Location %q is absolute; nginx emits relative", in, loc)
+		}
+	}
+	for _, p := range []string{"/portal.php", "/c/portal.php", "/whatever.php"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.RemoteAddr = "127.0.0.1:9"
+		front.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s: code=%d, want 404", p, rec.Code)
+		}
+	}
+}
+
+func TestNginxStatusStub(t *testing.T) {
+	front := NewServer(http.NotFoundHandler(), nil, t.TempDir(), LoadTrustedProxies())
+	// Remote peer denied (nginx's allow 127.0.0.1; deny all).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nginx_status", nil)
+	req.RemoteAddr = "203.0.113.1:9"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("remote /nginx_status: code=%d, want 403", rec.Code)
+	}
+	// Loopback: a stub_status body whose line[2] field[2] is numeric — what
+	// SystemInfo::nginxRequestCount reads (explode(' ', line[2])[2]).
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/nginx_status", nil)
+	req.RemoteAddr = "127.0.0.1:9"
+	front.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback /nginx_status: code=%d, want 200", rec.Code)
+	}
+	lines := strings.Split(strings.TrimRight(rec.Body.String(), "\n"), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("stub body has %d lines: %q", len(lines), rec.Body.String())
+	}
+	fields := strings.Fields(lines[2])
+	if len(fields) < 3 {
+		t.Fatalf("line[2] = %q, want 3 fields", lines[2])
+	}
+	if _, err := strconv.Atoi(fields[2]); err != nil {
+		t.Fatalf("requests field %q not numeric: %v", fields[2], err)
 	}
 }
