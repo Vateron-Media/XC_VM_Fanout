@@ -293,7 +293,9 @@ var SelfHealEvery = time.Hour
 // this node (ArtefactStage's `runs`), and reports whether it advertises the
 // `reached` feature (then its trial waits for it to reach MAIN, not just last).
 func probeBinary(ctx context.Context, path string) (reach, ok bool) {
-	out, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
+	// `agent version`: cmd/xc_node routes that to the agent, whose version prints
+	// the `features:` line (a bare `version` on the merged binary prints none).
+	out, err := exec.CommandContext(ctx, path, "agent", "version").CombinedOutput()
 	if err != nil {
 		return false, false
 	}

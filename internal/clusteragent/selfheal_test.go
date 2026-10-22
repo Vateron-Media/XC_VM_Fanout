@@ -187,3 +187,28 @@ func TestTargetReleaseDecision(t *testing.T) {
 		}
 	}
 }
+
+func TestProbeBinaryInvokesAgentVersion(t *testing.T) {
+	dir := t.TempDir()
+	// The probe must call the binary as `agent version` (cmd/xc_node routes that
+	// to the agent, whose version prints the `features:` line); a bare `version`
+	// prints no features. The fake asserts the exact argv, so a wrong invocation
+	// exits non-zero (ok=false).
+	reachScript := "#!/bin/sh\n[ \"$1\" = agent ] && [ \"$2\" = version ] || exit 7\necho 0.15.7\necho 'features: reached'\n"
+	good := filepath.Join(dir, "good")
+	os.WriteFile(good, []byte(reachScript), 0o755)
+	reach, ok := probeBinary(context.Background(), good)
+	if !ok || !reach {
+		t.Fatalf("reach binary: ok=%v reach=%v, want true true (argv must be `agent version`)", ok, reach)
+	}
+	noFeat := filepath.Join(dir, "nofeat")
+	os.WriteFile(noFeat, []byte("#!/bin/sh\n[ \"$1\" = agent ] && [ \"$2\" = version ] || exit 7\necho 0.15.7\n"), 0o755)
+	if r, ok := probeBinary(context.Background(), noFeat); !ok || r {
+		t.Fatalf("no-features binary: ok=%v reach=%v, want true false", ok, r)
+	}
+	bad := filepath.Join(dir, "bad")
+	os.WriteFile(bad, []byte("#!/bin/sh\nexit 1\n"), 0o755)
+	if _, ok := probeBinary(context.Background(), bad); ok {
+		t.Fatal("a binary that does not run must give ok=false")
+	}
+}
