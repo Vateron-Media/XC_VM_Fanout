@@ -98,6 +98,21 @@ func applyFunc(serveOnly bool, php, console string) func(ctx context.Context) er
 	return clusteragent.ApplyViaPHP(php, console, time.Minute)
 }
 
+// selfHealRepoFor returns the repo the Go agent self-heals its binary from, or
+// "" to leave self-heal off. It activates only on a serve-only node that is
+// PHP-free (console.php gone — the P6 end state): while PHP is present it owns
+// binary updates (root_signals fanout_binary), so the Go self-heal stays dormant
+// and the two never race to install the same binary.
+func selfHealRepoFor(serveOnly bool, console, repo string) string {
+	if !serveOnly {
+		return ""
+	}
+	if _, err := os.Stat(console); errors.Is(err, os.ErrNotExist) {
+		return repo
+	}
+	return ""
+}
+
 func Main(version string) {
 	args := os.Args[1:]
 	cmd := "run"
@@ -266,10 +281,9 @@ func Main(version string) {
 	go sampler.Run(stopSampler)
 	// A serve-only node writes tmp/gateway/policy.json itself (from the sealed
 	// policy section); only then does the agent own that file.
-	gwPolicyFile, shRepo, shChannel, shArch := "", "", "", ""
+	gwPolicyFile := ""
 	if *serveOnly {
 		gwPolicyFile = *gatewayPolicy
-		shRepo, shChannel, shArch = *selfhealRepo, *selfhealChannel, runtime.GOARCH
 	}
 	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
 		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
@@ -279,7 +293,7 @@ func Main(version string) {
 		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
 		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir, FloodDir: *floodDir,
 		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile,
-		SelfHealRepo: shRepo, SelfHealChannel: shChannel, SelfHealArch: shArch}
+		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH}
 	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
