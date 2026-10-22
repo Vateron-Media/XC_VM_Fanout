@@ -2,10 +2,13 @@ package clusteragent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -116,4 +119,81 @@ func listReleases(ctx context.Context, client *http.Client, apiURL, channel stri
 		out = append(out, r.TagName)
 	}
 	return out, nil
+}
+
+// getBody GETs url (GitHub UA/Accept) and returns its body, capped at 4 MiB for
+// the sums file; the binary stream is read by fetchAsset instead.
+func ghGet(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "XC_VM")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("clusteragent: GET %s: HTTP %d", url, resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// expectedSHA reads asset's hex SHA-256 from the SHA256SUMS at sumsURL (lines of
+// "<hex>  <name>", sha256sum format), ports ReleaseAsset::expectedSha256 /
+// sumFor. "" + error when the asset has no line.
+func expectedSHA(ctx context.Context, client *http.Client, sumsURL, asset string) (string, error) {
+	resp, err := ghGet(ctx, client, sumsURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[1] == asset {
+			return f[0], nil
+		}
+	}
+	return "", fmt.Errorf("clusteragent: %s has no SHA256SUMS line", asset)
+}
+
+// fetchAsset downloads baseURL/asset to dest, streaming it through SHA-256; it
+// writes dest only when the digest equals sha256Hex, else leaves nothing. The
+// download goes to dest+".part" and is renamed in on success (no half file at
+// dest). dest is a staged name (e.g. .xc_agent.new) the caller then installs.
+func fetchAsset(ctx context.Context, client *http.Client, baseURL, asset, sha256Hex, dest string) error {
+	resp, err := ghGet(ctx, client, strings.TrimRight(baseURL, "/")+"/"+asset)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	part := dest + ".part"
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(part)
+		return err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != sha256Hex {
+		os.Remove(part)
+		return fmt.Errorf("clusteragent: %s SHA-256 %s, want %s", asset, got, sha256Hex)
+	}
+	if err := os.Rename(part, dest); err != nil {
+		os.Remove(part)
+		return err
+	}
+	return nil
 }

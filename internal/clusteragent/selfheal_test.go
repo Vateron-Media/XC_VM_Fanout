@@ -2,10 +2,15 @@ package clusteragent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -56,5 +61,44 @@ func TestListReleasesChannelFilter(t *testing.T) {
 	}
 	if !reflect.DeepEqual(beta, []string{"0.16.0", "0.15.6", "0.15.5"}) {
 		t.Fatalf("beta includes prerelease (not draft): got %v", beta)
+	}
+}
+
+func TestFetchAssetVerifiesSHA256(t *testing.T) {
+	blob := []byte("the-xc_node-binary-bytes")
+	sum := sha256.Sum256(blob)
+	sumHex := hex.EncodeToString(sum[:])
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xc_node-linux-amd64":
+			w.Write(blob)
+		case "/SHA256SUMS":
+			io.WriteString(w, "0000000000000000000000000000000000000000000000000000000000000000  other-asset\n"+sumHex+"  xc_node-linux-amd64\n")
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+
+	got, err := expectedSHA(ctx, srv.Client(), srv.URL+"/SHA256SUMS", "xc_node-linux-amd64")
+	if err != nil || got != sumHex {
+		t.Fatalf("expectedSHA = %q, %v; want %q", got, err, sumHex)
+	}
+
+	dest := filepath.Join(t.TempDir(), ".xc_node.new")
+	if err := fetchAsset(ctx, srv.Client(), srv.URL, "xc_node-linux-amd64", sumHex, dest); err != nil {
+		t.Fatalf("fetchAsset (good sha): %v", err)
+	}
+	if b, _ := os.ReadFile(dest); string(b) != string(blob) {
+		t.Fatalf("dest not the downloaded blob: %q", b)
+	}
+
+	bad := filepath.Join(t.TempDir(), ".xc_node.new")
+	if err := fetchAsset(ctx, srv.Client(), srv.URL, "xc_node-linux-amd64", strings.Repeat("a", 64), bad); err == nil {
+		t.Fatal("fetchAsset must reject a SHA mismatch")
+	}
+	if _, err := os.Stat(bad); !os.IsNotExist(err) {
+		t.Fatal("a SHA-mismatched download must leave no file")
 	}
 }
