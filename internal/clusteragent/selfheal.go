@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -271,4 +272,108 @@ func installAgentBinary(target, newPath string, reach bool) error {
 		marker += " reach"
 	}
 	return os.WriteFile(target+".trial", []byte(marker+"\n"), 0o644)
+}
+
+// targetRelease is the self-heal decision: the tag to install now, or "" — the
+// release the fleet allows (releaseFor), unless it is not newer than installed
+// (no downgrade, no reinstall of the same).
+func targetRelease(tags []string, canary, server int64, pin, installed string) string {
+	tag := releaseFor(tags, canary, server, pin)
+	if tag == "" || compareVersions(tag, installed) <= 0 {
+		return ""
+	}
+	return tag
+}
+
+// SelfHealEvery is how often a serve-only node checks for a newer binary (the
+// root_signals fanout_binary cadence it replaces).
+var SelfHealEvery = time.Hour
+
+// probeBinary runs `<path> version` to confirm the downloaded binary runs on
+// this node (ArtefactStage's `runs`), and reports whether it advertises the
+// `reached` feature (then its trial waits for it to reach MAIN, not just last).
+func probeBinary(ctx context.Context, path string) (reach, ok bool) {
+	out, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
+	if err != nil {
+		return false, false
+	}
+	return strings.Contains(string(out), FeatureReached), true
+}
+
+// selfHeal resolves, downloads, verifies and installs a newer node binary from
+// GitHub, with no PHP — the Go port of `console.php fanout_binary`. A no-op when
+// not configured (not a serve-only node). The same xc_node asset installs under
+// both the fanout path (rename + respawn) and the agent's own (stage + run.sh
+// trial / .prev rollback); canary/pin come from the replica settings.
+func (a *Agent) selfHeal(ctx context.Context) error {
+	if a.SelfHealRepo == "" {
+		return nil
+	}
+	s := a.replicaSettings()
+	canary, _ := settingInt(s["lb_binary_canary_server"])
+	pin, _ := s["lb_release_pin"].(string)
+	serverID, _ := strconv.ParseInt(a.node.serverID, 10, 64)
+	api := "https://api.github.com/repos/" + a.SelfHealRepo + "/releases?per_page=100"
+	tags, err := listReleases(ctx, http.DefaultClient, api, a.SelfHealChannel)
+	if err != nil {
+		return err
+	}
+	tag := targetRelease(tags, canary, serverID, pin, a.Version)
+	if tag == "" {
+		return nil
+	}
+	base := "https://github.com/" + a.SelfHealRepo + "/releases/download/" + tag + "/"
+	asset := "xc_node-linux-" + a.SelfHealArch
+	sha, err := expectedSHA(ctx, http.DefaultClient, base+"SHA256SUMS", asset)
+	if err != nil {
+		return err
+	}
+	// Download once; the merged binary runs as both tools by its name.
+	tmp := filepath.Join(filepath.Dir(a.node.binary), ".xc_node.dl")
+	if err := fetchAsset(ctx, http.DefaultClient, base, asset, sha, tmp); err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	reach, ok := probeBinary(ctx, tmp)
+	if !ok {
+		return fmt.Errorf("clusteragent: self-heal: %s does not run on this node", tag)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	fdir := filepath.Dir(a.node.binary) + "/"
+	fnew := fdir + ".xc_fanout.new"
+	if err := linkOrCopy(tmp, fnew); err != nil {
+		return err
+	}
+	if err := installFanout(fdir, fnew); err != nil {
+		return err
+	}
+	anew := filepath.Dir(self) + "/.xc_agent.new"
+	if err := linkOrCopy(tmp, anew); err != nil {
+		return err
+	}
+	a.logf("cluster: self-heal: installing %s", tag)
+	return installAgentBinary(self, anew, reach)
+}
+
+// RunSelfHeal checks for a newer node binary on the self-heal cadence until ctx
+// ends. A no-op (returns at once) when self-heal is not configured.
+func (a *Agent) RunSelfHeal(ctx context.Context) {
+	if a.SelfHealRepo == "" {
+		return
+	}
+	t := time.NewTicker(SelfHealEvery)
+	defer t.Stop()
+	for {
+		if err := a.selfHeal(ctx); err != nil && ctx.Err() == nil {
+			a.logf("cluster: self-heal: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

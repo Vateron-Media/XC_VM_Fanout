@@ -165,3 +165,25 @@ func readFileStr(t *testing.T, p string) string {
 	}
 	return string(b)
 }
+
+func TestTargetReleaseDecision(t *testing.T) {
+	cases := []struct {
+		name            string
+		tags            []string
+		canary, server  int64
+		pin, installed  string
+		want            string
+	}{
+		{"newer, no canary", []string{"0.15.7", "0.15.6"}, 0, 7, "", "0.15.6", "0.15.7"},
+		{"downgrade refused", []string{"0.15.5"}, 0, 7, "", "0.15.6", ""},
+		{"equal refused", []string{"0.15.6"}, 0, 7, "", "0.15.6", ""},
+		{"canary holds, no pin", []string{"0.15.7"}, 3, 7, "", "0.15.6", ""},
+		{"held to pin, newer at pin", []string{"0.16.0", "0.15.7"}, 3, 7, "0.15.7", "0.15.6", "0.15.7"},
+		{"no releases", nil, 0, 7, "", "0.15.6", ""},
+	}
+	for _, c := range cases {
+		if got := targetRelease(c.tags, c.canary, c.server, c.pin, c.installed); got != c.want {
+			t.Errorf("%s: targetRelease=%q want %q", c.name, got, c.want)
+		}
+	}
+}
