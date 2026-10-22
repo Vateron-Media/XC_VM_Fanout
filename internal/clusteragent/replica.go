@@ -68,8 +68,12 @@ const replicaPurpose = "replica"
 // artefact grant's sha256.
 var etagRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// WholeSections are the sections MAIN sends whole, as named in `have`.
-var WholeSections = []string{"settings", "servers", "node", "crontab", "cluster", "secrets", "bouquets", "categories"}
+// WholeSections are the sections MAIN sends whole, as named in `have`. `policy`
+// is the per-node gateway policy a serve-only node writes to tmp/gateway/policy.json
+// itself (writeGatewayPolicy), replacing PHP cron:cache; MAIN simply does not
+// serve it to a node that does not ask with its ETag, so a non-serve-only node
+// stores it harmlessly and PHP keeps writing the live file there.
+var WholeSections = []string{"settings", "servers", "node", "crontab", "cluster", "secrets", "bouquets", "categories", "policy"}
 
 // secretSection is the one section that carries secrets.
 const secretSection = "secrets"
@@ -856,6 +860,14 @@ func (a *Agent) RunReplica(ctx context.Context) {
 		}
 		if first && !applied && ctx.Err() == nil {
 			a.runApply(ctx)
+		}
+		// A serve-only node writes tmp/gateway/policy.json from the MAIN-sealed
+		// policy section itself (no PHP cron:cache), re-stamping its freshness to
+		// this node's clock each tick. Quiet until MAIN serves the section.
+		if a.GatewayPolicyFile != "" {
+			if e := a.writeGatewayPolicy(time.Now().Unix()); e != nil && ctx.Err() == nil {
+				a.logf("cluster: gateway policy: %v", e)
+			}
 		}
 		// The R2 streams section: a delta after every config sync.
 		a.kick(kicks.streams)
