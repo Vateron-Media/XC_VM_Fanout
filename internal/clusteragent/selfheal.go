@@ -9,8 +9,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Binary self-heal (plan P2): a serve-only node keeps its own xc_node binary
@@ -196,4 +198,77 @@ func fetchAsset(ctx context.Context, client *http.Client, baseURL, asset, sha256
 		return err
 	}
 	return nil
+}
+
+// linkOrCopy makes dst a copy of src — a hard link when it can, else a byte
+// copy (ArtefactStage's `@link || @copy`).
+func linkOrCopy(src, dst string) error {
+	if os.Link(src, dst) == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// installFanout places the verified fanout binary (newPath) and forces the
+// supervisor (run.sh) to respawn it: atomic rename onto <dir>/xc_fanout, then
+// pkill the running daemon. No trial — the fanout is not self; run.sh respawns
+// it. pkill is best effort (none running at first install).
+func installFanout(dir, newPath string) error {
+	target := strings.TrimRight(dir, "/") + "/xc_fanout"
+	if err := os.Chmod(newPath, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(newPath, target); err != nil {
+		return err
+	}
+	_ = exec.Command("pkill", "-u", "xc_vm", "-x", "xc_fanout").Run()
+	return nil
+}
+
+// installAgentBinary places the agent's own verified new binary (newPath) onto
+// target and stages it for run.sh's trial: it saves the current binary as
+// target.prev (so a bad new one rolls back) and writes target.trial as
+// "<unix> 0[ reach]". The .prev is NOT overwritten while a trial is already in
+// flight — the last PROVEN binary stays the rollback target, never an unproven
+// one (ArtefactStage::installAgent). `reach` is whether the new binary reports
+// the `reached` feature (the caller probes it): then lasting is not enough, the
+// trial ends only once it has reached MAIN. The agent never execs the new binary
+// in-process — the supervisor + run.sh trial it.
+func installAgentBinary(target, newPath string, reach bool) error {
+	if err := os.Chmod(newPath, 0o755); err != nil {
+		return err
+	}
+	_, trialErr := os.Stat(target + ".trial")
+	_, prevErr := os.Stat(target + ".prev")
+	onTrial := trialErr == nil && prevErr == nil
+	if !onTrial {
+		if _, err := os.Stat(target); err == nil {
+			os.Remove(target + ".prev")
+			if err := linkOrCopy(target, target+".prev"); err != nil {
+				return err
+			}
+			os.Chmod(target+".prev", 0o755)
+		}
+	}
+	if err := os.Rename(newPath, target); err != nil {
+		return err
+	}
+	marker := strconv.FormatInt(time.Now().Unix(), 10) + " 0"
+	if reach {
+		marker += " reach"
+	}
+	return os.WriteFile(target+".trial", []byte(marker+"\n"), 0o644)
 }

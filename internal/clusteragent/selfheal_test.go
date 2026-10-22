@@ -102,3 +102,66 @@ func TestFetchAssetVerifiesSHA256(t *testing.T) {
 		t.Fatal("a SHA-mismatched download must leave no file")
 	}
 }
+
+func TestInstallAgentBinaryStagesTrialAndPrev(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "xc_agent")
+	if err := os.WriteFile(target, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	new1 := filepath.Join(dir, ".xc_agent.new")
+	os.WriteFile(new1, []byte("NEW1"), 0o755)
+	if err := installAgentBinary(target, new1, true); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "NEW1" {
+		t.Fatalf("target not replaced: %q", b)
+	}
+	if b, _ := os.ReadFile(target + ".prev"); string(b) != "OLD" {
+		t.Fatalf(".prev must be the replaced binary: %q", b)
+	}
+	f := strings.Fields(readFileStr(t, target+".trial"))
+	if len(f) != 3 || f[1] != "0" || f[2] != "reach" {
+		t.Fatalf(".trial = %v, want <ts> 0 reach", f)
+	}
+
+	// A second install while still on trial must NOT promote the unproven NEW1
+	// into .prev — the last PROVEN binary (OLD) stays the rollback target.
+	new2 := filepath.Join(dir, ".xc_agent.new2")
+	os.WriteFile(new2, []byte("NEW2"), 0o755)
+	if err := installAgentBinary(target, new2, false); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "NEW2" {
+		t.Fatalf("target not replaced on 2nd install: %q", b)
+	}
+	if b, _ := os.ReadFile(target + ".prev"); string(b) != "OLD" {
+		t.Fatalf(".prev must stay the proven OLD, not NEW1: %q", b)
+	}
+	f2 := strings.Fields(readFileStr(t, target+".trial"))
+	if len(f2) != 2 {
+		t.Fatalf("non-reach trial = %v, want <ts> 0 (no reach)", f2)
+	}
+}
+
+func TestInstallFanoutRenames(t *testing.T) {
+	dir := t.TempDir() + "/"
+	os.MkdirAll(dir, 0o755)
+	newPath := dir + ".xc_fanout.new"
+	os.WriteFile(newPath, []byte("FANOUT"), 0o755)
+	if err := installFanout(dir, newPath); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(dir + "xc_fanout"); string(b) != "FANOUT" {
+		t.Fatalf("fanout not installed: %q", b)
+	}
+}
+
+func readFileStr(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
