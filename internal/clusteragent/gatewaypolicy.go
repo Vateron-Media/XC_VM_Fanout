@@ -45,5 +45,7 @@ func (a *Agent) writeGatewayPolicy(now int64) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(a.GatewayPolicyFile, out)
+	// 0600: the policy carries the node's viewer-key material, matching PHP's
+	// tmp/gateway/policy.json.
+	return writeFileMode(a.GatewayPolicyFile, out, 0o600)
 }

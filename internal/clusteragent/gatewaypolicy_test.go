@@ -45,6 +45,9 @@ func TestWriteGatewayPolicyReStampsAndUnwraps(t *testing.T) {
 	if !p.Fresh(now) {
 		t.Fatal("written policy is not Fresh at now")
 	}
+	if fi, _ := os.Stat(gw); fi == nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("policy file mode = %v, want 0600 (carries viewer-key material)", fi)
+	}
 }
 
 // No section stored yet (MAIN has not served it) is a quiet no-op — no error

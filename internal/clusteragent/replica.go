@@ -78,6 +78,10 @@ var WholeSections = []string{"settings", "servers", "node", "crontab", "cluster"
 // secretSection is the one section that carries secrets.
 const secretSection = "secrets"
 
+// policySection carries the per-node gateway policy (viewer-key material); its
+// stored files and the written tmp/gateway/policy.json are 0600, like secrets.
+const policySection = "policy"
+
 // ReplicaState is where the node's replica stands.
 type ReplicaState struct {
 	BlocklistSeq  int64  `json:"blocklist_seq"`
@@ -476,7 +480,9 @@ func (a *Agent) storeWhole(dir, name string, w *wholeReply) error {
 		return fmt.Errorf("clusteragent: config: the %s section is for another generation of this node", name)
 	}
 	perm := os.FileMode(0o640)
-	if name == secretSection {
+	if name == secretSection || name == policySection {
+		// The policy section carries the node's viewer-key material, like secrets:
+		// owner-only, matching PHP's 0600 tmp/gateway/policy.json.
 		perm = 0o600
 	}
 	if err := writeFileMode(filepath.Join(dir, name+".rep"), sealed, perm); err != nil {
