@@ -86,6 +86,17 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/clusteragent"
 )
 
+// applyFunc is the cluster:apply hook for the agent: ApplyViaPHP normally, nil
+// on a serve-only node. A serve-only node's Go agent materialises the whole
+// replica itself, so console.php cluster:apply would only fill PHP FileCache
+// that a PHP-free node never reads — and the node runs no PHP to call.
+func applyFunc(serveOnly bool, php, console string) func(ctx context.Context) error {
+	if serveOnly {
+		return nil
+	}
+	return clusteragent.ApplyViaPHP(php, console, time.Minute)
+}
+
 func Main(version string) {
 	args := os.Args[1:]
 	cmd := "run"
@@ -106,6 +117,8 @@ func Main(version string) {
 	playlistDir := fs.String("playlist", "/home/xc_vm/content/playlists/", "run: PLAYLIST_PATH, pruned by the agent's tmp sweep per cache_playlists; empty = skip")
 	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
 	seedFanout := fs.Bool("seed-fanout", false, "run: serve-only LB — register assigned restreams on the fanout from the replica (replaces PHP seedLocal); off leaves registration to PHP")
+	serveOnly := fs.Bool("serve-only", false, "run: serve-only LB — the Go agent is authoritative: no console.php cluster:apply (it materialises the whole replica itself and writes policy.json)")
+	gatewayPolicy := fs.String("gateway-policy", "/home/xc_vm/tmp/gateway/policy.json", "run: serve-only LB — the tmp/gateway/policy.json the agent writes from the sealed policy section (the file the fanout -gw-policy reads); only used with -serve-only")
 	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on (also the {ffmpeg_cpu} transcode value)")
 	nodeStreams := fs.String("streams", "/home/xc_vm/streams/", "run: node streams path ({streams}) for applying a transcode directive")
 	nodeLogs := fs.String("logs", "/home/xc_vm/logs/tmp/", "run: node logs-tmp path ({logs}) for applying a transcode directive")
@@ -248,14 +261,20 @@ func Main(version string) {
 	stopSampler := make(chan struct{})
 	defer close(stopSampler)
 	go sampler.Run(stopSampler)
+	// A serve-only node writes tmp/gateway/policy.json itself (from the sealed
+	// policy section); only then does the agent own that file.
+	gwPolicyFile := ""
+	if *serveOnly {
+		gwPolicyFile = *gatewayPolicy
+	}
 	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
 		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
 		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl, SeedFanout: *seedFanout, FfmpegBin: *ffmpegBin, LeaseFile: filepath.Join(filepath.Dir(*statePath), clusteragent.LeaseStateFile),
-		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: clusteragent.ApplyViaPHP(*phpBin, *console, time.Minute),
+		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: applyFunc(*serveOnly, *phpBin, *console),
 		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
 		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
 		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir, FloodDir: *floodDir,
-		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons")}
+		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile}
 	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)

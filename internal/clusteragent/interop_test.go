@@ -325,8 +325,15 @@ func TestInteropWithPanel(t *testing.T) {
 		// A panel before the twelfth Phase 7 increment serves neither
 		// catalogue section; one with it must serve both.
 		_, catalogue := os.Stat(filepath.Join(panel, "src/Core/Cluster/ReplicaStreamCache.php"))
+		// A panel before P1 serves no per-node `policy` section (ReplicaBuilder::policyData);
+		// the agent asks for it harmlessly and stores nothing, as with the catalogue above.
+		pb, _ := os.ReadFile(filepath.Join(panel, "src/Domain/Cluster/ReplicaBuilder.php"))
+		hasPolicy := strings.Contains(string(pb), "policyData")
 		for _, name := range WholeSections {
 			if (name == "bouquets" || name == "categories") && catalogue != nil {
+				continue
+			}
+			if name == "policy" && !hasPolicy {
 				continue
 			}
 			rep, err := os.ReadFile(filepath.Join(a.ReplicaDir, name+".rep"))
