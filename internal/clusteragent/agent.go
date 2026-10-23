@@ -71,6 +71,13 @@ type Agent struct {
 	SelfHealRepo    string
 	SelfHealChannel string
 	SelfHealArch    string
+	// FfmpegRepo ("owner/repo"), FfmpegChannel and FfmpegBinDir configure the
+	// serve-only node's own ffmpeg-build refresh (ffmpeg.go, replacing
+	// cron:root_signals' console.php ffmpeg). Empty FfmpegRepo leaves it off —
+	// set only on a PHP-free serve-only node (agentcmd.ffmpegRepoFor).
+	FfmpegRepo    string
+	FfmpegChannel string
+	FfmpegBinDir  string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
@@ -698,6 +705,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		hctx, stopHeal := context.WithCancel(ctx)
 		defer stopHeal()
 		go a.RunSelfHeal(hctx)
+	}
+	if a.FfmpegRepo != "" {
+		fctx, stopFfmpeg := context.WithCancel(ctx)
+		defer stopFfmpeg()
+		go a.RunFfmpegRefresh(fctx)
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)

@@ -113,6 +113,19 @@ func selfHealRepoFor(serveOnly bool, console, repo string) string {
 	return ""
 }
 
+// ffmpegRepoFor gates the ffmpeg-build refresh exactly like selfHealRepoFor: on
+// only for a serve-only node that is PHP-free (console.php gone), so it never
+// races cron:root_signals' console.php ffmpeg while PHP still owns the refresh.
+func ffmpegRepoFor(serveOnly bool, console, repo string) string {
+	if !serveOnly {
+		return ""
+	}
+	if _, err := os.Stat(console); errors.Is(err, os.ErrNotExist) {
+		return repo
+	}
+	return ""
+}
+
 func Main(version string) {
 	args := os.Args[1:]
 	cmd := "run"
@@ -136,6 +149,9 @@ func Main(version string) {
 	serveOnly := fs.Bool("serve-only", false, "run: serve-only LB — the Go agent is authoritative: no console.php cluster:apply (it materialises the whole replica itself and writes policy.json)")
 	gatewayPolicy := fs.String("gateway-policy", "/home/xc_vm/tmp/gateway/policy.json", "run: serve-only LB — the tmp/gateway/policy.json the agent writes from the sealed policy section (the file the fanout -gw-policy reads); only used with -serve-only")
 	selfhealRepo := fs.String("selfheal-repo", "Vateron-Media/XC_VM_Fanout", "run: serve-only LB — owner/repo the agent self-heals its own xc_node binary from (GitHub releases), replacing console.php fanout_binary; only with -serve-only, empty = off")
+	ffmpegRepo := fs.String("ffmpeg-repo", "Vateron-Media/XC_VM_FFMPEG", "run: serve-only LB — the XC_VM_FFMPEG repo the agent refreshes ffmpeg builds from when PHP-free")
+	ffmpegChannel := fs.String("ffmpeg-channel", "stable", "run: serve-only LB — the XC_VM_FFMPEG release channel (stable/beta/dev)")
+	ffmpegBinDir := fs.String("ffmpeg-bin-dir", "/home/xc_vm/bin/ffmpeg_bin/", "run: serve-only LB — where per-label ffmpeg builds are installed")
 	selfhealChannel := fs.String("selfheal-channel", "stable", "run: serve-only LB — the release channel to self-heal from (stable/beta/dev)")
 	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on (also the {ffmpeg_cpu} transcode value)")
 	nodeStreams := fs.String("streams", "/home/xc_vm/streams/", "run: node streams path ({streams}) for applying a transcode directive")
@@ -293,7 +309,8 @@ func Main(version string) {
 		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
 		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir, FloodDir: *floodDir,
 		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile,
-		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH}
+		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH,
+		FfmpegRepo: ffmpegRepoFor(*serveOnly, *console, *ffmpegRepo), FfmpegChannel: *ffmpegChannel, FfmpegBinDir: *ffmpegBinDir}
 	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
