@@ -78,16 +78,16 @@ func TestNodeRootClassification(t *testing.T) {
 			t.Errorf("%s stops the agent and must be self-stopping", a)
 		}
 	}
-	for _, a := range []string{"reload_nginx", "enable_ramdisk", "disable_ramdisk", "set_sysctl"} {
+	for _, a := range []string{"reload_nginx", "enable_ramdisk", "disable_ramdisk", "set_sysctl", "flush"} {
 		if !nodeRootEssential[a] {
-			t.Errorf("%s must be essential (ported in P5a)", a)
+			t.Errorf("%s must be essential (ported in P5a/P5c)", a)
 		}
 		if nodeRootSelfStopping[a] {
 			t.Errorf("%s does not stop the agent and must not be self-stopping", a)
 		}
 	}
-	// flush / set_governor / set_port stay deferred to P5b.
-	for _, a := range []string{"rotate_db", "install_module", "update", "set_port", "set_governor", "flush"} {
+	// set_governor / set_port stay deferred to P5b.
+	for _, a := range []string{"rotate_db", "install_module", "update", "set_port", "set_governor"} {
 		if nodeRootEssential[a] {
 			t.Errorf("%s is deferred, must not be essential", a)
 		}

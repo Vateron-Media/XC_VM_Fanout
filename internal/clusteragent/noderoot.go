@@ -32,12 +32,13 @@ var nodeRootRun nodeRootRunner = func(ctx context.Context, name string, args ...
 var nodeRootStopDelay = time.Second
 
 // nodeRootEssential are the node.root actions a PHP-free node runs in Go. B1
-// ported the lifecycle commands; P5a adds reload_nginx + ramdisk + set_sysctl.
-// flush (iptables), set_governor (cpufreq output capture) and set_port (the Go
-// front's port rebind) stay deferred to P5b.
+// ported the lifecycle commands; P5a adds reload_nginx + ramdisk + set_sysctl;
+// P5c adds flush (empty the viewer-ban ipsets, bansync.go). set_governor (cpufreq
+// output capture) and set_port (the Go front's port rebind) stay deferred to P5b.
 var nodeRootEssential = map[string]bool{
 	"reboot": true, "restart_services": true, "stop_services": true,
 	"reload_nginx": true, "enable_ramdisk": true, "disable_ramdisk": true, "set_sysctl": true,
+	"flush": true,
 }
 
 // nodeRootSelfStopping are the actions that stop the agent itself: their ack is
@@ -148,6 +149,12 @@ func (a *Agent) execNodeRootCmd(ctx context.Context, cmd *Command) (bool, []byte
 	if !nodeRootEssential[cmd.Action] {
 		a.logf("cluster: node.root %s not run on this PHP-free node (deferred to P5)", cmd.Action)
 		return true, []byte(`{"result":true,"detail":"deferred"}`)
+	}
+	if cmd.Action == "flush" {
+		// Empty the viewer-ban ipsets; the next chore tick re-fills from the
+		// replica (bansync.go). Needs the agent's ReplicaDir, so handled here.
+		a.flushBans(ctx)
+		return true, []byte(`{"result":true}`)
 	}
 	run, delay, home := nodeRootRun, nodeRootStopDelay, a.NodeHome // captured here (no global read in the goroutine)
 	if nodeRootSelfStopping[cmd.Action] {
