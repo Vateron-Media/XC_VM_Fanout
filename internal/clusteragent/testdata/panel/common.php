@@ -2,19 +2,12 @@
 // Interop harness: MAIN's real ClusterApi from a panel checkout (XCVM_PANEL_DIR),
 // with the panel's test fake of xcvm_core and a SQLite file. Test-only.
 
-use XcVm\Core\Config\ConstantsInitializer;
 use XcVm\Core\Config\SettingsManager;
 use XcVm\Infrastructure\Database\DatabaseFactory;
 
 $rPanel = rtrim((string) getenv('XCVM_PANEL_DIR'), '/');
 $rDbFile = (string) getenv('XCVM_INTEROP_DB');
 require $rPanel . '/tests/bootstrap.php';
-// MAIN's real cluster API (Public/cluster/index.php) runs this before any op,
-// so the path constants its ops emit (the policy section's CONS_TMP_PATH,
-// STREAMS_PATH, …, via GatewayPolicy::build) are defined. The harness boots the
-// panel through tests/bootstrap.php, which does not, so without this the config
-// op would fatal on the first undefined path constant and answer 503 DB.
-ConstantsInitializer::init();
 
 /**
  * A table of the panel's install schema (src/bin/install/database.sql) as
