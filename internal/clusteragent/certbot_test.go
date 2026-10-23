@@ -78,3 +78,51 @@ func TestRunCertbotOutcomes(t *testing.T) {
 		t.Fatal("other non-zero exit must be an error")
 	}
 }
+
+// syncFrontCert installs certbot's fullchain/privkey as bin/nginx/conf/
+// server.{crt,key} (key 0600, key renamed before cert), keeping the installed
+// pair when the source cannot be read. Ports CertbotCommand::syncFrontCert.
+func TestSyncFrontCertAtomicKeyFirst(t *testing.T) {
+	bin := t.TempDir() + "/"
+	live := bin + "certbot/config/live/lb1.example.com/"
+	os.MkdirAll(live, 0o755)
+	os.WriteFile(live+"fullchain.pem", []byte("CERTDATA"), 0o644)
+	os.WriteFile(live+"privkey.pem", []byte("KEYDATA"), 0o644)
+	conf := bin + "nginx/conf/"
+	os.MkdirAll(conf, 0o755)
+
+	if err := syncFrontCert(bin, "lb1.example.com"); err != nil {
+		t.Fatalf("syncFrontCert: %v", err)
+	}
+	if b, _ := os.ReadFile(conf + "server.crt"); string(b) != "CERTDATA" {
+		t.Fatalf("server.crt = %q", b)
+	}
+	if b, _ := os.ReadFile(conf + "server.key"); string(b) != "KEYDATA" {
+		t.Fatalf("server.key = %q", b)
+	}
+	if fi, _ := os.Stat(conf + "server.key"); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("server.key mode %o, want 600", fi.Mode().Perm())
+	}
+
+	// Source key gone: the installed pair must stay as it was.
+	os.Remove(live + "privkey.pem")
+	os.WriteFile(live+"fullchain.pem", []byte("NEWCERT"), 0o644)
+	if err := syncFrontCert(bin, "lb1.example.com"); err == nil {
+		t.Fatal("missing privkey must error")
+	}
+	if b, _ := os.ReadFile(conf + "server.crt"); string(b) != "CERTDATA" {
+		t.Fatalf("server.crt changed to %q despite missing key", b)
+	}
+}
+
+// certbotLiveDir falls back to the newest live subdir when the exact domain dir
+// is absent (certbot's -NNNN suffix on a domain-set change).
+func TestCertbotLiveDirNewestFallback(t *testing.T) {
+	bin := t.TempDir() + "/"
+	live := bin + "certbot/config/live/"
+	os.MkdirAll(live+"lb1.example.com-0001", 0o755)
+	os.WriteFile(live+"lb1.example.com-0001/fullchain.pem", []byte("x"), 0o644)
+	if got := certbotLiveDir(bin, "lb1.example.com"); got != live+"lb1.example.com-0001/" {
+		t.Fatalf("certbotLiveDir = %q, want the -0001 fallback", got)
+	}
+}
