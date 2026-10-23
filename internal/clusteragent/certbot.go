@@ -1,9 +1,12 @@
 package clusteragent
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"strings"
 )
@@ -63,4 +66,47 @@ func certbotDomains(nodeJSONPath string) []string {
 		}
 	}
 	return out
+}
+
+// certbotSudo is the privilege prefix certbot runs under (certbot writes under
+// bin/certbot/, owned via the install's sudoers entry). Tests set it to "".
+var certbotSudo = "sudo"
+
+// certbotArgs is the argv after the certbot binary: the serve-only --webroot
+// branch of CertbotCommand, one -d per domain.
+func certbotArgs(binPath, webroot string, domains []string) []string {
+	bin := strings.TrimRight(binPath, "/") + "/"
+	args := []string{
+		"certonly",
+		"--config-dir", bin + "certbot/config",
+		"--work-dir", bin + "certbot/work",
+		"--logs-dir", bin + "certbot/logs",
+		"--agree-tos", "--expand", "--non-interactive", "--register-unsafely-without-email",
+		"--webroot", "-w", webroot,
+	}
+	for _, d := range domains {
+		args = append(args, "-d", d)
+	}
+	return args
+}
+
+// runCertbot execs `sudo <certbotBin> certonly --webroot …` (no shell; domains
+// are separate args, so a replica-sourced domain cannot inject). It returns
+// (true,nil) when a cert was obtained/renewed, (false,nil) when certbot reports
+// the cert is not yet due for renewal, and an error on any other non-zero exit.
+func runCertbot(ctx context.Context, certbotBin, binPath, webroot string, domains []string) (bool, error) {
+	args := certbotArgs(binPath, webroot, domains)
+	name := certbotBin
+	if certbotSudo != "" {
+		name = certbotSudo
+		args = append([]string{certbotBin}, args...)
+	}
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(strings.ToLower(string(out)), "not yet due for renewal") {
+		return false, nil
+	}
+	return false, fmt.Errorf("certbot: %w: %s", err, strings.TrimSpace(string(out)))
 }
