@@ -14,9 +14,13 @@ import (
 // unchanged; only the execution moves. See
 // docs/superpowers/plans/2026-10-23-lb-p6-install-php-free.md.
 
+// nodeRootRunner runs one privileged command.
+type nodeRootRunner func(ctx context.Context, name string, args ...string) error
+
 // nodeRootRun runs one privileged command; a test seam. The agent's service runs
-// as root, so no sudo is needed.
-var nodeRootRun = func(ctx context.Context, name string, args ...string) error {
+// as root, so no sudo is needed. A self-stopping command captures it into a local
+// before its goroutine fires, so a test swapping this global never races it.
+var nodeRootRun nodeRootRunner = func(ctx context.Context, name string, args ...string) error {
 	return exec.CommandContext(ctx, name, args...).Run()
 }
 
@@ -39,17 +43,17 @@ var nodeRootSelfStopping = map[string]bool{
 // execNodeRoot runs one essential action's privileged shell (ports the
 // RootSignalsCronJob case). The agent runs as root; the PHP's DB syslog line is
 // dropped (a serve-only node has no DB — the agent logs instead).
-func execNodeRoot(ctx context.Context, action string, _ map[string]any) error {
+func execNodeRoot(ctx context.Context, run nodeRootRunner, action string, _ map[string]any) error {
 	switch action {
 	case "reboot":
-		return nodeRootRun(ctx, "reboot")
+		return run(ctx, "reboot")
 	case "stop_services":
-		return nodeRootRun(ctx, "systemctl", "stop", "xc_vm")
+		return run(ctx, "systemctl", "stop", "xc_vm")
 	case "restart_services":
-		if err := nodeRootRun(ctx, "systemctl", "stop", "xc_vm"); err != nil {
+		if err := run(ctx, "systemctl", "stop", "xc_vm"); err != nil {
 			return err
 		}
-		return nodeRootRun(ctx, "systemctl", "start", "xc_vm")
+		return run(ctx, "systemctl", "start", "xc_vm")
 	}
 	return fmt.Errorf("node.root: no Go handler for %s", action)
 }
@@ -63,17 +67,18 @@ func (a *Agent) execNodeRootCmd(ctx context.Context, cmd *Command) (bool, []byte
 		a.logf("cluster: node.root %s not run on this PHP-free node (deferred to P5)", cmd.Action)
 		return true, []byte(`{"result":true,"detail":"deferred"}`)
 	}
+	run, delay := nodeRootRun, nodeRootStopDelay // captured here (no global read in the goroutine)
 	if nodeRootSelfStopping[cmd.Action] {
 		action, args := cmd.Action, cmd.Args
 		go func() {
-			time.Sleep(nodeRootStopDelay)
-			if err := execNodeRoot(context.Background(), action, args); err != nil {
+			time.Sleep(delay)
+			if err := execNodeRoot(context.Background(), run, action, args); err != nil {
 				a.logf("cluster: node.root %s: %v", action, err)
 			}
 		}()
 		return true, []byte(`{"result":true,"detail":"issued"}`)
 	}
-	if err := execNodeRoot(ctx, cmd.Action, cmd.Args); err != nil {
+	if err := execNodeRoot(ctx, run, cmd.Action, cmd.Args); err != nil {
 		return false, []byte(err.Error())
 	}
 	return true, []byte(`{"result":true}`)
