@@ -3,7 +3,10 @@ package clusteragent
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -29,9 +32,12 @@ var nodeRootRun nodeRootRunner = func(ctx context.Context, name string, args ...
 var nodeRootStopDelay = time.Second
 
 // nodeRootEssential are the node.root actions a PHP-free node runs in Go. B1
-// ports the lifecycle commands; B2 adds reload_nginx/flush/ramdisk/sysctl/governor.
+// ported the lifecycle commands; P5a adds reload_nginx + ramdisk + set_sysctl.
+// flush (iptables), set_governor (cpufreq output capture) and set_port (the Go
+// front's port rebind) stay deferred to P5b.
 var nodeRootEssential = map[string]bool{
 	"reboot": true, "restart_services": true, "stop_services": true,
+	"reload_nginx": true, "enable_ramdisk": true, "disable_ramdisk": true, "set_sysctl": true,
 }
 
 // nodeRootSelfStopping are the actions that stop the agent itself: their ack is
@@ -43,7 +49,7 @@ var nodeRootSelfStopping = map[string]bool{
 // execNodeRoot runs one essential action's privileged shell (ports the
 // RootSignalsCronJob case). The agent runs as root; the PHP's DB syslog line is
 // dropped (a serve-only node has no DB — the agent logs instead).
-func execNodeRoot(ctx context.Context, run nodeRootRunner, action string, _ map[string]any) error {
+func execNodeRoot(ctx context.Context, run nodeRootRunner, home, action string, args map[string]any) error {
 	switch action {
 	case "reboot":
 		return run(ctx, "reboot")
@@ -54,8 +60,84 @@ func execNodeRoot(ctx context.Context, run nodeRootRunner, action string, _ map[
 			return err
 		}
 		return run(ctx, "systemctl", "start", "xc_vm")
+	case "reload_nginx":
+		// http-nginx is gone on a serve-only node; reload nginx_rtmp only (the
+		// RTMP byte server stays), as xc_vm — matching `service reload`.
+		return run(ctx, "sudo", "-u", "xc_vm", filepath.Join(home, "bin/nginx_rtmp/sbin/nginx_rtmp"), "-s", "reload")
+	case "enable_ramdisk":
+		return setRamdisk(ctx, run, home, true)
+	case "disable_ramdisk":
+		return setRamdisk(ctx, run, home, false)
+	case "set_sysctl":
+		return setSysctl(ctx, run, args)
 	}
 	return fmt.Errorf("node.root: no Go handler for %s", action)
+}
+
+// ramdiskMount is the fstab line the installers write for the streams tmpfs,
+// matching RootSignalsCronJob::RAMDISK_MOUNT exactly; the toggle keys on it.
+const ramdiskMount = "tmpfs /home/xc_vm/content/streams"
+
+// fstabPath and sysctlPath are the files the ramdisk/sysctl actions edit;
+// overridable in tests.
+var (
+	fstabPath  = "/etc/fstab"
+	sysctlPath = "/etc/sysctl.conf"
+)
+
+// ramdiskFstab toggles the streams tmpfs line on/off, a port of
+// RootSignalsCronJob::ramdiskFstab: enabling uncomments "#tmpfs …", disabling
+// comments "tmpfs …"; every other line, and one already in the wanted state, is
+// left as it is.
+func ramdiskFstab(fstab string, enable bool) string {
+	lines := strings.Split(fstab, "\n")
+	for i, line := range lines {
+		if enable && strings.HasPrefix(line, "#"+ramdiskMount) {
+			lines[i] = strings.TrimLeft(line, "#")
+		} else if !enable && strings.HasPrefix(line, ramdiskMount) {
+			lines[i] = "#" + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// setRamdisk rewrites /etc/fstab's streams tmpfs line, mounts or lazily
+// unmounts STREAMS_PATH, and hands it back to xc_vm — a port of the
+// enable/disable_ramdisk cases. Serve-only has no DB, so the PHP state write is dropped.
+func setRamdisk(ctx context.Context, run nodeRootRunner, home string, enable bool) error {
+	cur, err := os.ReadFile(fstabPath)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(fstabPath, []byte(ramdiskFstab(string(cur), enable)), 0o644); err != nil {
+		return err
+	}
+	streams := filepath.Join(home, "content/streams")
+	if enable {
+		if err := run(ctx, "mount", streams); err != nil {
+			return err
+		}
+	} else if err := run(ctx, "umount", "-l", streams); err != nil {
+		return err
+	}
+	return run(ctx, "chown", "-R", "xc_vm:xc_vm", streams)
+}
+
+// setSysctl writes /etc/sysctl.conf and applies it only when MAIN's body differs
+// from the current file, a port of the set_sysctl case; the DB state write is dropped.
+func setSysctl(ctx context.Context, run nodeRootRunner, args map[string]any) error {
+	body, _ := args["data"].(string)
+	if body == "" {
+		return nil
+	}
+	if cur, _ := os.ReadFile(sysctlPath); string(cur) == body {
+		return nil
+	}
+	_ = run(ctx, "modprobe", "ip_conntrack")
+	if err := os.WriteFile(sysctlPath, []byte(body), 0o644); err != nil {
+		return err
+	}
+	return run(ctx, "sysctl", "-p")
 }
 
 // execNodeRootCmd runs a verified node.root command on a PHP-free node and is
@@ -67,18 +149,18 @@ func (a *Agent) execNodeRootCmd(ctx context.Context, cmd *Command) (bool, []byte
 		a.logf("cluster: node.root %s not run on this PHP-free node (deferred to P5)", cmd.Action)
 		return true, []byte(`{"result":true,"detail":"deferred"}`)
 	}
-	run, delay := nodeRootRun, nodeRootStopDelay // captured here (no global read in the goroutine)
+	run, delay, home := nodeRootRun, nodeRootStopDelay, a.NodeHome // captured here (no global read in the goroutine)
 	if nodeRootSelfStopping[cmd.Action] {
 		action, args := cmd.Action, cmd.Args
 		go func() {
 			time.Sleep(delay)
-			if err := execNodeRoot(context.Background(), run, action, args); err != nil {
+			if err := execNodeRoot(context.Background(), run, home, action, args); err != nil {
 				a.logf("cluster: node.root %s: %v", action, err)
 			}
 		}()
 		return true, []byte(`{"result":true,"detail":"issued"}`)
 	}
-	if err := execNodeRoot(ctx, run, cmd.Action, cmd.Args); err != nil {
+	if err := execNodeRoot(ctx, run, home, cmd.Action, cmd.Args); err != nil {
 		return false, []byte(err.Error())
 	}
 	return true, []byte(`{"result":true}`)

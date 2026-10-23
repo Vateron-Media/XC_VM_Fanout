@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -76,9 +78,120 @@ func TestNodeRootClassification(t *testing.T) {
 			t.Errorf("%s stops the agent and must be self-stopping", a)
 		}
 	}
-	for _, a := range []string{"rotate_db", "install_module", "update", "set_port"} {
-		if nodeRootEssential[a] {
-			t.Errorf("%s is deferred to P5, must not be essential", a)
+	for _, a := range []string{"reload_nginx", "enable_ramdisk", "disable_ramdisk", "set_sysctl"} {
+		if !nodeRootEssential[a] {
+			t.Errorf("%s must be essential (ported in P5a)", a)
 		}
+		if nodeRootSelfStopping[a] {
+			t.Errorf("%s does not stop the agent and must not be self-stopping", a)
+		}
+	}
+	// flush / set_governor / set_port stay deferred to P5b.
+	for _, a := range []string{"rotate_db", "install_module", "update", "set_port", "set_governor", "flush"} {
+		if nodeRootEssential[a] {
+			t.Errorf("%s is deferred, must not be essential", a)
+		}
+	}
+}
+
+// P5a ports four discrete node.root actions to Go: reload_nginx (nginx_rtmp),
+// enable/disable_ramdisk (the /etc/fstab tmpfs toggle + mount/chown), and
+// set_sysctl (write + apply on change). Each is a faithful port of its
+// RootSignalsCronJob case, exercised through the shell seam + temp files.
+func TestNodeRootP5aActions(t *testing.T) {
+	var ran []string
+	run := func(_ context.Context, name string, args ...string) error {
+		ran = append(ran, strings.TrimSpace(name+" "+strings.Join(args, " ")))
+		return nil
+	}
+	ctx := context.Background()
+	const home = "/home/xc_vm"
+
+	// reload_nginx → reload nginx_rtmp only, as xc_vm.
+	ran = nil
+	if err := execNodeRoot(ctx, run, home, "reload_nginx", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(ran) != 1 || !strings.Contains(ran[0], "-u xc_vm") || !strings.Contains(ran[0], "bin/nginx_rtmp/sbin/nginx_rtmp -s reload") {
+		t.Fatalf("reload_nginx ran %v", ran)
+	}
+
+	dir := t.TempDir()
+	oldF, oldS := fstabPath, sysctlPath
+	defer func() { fstabPath, sysctlPath = oldF, oldS }()
+	fstabPath = filepath.Join(dir, "fstab")
+	sysctlPath = filepath.Join(dir, "sysctl.conf")
+
+	// enable_ramdisk uncomments the tmpfs line, then mounts + chowns.
+	if err := os.WriteFile(fstabPath, []byte("UUID=x / ext4 defaults 0 1\n#"+ramdiskMount+" tmpfs defaults,size=50% 0 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ran = nil
+	if err := execNodeRoot(ctx, run, home, "enable_ramdisk", nil); err != nil {
+		t.Fatal(err)
+	}
+	fs, _ := os.ReadFile(fstabPath)
+	if strings.Contains(string(fs), "#"+ramdiskMount) || !strings.Contains(string(fs), "\n"+ramdiskMount) {
+		t.Fatalf("enable_ramdisk fstab = %q", fs)
+	}
+	if len(ran) != 2 || !strings.HasPrefix(ran[0], "mount "+home) || !strings.HasPrefix(ran[1], "chown -R xc_vm:xc_vm "+home) {
+		t.Fatalf("enable_ramdisk ran %v", ran)
+	}
+
+	// disable_ramdisk comments it, then lazily unmounts + chowns.
+	ran = nil
+	if err := execNodeRoot(ctx, run, home, "disable_ramdisk", nil); err != nil {
+		t.Fatal(err)
+	}
+	fs, _ = os.ReadFile(fstabPath)
+	if !strings.Contains(string(fs), "#"+ramdiskMount) {
+		t.Fatalf("disable_ramdisk fstab = %q", fs)
+	}
+	if len(ran) != 2 || !strings.HasPrefix(ran[0], "umount -l "+home) || !strings.HasPrefix(ran[1], "chown -R ") {
+		t.Fatalf("disable_ramdisk ran %v", ran)
+	}
+	if !strings.Contains(string(fs), "UUID=x / ext4 defaults 0 1") {
+		t.Fatalf("ramdisk toggle disturbed another fstab line: %q", fs)
+	}
+
+	// set_sysctl writes + applies only when MAIN's body differs.
+	if err := os.WriteFile(sysctlPath, []byte("net.ipv4.old = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ran = nil
+	if err := execNodeRoot(ctx, run, home, "set_sysctl", map[string]any{"data": "net.ipv4.new = 2\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if sc, _ := os.ReadFile(sysctlPath); string(sc) != "net.ipv4.new = 2\n" {
+		t.Fatalf("set_sysctl wrote %q", sc)
+	}
+	if len(ran) != 2 || ran[0] != "modprobe ip_conntrack" || ran[1] != "sysctl -p" {
+		t.Fatalf("set_sysctl ran %v", ran)
+	}
+	// Unchanged body is a no-op (no re-apply).
+	ran = nil
+	if err := execNodeRoot(ctx, run, home, "set_sysctl", map[string]any{"data": "net.ipv4.new = 2\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ran) != 0 {
+		t.Fatalf("set_sysctl re-applied an unchanged config: %v", ran)
+	}
+}
+
+func TestRamdiskFstabToggleIsFaithful(t *testing.T) {
+	// Already in the wanted state → unchanged; other lines never touched.
+	base := "UUID=1 / ext4 defaults 0 1\n" + ramdiskMount + " tmpfs defaults 0 0\n"
+	if got := ramdiskFstab(base, true); got != base {
+		t.Fatalf("enable of an already-enabled fstab changed it: %q", got)
+	}
+	off := ramdiskFstab(base, false)
+	if !strings.Contains(off, "#"+ramdiskMount) || !strings.Contains(off, "UUID=1 / ext4 defaults 0 1") {
+		t.Fatalf("disable = %q", off)
+	}
+	if ramdiskFstab(off, false) != off {
+		t.Fatal("disable of an already-disabled fstab changed it")
+	}
+	if ramdiskFstab(off, true) != base {
+		t.Fatal("enable did not restore the original line")
 	}
 }
