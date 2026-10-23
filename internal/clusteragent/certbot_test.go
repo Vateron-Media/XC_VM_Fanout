@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // certbotDomains reads the node replica section's domain_name (CSV), keeping only
@@ -124,5 +125,16 @@ func TestCertbotLiveDirNewestFallback(t *testing.T) {
 	os.WriteFile(live+"lb1.example.com-0001/fullchain.pem", []byte("x"), 0o644)
 	if got := certbotLiveDir(bin, "lb1.example.com"); got != live+"lb1.example.com-0001/" {
 		t.Fatalf("certbotLiveDir = %q, want the -0001 fallback", got)
+	}
+}
+
+// RunCertbot with no webroot (non-serve-only or still-PHP node) returns at once.
+func TestRunCertbotEmptyWebrootNoop(t *testing.T) {
+	done := make(chan struct{})
+	go func() { (&Agent{}).RunCertbot(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunCertbot with no webroot must return immediately")
 	}
 }

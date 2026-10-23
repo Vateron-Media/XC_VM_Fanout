@@ -207,3 +207,48 @@ func syncFrontCert(binPath, primaryDomain string) error {
 	}
 	return nil
 }
+
+// certbotEvery is how often a PHP-free node renews its cert; cron:certbot runs daily.
+var certbotEvery = 24 * time.Hour
+
+// certbotRefresh resolves the node's domains from the replica and, if any, runs
+// certbot; on a fresh/renewed cert it syncs it to the front. No domains (IP-only
+// node) or a not-due cert is a no-op.
+func (a *Agent) certbotRefresh(ctx context.Context) error {
+	if a.CertbotWebroot == "" {
+		return nil
+	}
+	domains := certbotDomains(strings.TrimRight(a.ReplicaDir, "/") + "/node.json")
+	if len(domains) == 0 {
+		return nil
+	}
+	changed, err := runCertbot(ctx, a.CertbotBin, a.CertbotBinPath, a.CertbotWebroot, domains)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return syncFrontCert(a.CertbotBinPath, domains[0])
+}
+
+// RunCertbot renews the node's cert once at start and then daily, only on a
+// PHP-free serve-only node (CertbotWebroot set by certbotWebrootFor); dormant
+// otherwise so it never races cron:certbot / root_signals certbot_generate.
+func (a *Agent) RunCertbot(ctx context.Context) {
+	if a.CertbotWebroot == "" {
+		return
+	}
+	t := time.NewTicker(certbotEvery)
+	defer t.Stop()
+	for {
+		if err := a.certbotRefresh(ctx); err != nil && ctx.Err() == nil {
+			a.logf("cluster: certbot: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}

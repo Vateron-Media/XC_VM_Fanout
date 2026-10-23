@@ -126,6 +126,19 @@ func ffmpegRepoFor(serveOnly bool, console, repo string) string {
 	return ""
 }
 
+// certbotWebrootFor gates the certbot loop like ffmpegRepoFor: the webroot only
+// for a serve-only node that is PHP-free (console.php gone), so it never races
+// cron:certbot / root_signals certbot_generate while PHP still owns renewal.
+func certbotWebrootFor(serveOnly bool, console, webroot string) string {
+	if !serveOnly {
+		return ""
+	}
+	if _, err := os.Stat(console); errors.Is(err, os.ErrNotExist) {
+		return webroot
+	}
+	return ""
+}
+
 func Main(version string) {
 	args := os.Args[1:]
 	cmd := "run"
@@ -152,6 +165,9 @@ func Main(version string) {
 	ffmpegRepo := fs.String("ffmpeg-repo", "Vateron-Media/XC_VM_FFMPEG", "run: serve-only LB — the XC_VM_FFMPEG repo the agent refreshes ffmpeg builds from when PHP-free")
 	ffmpegChannel := fs.String("ffmpeg-channel", "stable", "run: serve-only LB — the XC_VM_FFMPEG release channel (stable/beta/dev)")
 	ffmpegBinDir := fs.String("ffmpeg-bin-dir", "/home/xc_vm/bin/ffmpeg_bin/", "run: serve-only LB — where per-label ffmpeg builds are installed")
+	certbotBin := fs.String("certbot", "certbot", "run: serve-only LB — the certbot binary the agent runs (sudo) when PHP-free")
+	certbotWebroot := fs.String("certbot-webroot", "/home/xc_vm/certbot-webroot", "run: serve-only LB — certbot's --webroot dir; MUST equal the front's -webroot")
+	certbotBinPath := fs.String("certbot-bin-path", "/home/xc_vm/bin/", "run: serve-only LB — BIN_PATH; certbot config/work/logs live under <path>/certbot/, the front cert under <path>/nginx/conf/")
 	selfhealChannel := fs.String("selfheal-channel", "stable", "run: serve-only LB — the release channel to self-heal from (stable/beta/dev)")
 	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on (also the {ffmpeg_cpu} transcode value)")
 	nodeStreams := fs.String("streams", "/home/xc_vm/streams/", "run: node streams path ({streams}) for applying a transcode directive")
@@ -310,7 +326,8 @@ func Main(version string) {
 		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir, FloodDir: *floodDir,
 		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile,
 		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH,
-		FfmpegRepo: ffmpegRepoFor(*serveOnly, *console, *ffmpegRepo), FfmpegChannel: *ffmpegChannel, FfmpegBinDir: *ffmpegBinDir}
+		FfmpegRepo: ffmpegRepoFor(*serveOnly, *console, *ffmpegRepo), FfmpegChannel: *ffmpegChannel, FfmpegBinDir: *ffmpegBinDir,
+		CertbotWebroot: certbotWebrootFor(*serveOnly, *console, *certbotWebroot), CertbotBin: *certbotBin, CertbotBinPath: *certbotBinPath}
 	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
