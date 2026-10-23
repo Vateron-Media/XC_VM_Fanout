@@ -2,6 +2,15 @@
 // php -S router: every request goes through the real ClusterApi.
 require __DIR__ . '/common.php';
 
+// MAIN's real cluster API (Public/cluster/index.php) runs this before serving
+// any op, so the node path constants its ops emit — the policy section's
+// CONS_TMP_PATH, STREAMS_PATH, … via GatewayPolicy::build — are defined. It
+// lives here, in the request handler, not common.php: the one-shot setup
+// scripts (main_dataplane.php) set CONFIG_PATH from their own argv, which
+// init() would otherwise pre-empt. Without it the config op fatals on the
+// first undefined path constant and answers 503 DB.
+\XcVm\Core\Config\ConstantsInitializer::init();
+
 // Every request and every throwable, beside the harness DB: a fatal must not
 // reach the response body (a node would read it as a reply), and php -S does not
 // pass this script's STDERR through, so a 500 otherwise says nothing at all.

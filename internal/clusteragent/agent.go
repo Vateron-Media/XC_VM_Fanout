@@ -64,6 +64,13 @@ type Agent struct {
 	// loads, written by cron:cache) the agent reads the viewer token keys from to
 	// decode /admin uitokens (admin.go); "" leaves the uitoken admission arm off.
 	GatewayPolicyFile string
+	// SelfHealRepo ("owner/repo"), SelfHealChannel ("stable"/"beta"/"dev") and
+	// SelfHealArch ("amd64"/…) configure the serve-only node's own binary
+	// self-heal from GitHub (selfheal.go, replacing console.php fanout_binary).
+	// Empty SelfHealRepo leaves self-heal off (a non-serve-only node).
+	SelfHealRepo    string
+	SelfHealChannel string
+	SelfHealArch    string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
@@ -686,6 +693,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		cctx, stopChores := context.WithCancel(ctx)
 		defer stopChores()
 		go a.RunChores(cctx)
+	}
+	if a.SelfHealRepo != "" {
+		hctx, stopHeal := context.WithCancel(ctx)
+		defer stopHeal()
+		go a.RunSelfHeal(hctx)
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)
