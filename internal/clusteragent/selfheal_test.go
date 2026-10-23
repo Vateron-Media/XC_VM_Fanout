@@ -19,9 +19,9 @@ import (
 func TestReleaseFor(t *testing.T) {
 	tags := []string{"0.16.0", "0.15.6", "0.15.5"} // newest first, as the API lists
 	cases := []struct {
-		name                   string
-		canary, server         int64
-		pin, want              string
+		name           string
+		canary, server int64
+		pin, want      string
 	}{
 		{"no canary -> newest", 0, 3, "", "0.16.0"},
 		{"this server is the canary -> newest", 3, 3, "", "0.16.0"},
@@ -168,11 +168,11 @@ func readFileStr(t *testing.T, p string) string {
 
 func TestTargetReleaseDecision(t *testing.T) {
 	cases := []struct {
-		name            string
-		tags            []string
-		canary, server  int64
-		pin, installed  string
-		want            string
+		name           string
+		tags           []string
+		canary, server int64
+		pin, installed string
+		want           string
 	}{
 		{"newer, no canary", []string{"0.15.7", "0.15.6"}, 0, 7, "", "0.15.6", "0.15.7"},
 		{"downgrade refused", []string{"0.15.5"}, 0, 7, "", "0.15.6", ""},
