@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -78,18 +79,18 @@ func TestNodeRootClassification(t *testing.T) {
 			t.Errorf("%s stops the agent and must be self-stopping", a)
 		}
 	}
-	for _, a := range []string{"reload_nginx", "enable_ramdisk", "disable_ramdisk", "set_sysctl", "flush"} {
+	for _, a := range []string{"reload_nginx", "enable_ramdisk", "disable_ramdisk", "set_sysctl", "flush", "set_governor", "set_port"} {
 		if !nodeRootEssential[a] {
-			t.Errorf("%s must be essential (ported in P5a/P5c)", a)
+			t.Errorf("%s must be essential (ported in P5a/P5b/P5c)", a)
 		}
 		if nodeRootSelfStopping[a] {
 			t.Errorf("%s does not stop the agent and must not be self-stopping", a)
 		}
 	}
-	// set_governor / set_port stay deferred to P5b.
-	for _, a := range []string{"rotate_db", "install_module", "update", "set_port", "set_governor"} {
+	// Still dropped: moot on a serve-only node, or pending confirmation.
+	for _, a := range []string{"rotate_db", "install_module", "update", "rotate_sign_key", "seed_connections"} {
 		if nodeRootEssential[a] {
-			t.Errorf("%s is deferred, must not be essential", a)
+			t.Errorf("%s is not ported, must not be essential", a)
 		}
 	}
 }
@@ -193,5 +194,130 @@ func TestRamdiskFstabToggleIsFaithful(t *testing.T) {
 	}
 	if ramdiskFstab(off, true) != base {
 		t.Fatal("enable did not restore the original line")
+	}
+}
+
+func TestSetGovernor(t *testing.T) {
+	var ran []string
+	run := func(_ context.Context, name string, args ...string) error {
+		ran = append(ran, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	oldOut := nodeRootOutput
+	defer func() { nodeRootOutput = oldOut }()
+	avail := "conservative ondemand userspace powersave performance schedutil"
+	cur := "1200000 3000000 ondemand"
+	nodeRootOutput = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "-g" {
+			return []byte(avail), nil
+		}
+		return []byte(cur), nil // -p: "min max governor"
+	}
+	ctx := context.Background()
+
+	// Supported and different from the current → set on every core.
+	ran = nil
+	if err := setGovernor(ctx, run, map[string]any{"data": "performance"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ran) != runtime.NumCPU() {
+		t.Fatalf("expected %d cpufreq-set calls, got %d: %v", runtime.NumCPU(), len(ran), ran)
+	}
+	for i, c := range ran {
+		if want := fmt.Sprintf("cpufreq-set -c %d -g performance", i); c != want {
+			t.Errorf("core %d ran %q, want %q", i, c, want)
+		}
+	}
+
+	// Already the current governor → no-op.
+	ran = nil
+	if err := setGovernor(ctx, run, map[string]any{"data": "ondemand"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ran) != 0 {
+		t.Errorf("unchanged governor was re-applied: %v", ran)
+	}
+
+	// A governor the host does not offer → no-op; empty → no-op.
+	for _, gov := range []string{"turbo", ""} {
+		ran = nil
+		if err := setGovernor(ctx, run, map[string]any{"data": gov}); err != nil {
+			t.Fatal(err)
+		}
+		if len(ran) != 0 {
+			t.Errorf("governor %q acted: %v", gov, ran)
+		}
+	}
+
+	// No cpufreq-info present → no-op.
+	nodeRootOutput = func(context.Context, string, ...string) ([]byte, error) { return nil, fmt.Errorf("not found") }
+	ran = nil
+	if err := setGovernor(ctx, run, map[string]any{"data": "performance"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ran) != 0 {
+		t.Errorf("set a governor without cpufreq-info: %v", ran)
+	}
+}
+
+func TestSetPort(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "bin/nginx/conf/ports"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "bin/nginx_rtmp/conf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var ran []string
+	run := func(_ context.Context, name string, args ...string) error {
+		ran = append(ran, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	ctx := context.Background()
+	read := func(p string) string { b, _ := os.ReadFile(filepath.Join(home, p)); return string(b) }
+
+	// type 1 (HTTPS): writes https.conf; the Go front hot-rebinds, so NO reload.
+	ran = nil
+	if err := setPort(ctx, run, home, map[string]any{"type": float64(1), "ports": []any{float64(443), float64(8443)}, "reload": true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read("bin/nginx/conf/ports/https.conf"); got != "listen 443 ssl; listen 8443 ssl;" {
+		t.Fatalf("https.conf = %q", got)
+	}
+	if len(ran) != 0 {
+		t.Errorf("type 1 must not reload (front hot-rebinds): %v", ran)
+	}
+
+	// type 0 (HTTP): writes http.conf + the nginx_rtmp live.conf callbacks; reloads rtmp.
+	ran = nil
+	if err := setPort(ctx, run, home, map[string]any{"type": float64(0), "ports": []any{float64(80)}, "reload": true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read("bin/nginx/conf/ports/http.conf"); got != "listen 80;" {
+		t.Fatalf("http.conf = %q", got)
+	}
+	wantLive := "on_play http://127.0.0.1:80/stream/rtmp; on_publish http://127.0.0.1:80/stream/rtmp; on_play_done http://127.0.0.1:80/stream/rtmp;"
+	if got := read("bin/nginx_rtmp/conf/live.conf"); got != wantLive {
+		t.Fatalf("live.conf = %q", got)
+	}
+	if len(ran) != 1 || !strings.Contains(ran[0], "nginx_rtmp -s reload") {
+		t.Fatalf("type 0 reload = %v", ran)
+	}
+
+	// type 2 (RTMP port): writes port.conf; reload=false → no reload.
+	ran = nil
+	if err := setPort(ctx, run, home, map[string]any{"type": float64(2), "ports": []any{float64(1935)}, "reload": false}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read("bin/nginx_rtmp/conf/port.conf"); got != "listen 1935;" {
+		t.Fatalf("port.conf = %q", got)
+	}
+	if len(ran) != 0 {
+		t.Errorf("type 2 with reload=false must not reload: %v", ran)
+	}
+
+	// out-of-range / non-numeric ports are filtered (PHP is_numeric + 80..65535).
+	if got := toPorts([]any{float64(79), float64(443), "8080", "x", float64(70000)}); len(got) != 2 || got[0] != 443 || got[1] != 8080 {
+		t.Fatalf("toPorts filtered wrong: %v", got)
 	}
 }
