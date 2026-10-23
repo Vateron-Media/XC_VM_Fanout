@@ -32,6 +32,7 @@ const (
 func (a *Agent) RunChores(ctx context.Context) {
 	a.runChores()
 	a.runRecordingSchedulers(ctx)
+	a.syncBans(ctx)
 	a.touchNodeCrons()
 	t := time.NewTicker(choreTouchInterval)
 	defer t.Stop()
@@ -46,6 +47,7 @@ func (a *Agent) RunChores(ctx context.Context) {
 				elapsed = 0
 				a.runChores()
 				a.runRecordingSchedulers(ctx)
+				a.syncBans(ctx)
 			}
 		}
 	}
