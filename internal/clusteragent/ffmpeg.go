@@ -1,13 +1,20 @@
 package clusteragent
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto/md5"
+	crand "crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -101,4 +108,181 @@ func fetchFfmpegArchive(ctx context.Context, client *http.Client, baseURL, asset
 		return err
 	}
 	return nil
+}
+
+// randHex is 8 hex chars for a temp build dir, like FfmpegBuildsCommand's bin2hex(random_bytes(4)).
+func randHex() string {
+	var b [4]byte
+	_, _ = crand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// extractFfmpeg pulls exactly ffmpeg, ffprobe and BUILD_INFO out of the tar.gz
+// into dir (whatever else the archive holds is ignored, like the PHP's
+// `tar … ffmpeg ffprobe BUILD_INFO`). Only those three known names are ever
+// written, so a crafted entry name cannot escape dir.
+func extractFfmpeg(archive, dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	want := map[string]bool{"ffmpeg": true, "ffprobe": true, "BUILD_INFO": true}
+	found := map[string]bool{}
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		name := path.Base(strings.TrimRight(hdr.Name, "/"))
+		if !want[name] || found[name] {
+			continue
+		}
+		out, err := os.OpenFile(strings.TrimRight(dir, "/")+"/"+name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(out, io.LimitReader(tr, 256<<20))
+		cerr := out.Close()
+		if err != nil {
+			return err
+		}
+		if cerr != nil {
+			return cerr
+		}
+		found[name] = true
+	}
+	if len(found) < len(want) {
+		return fmt.Errorf("the archive does not hold ffmpeg, ffprobe and BUILD_INFO")
+	}
+	return nil
+}
+
+// bannerMatchesLabel is FfmpegBuildsCommand's `^ffmpeg version n?<label>(?![0-9])`:
+// a 4.4.5 banner counts as label 4.4, but 7.10 never passes as 7.1.
+func bannerMatchesLabel(banner, label string) bool {
+	return regexp.MustCompile(`^ffmpeg version n?` + regexp.QuoteMeta(label) + `([^0-9]|$)`).MatchString(banner)
+}
+
+// placeFfmpeg extracts the build aside, proves both binaries run on this node
+// and the ffmpeg banner names the label, then swaps it into <binDir>/<label>/
+// atomically. The installed build is kept on every failure (last-known-good);
+// a crash leaves only a .new/.old temp dir, never a partial <label>/.
+func placeFfmpeg(archive, binDir, label string) error {
+	base := strings.TrimRight(binDir, "/") + "/"
+	newDir := base + "." + label + ".new." + randHex()
+	if err := extractFfmpeg(archive, newDir); err != nil {
+		os.RemoveAll(newDir)
+		return err
+	}
+	defer os.RemoveAll(newDir)
+	for _, name := range []string{"ffmpeg", "ffprobe"} {
+		p := newDir + "/" + name
+		_ = os.Chmod(p, 0o755)
+		if err := exec.Command(p, "-hide_banner", "-version").Run(); err != nil {
+			return fmt.Errorf("%s does not run on this node: %w", name, err)
+		}
+	}
+	out, _ := exec.Command(newDir+"/ffmpeg", "-hide_banner", "-version").Output()
+	if !bannerMatchesLabel(string(out), label) {
+		return fmt.Errorf("its ffmpeg is not FFmpeg %s", label)
+	}
+	dst := base + label
+	oldDir := base + "." + label + ".old." + randHex()
+	movedOld := false
+	if _, err := os.Stat(dst); err == nil {
+		if err := os.Rename(dst, oldDir); err != nil {
+			return fmt.Errorf("cannot move the installed build aside: %w", err)
+		}
+		movedOld = true
+	}
+	if err := os.Rename(newDir, dst); err != nil {
+		if movedOld {
+			_ = os.Rename(oldDir, dst) // restore the last-known-good
+		}
+		return fmt.Errorf("cannot install the build: %w", err)
+	}
+	if movedOld {
+		os.RemoveAll(oldDir)
+	}
+	return nil
+}
+
+// ffmpegIndexEntry is one label's line in ffmpeg_version.json.
+type ffmpegIndexEntry struct {
+	Version string `json:"version"`
+	MD5     string `json:"md5"`
+}
+
+func ffmpegIndexPath(binDir string) string {
+	return strings.TrimRight(binDir, "/") + "/" + "ffmpeg_version.json"
+}
+
+// readFfmpegIndex loads ffmpeg_version.json ({label:{version,md5}}); an absent
+// or unreadable index is an empty map, so every label is then re-checked.
+func readFfmpegIndex(p string) map[string]ffmpegIndexEntry {
+	out := map[string]ffmpegIndexEntry{}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+func writeFfmpegIndex(p string, idx map[string]ffmpegIndexEntry) error {
+	b, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, append(b, '\n'), 0o644)
+}
+
+// refreshLabel brings one label up to release `version` for `distro`: it skips
+// when the index already names it and the build is present (unless force), keeps
+// the installed build when the release has no asset or its hashes.md5 cannot be
+// read, and otherwise fetches, md5-verifies, installs and records it. Ports
+// FfmpegBuildsCommand::label. Returns whether the build changed.
+func refreshLabel(ctx context.Context, client *http.Client, baseURL, hashesURL, version, label, distro, binDir string, force bool) (bool, error) {
+	base := strings.TrimRight(binDir, "/") + "/"
+	labelDir := base + label
+	idxPath := ffmpegIndexPath(binDir)
+	idx := readFfmpegIndex(idxPath)
+	if !force && idx[label].Version == version && fileExists(labelDir+"/ffmpeg") && fileExists(labelDir+"/BUILD_INFO") {
+		return false, nil
+	}
+	asset := "ffmpeg_" + label + "_" + distro + ".tar.gz"
+	md5Hex, err := ffmpegAssetMD5(ctx, client, hashesURL, asset)
+	if err != nil {
+		// No line for this label, or hashes.md5 unreadable: keep what is installed.
+		return false, nil
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return false, err
+	}
+	tmp := base + ".dl." + randHex() + ".tar.gz"
+	if err := fetchFfmpegArchive(ctx, client, baseURL, asset, md5Hex, tmp); err != nil {
+		return false, err
+	}
+	defer os.Remove(tmp)
+	if err := placeFfmpeg(tmp, binDir, label); err != nil {
+		return false, err
+	}
+	idx[label] = ffmpegIndexEntry{Version: version, MD5: md5Hex}
+	return true, writeFfmpegIndex(idxPath, idx)
 }
