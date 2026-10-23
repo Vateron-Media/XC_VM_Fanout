@@ -139,6 +139,17 @@ func certbotWebrootFor(serveOnly bool, console, webroot string) string {
 	return ""
 }
 
+// nodeRootGoFor reports whether the agent runs node.root commands itself (and
+// drops the rest) — on a serve-only node that is PHP-free (console.php gone), so
+// there is no cluster:exec to hand them to. Same gate as the P2/P3/P4 loops.
+func nodeRootGoFor(serveOnly bool, console string) bool {
+	if !serveOnly {
+		return false
+	}
+	_, err := os.Stat(console)
+	return errors.Is(err, os.ErrNotExist)
+}
+
 func Main(version string) {
 	args := os.Args[1:]
 	cmd := "run"
@@ -328,6 +339,12 @@ func Main(version string) {
 		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH,
 		FfmpegRepo: ffmpegRepoFor(*serveOnly, *console, *ffmpegRepo), FfmpegChannel: *ffmpegChannel, FfmpegBinDir: *ffmpegBinDir,
 		CertbotWebroot: certbotWebrootFor(*serveOnly, *console, *certbotWebroot), CertbotBin: *certbotBin, CertbotBinPath: *certbotBinPath}
+	if nodeRootGoFor(*serveOnly, *console) {
+		// PHP-free: run the essential node.root commands in Go, and drop the rest
+		// (no console.php cluster:exec to hand anything to).
+		a.NodeRootGo = true
+		a.Exec = clusteragent.DropExec
+	}
 	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)

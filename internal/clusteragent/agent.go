@@ -85,6 +85,10 @@ type Agent struct {
 	CertbotWebroot string
 	CertbotBin     string
 	CertbotBinPath string
+	// NodeRootGo makes the agent run the essential node.root commands itself
+	// (noderoot.go) instead of console.php cluster:exec — set only on a PHP-free
+	// serve-only node (agentcmd.nodeRootGoFor). The rest are dropped (DropExec).
+	NodeRootGo bool
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
