@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,18 +29,27 @@ var nodeRootRun nodeRootRunner = func(ctx context.Context, name string, args ...
 	return exec.CommandContext(ctx, name, args...).Run()
 }
 
+// nodeRootOutput runs a command and returns its combined output; a test seam for
+// the cpufreq-info reads set_governor makes. A missing binary returns an error, so
+// set_governor skips (as PHP's `which cpufreq-info` guard does).
+var nodeRootOutput = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
 // nodeRootStopDelay is how long a self-stopping command waits before firing, so
 // its ack is persisted first. A test sets it to 0.
 var nodeRootStopDelay = time.Second
 
 // nodeRootEssential are the node.root actions a PHP-free node runs in Go. B1
 // ported the lifecycle commands; P5a adds reload_nginx + ramdisk + set_sysctl;
-// P5c adds flush (empty the viewer-ban ipsets, bansync.go). set_governor (cpufreq
-// output capture) and set_port (the Go front's port rebind) stay deferred to P5b.
+// P5c adds flush (the viewer-ban ipsets, bansync.go); P5b adds set_governor and
+// set_port. (OPENSSL_EXTRA / rotate_sign_key / install_config / seed_connections
+// are still dropped pending confirmation they are moot or Go-owned on a serve-only
+// node — see the P5 design doc.)
 var nodeRootEssential = map[string]bool{
 	"reboot": true, "restart_services": true, "stop_services": true,
 	"reload_nginx": true, "enable_ramdisk": true, "disable_ramdisk": true, "set_sysctl": true,
-	"flush": true,
+	"flush": true, "set_governor": true, "set_port": true,
 }
 
 // nodeRootSelfStopping are the actions that stop the agent itself: their ack is
@@ -62,15 +73,17 @@ func execNodeRoot(ctx context.Context, run nodeRootRunner, home, action string, 
 		}
 		return run(ctx, "systemctl", "start", "xc_vm")
 	case "reload_nginx":
-		// http-nginx is gone on a serve-only node; reload nginx_rtmp only (the
-		// RTMP byte server stays), as xc_vm — matching `service reload`.
-		return run(ctx, "sudo", "-u", "xc_vm", filepath.Join(home, "bin/nginx_rtmp/sbin/nginx_rtmp"), "-s", "reload")
+		return reloadNginxRtmp(ctx, run, home)
 	case "enable_ramdisk":
 		return setRamdisk(ctx, run, home, true)
 	case "disable_ramdisk":
 		return setRamdisk(ctx, run, home, false)
 	case "set_sysctl":
 		return setSysctl(ctx, run, args)
+	case "set_governor":
+		return setGovernor(ctx, run, args)
+	case "set_port":
+		return setPort(ctx, run, home, args)
 	}
 	return fmt.Errorf("node.root: no Go handler for %s", action)
 }
@@ -139,6 +152,139 @@ func setSysctl(ctx context.Context, run nodeRootRunner, args map[string]any) err
 		return err
 	}
 	return run(ctx, "sysctl", "-p")
+}
+
+// reloadNginxRtmp reloads nginx_rtmp (the only nginx on a serve-only node), as
+// xc_vm — matching `service reload`. Shared by reload_nginx and set_port.
+func reloadNginxRtmp(ctx context.Context, run nodeRootRunner, home string) error {
+	return run(ctx, "sudo", "-u", "xc_vm", filepath.Join(home, "bin/nginx_rtmp/sbin/nginx_rtmp"), "-s", "reload")
+}
+
+// setGovernor sets the CPU frequency governor on every core when MAIN sends a
+// supported one that differs from the current — a port of the set_governor case.
+// No cpufreq-info, or a governor the host does not offer, is a no-op (as PHP's
+// `which cpufreq-info` guard is). The PHP DB state write is dropped (no DB).
+func setGovernor(ctx context.Context, run nodeRootRunner, args map[string]any) error {
+	gov, _ := args["data"].(string)
+	if gov == "" {
+		return nil
+	}
+	avail, err := nodeRootOutput(ctx, "cpufreq-info", "-g")
+	if err != nil || !fieldIn(string(avail), gov) {
+		return nil
+	}
+	if cur, _ := nodeRootOutput(ctx, "cpufreq-info", "-p"); curGovernor(string(cur)) == gov {
+		return nil
+	}
+	for i := 0; i < runtime.NumCPU(); i++ {
+		if err := run(ctx, "cpufreq-set", "-c", strconv.Itoa(i), "-g", gov); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fieldIn reports whether want is one of the whitespace-separated fields of s
+// (the governors `cpufreq-info -g` lists).
+func fieldIn(s, want string) bool {
+	for _, f := range strings.Fields(s) {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// curGovernor is the active governor from `cpufreq-info -p` ("min max governor").
+func curGovernor(s string) string {
+	if f := strings.Fields(s); len(f) >= 3 {
+		return f[2]
+	}
+	return ""
+}
+
+// setPort rewrites the node's listen ports from a set_port command — a port of
+// that case for a serve-only node. The Go front hot-rebinds ports/http.conf and
+// ports/https.conf itself (front.WatchPorts), so writing the files is enough; only
+// the nginx_rtmp configs need a reload. type 0 = plain-HTTP ports (+ the nginx_rtmp
+// live.conf callbacks), 1 = HTTPS ports, 2 = the nginx_rtmp listen port.
+func setPort(ctx context.Context, run nodeRootRunner, home string, args map[string]any) error {
+	ports := toPorts(args["ports"])
+	reload, _ := args["reload"].(bool)
+	switch argInt(args["type"]) {
+	case 0:
+		if len(ports) == 0 {
+			return nil
+		}
+		if err := writeFileMode(filepath.Join(home, "bin/nginx/conf/ports/http.conf"), []byte(listenLines(ports, "")), 0o644); err != nil {
+			return err
+		}
+		live := ""
+		for _, d := range []string{"on_play", "on_publish", "on_play_done"} {
+			live += fmt.Sprintf("%s http://127.0.0.1:%d/stream/rtmp; ", d, ports[0])
+		}
+		if err := writeFileMode(filepath.Join(home, "bin/nginx_rtmp/conf/live.conf"), []byte(strings.TrimRight(live, " ")), 0o644); err != nil {
+			return err
+		}
+		if reload {
+			return reloadNginxRtmp(ctx, run, home)
+		}
+	case 1:
+		// The Go front binds these; WatchPorts picks up the change — no reload.
+		return writeFileMode(filepath.Join(home, "bin/nginx/conf/ports/https.conf"), []byte(listenLines(ports, " ssl")), 0o644)
+	case 2:
+		if len(ports) == 0 {
+			return nil
+		}
+		if err := writeFileMode(filepath.Join(home, "bin/nginx_rtmp/conf/port.conf"), []byte(fmt.Sprintf("listen %d;", ports[0])), 0o644); err != nil {
+			return err
+		}
+		if reload {
+			return reloadNginxRtmp(ctx, run, home)
+		}
+	}
+	return nil
+}
+
+// listenLines renders nginx listen directives for a port set, matching set_port:
+// "listen <p>;" (suffix "") or "listen <p> ssl;" (suffix " ssl"), space-joined, as
+// the front's ParseListenSet reads them.
+func listenLines(ports []int, suffix string) string {
+	out := make([]string, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, fmt.Sprintf("listen %d%s;", p, suffix))
+	}
+	return strings.Join(out, " ")
+}
+
+// toPorts parses a set_port `ports` arg (a JSON array of numbers or numeric
+// strings) into valid listen ports (80–65535), as PHP's is_numeric guard does.
+func toPorts(v any) []int {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	var out []int
+	for _, e := range arr {
+		if p := argInt(e); p >= 80 && p <= 65535 {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// argInt coerces a JSON number or numeric string to an int (0 if neither).
+func argInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case string:
+		i, _ := strconv.Atoi(strings.TrimSpace(n))
+		return i
+	}
+	return 0
 }
 
 // execNodeRootCmd runs a verified node.root command on a PHP-free node and is
