@@ -60,3 +60,23 @@ func TestFfmpegRepoFor(t *testing.T) {
 		t.Fatalf("serve-only + PHP-free: got %q, want owner/repo", got)
 	}
 }
+
+// certbotWebrootFor gates the certbot loop like ffmpegRepoFor: on only for a
+// serve-only node that is PHP-free, so it never races cron:certbot.
+func TestCertbotWebrootFor(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "console.php")
+	if err := os.WriteFile(present, []byte("<?php"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(dir, "gone.php")
+	if got := certbotWebrootFor(true, present, "/wr"); got != "" {
+		t.Fatalf("serve-only but PHP present: got %q, want ''", got)
+	}
+	if got := certbotWebrootFor(false, absent, "/wr"); got != "" {
+		t.Fatalf("not serve-only: got %q, want ''", got)
+	}
+	if got := certbotWebrootFor(true, absent, "/wr"); got != "/wr" {
+		t.Fatalf("serve-only + PHP-free: got %q, want /wr", got)
+	}
+}

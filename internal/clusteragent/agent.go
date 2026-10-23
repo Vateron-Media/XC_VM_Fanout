@@ -78,6 +78,13 @@ type Agent struct {
 	FfmpegRepo    string
 	FfmpegChannel string
 	FfmpegBinDir  string
+	// CertbotWebroot (certbot's -w, and the front's ACME webroot), CertbotBin and
+	// CertbotBinPath (<home>/bin/) drive the serve-only node's own cert
+	// issue/renewal (certbot.go, replacing cron:certbot). Empty CertbotWebroot
+	// leaves it off — set only on a PHP-free serve-only node (agentcmd.certbotWebrootFor).
+	CertbotWebroot string
+	CertbotBin     string
+	CertbotBinPath string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
@@ -710,6 +717,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		fctx, stopFfmpeg := context.WithCancel(ctx)
 		defer stopFfmpeg()
 		go a.RunFfmpegRefresh(fctx)
+	}
+	if a.CertbotWebroot != "" {
+		cbctx, stopCertbot := context.WithCancel(ctx)
+		defer stopCertbot()
+		go a.RunCertbot(cbctx)
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)
