@@ -80,3 +80,23 @@ func TestCertbotWebrootFor(t *testing.T) {
 		t.Fatalf("serve-only + PHP-free: got %q, want /wr", got)
 	}
 }
+
+// nodeRootGoFor turns on the Go node.root executor only for a serve-only node
+// that is PHP-free (console.php gone), like the P2/P3/P4 gates.
+func TestNodeRootGoFor(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "console.php")
+	if err := os.WriteFile(present, []byte("<?php"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(dir, "gone.php")
+	if nodeRootGoFor(true, present) {
+		t.Fatal("serve-only but PHP present: want false (cluster:exec still owns node.root)")
+	}
+	if nodeRootGoFor(false, absent) {
+		t.Fatal("not serve-only: want false")
+	}
+	if !nodeRootGoFor(true, absent) {
+		t.Fatal("serve-only + PHP-free: want true")
+	}
+}

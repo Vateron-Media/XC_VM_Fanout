@@ -290,6 +290,11 @@ func (a *Agent) localExec(next Executor) Executor {
 		if handled, ok, result := a.controlExec(ctx, cmd); handled {
 			return ok, result
 		}
+		if a.NodeRootGo && cmd.Type == "node.root" {
+			// A PHP-free node runs the essential node.root commands in Go instead
+			// of handing them to console.php cluster:exec (P6).
+			return a.execNodeRootCmd(ctx, cmd)
+		}
 		if cmd.Type == "config.changed" && a.ReplicaDir != "" {
 			// Another node's key changed hands: fetch the replica now, and
 			// ack without waiting for the sync.
