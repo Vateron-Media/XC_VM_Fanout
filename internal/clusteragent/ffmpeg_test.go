@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ffmpegDistro ports ReleaseAsset::bundleFor: the XC_VM_FFMPEG asset distro tag
@@ -79,5 +80,17 @@ func TestFfmpegAssetMD5AndFetch(t *testing.T) {
 	}
 	if _, err := os.Stat(bad); !os.IsNotExist(err) {
 		t.Fatal("an md5-mismatched download must leave no file")
+	}
+}
+
+// RunFfmpegRefresh with no repo (a non-serve-only or still-PHP node) returns at
+// once: the loop never starts.
+func TestRunFfmpegRefreshEmptyRepoNoop(t *testing.T) {
+	done := make(chan struct{})
+	go func() { (&Agent{}).RunFfmpegRefresh(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunFfmpegRefresh with no repo must return immediately")
 	}
 }

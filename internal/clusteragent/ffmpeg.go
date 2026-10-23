@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Node maintenance (P4): a PHP-free serve-only node refreshes its own ffmpeg
@@ -285,4 +286,87 @@ func refreshLabel(ctx context.Context, client *http.Client, baseURL, hashesURL, 
 	}
 	idx[label] = ffmpegIndexEntry{Version: version, MD5: md5Hex}
 	return true, writeFfmpegIndex(idxPath, idx)
+}
+
+// ffmpegRefreshEvery is how often a PHP-free node refreshes its ffmpeg builds —
+// cron:root_signals runs console.php ffmpeg daily.
+var ffmpegRefreshEvery = 24 * time.Hour
+
+// nodeFfmpegDistro reads /etc/os-release and returns this node's XC_VM_FFMPEG
+// distro tag, "" for one with no builds (FfmpegBuildsCommand's os-release read).
+func nodeFfmpegDistro() string {
+	b, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return ""
+	}
+	var id, ver string
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"`)
+		switch strings.TrimSpace(k) {
+		case "ID":
+			id = strings.ToLower(v)
+		case "VERSION_ID":
+			ver = v
+		}
+	}
+	return ffmpegDistro(id, ver)
+}
+
+// ffmpegRefresh brings every label up to the latest XC_VM_FFMPEG release for this
+// node's distribution. An unsupported distribution or no release yet keeps the
+// installed builds; one label's failure is logged and the rest still refresh.
+func (a *Agent) ffmpegRefresh(ctx context.Context) error {
+	if a.FfmpegRepo == "" {
+		return nil
+	}
+	distro := nodeFfmpegDistro()
+	if distro == "" {
+		return nil
+	}
+	api := "https://api.github.com/repos/" + a.FfmpegRepo + "/releases?per_page=100"
+	tags, err := listReleases(ctx, http.DefaultClient, api, a.FfmpegChannel)
+	if err != nil {
+		return err
+	}
+	tag := releaseFor(tags, 0, 0, "")
+	if tag == "" {
+		return nil
+	}
+	base := "https://github.com/" + a.FfmpegRepo + "/releases/download/" + tag + "/"
+	hashes := base + "hashes.md5"
+	var firstErr error
+	for _, label := range ffmpegLabels {
+		if _, err := refreshLabel(ctx, http.DefaultClient, base, hashes, tag, label, distro, a.FfmpegBinDir, false); err != nil {
+			a.logf("cluster: ffmpeg %s: %v", label, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// RunFfmpegRefresh refreshes the ffmpeg builds once at start and then daily, only
+// on a PHP-free serve-only node (FfmpegRepo set by ffmpegRepoFor); dormant
+// otherwise so it never races cron:root_signals' console.php ffmpeg.
+func (a *Agent) RunFfmpegRefresh(ctx context.Context) {
+	if a.FfmpegRepo == "" {
+		return
+	}
+	t := time.NewTicker(ffmpegRefreshEvery)
+	defer t.Stop()
+	for {
+		if err := a.ffmpegRefresh(ctx); err != nil && ctx.Err() == nil {
+			a.logf("cluster: ffmpeg refresh: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
