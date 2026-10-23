@@ -79,6 +79,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -95,6 +96,21 @@ func applyFunc(serveOnly bool, php, console string) func(ctx context.Context) er
 		return nil
 	}
 	return clusteragent.ApplyViaPHP(php, console, time.Minute)
+}
+
+// selfHealRepoFor returns the repo the Go agent self-heals its binary from, or
+// "" to leave self-heal off. It activates only on a serve-only node that is
+// PHP-free (console.php gone — the P6 end state): while PHP is present it owns
+// binary updates (root_signals fanout_binary), so the Go self-heal stays dormant
+// and the two never race to install the same binary.
+func selfHealRepoFor(serveOnly bool, console, repo string) string {
+	if !serveOnly {
+		return ""
+	}
+	if _, err := os.Stat(console); errors.Is(err, os.ErrNotExist) {
+		return repo
+	}
+	return ""
 }
 
 func Main(version string) {
@@ -119,6 +135,8 @@ func Main(version string) {
 	seedFanout := fs.Bool("seed-fanout", false, "run: serve-only LB — register assigned restreams on the fanout from the replica (replaces PHP seedLocal); off leaves registration to PHP")
 	serveOnly := fs.Bool("serve-only", false, "run: serve-only LB — the Go agent is authoritative: no console.php cluster:apply (it materialises the whole replica itself and writes policy.json)")
 	gatewayPolicy := fs.String("gateway-policy", "/home/xc_vm/tmp/gateway/policy.json", "run: serve-only LB — the tmp/gateway/policy.json the agent writes from the sealed policy section (the file the fanout -gw-policy reads); only used with -serve-only")
+	selfhealRepo := fs.String("selfheal-repo", "Vateron-Media/XC_VM_Fanout", "run: serve-only LB — owner/repo the agent self-heals its own xc_node binary from (GitHub releases), replacing console.php fanout_binary; only with -serve-only, empty = off")
+	selfhealChannel := fs.String("selfheal-channel", "stable", "run: serve-only LB — the release channel to self-heal from (stable/beta/dev)")
 	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on (also the {ffmpeg_cpu} transcode value)")
 	nodeStreams := fs.String("streams", "/home/xc_vm/streams/", "run: node streams path ({streams}) for applying a transcode directive")
 	nodeLogs := fs.String("logs", "/home/xc_vm/logs/tmp/", "run: node logs-tmp path ({logs}) for applying a transcode directive")
@@ -274,7 +292,8 @@ func Main(version string) {
 		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
 		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
 		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir, FloodDir: *floodDir,
-		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile}
+		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile,
+		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH}
 	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
 	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
 	err = a.Run(ctx)
