@@ -338,7 +338,8 @@ func Main(version string) {
 		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile,
 		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH,
 		FfmpegRepo: ffmpegRepoFor(*serveOnly, *console, *ffmpegRepo), FfmpegChannel: *ffmpegChannel, FfmpegBinDir: *ffmpegBinDir,
-		CertbotWebroot: certbotWebrootFor(*serveOnly, *console, *certbotWebroot), CertbotBin: *certbotBin, CertbotBinPath: *certbotBinPath}
+		CertbotWebroot: certbotWebrootFor(*serveOnly, *console, *certbotWebroot), CertbotBin: *certbotBin, CertbotBinPath: *certbotBinPath,
+		NodeHome: filepath.Dir(*console)}
 	if nodeRootGoFor(*serveOnly, *console) {
 		// PHP-free: run the essential node.root commands in Go, and drop the rest
 		// (no console.php cluster:exec to hand anything to).

@@ -89,6 +89,10 @@ type Agent struct {
 	// (noderoot.go) instead of console.php cluster:exec — set only on a PHP-free
 	// serve-only node (agentcmd.nodeRootGoFor). The rest are dropped (DropExec).
 	NodeRootGo bool
+	// NodeHome is the node's install root (MAIN_HOME, e.g. /home/xc_vm), set from
+	// the console path (agentcmd: filepath.Dir(-console)). node.root handlers that
+	// touch node files derive paths from it (bin/nginx_rtmp, content/streams).
+	NodeHome string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
