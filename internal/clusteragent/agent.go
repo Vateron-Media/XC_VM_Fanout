@@ -71,6 +71,28 @@ type Agent struct {
 	SelfHealRepo    string
 	SelfHealChannel string
 	SelfHealArch    string
+	// FfmpegRepo ("owner/repo"), FfmpegChannel and FfmpegBinDir configure the
+	// serve-only node's own ffmpeg-build refresh (ffmpeg.go, replacing
+	// cron:root_signals' console.php ffmpeg). Empty FfmpegRepo leaves it off —
+	// set only on a PHP-free serve-only node (agentcmd.ffmpegRepoFor).
+	FfmpegRepo    string
+	FfmpegChannel string
+	FfmpegBinDir  string
+	// CertbotWebroot (certbot's -w, and the front's ACME webroot), CertbotBin and
+	// CertbotBinPath (<home>/bin/) drive the serve-only node's own cert
+	// issue/renewal (certbot.go, replacing cron:certbot). Empty CertbotWebroot
+	// leaves it off — set only on a PHP-free serve-only node (agentcmd.certbotWebrootFor).
+	CertbotWebroot string
+	CertbotBin     string
+	CertbotBinPath string
+	// NodeRootGo makes the agent run the essential node.root commands itself
+	// (noderoot.go) instead of console.php cluster:exec — set only on a PHP-free
+	// serve-only node (agentcmd.nodeRootGoFor). The rest are dropped (DropExec).
+	NodeRootGo bool
+	// NodeHome is the node's install root (MAIN_HOME, e.g. /home/xc_vm), set from
+	// the console path (agentcmd: filepath.Dir(-console)). node.root handlers that
+	// touch node files derive paths from it (bin/nginx_rtmp, content/streams).
+	NodeHome string
 	// SocketPath is the local socket the node's PHP calls MAIN through
 	// (socket.go); "" leaves it off.
 	SocketPath string
@@ -698,6 +720,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		hctx, stopHeal := context.WithCancel(ctx)
 		defer stopHeal()
 		go a.RunSelfHeal(hctx)
+	}
+	if a.FfmpegRepo != "" {
+		fctx, stopFfmpeg := context.WithCancel(ctx)
+		defer stopFfmpeg()
+		go a.RunFfmpegRefresh(fctx)
+	}
+	if a.CertbotWebroot != "" {
+		cbctx, stopCertbot := context.WithCancel(ctx)
+		defer stopCertbot()
+		go a.RunCertbot(cbctx)
 	}
 	if a.SocketPath != "" {
 		sctx, stopSocket := context.WithCancel(ctx)

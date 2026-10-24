@@ -38,3 +38,65 @@ func TestSelfHealRepoFor(t *testing.T) {
 		t.Fatalf("serve-only + PHP-free: got %q, want owner/repo", got)
 	}
 }
+
+// ffmpegRepoFor gates the Go ffmpeg refresh the same way selfHealRepoFor gates
+// self-heal: on only when the node is serve-only AND PHP-free (console.php gone).
+// While PHP is present, cron:root_signals runs console.php ffmpeg, so the Go
+// refresh stays dormant and the two never race to install a build.
+func TestFfmpegRepoFor(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "console.php")
+	if err := os.WriteFile(present, []byte("<?php"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(dir, "gone.php")
+	if got := ffmpegRepoFor(true, present, "owner/repo"); got != "" {
+		t.Fatalf("serve-only but PHP present: got %q, want '' (dormant while PHP refreshes)", got)
+	}
+	if got := ffmpegRepoFor(false, absent, "owner/repo"); got != "" {
+		t.Fatalf("not serve-only: got %q, want ''", got)
+	}
+	if got := ffmpegRepoFor(true, absent, "owner/repo"); got != "owner/repo" {
+		t.Fatalf("serve-only + PHP-free: got %q, want owner/repo", got)
+	}
+}
+
+// certbotWebrootFor gates the certbot loop like ffmpegRepoFor: on only for a
+// serve-only node that is PHP-free, so it never races cron:certbot.
+func TestCertbotWebrootFor(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "console.php")
+	if err := os.WriteFile(present, []byte("<?php"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(dir, "gone.php")
+	if got := certbotWebrootFor(true, present, "/wr"); got != "" {
+		t.Fatalf("serve-only but PHP present: got %q, want ''", got)
+	}
+	if got := certbotWebrootFor(false, absent, "/wr"); got != "" {
+		t.Fatalf("not serve-only: got %q, want ''", got)
+	}
+	if got := certbotWebrootFor(true, absent, "/wr"); got != "/wr" {
+		t.Fatalf("serve-only + PHP-free: got %q, want /wr", got)
+	}
+}
+
+// nodeRootGoFor turns on the Go node.root executor only for a serve-only node
+// that is PHP-free (console.php gone), like the P2/P3/P4 gates.
+func TestNodeRootGoFor(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "console.php")
+	if err := os.WriteFile(present, []byte("<?php"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(dir, "gone.php")
+	if nodeRootGoFor(true, present) {
+		t.Fatal("serve-only but PHP present: want false (cluster:exec still owns node.root)")
+	}
+	if nodeRootGoFor(false, absent) {
+		t.Fatal("not serve-only: want false")
+	}
+	if !nodeRootGoFor(true, absent) {
+		t.Fatal("serve-only + PHP-free: want true")
+	}
+}
