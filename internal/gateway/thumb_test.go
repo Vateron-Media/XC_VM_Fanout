@@ -62,12 +62,11 @@ func TestJudgeThumb(t *testing.T) {
 		t.Errorf("past lease: got %+v, want PHP", v)
 	}
 
-	// send_unique_header hands thumbnails to PHP: it writes a per-response
-	// cookie the gateway does not reproduce.
+	// send_unique_header no longer defers: the gateway writes the cookie itself.
 	p.ServeUntil = 0
-	p.Headers.UniqueHeader = true
-	if v := JudgeThumb(p, tok(`{"expires":`+decs(testNow+3600)+`,"stream":12}`), testNow, fresh); v.Action != PHP {
-		t.Errorf("unique-header: got %+v, want PHP", v)
+	p.Headers.UniqueName = "xcuniq"
+	if v := JudgeThumb(p, tok(`{"expires":`+decs(testNow+3600)+`,"stream":12}`), testNow, fresh); v.Action != Serve {
+		t.Errorf("unique-header: got %+v, want Serve", v)
 	}
 }
 
@@ -92,6 +91,13 @@ func TestServeThumb(t *testing.T) {
 	rec := serveReq(s, "/thauth/"+token, "198.51.100.7")
 	if rec.Code != 200 || rec.Header().Get("Content-Type") != "image/jpg" || rec.Body.String() != string(jpg) {
 		t.Fatalf("served thumbnail: %d %v body=%q", rec.Code, rec.Header(), rec.Body.String())
+	}
+	wantCookies(t, rec, nil)
+	un := NewServer(writeServePolicy(t, dir, "segments+playlist+thumb", func(d map[string]any) { withStreams(d); withUniqueCookie(d) }), http.NotFoundHandler(), nil)
+	if r2 := serveReq(un, "/thauth/"+token, "198.51.100.7"); r2.Code != 200 || r2.Body.String() != string(jpg) {
+		t.Fatalf("thumb with cookie: %d %q", r2.Code, r2.Body.String())
+	} else {
+		wantCookies(t, r2, []string{"xcuniq="})
 	}
 	if rec.Header().Get("Access-Control-Allow-Origin") != "*" || rec.Header().Get("Age") == "" {
 		t.Fatalf("thumb headers: %v", rec.Header())

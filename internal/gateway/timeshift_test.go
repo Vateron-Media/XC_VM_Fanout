@@ -123,7 +123,6 @@ func TestJudgeTimeshift(t *testing.T) {
 		reason string
 	}{
 		{"behind an originator", tsToken(func(m map[string]any) { m["originator_id"] = 9 }), nil, nil, "proxy"},
-		{"send_unique_header", tsToken(nil), func(p *Policy) { p.Headers.UniqueHeader = true }, nil, "unique-header"},
 		{"the first minute is gone", tsToken(nil), nil, func(s *liveEnvState) { s.sizes = map[string]int64{} }, "missing"},
 		{"no timestamp form", tsToken(func(m map[string]any) { m["start"] = "notadate" }), nil, nil, "timestamp"},
 		{"an unloadable timezone", tsToken(func(m map[string]any) { m["start"] = "2026-10-16:14-00" }), func(p *Policy) { p.DefaultTimezone = "No/Such" }, func(s *liveEnvState) { s.rec = nil }, "timezone"},
@@ -163,6 +162,7 @@ func TestServeTimeshift(t *testing.T) {
 	a := &fakeAgent{records: map[string]map[string]any{}}
 	sock := startAgent(t, a)
 	path := writeServePolicy(t, dir, "segments+playlist+thumb+subtitle+vod+timeshift", func(doc map[string]any) {
+		withUniqueCookie(doc)
 		doc["conn_store"] = "agent"
 		doc["vod_limit_perc"] = 50
 		doc["live"] = map[string]any{"use_buffer": true, "create_expiration": 5, "admission": true}
@@ -188,6 +188,7 @@ func TestServeTimeshift(t *testing.T) {
 	req.Header.Set("User-Agent", testUA)
 	rec := httptest.NewRecorder()
 	s.ServeHTTP(rec, req)
+	wantCookies(t, rec, []string{"xcuniq="})
 
 	if rec.Code != 200 || rec.Body.String() != "MOVIE" || rec.Header().Get("Content-Type") != "video/mp2t" {
 		t.Fatalf("timeshift: %d %q %v; stats %v", rec.Code, rec.Body.String(), rec.Header(), s.Stats())

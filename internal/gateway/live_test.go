@@ -294,7 +294,6 @@ func TestJudgeLive(t *testing.T) {
 	}{
 		{"a known viewer's refresh", liveTokenJSON(nil), testUA, nil, nil, Serve, "playlist"},
 		{"viewers in MAIN's store", liveTokenJSON(nil), testUA, func(p *Policy) { p.ConnStore = "php" }, nil, PHP, "conn-store"},
-		{"a cookie per response", liveTokenJSON(nil), testUA, func(p *Policy) { p.Live.UniqueHeader = true }, nil, PHP, "unique-header"},
 		{"a token this node does not open", tok("x"), testUA, nil, nil, PHP, "token"},
 		{"an off-air token", liveTokenJSON(func(m map[string]any) { m["off_air"] = 1 }), testUA, nil, nil, PHP, "off-air"},
 		{"an adaptive token", liveTokenJSON(func(m map[string]any) { m["adaptive"] = []int{1} }), testUA, nil, nil, PHP, "off-air"},
@@ -978,14 +977,14 @@ func TestJudgeLiveServeOnlyServesIdleRegistered(t *testing.T) {
 		}
 	})
 
-	t.Run("TS unregistered on serve-only defers not-on-air", func(t *testing.T) {
+	t.Run("TS unregistered on serve-only denies not-on-air", func(t *testing.T) {
 		p := tsPolicy()
 		first(p)
 		p.ServeOnly = true
 		st := goodTSEnv()
 		st.rec, st.fed, st.registered = nil, false, false
-		if v, _ := JudgeLive(p, firstTSToken(nil), ip, testUA, testNow, st.env()); v.Action != PHP || v.Reason != "not-on-air" {
-			t.Fatalf("got %s/%s; want PHP/not-on-air", v.Action, v.Reason)
+		if v, _ := JudgeLive(p, firstTSToken(nil), ip, testUA, testNow, st.env()); v.Action != Deny || v.Reason != "not-on-air" {
+			t.Fatalf("got %s/%s; want Deny/not-on-air", v.Action, v.Reason)
 		}
 	})
 
@@ -1014,14 +1013,14 @@ func TestJudgeLiveServeOnlyServesIdleRegistered(t *testing.T) {
 		}
 	})
 
-	t.Run("HLS unregistered on serve-only defers not-on-air", func(t *testing.T) {
+	t.Run("HLS unregistered on serve-only denies not-on-air", func(t *testing.T) {
 		p := livePolicy()
 		first(p)
 		p.ServeOnly = true
 		st := goodLiveEnv()
 		st.rec, st.fed, st.playlist, st.registered = nil, false, "", false
-		if v, _ := JudgeLive(p, firstHLSToken(nil), ip, testUA, testNow, st.env()); v.Action != PHP || v.Reason != "not-on-air" {
-			t.Fatalf("got %s/%s; want PHP/not-on-air", v.Action, v.Reason)
+		if v, _ := JudgeLive(p, firstHLSToken(nil), ip, testUA, testNow, st.env()); v.Action != Deny || v.Reason != "not-on-air" {
+			t.Fatalf("got %s/%s; want Deny/not-on-air", v.Action, v.Reason)
 		}
 	})
 }

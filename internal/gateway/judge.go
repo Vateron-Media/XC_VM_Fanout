@@ -63,6 +63,29 @@ var (
 
 func verdict(a Action, reason string) Verdict { return Verdict{Action: a, Reason: reason} }
 
+// serveOnlyRejects are the reasons PHP answers with its own 404 (generate404, or
+// generateError with no code: TOKEN_EXPIRED, NO_TIMESTAMP, IP_MISMATCH,
+// VOD_DOESNT_EXIST). On a serve-only node there is no PHP behind the front, so
+// deferring them would be a 502: the gateway denies them itself. The node holds
+// the authoritative keys, so a token that does not open is definitively bad.
+var serveOnlyRejects = map[string]bool{
+	"token": true, "token-form": true, "token-json": true, "timestamp": true,
+	"stream-id": true, "missing": true, "ip": true, "lease": true,
+	"expired": true, "not-on-air": true, "stream": true, "stale": true,
+	// serve-level: an admission the agent refuses (the faithful off-air clip is a
+	// deferred follow-on), the rare corrupt-token second-ip, an unusable container.
+	"refused": true, "second-ip": true, "extension": true,
+}
+
+// reject is the verdict for a request PHP would 404: a Deny on a serve-only
+// node, the unchanged PHP hand-over on any other.
+func reject(p *Policy, why string) Verdict {
+	if p != nil && p.ServeOnly && serveOnlyRejects[why] {
+		return verdict(Deny, why)
+	}
+	return verdict(PHP, why)
+}
+
 // JudgeSegment is segment.php's decision on /hls/<token> as far as the gateway
 // owns it: a live daemon segment ("<id>_d<seq>.ts") and a catch-up minute are
 // served, a token of another server redirected, what PHP refuses denied, and
@@ -73,12 +96,12 @@ func JudgeSegment(p *Policy, token, clientIP string, now int64, env Env) Verdict
 		return verdict(PHP, "policy")
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
-		return verdict(PHP, "lease")
+		return reject(p, "lease")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	switch v {
 	case Unsure:
-		return verdict(PHP, "token-form")
+		return reject(p, "token-form")
 	case Refused:
 		return verdict(Deny, "token")
 	}
@@ -119,7 +142,7 @@ func JudgeSegment(p *Policy, token, clientIP string, now int64, env Env) Verdict
 	}
 	stream, ok := digits(f[3])
 	if !ok {
-		return verdict(PHP, "stream-id")
+		return reject(p, "stream-id")
 	}
 	seq, isDaemon := daemonSeq(f[4], stream)
 	if !isDaemon {
@@ -152,7 +175,7 @@ func judgeArchive(p *Policy, f []string, clientIP string, env Env) Verdict {
 	}
 	stream, ok := digits(parts[0])
 	if !ok {
-		return verdict(PHP, "stream-id")
+		return reject(p, "stream-id")
 	}
 	var offset int64
 	if len(parts) > 2 {
@@ -225,12 +248,12 @@ func JudgeKey(p *Policy, token, clientIP string, now int64) Verdict {
 		return verdict(PHP, "policy")
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
-		return verdict(PHP, "lease")
+		return reject(p, "lease")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	switch v {
 	case Unsure:
-		return verdict(PHP, "token-form")
+		return reject(p, "token-form")
 	case Refused:
 		return verdict(Deny, "token")
 	}
@@ -243,7 +266,7 @@ func JudgeKey(p *Policy, token, clientIP string, now int64) Verdict {
 	}
 	stream, ok := digits(f[1])
 	if !ok {
-		return verdict(PHP, "stream-id")
+		return reject(p, "stream-id")
 	}
 	return Verdict{Action: Serve, Reason: "key", Stream: stream}
 }
@@ -261,18 +284,12 @@ func JudgeThumb(p *Policy, token string, now int64, env Env) Verdict {
 		return verdict(PHP, "policy")
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
-		return verdict(PHP, "lease")
-	}
-	if p.Headers.UniqueHeader {
-		// thumb.php sets a fresh random send_unique_header cookie on every
-		// response; the gateway does not reproduce it (nor does JudgeLive), so a
-		// node with it set hands thumbnails to PHP, which sets the cookie.
-		return verdict(PHP, "unique-header")
+		return reject(p, "lease")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
 		// Refused or Unsure: it is not a 404, so PHP answers (TOKEN_EXPIRED).
-		return verdict(PHP, "token")
+		return reject(p, "token")
 	}
 	var td struct {
 		Expires *int64 `json:"expires"`
@@ -281,18 +298,18 @@ func JudgeThumb(p *Policy, token string, now int64, env Env) Verdict {
 	// A thumbnail link names when it expires; one that does not (or is another
 	// endpoint's slash-field token) is not this endpoint's.
 	if json.Unmarshal(plain, &td) != nil || td.Expires == nil {
-		return verdict(PHP, "token-json")
+		return reject(p, "token-json")
 	}
 	if *td.Expires < now-p.TimeOffset {
-		return verdict(PHP, "expired")
+		return reject(p, "expired")
 	}
 	if td.Stream <= 0 {
-		return verdict(PHP, "stream")
+		return reject(p, "stream")
 	}
 	path := p.Paths.Streams + strconv.Itoa(td.Stream) + "_.jpg"
 	mod, ok := env.Mtime(path)
 	if !ok || now-mod >= 60 {
-		return verdict(PHP, "stale")
+		return reject(p, "stale")
 	}
 	return Verdict{Action: Serve, Reason: "thumb", Stream: td.Stream, Path: path}
 }
@@ -310,15 +327,11 @@ func JudgeSubtitle(p *Policy, token string, now int64, env Env) Verdict {
 		return verdict(PHP, "policy")
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
-		return verdict(PHP, "lease")
-	}
-	if p.Headers.UniqueHeader {
-		// subtitle.php, like thumb.php, writes a fresh random cookie per response.
-		return verdict(PHP, "unique-header")
+		return reject(p, "lease")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
-		return verdict(PHP, "token")
+		return reject(p, "token")
 	}
 	var td struct {
 		Expires  *int64 `json:"expires"`
@@ -329,17 +342,17 @@ func JudgeSubtitle(p *Policy, token string, now int64, env Env) Verdict {
 	// A subtitle link names when it expires; one that does not (or another
 	// endpoint's slash-field token) is not this endpoint's.
 	if json.Unmarshal(plain, &td) != nil || td.Expires == nil {
-		return verdict(PHP, "token-json")
+		return reject(p, "token-json")
 	}
 	if *td.Expires < now-p.TimeOffset {
-		return verdict(PHP, "expired")
+		return reject(p, "expired")
 	}
 	if td.StreamID <= 0 {
-		return verdict(PHP, "stream")
+		return reject(p, "stream")
 	}
 	path := p.Paths.Vod + strconv.Itoa(td.StreamID) + "_" + strconv.Itoa(td.SubID) + ".srt"
 	if !env.File(path) {
-		return verdict(PHP, "missing")
+		return reject(p, "missing")
 	}
 	return Verdict{Action: Serve, Reason: "subtitle", Stream: td.StreamID, Seq: int64(td.SubID), WebVTT: td.WebVTT != 0, Path: path}
 }

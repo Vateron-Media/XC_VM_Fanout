@@ -37,10 +37,11 @@ type Policy struct {
 		Server     string `json:"server"`
 		Protection bool   `json:"protection"`
 		AltsvcPort int    `json:"altsvc_port"`
-		// UniqueHeader is send_unique_header on: the endpoints that set a fresh
-		// per-response cookie (thumb.php, subtitle.php) are then PHP's, since the
-		// gateway does not reproduce that cookie.
-		UniqueHeader bool `json:"unique_header"`
+		// UniqueName/UniqueDomain are send_unique_header / _domain: the name of
+		// the per-response anti-restream cookie (empty: off) and its configured
+		// domain (empty: derived from the request host).
+		UniqueName   string `json:"unique_header_name"`
+		UniqueDomain string `json:"unique_header_domain"`
 	} `json:"headers"`
 	// ServeUntil is the node's lease fence on this host's clock: nothing is
 	// served past it (PHP answers from then). 0: no lease limits the node.
@@ -50,7 +51,15 @@ type Policy struct {
 	// a registered idle stream (starts its puller) instead of deferring
 	// not-on-air. Off (a transition node) keeps the defer-to-PHP path.
 	ServeOnly bool `json:"serve_only"`
-	Paths     struct {
+	// OffAir is what live.php's off-air clip reads: VIDEO_PATH and the five
+	// configured clip paths (ReplicaSections::OFF_AIR's settings), by setting key.
+	OffAir struct {
+		VideoPath string            `json:"video_path"`
+		Paths     map[string]string `json:"paths"`
+		// Show is the show_*_video switch per off_air name (not_on_air, ...).
+		Show map[string]bool `json:"show"`
+	} `json:"off_air"`
+	Paths struct {
 		Cons      string `json:"cons"`
 		Streams   string `json:"streams"`
 		Archive   string `json:"archive"`
@@ -86,11 +95,12 @@ type Policy struct {
 
 // LivePolicy is the settings live.php reads for a playlist refresh or a TS reconnect.
 type LivePolicy struct {
-	UseBuffer        bool  `json:"use_buffer"`
-	InstantOff       bool  `json:"on_demand_instant_off"`
-	Disallow2ndIP    bool  `json:"disallow_2nd_ip_con"`
-	Disallow2ndIPMax int64 `json:"disallow_2nd_ip_max"`
-	UniqueHeader     bool  `json:"unique_header"`
+	UseBuffer bool `json:"use_buffer"`
+	// ApiContainer is the api_container setting, live.php's fallback for an unknown extension.
+	ApiContainer     string `json:"api_container"`
+	InstantOff       bool   `json:"on_demand_instant_off"`
+	Disallow2ndIP    bool   `json:"disallow_2nd_ip_con"`
+	Disallow2ndIPMax int64  `json:"disallow_2nd_ip_max"`
 	// TS: the panel writes the TS fields below; without them a TS reconnect is PHP's.
 	TS bool `json:"ts"`
 	// The seconds of history a TS viewer joins with (live.php's ?prebuffer=):

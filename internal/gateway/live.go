@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,6 +34,9 @@ type LiveEnv struct {
 	Record func(uuid string) (rec map[string]json.RawMessage, found, ok bool)
 	// AgentAlive: is the agent draining its spool (EventSpool::agentAlive)?
 	AgentAlive func() bool
+	// Oldest is the line's oldest open connection's address (the agent's
+	// /v1/conn/oldest): found, and whether the agent answered. Nil reads as unanswered.
+	Oldest func(lineID int64) (ip string, found, answered bool)
 	// File: does this path exist (vod.php's file_exists on the movie)?
 	File func(path string) bool
 	// FileSize is a file's size and whether it is there (timeshift's archive scan).
@@ -51,13 +55,18 @@ type Refresh struct {
 	Prebuffer int64
 	Stream    int
 	UUID      string
-	Record    map[string]json.RawMessage
+	// Adaptive: a variant of a multi-bitrate master; its connection is keyed
+	// on MasterStream, shared by every variant.
+	Adaptive     bool
+	MasterStream int
+	Record       map[string]json.RawMessage
 	// New: a TS viewer's first request. Record is then the record to store
 	// (ConnectionTracker::createLive), and Admission the agent's
 	// X-XCVM-Admission for it ("" for a plain register).
 	New       bool
 	Admission string
 	ServerID  json.RawMessage
+	ProxyID   json.RawMessage // the front proxy's id (originator_id set), else null
 	Playlist  string
 	UserAgent string // as live.php holds it: htmlentities(trim(UA))
 	NoBuffer  bool   // use_buffer off: X-Accel-Buffering: no
@@ -104,7 +113,7 @@ var segLineRe = regexp.MustCompile(`(?m)^(\d+)\.ts$`)
 // request, a stream that is not running, a proxied or adaptive link, a line
 // under the second-address rule, and any form PHP could read otherwise.
 func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
-	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
 	if p == nil {
 		return php("policy")
 	}
@@ -113,9 +122,6 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return php("lease")
-	}
-	if p.Live.UniqueHeader {
-		return php("unique-header")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
@@ -126,7 +132,34 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("token")
 	}
 	set := func(m map[string]json.RawMessage, k string) bool { r, ok := m[k]; return ok && !isNull(r) }
-	if set(t, "video_path") || set(t, "off_air") || set(t, "adaptive") {
+	// decryptToken refuses an expired token first, an off-air one included.
+	if set(t, "expires") {
+		exp, ok := jsonInt(t["expires"])
+		if !ok || exp < now-p.TimeOffset {
+			return php("expired")
+		}
+	}
+	if set(t, "video_path") || set(t, "off_air") {
+		if !p.ServeOnly {
+			return php("off-air")
+		}
+		// showVideoServer's gate: the clip only for a non-restreamer with the
+		// option on; else PHP errors (EXPIRED/BANNED/STREAM_OFFLINE/404) or, for
+		// expiring, shows nothing. Every case is a Deny here (nothing to play on).
+		// A bare legacy video_path names no option: only is_restreamer applies.
+		var ui map[string]json.RawMessage
+		_ = json.Unmarshal(t["user_info"], &ui)
+		name, _ := jsonString(t["off_air"])
+		if _, named := offAirFiles[name]; phpTruthy(ui["is_restreamer"]) || (named && !p.OffAir.Show[name]) {
+			return verdict(Deny, "off-air-disabled"), nil
+		}
+		// live.php's off-air arm: the clip for the token, as video/mp2t.
+		if path := offAirClip(p, t); path != "" {
+			return Verdict{Action: Serve, Reason: "off-air-clip", Path: path}, nil
+		}
+		return verdict(Deny, "off-air-missing"), nil
+	}
+	if set(t, "adaptive") && !p.ServeOnly {
 		return php("off-air")
 	}
 	if u, ok := t["uuid"]; ok {
@@ -134,25 +167,31 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 			return php("token")
 		}
 	}
-	if set(t, "expires") {
-		exp, ok := jsonInt(t["expires"])
-		if !ok || exp < now-p.TimeOffset {
-			return php("expired")
-		}
-	}
 	ext, _ := jsonString(t["extension"])
+	if ext != "m3u8" && ext != "ts" && p.ServeOnly && (p.Live.ApiContainer == "m3u8" || p.Live.ApiContainer == "ts") {
+		// live.php: an unknown extension falls back to the api_container setting.
+		// A setting that is neither (or empty) keeps the defer below.
+		ext = p.Live.ApiContainer
+	}
 	if ext != "m3u8" && ext != "ts" {
 		return php("extension")
 	}
 	if ext == "ts" && !p.Live.TS {
-		// A panel from before the TS reconnect writes no prebuffer settings.
+		// A panel from before the TS reconnect writes no prebuffer settings. PHP
+		// would serve this token: a gateway limitation, not a bad request, so its
+		// own reason on serve-only (not a Deny); the transition reason is unchanged.
+		if p.ServeOnly {
+			return php("ts-settings")
+		}
 		return php("extension")
 	}
 	var ch, ui map[string]json.RawMessage
 	if json.Unmarshal(t["channel_info"], &ch) != nil || len(ch) == 0 || json.Unmarshal(t["user_info"], &ui) != nil || ui == nil {
 		return php("token")
 	}
-	if phpTruthy(ch["proxy"]) {
+	// A direct-proxy channel: a serve-only node pulls the origin itself (the
+	// registered kind:"proxy" puller) and serves its own ring like any stream.
+	if phpTruthy(ch["proxy"]) && !p.ServeOnly {
 		return php("proxy")
 	}
 	stream, ok := jsonInt(t["stream_id"])
@@ -160,6 +199,17 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("stream-id")
 	}
 	r := &Refresh{Stream: int(stream), NoBuffer: !p.Live.UseBuffer, TS: ext == "ts"}
+	if set(t, "adaptive") {
+		// The variants of an adaptive master are one viewer, keyed on the master
+		// (the token's adaptive[1]; live.php's `?? $rStreamID`).
+		r.Adaptive, r.MasterStream = true, r.Stream
+		var ad []json.RawMessage
+		if json.Unmarshal(t["adaptive"], &ad) == nil && len(ad) > 1 {
+			if m, ok := jsonInt(ad[1]); ok && m > 0 && m <= math.MaxInt32 {
+				r.MasterStream = int(m)
+			}
+		}
+	}
 
 	// The serving server and the proxy in front of it (live.php's channel block).
 	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
@@ -169,15 +219,21 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	} else if phpTruthy(ch["redirect_id"]) {
 		r.ServerID = ch["redirect_id"]
 	}
+	// Front proxy: this node is the originator, the content is local; only the
+	// accounting (proxy_id) differs, so serve-only serves it.
 	if phpTruthy(proxy) {
-		return php("proxy")
+		if !p.ServeOnly {
+			return php("proxy")
+		}
+		r.ProxyID = proxy
 	}
 	onDemand, ok := jsonInt(ch["on_demand"])
 	if !ok && set(ch, "on_demand") {
 		return php("token")
 	}
 	r.OnDemand = int(onDemand)
-	if p.Live.InstantOff && onDemand == 1 {
+	// A serve-only node has no php-fpm queue to park the viewer in: it serves.
+	if p.Live.InstantOff && onDemand == 1 && !p.ServeOnly {
 		return php("instant-off")
 	}
 	// Serve-only LB: these two are live.php's gates, which relied on PHP (its
@@ -199,7 +255,8 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		}
 		r.Warmup = true
 	}
-	if applies, sure := p.Live.secondIPRule(ui); applies || !sure {
+	applies2, sure2 := p.Live.secondIPRule(ui)
+	if (applies2 || !sure2) && (!p.ServeOnly || !sure2) {
 		return php("second-ip")
 	}
 
@@ -222,12 +279,19 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		r.Username, r.Password, r.UserID = user, pass, id
 		r.IdentityKey = "u" + strconv.FormatInt(id, 10)
 	}
+	if applies2 && r.HMAC == "" && env.Oldest != nil {
+		// Serve-only: live.php's disallow_2nd_ip_con against the oldest open
+		// connection (an unanswering agent degrades to serving, as below).
+		if ip, found, answered := env.Oldest(r.UserID); answered && found && !ipMatch(ip, clientIP, p.IPSubnetMatch) {
+			return verdict(Deny, "second-ip"), nil
+		}
+	}
 	codec, ok := phpString(t["video_codec"])
 	if !ok {
 		return php("token")
 	}
 	r.Codec = codec
-	ua, ok := htmlentitiesASCII(rawUA)
+	ua, ok := htmlentitiesUA(rawUA, p.ServeOnly)
 	if !ok {
 		return php("user-agent")
 	}
@@ -242,15 +306,28 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		}
 		r.UUID, container = u, "ts"
 	} else {
-		r.UUID = hlsConnectionKey(r.IdentityKey, r.Stream, clientIP, ua)
+		r.UUID = hlsConnectionKey(r.IdentityKey, r.keyStream(), clientIP, ua)
 	}
 
 	// The connection: open, this viewer's, on this server and stream (lookupLive in the agent).
 	rec, found, answered := env.Record(r.UUID)
-	if !answered {
+	if !answered && !p.ServeOnly {
 		return php("agent")
 	}
-	if !found && p.Live.CreateExpiration > 0 {
+	// Serve-only: an agent that does not answer, or a record the lookup would
+	// not return (HLS: ended or other; TS: other, an ended one is reopened), is
+	// a viewer's first request: its connection is created.
+	matches := found && liveMatches(rec, r, container)
+	if found && !matches && p.ServeOnly && r.TS {
+		open := make(map[string]json.RawMessage, len(rec))
+		for k, v := range rec {
+			open[k] = v
+		}
+		delete(open, "hls_end")
+		matches = liveMatches(open, r, container)
+	}
+	fresh := !found || (p.ServeOnly && !matches)
+	if fresh && p.Live.CreateExpiration > 0 {
 		// A viewer's first request: its connection is created (createLive). A TS
 		// viewer is keyed on the token's uuid, an HLS one on its playlist key.
 		var why string
@@ -265,15 +342,18 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		r.New = true
 	} else {
 		// An ended connection is re-opened by PHP (its lookup is not open-only).
-		if !found || !liveMatches(rec, r, container) {
+		if !found || !matches {
 			return php("new-connection")
 		}
+		// Unreachable on serve-only: every row there is written by the gateway,
+		// which always sets identity and uuid (newLiveRecord/newTSRecord).
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
-		if r.TS {
+		if r.TS && !phpTruthy(rec["hls_end"]) {
 			// live.php kills a PHP worker still feeding this connection; the
 			// gateway takes over only from fanout's own (pid 0).
+			// Unreachable on serve-only: no php-fpm workers, gateway rows are pid 0.
 			if pid, ok := jsonInt(rec["pid"]); !ok || pid != 0 {
 				return php("worker")
 			}
@@ -287,7 +367,9 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 
 	// The line's limit is MAIN's, told through the agent's spool; a stopped agent means PHP's own limiter.
 	if mc, ok := jsonInt(ui["max_connections"]); ok && mc != 0 {
-		if !env.AgentAlive() {
+		// Serve-only: serve and append conn.limit best-effort (serveLive); MAIN
+		// takes it when the agent drains again.
+		if !p.ServeOnly && !env.AgentAlive() {
 			return php("spool")
 		}
 		r.Limit, r.MaxConns = true, mc
@@ -398,10 +480,10 @@ func vodThrottle(p *Policy, ch, ui map[string]json.RawMessage) (int, int64) {
 // JudgeVOD is vod.php's decision on /vauth/<token> as far as the gateway owns
 // it: a local movie file (VOD_PATH/<id>.<ext>) the fanout daemon serves
 // (handOverFile), the viewer tracked in the agent with pid 0, as on a modern
-// fanout node. A direct-proxy movie, a connection a PHP worker still feeds, a
-// node with send_unique_header, or any form PHP reads otherwise goes to PHP.
+// fanout node. A direct-proxy movie, a connection a PHP worker still feeds,
+// or any form PHP reads otherwise goes to PHP.
 func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
-	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
 	if p == nil {
 		return php("policy")
 	}
@@ -410,10 +492,6 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return php("lease")
-	}
-	if p.Headers.UniqueHeader {
-		// vod.php's sendStreamHeaders writes a fresh send_unique_header cookie.
-		return php("unique-header")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
@@ -447,7 +525,10 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 	// (an originator/redirect proxy is PHP's, which tracks the proxied source).
 	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
 	if phpTruthy(ch["originator_id"]) {
-		return php("proxy")
+		if !p.ServeOnly {
+			return php("proxy")
+		}
+		r.ServerID, r.ProxyID = ch["originator_id"], ch["redirect_id"]
 	} else if phpTruthy(ch["redirect_id"]) {
 		r.ServerID = ch["redirect_id"]
 	}
@@ -467,7 +548,7 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 		}
 		r.UserID, r.IdentityKey = id, "u"+strconv.FormatInt(id, 10)
 	}
-	ua, ok := htmlentitiesASCII(rawUA)
+	ua, ok := htmlentitiesUA(rawUA, p.ServeOnly)
 	if !ok {
 		return php("user-agent")
 	}
@@ -488,7 +569,7 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 
 	// The connection, under the token's uuid (findByUuid).
 	rec, found, answered := env.Record(r.UUID)
-	if !answered {
+	if !answered && !p.ServeOnly { // serve-only degrades: the connection is created
 		return php("agent")
 	}
 	if !found {
@@ -501,11 +582,14 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 		if !liveMatches(rec, r, "VOD") {
 			return php("new-connection")
 		}
+		// Unreachable on serve-only: every row there is written by the gateway,
+		// which always sets identity and uuid (newLiveRecord/newTSRecord).
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
 		// The gateway takes over only a connection fanout already serves (pid 0);
 		// one a PHP worker still feeds (vod.php may kill it) is PHP's.
+		// Unreachable on serve-only: no php-fpm workers, gateway rows are pid 0.
 		if pid, okP := jsonInt(rec["pid"]); !okP || pid != 0 {
 			return php("worker")
 		}
@@ -517,7 +601,9 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 	r.Record = rec
 	// The line's limit via the agent's spool; a stopped agent is PHP's limiter.
 	if mc, okM := jsonInt(ui["max_connections"]); okM && mc != 0 {
-		if !env.AgentAlive() {
+		// Serve-only: serve and append conn.limit best-effort (serveLive); MAIN
+		// takes it when the agent drains again.
+		if !p.ServeOnly && !env.AgentAlive() {
 			return php("spool")
 		}
 		r.Limit, r.MaxConns = true, mc
@@ -594,10 +680,10 @@ func gmdateMinute(ts int64) string { return time.Unix(ts, 0).UTC().Format("2006-
 // JudgeTimeshift is timeshift.php's decision on /tsauth/<token> for the arm the
 // gateway owns: the run of archive minute files the daemon serves (handOverFile),
 // the viewer tracked in the agent with pid 0. The m3u8 playlist arm (it mints
-// per-segment tokens), a proxy, a node with send_unique_header, a connection a
+// per-segment tokens), a proxy, a connection a
 // PHP worker still feeds, and any form PHP reads otherwise go to PHP.
 func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
-	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
 	if p == nil {
 		return php("policy")
 	}
@@ -606,9 +692,6 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return php("lease")
-	}
-	if p.Headers.UniqueHeader {
-		return php("unique-header")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
@@ -650,7 +733,10 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	r := &Refresh{Stream: int(stream)}
 	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
 	if phpTruthy(t["originator_id"]) {
-		return php("proxy")
+		if !p.ServeOnly {
+			return php("proxy")
+		}
+		r.ServerID, r.ProxyID = t["originator_id"], t["redirect_id"]
 	} else if phpTruthy(t["redirect_id"]) {
 		r.ServerID = t["redirect_id"]
 	}
@@ -665,6 +751,10 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		loc := time.UTC
 		if p.DefaultTimezone != "" {
 			l, err := time.LoadLocation(p.DefaultTimezone)
+			if err != nil && p.ServeOnly {
+				// ponytail: UTC fallback, matches PHP default-tz
+				l, err = time.UTC, nil
+			}
 			if err != nil {
 				return php("timezone")
 			}
@@ -683,7 +773,7 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	r.UserID, r.IdentityKey = id, "u"+strconv.FormatInt(id, 10)
 	r.Username, _ = phpString(t["username"])
 	r.Password, _ = phpString(t["password"])
-	ua, ok := htmlentitiesASCII(rawUA)
+	ua, ok := htmlentitiesUA(rawUA, p.ServeOnly)
 	if !ok {
 		return php("user-agent")
 	}
@@ -734,7 +824,7 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 
 	// The connection, under the token's uuid.
 	rec, found, answered := env.Record(r.UUID)
-	if !answered {
+	if !answered && !p.ServeOnly { // serve-only degrades: the connection is created
 		return php("agent")
 	}
 	if !found {
@@ -747,6 +837,8 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		if !liveMatches(rec, r, container) {
 			return php("new-connection")
 		}
+		// Unreachable on serve-only: every row there is written by the gateway,
+		// which always sets identity and uuid (newLiveRecord/newTSRecord).
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
@@ -754,6 +846,7 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		// m3u8 arm (no daemon stream) has no worker to check. timeshift.php only
 		// kills a worker on the file arm.
 		if !isM3U8 {
+			// Unreachable on serve-only: no php-fpm workers, gateway rows are pid 0.
 			if rpid, okP := jsonInt(rec["pid"]); !okP || rpid != 0 {
 				return php("worker")
 			}
@@ -765,7 +858,9 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	}
 	r.Record = rec
 	if mc, okM := jsonInt(ui["max_connections"]); okM && mc != 0 {
-		if !env.AgentAlive() {
+		// Serve-only: serve and append conn.limit best-effort (serveLive); MAIN
+		// takes it when the agent drains again.
+		if !p.ServeOnly && !env.AgentAlive() {
 			return php("spool")
 		}
 		r.Limit, r.MaxConns = true, mc
@@ -885,7 +980,7 @@ func newLiveRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, 
 	rec := map[string]json.RawMessage{
 		"stream_id":          json.RawMessage(strconv.Itoa(r.Stream)),
 		"server_id":          raw(r.ServerID),
-		"proxy_id":           json.RawMessage("null"),
+		"proxy_id":           raw(r.ProxyID),
 		"user_agent":         str(r.UserAgent),
 		"user_ip":            str(clientIP),
 		"container":          str(container),
@@ -1008,6 +1103,9 @@ func liveMatches(rec map[string]json.RawMessage, r *Refresh, container string) b
 	} else if str("user_id") != strconv.FormatInt(r.UserID, 10) {
 		return false
 	}
+	if r.Adaptive {
+		return true // a variant switch moves the record: any server and stream
+	}
 	return str("server_id") == server && str("stream_id") == strconv.Itoa(r.Stream)
 }
 
@@ -1023,7 +1121,11 @@ func hlsConnectionKey(identity string, stream int, ip, ua string) string {
 // htmlentitiesASCII is live.php's user agent, htmlentities(trim(UA)), for an
 // ASCII one: false for any other byte, which PHP's entity table may turn into
 // a name (the request is PHP's then).
-func htmlentitiesASCII(ua string) (string, bool) {
+func htmlentitiesASCII(ua string) (string, bool) { return htmlentitiesUA(ua, false) }
+
+// htmlentitiesUA is htmlentitiesASCII; passHigh (serve-only, no PHP to defer
+// to) passes bytes >= 0x80 through instead of refusing, so it always succeeds.
+func htmlentitiesUA(ua string, passHigh bool) (string, bool) {
 	if ua == "" || ua == "0" { // PHP's empty()
 		return "", true
 	}
@@ -1032,7 +1134,7 @@ func htmlentitiesASCII(ua string) (string, bool) {
 	for i := 0; i < len(ua); i++ {
 		c := ua[i]
 		switch {
-		case c >= 0x80:
+		case c >= 0x80 && !passHigh:
 			return "", false
 		case c == '&':
 			b.WriteString("&amp;")
@@ -1148,4 +1250,53 @@ func phpString(r json.RawMessage) (string, bool) {
 // phpTruthy is PHP's boolean value of a decoded JSON value.
 func phpTruthy(r json.RawMessage) bool {
 	return phpNonEmpty(r)
+}
+
+// stagedNameRe is ArtefactStage::NAME_PATTERN.
+var stagedNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+func (r *Refresh) keyStream() int {
+	if r.Adaptive {
+		return r.MasterStream
+	}
+	return r.Stream
+}
+
+// offAirFiles is ReplicaSections::OFF_AIR (token name -> setting key) with the
+// file getOffAirVideo falls back to under VIDEO_PATH when the setting is empty.
+var offAirFiles = map[string][2]string{
+	"connected":  {"connected_video_path", "connected.ts"},
+	"not_on_air": {"not_on_air_video_path", "offline.ts"},
+	"banned":     {"banned_video_path", "banned.ts"},
+	"expired":    {"expired_video_path", "expired.ts"},
+	"expiring":   {"expiring_video_path", "expiring.ts"},
+}
+
+// offAirClip is OffAirHandler::tokenVideo: the configured clip for the token's
+// off_air name (or VIDEO_PATH's file), else the token's own video_path; ""
+// when no such file exists.
+func offAirClip(p *Policy, t map[string]json.RawMessage) string {
+	path := ""
+	name, _ := jsonString(t["off_air"])
+	if f, ok := offAirFiles[name]; ok {
+		path = p.OffAir.Paths[f[0]]
+		if path == "" && p.OffAir.VideoPath != "" && exists(p.OffAir.VideoPath+f[1]) {
+			path = p.OffAir.VideoPath + f[1]
+		}
+	}
+	if path == "" {
+		path, _ = jsonString(t["video_path"])
+	}
+	// ArtefactStage::offAirVideo: a custom path MAIN configured that is not on
+	// this node is MAIN's staged copy under VIDEO_PATH/cluster/.
+	if strings.HasPrefix(path, "/") && !exists(path) {
+		base := filepath.Base(path)
+		if stagedNameRe.MatchString(base) && strings.HasSuffix(path, "/"+base) && p.OffAir.VideoPath != "" {
+			path = p.OffAir.VideoPath + "cluster/" + base
+		}
+	}
+	if path == "" || !exists(path) {
+		return ""
+	}
+	return path
 }
