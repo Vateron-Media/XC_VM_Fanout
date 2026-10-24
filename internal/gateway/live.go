@@ -157,6 +157,11 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		}
 	}
 	ext, _ := jsonString(t["extension"])
+	if ext != "m3u8" && ext != "ts" && p.ServeOnly && (p.Live.ApiContainer == "m3u8" || p.Live.ApiContainer == "ts") {
+		// live.php: an unknown extension falls back to the api_container setting.
+		// A setting that is neither (or empty) keeps the defer below.
+		ext = p.Live.ApiContainer
+	}
 	if ext != "m3u8" && ext != "ts" {
 		return php("extension")
 	}
@@ -250,7 +255,7 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("token")
 	}
 	r.Codec = codec
-	ua, ok := htmlentitiesASCII(rawUA)
+	ua, ok := htmlentitiesUA(rawUA, p.ServeOnly)
 	if !ok {
 		return php("user-agent")
 	}
@@ -501,7 +506,7 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 		}
 		r.UserID, r.IdentityKey = id, "u"+strconv.FormatInt(id, 10)
 	}
-	ua, ok := htmlentitiesASCII(rawUA)
+	ua, ok := htmlentitiesUA(rawUA, p.ServeOnly)
 	if !ok {
 		return php("user-agent")
 	}
@@ -698,6 +703,10 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		loc := time.UTC
 		if p.DefaultTimezone != "" {
 			l, err := time.LoadLocation(p.DefaultTimezone)
+			if err != nil && p.ServeOnly {
+				// ponytail: UTC fallback, matches PHP default-tz
+				l, err = time.UTC, nil
+			}
 			if err != nil {
 				return php("timezone")
 			}
@@ -716,7 +725,7 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	r.UserID, r.IdentityKey = id, "u"+strconv.FormatInt(id, 10)
 	r.Username, _ = phpString(t["username"])
 	r.Password, _ = phpString(t["password"])
-	ua, ok := htmlentitiesASCII(rawUA)
+	ua, ok := htmlentitiesUA(rawUA, p.ServeOnly)
 	if !ok {
 		return php("user-agent")
 	}
@@ -1061,7 +1070,11 @@ func hlsConnectionKey(identity string, stream int, ip, ua string) string {
 // htmlentitiesASCII is live.php's user agent, htmlentities(trim(UA)), for an
 // ASCII one: false for any other byte, which PHP's entity table may turn into
 // a name (the request is PHP's then).
-func htmlentitiesASCII(ua string) (string, bool) {
+func htmlentitiesASCII(ua string) (string, bool) { return htmlentitiesUA(ua, false) }
+
+// htmlentitiesUA is htmlentitiesASCII; passHigh (serve-only, no PHP to defer
+// to) passes bytes >= 0x80 through instead of refusing, so it always succeeds.
+func htmlentitiesUA(ua string, passHigh bool) (string, bool) {
 	if ua == "" || ua == "0" { // PHP's empty()
 		return "", true
 	}
@@ -1070,7 +1083,7 @@ func htmlentitiesASCII(ua string) (string, bool) {
 	for i := 0; i < len(ua); i++ {
 		c := ua[i]
 		switch {
-		case c >= 0x80:
+		case c >= 0x80 && !passHigh:
 			return "", false
 		case c == '&':
 			b.WriteString("&amp;")

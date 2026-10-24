@@ -93,10 +93,12 @@ type Policy struct {
 
 // LivePolicy is the settings live.php reads for a playlist refresh or a TS reconnect.
 type LivePolicy struct {
-	UseBuffer        bool  `json:"use_buffer"`
-	InstantOff       bool  `json:"on_demand_instant_off"`
-	Disallow2ndIP    bool  `json:"disallow_2nd_ip_con"`
-	Disallow2ndIPMax int64 `json:"disallow_2nd_ip_max"`
+	UseBuffer bool `json:"use_buffer"`
+	// ApiContainer is the api_container setting, live.php's fallback for an unknown extension.
+	ApiContainer     string `json:"api_container"`
+	InstantOff       bool   `json:"on_demand_instant_off"`
+	Disallow2ndIP    bool   `json:"disallow_2nd_ip_con"`
+	Disallow2ndIPMax int64  `json:"disallow_2nd_ip_max"`
 	// TS: the panel writes the TS fields below; without them a TS reconnect is PHP's.
 	TS bool `json:"ts"`
 	// The seconds of history a TS viewer joins with (live.php's ?prebuffer=):
