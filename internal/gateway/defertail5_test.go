@@ -15,8 +15,8 @@ func TestJudgeLiveExtensionApiContainerServeOnly(t *testing.T) {
 	}{
 		{"api_container ts routes as TS", "ts", true, true, Serve, "ts"},
 		{"api_container m3u8 routes as HLS", "m3u8", true, false, Serve, "playlist"},
-		{"empty api_container keeps the defer", "", true, false, PHP, "extension"},
-		{"unusable api_container keeps the defer", "mp4", true, false, PHP, "extension"},
+		{"empty api_container is denied", "", true, false, Deny, "extension"},
+		{"unusable api_container is denied", "mp4", true, false, Deny, "extension"},
 		{"not serve-only defers", "ts", false, true, PHP, "extension"},
 	} {
 		t.Run(c.name, func(t *testing.T) {

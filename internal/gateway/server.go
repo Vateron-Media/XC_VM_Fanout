@@ -557,6 +557,9 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 		// (StreamAuth::refuseAdmission): it asks again and is refused the same.
 		stored, refused := s.agentFor(p.Paths.AgentSock).Register(ref.UUID, ref.Record, ref.Admission)
 		if refused {
+			// ponytail: serve-only has no PHP to refuse with (refuseAdmission's
+			// max-connections off-air clip is a deferred follow-on); the reason is a
+			// Deny (404) there, better than a 502.
 			return "refused"
 		}
 		if !stored && !p.ServeOnly { // serve-only degrades: served without the record
@@ -671,7 +674,7 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 // (or refreshed) in the agent with pid 0 and admitted, the limit spooled for
 // MAIN, the viewer's marker touched, then the movie file handed to the daemon
 // (node.HandOverFile) with vod.php's content type, throttle and range. A node
-// with send_unique_header, a direct proxy, a legacy node or a connection a PHP
+// with a direct proxy, a legacy node or a connection a PHP
 // worker feeds never reaches here (JudgeVOD hands those to PHP). "" when served,
 // else why PHP answers it after all.
 func (s *Server) serveVOD(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
@@ -734,9 +737,12 @@ func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy
 		// openRecord: stored, a limited line admitted by the agent.
 		stored, refused := s.agentFor(p.Paths.AgentSock).Register(ref.UUID, ref.Record, ref.Admission)
 		if refused {
+			// ponytail: serve-only has no PHP to refuse with (refuseAdmission's
+			// max-connections off-air clip is a deferred follow-on); the reason is a
+			// Deny (404) there, better than a 502.
 			return "refused"
 		}
-		if !stored {
+		if !stored && !p.ServeOnly { // serve-only degrades: served without the record
 			return "agent-put"
 		}
 	} else {
@@ -752,12 +758,12 @@ func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy
 		rec["proxy_id"] = nullIfEmpty(ref.ProxyID)
 		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
 		rec["hls_end"] = json.RawMessage("0")
-		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
+		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) && !p.ServeOnly {
 			return "agent-put"
 		}
 	}
 	if ref.Limit {
-		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil {
+		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil && !p.ServeOnly { // serve-only: best-effort
 			return "spool"
 		}
 	}

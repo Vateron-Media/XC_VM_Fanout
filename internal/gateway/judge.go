@@ -72,6 +72,9 @@ var serveOnlyRejects = map[string]bool{
 	"token": true, "token-form": true, "token-json": true, "timestamp": true,
 	"stream-id": true, "missing": true, "ip": true, "lease": true,
 	"expired": true, "not-on-air": true, "stream": true, "stale": true,
+	// serve-level: an admission the agent refuses (the faithful off-air clip is a
+	// deferred follow-on), the rare corrupt-token second-ip, an unusable container.
+	"refused": true, "second-ip": true, "extension": true,
 }
 
 // reject is the verdict for a request PHP would 404: a Deny on a serve-only
