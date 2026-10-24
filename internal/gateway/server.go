@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/dlog"
@@ -36,10 +38,11 @@ import (
 //   - GET /stats: the verdict counts and how long each decision took (the
 //     judgement, not the bytes served after it: what the gateway adds).
 type Server struct {
-	policy   *PolicyFile
-	segments http.Handler
-	node     Node
-	now      func() time.Time
+	policy      *PolicyFile
+	noPolicyLog atomic.Int64 // unix time of the last no-policy warning
+	segments    http.Handler
+	node        Node
+	now         func() time.Time
 
 	agentMu   sync.Mutex
 	agentSock string
@@ -295,6 +298,18 @@ func serves(mode, kind string) bool {
 	return false
 }
 
+// warnNoPolicy logs, at most once a minute, that requests arrive with no
+// policy. ServeOnly lives in the policy, so a missing one cannot be told from
+// a non-serve-only node here; on a serve-only node the hand-over to PHP is a
+// 502 (no PHP behind it), so name the cause instead of leaving a bare 502.
+func (s *Server) warnNoPolicy(now time.Time) {
+	t := now.Unix()
+	if last := s.noPolicyLog.Load(); t-last < 60 || !s.noPolicyLog.CompareAndSwap(last, t) {
+		return
+	}
+	log.Printf("gateway: no policy loaded (policy.json missing or stale): requests go to PHP; on a serve-only node that is a 502 - replica/agent not yet applied?")
+}
+
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	now := s.now()
 	var j judged
@@ -304,6 +319,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if cur := s.policy.Get(now); cur == nil || !serves(cur.Mode, kind) {
 		// No policy, or the node's mode moved off serving this and nginx has
 		// not been reloaded yet: nothing judged (nor touched), PHP answers.
+		if cur == nil {
+			s.warnNoPolicy(now)
+		}
 		j = judged{kind: kind, verdict: verdict(PHP, "mode")}
 	} else {
 		j = s.judge(r, now, true)

@@ -317,12 +317,15 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		if !found || !matches {
 			return php("new-connection")
 		}
+		// Unreachable on serve-only: every row there is written by the gateway,
+		// which always sets identity and uuid (newLiveRecord/newTSRecord).
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
 		if r.TS && !phpTruthy(rec["hls_end"]) {
 			// live.php kills a PHP worker still feeding this connection; the
 			// gateway takes over only from fanout's own (pid 0).
+			// Unreachable on serve-only: no php-fpm workers, gateway rows are pid 0.
 			if pid, ok := jsonInt(rec["pid"]); !ok || pid != 0 {
 				return php("worker")
 			}
@@ -551,11 +554,14 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 		if !liveMatches(rec, r, "VOD") {
 			return php("new-connection")
 		}
+		// Unreachable on serve-only: every row there is written by the gateway,
+		// which always sets identity and uuid (newLiveRecord/newTSRecord).
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
 		// The gateway takes over only a connection fanout already serves (pid 0);
 		// one a PHP worker still feeds (vod.php may kill it) is PHP's.
+		// Unreachable on serve-only: no php-fpm workers, gateway rows are pid 0.
 		if pid, okP := jsonInt(rec["pid"]); !okP || pid != 0 {
 			return php("worker")
 		}
@@ -803,6 +809,8 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		if !liveMatches(rec, r, container) {
 			return php("new-connection")
 		}
+		// Unreachable on serve-only: every row there is written by the gateway,
+		// which always sets identity and uuid (newLiveRecord/newTSRecord).
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
@@ -810,6 +818,7 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 		// m3u8 arm (no daemon stream) has no worker to check. timeshift.php only
 		// kills a worker on the file arm.
 		if !isM3U8 {
+			// Unreachable on serve-only: no php-fpm workers, gateway rows are pid 0.
 			if rpid, okP := jsonInt(rec["pid"]); !okP || rpid != 0 {
 				return php("worker")
 			}
