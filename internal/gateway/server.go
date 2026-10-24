@@ -307,7 +307,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		j.kind = "other"
 	}
 	p, v := j.policy, j.verdict
-	if v.Action == Serve && j.kind == "live" {
+	if v.Action == Serve && j.kind == "live" && v.Reason == "off-air-clip" {
+		if s.serveOffAir(w, r, v.Path) {
+			return
+		}
+		j.verdict = verdict(Deny, "off-air-stale")
+		v = j.verdict
+	}
+	if v.Action == Serve && j.kind == "live" && j.refresh != nil {
 		why := s.serveLive(w, r, p, j.refresh, now)
 		if why == "" {
 			return
@@ -542,6 +549,10 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 		} else {
 			rec["server_id"] = ref.ServerID
 			rec["proxy_id"] = json.RawMessage("null")
+			if ref.Adaptive {
+				// The viewer moves to the variant it now plays.
+				rec["stream_id"] = json.RawMessage(strconv.Itoa(ref.Stream))
+			}
 		}
 		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
 		rec["hls_end"] = json.RawMessage("0")
@@ -877,4 +888,21 @@ func randAlnum(n int) string {
 		b[i] = alnum[int(b[i])%len(alnum)]
 	}
 	return string(b)
+}
+
+// serveOffAir streams live.php's off-air clip (readfile) as video/mp2t; false
+// when the file went away since the judgement.
+func (s *Server) serveOffAir(w http.ResponseWriter, r *http.Request, path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	w.Header().Set("Content-Type", "video/mp2t")
+	http.ServeContent(w, r, "", fi.ModTime(), f)
+	return true
 }

@@ -51,7 +51,13 @@ type Policy struct {
 	// a registered idle stream (starts its puller) instead of deferring
 	// not-on-air. Off (a transition node) keeps the defer-to-PHP path.
 	ServeOnly bool `json:"serve_only"`
-	Paths     struct {
+	// OffAir is what live.php's off-air clip reads: VIDEO_PATH and the five
+	// configured clip paths (ReplicaSections::OFF_AIR's settings), by setting key.
+	OffAir struct {
+		VideoPath string            `json:"video_path"`
+		Paths     map[string]string `json:"paths"`
+	} `json:"off_air"`
+	Paths struct {
 		Cons      string `json:"cons"`
 		Streams   string `json:"streams"`
 		Archive   string `json:"archive"`

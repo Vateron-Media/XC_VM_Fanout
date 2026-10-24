@@ -51,7 +51,11 @@ type Refresh struct {
 	Prebuffer int64
 	Stream    int
 	UUID      string
-	Record    map[string]json.RawMessage
+	// Adaptive: a variant of a multi-bitrate master; its connection is keyed
+	// on MasterStream, shared by every variant.
+	Adaptive     bool
+	MasterStream int
+	Record       map[string]json.RawMessage
 	// New: a TS viewer's first request. Record is then the record to store
 	// (ConnectionTracker::createLive), and Admission the agent's
 	// X-XCVM-Admission for it ("" for a plain register).
@@ -123,7 +127,17 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("token")
 	}
 	set := func(m map[string]json.RawMessage, k string) bool { r, ok := m[k]; return ok && !isNull(r) }
-	if set(t, "video_path") || set(t, "off_air") || set(t, "adaptive") {
+	if set(t, "video_path") || set(t, "off_air") {
+		if !p.ServeOnly {
+			return php("off-air")
+		}
+		// live.php's off-air arm: the clip for the token, as video/mp2t.
+		if path := offAirClip(p, t); path != "" {
+			return Verdict{Action: Serve, Reason: "off-air-clip", Path: path}, nil
+		}
+		return verdict(Deny, "off-air-missing"), nil
+	}
+	if set(t, "adaptive") && !p.ServeOnly {
 		return php("off-air")
 	}
 	if u, ok := t["uuid"]; ok {
@@ -157,6 +171,17 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("stream-id")
 	}
 	r := &Refresh{Stream: int(stream), NoBuffer: !p.Live.UseBuffer, TS: ext == "ts"}
+	if set(t, "adaptive") {
+		// The variants of an adaptive master are one viewer, keyed on the master
+		// (the token's adaptive[1]; live.php's `?? $rStreamID`).
+		r.Adaptive, r.MasterStream = true, r.Stream
+		var ad []json.RawMessage
+		if json.Unmarshal(t["adaptive"], &ad) == nil && len(ad) > 1 {
+			if m, ok := jsonInt(ad[1]); ok && m > 0 && m <= math.MaxInt32 {
+				r.MasterStream = int(m)
+			}
+		}
+	}
 
 	// The serving server and the proxy in front of it (live.php's channel block).
 	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
@@ -226,7 +251,7 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		}
 		r.UUID, container = u, "ts"
 	} else {
-		r.UUID = hlsConnectionKey(r.IdentityKey, r.Stream, clientIP, ua)
+		r.UUID = hlsConnectionKey(r.IdentityKey, r.keyStream(), clientIP, ua)
 	}
 
 	// The connection: open, this viewer's, on this server and stream (lookupLive in the agent).
@@ -985,6 +1010,9 @@ func liveMatches(rec map[string]json.RawMessage, r *Refresh, container string) b
 	} else if str("user_id") != strconv.FormatInt(r.UserID, 10) {
 		return false
 	}
+	if r.Adaptive {
+		return true // a variant switch moves the record: any server and stream
+	}
 	return str("server_id") == server && str("stream_id") == strconv.Itoa(r.Stream)
 }
 
@@ -1125,4 +1153,42 @@ func phpString(r json.RawMessage) (string, bool) {
 // phpTruthy is PHP's boolean value of a decoded JSON value.
 func phpTruthy(r json.RawMessage) bool {
 	return phpNonEmpty(r)
+}
+
+func (r *Refresh) keyStream() int {
+	if r.Adaptive {
+		return r.MasterStream
+	}
+	return r.Stream
+}
+
+// offAirFiles is ReplicaSections::OFF_AIR (token name -> setting key) with the
+// file getOffAirVideo falls back to under VIDEO_PATH when the setting is empty.
+var offAirFiles = map[string][2]string{
+	"connected":  {"connected_video_path", "connected.ts"},
+	"not_on_air": {"not_on_air_video_path", "offline.ts"},
+	"banned":     {"banned_video_path", "banned.ts"},
+	"expired":    {"expired_video_path", "expired.ts"},
+	"expiring":   {"expiring_video_path", "expiring.ts"},
+}
+
+// offAirClip is OffAirHandler::tokenVideo: the configured clip for the token's
+// off_air name (or VIDEO_PATH's file), else the token's own video_path; ""
+// when no such file exists.
+func offAirClip(p *Policy, t map[string]json.RawMessage) string {
+	path := ""
+	name, _ := jsonString(t["off_air"])
+	if f, ok := offAirFiles[name]; ok {
+		path = p.OffAir.Paths[f[0]]
+		if path == "" && p.OffAir.VideoPath != "" && exists(p.OffAir.VideoPath+f[1]) {
+			path = p.OffAir.VideoPath + f[1]
+		}
+	}
+	if path == "" {
+		path, _ = jsonString(t["video_path"])
+	}
+	if path == "" || !exists(path) {
+		return ""
+	}
+	return path
 }
