@@ -554,7 +554,7 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 			rec["pid"] = json.RawMessage("0")
 		} else {
 			rec["server_id"] = ref.ServerID
-			rec["proxy_id"] = json.RawMessage("null")
+			rec["proxy_id"] = nullIfEmpty(ref.ProxyID)
 			if ref.Adaptive {
 				// The viewer moves to the variant it now plays.
 				rec["stream_id"] = json.RawMessage(strconv.Itoa(ref.Stream))
@@ -731,7 +731,7 @@ func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy
 			rec["pid"] = refreshPID
 		}
 		rec["server_id"] = ref.ServerID
-		rec["proxy_id"] = json.RawMessage("null")
+		rec["proxy_id"] = nullIfEmpty(ref.ProxyID)
 		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
 		rec["hls_end"] = json.RawMessage("0")
 		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
@@ -911,4 +911,12 @@ func (s *Server) serveOffAir(w http.ResponseWriter, r *http.Request, path string
 	w.Header().Set("Content-Type", "video/mp2t")
 	http.ServeContent(w, r, "", fi.ModTime(), f)
 	return true
+}
+
+// nullIfEmpty is a record field's JSON: null when the token carried none.
+func nullIfEmpty(v json.RawMessage) json.RawMessage {
+	if len(v) == 0 {
+		return json.RawMessage("null")
+	}
+	return v
 }

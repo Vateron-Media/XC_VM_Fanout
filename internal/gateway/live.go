@@ -66,6 +66,7 @@ type Refresh struct {
 	New       bool
 	Admission string
 	ServerID  json.RawMessage
+	ProxyID   json.RawMessage // the front proxy's id (originator_id set), else null
 	Playlist  string
 	UserAgent string // as live.php holds it: htmlentities(trim(UA))
 	NoBuffer  bool   // use_buffer off: X-Accel-Buffering: no
@@ -173,7 +174,9 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if json.Unmarshal(t["channel_info"], &ch) != nil || len(ch) == 0 || json.Unmarshal(t["user_info"], &ui) != nil || ui == nil {
 		return php("token")
 	}
-	if phpTruthy(ch["proxy"]) {
+	// A direct-proxy channel: a serve-only node pulls the origin itself (the
+	// registered kind:"proxy" puller) and serves its own ring like any stream.
+	if phpTruthy(ch["proxy"]) && !p.ServeOnly {
 		return php("proxy")
 	}
 	stream, ok := jsonInt(t["stream_id"])
@@ -201,8 +204,13 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	} else if phpTruthy(ch["redirect_id"]) {
 		r.ServerID = ch["redirect_id"]
 	}
+	// Front proxy: this node is the originator, the content is local; only the
+	// accounting (proxy_id) differs, so serve-only serves it.
 	if phpTruthy(proxy) {
-		return php("proxy")
+		if !p.ServeOnly {
+			return php("proxy")
+		}
+		r.ProxyID = proxy
 	}
 	onDemand, ok := jsonInt(ch["on_demand"])
 	if !ok && set(ch, "on_demand") {
@@ -486,7 +494,10 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 	// (an originator/redirect proxy is PHP's, which tracks the proxied source).
 	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
 	if phpTruthy(ch["originator_id"]) {
-		return php("proxy")
+		if !p.ServeOnly {
+			return php("proxy")
+		}
+		r.ServerID, r.ProxyID = ch["originator_id"], ch["redirect_id"]
 	} else if phpTruthy(ch["redirect_id"]) {
 		r.ServerID = ch["redirect_id"]
 	}
@@ -688,7 +699,10 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	r := &Refresh{Stream: int(stream)}
 	r.ServerID = json.RawMessage(strconv.Itoa(p.ServerID))
 	if phpTruthy(t["originator_id"]) {
-		return php("proxy")
+		if !p.ServeOnly {
+			return php("proxy")
+		}
+		r.ServerID, r.ProxyID = t["originator_id"], t["redirect_id"]
 	} else if phpTruthy(t["redirect_id"]) {
 		r.ServerID = t["redirect_id"]
 	}
@@ -929,7 +943,7 @@ func newLiveRecord(p *Policy, t, ch, ui map[string]json.RawMessage, r *Refresh, 
 	rec := map[string]json.RawMessage{
 		"stream_id":          json.RawMessage(strconv.Itoa(r.Stream)),
 		"server_id":          raw(r.ServerID),
-		"proxy_id":           json.RawMessage("null"),
+		"proxy_id":           raw(r.ProxyID),
 		"user_agent":         str(r.UserAgent),
 		"user_ip":            str(clientIP),
 		"container":          str(container),
