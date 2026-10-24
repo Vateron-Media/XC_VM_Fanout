@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -127,6 +128,13 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("token")
 	}
 	set := func(m map[string]json.RawMessage, k string) bool { r, ok := m[k]; return ok && !isNull(r) }
+	// decryptToken refuses an expired token first, an off-air one included.
+	if set(t, "expires") {
+		exp, ok := jsonInt(t["expires"])
+		if !ok || exp < now-p.TimeOffset {
+			return php("expired")
+		}
+	}
 	if set(t, "video_path") || set(t, "off_air") {
 		if !p.ServeOnly {
 			return php("off-air")
@@ -143,12 +151,6 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if u, ok := t["uuid"]; ok {
 		if s, isStr := jsonString(u); !isStr || !uuidRe.MatchString(s) {
 			return php("token")
-		}
-	}
-	if set(t, "expires") {
-		exp, ok := jsonInt(t["expires"])
-		if !ok || exp < now-p.TimeOffset {
-			return php("expired")
 		}
 	}
 	ext, _ := jsonString(t["extension"])
@@ -1155,6 +1157,9 @@ func phpTruthy(r json.RawMessage) bool {
 	return phpNonEmpty(r)
 }
 
+// stagedNameRe is ArtefactStage::NAME_PATTERN.
+var stagedNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
 func (r *Refresh) keyStream() int {
 	if r.Adaptive {
 		return r.MasterStream
@@ -1186,6 +1191,14 @@ func offAirClip(p *Policy, t map[string]json.RawMessage) string {
 	}
 	if path == "" {
 		path, _ = jsonString(t["video_path"])
+	}
+	// ArtefactStage::offAirVideo: a custom path MAIN configured that is not on
+	// this node is MAIN's staged copy under VIDEO_PATH/cluster/.
+	if strings.HasPrefix(path, "/") && !exists(path) {
+		base := filepath.Base(path)
+		if stagedNameRe.MatchString(base) && strings.HasSuffix(path, "/"+base) && p.OffAir.VideoPath != "" {
+			path = p.OffAir.VideoPath + "cluster/" + base
+		}
 	}
 	if path == "" || !exists(path) {
 		return ""

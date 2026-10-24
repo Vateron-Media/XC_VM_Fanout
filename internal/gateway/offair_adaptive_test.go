@@ -38,6 +38,25 @@ func TestJudgeLiveOffAirClip(t *testing.T) {
 	if v := judge(true, nil, func(m map[string]any) { m["video_path"] = custom }); v.Path != custom {
 		t.Fatalf("legacy video_path: %+v", v)
 	}
+	if err := os.MkdirAll(dir+"cluster", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"cluster/remote.ts", []byte("S"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remote := func(p *Policy) { p.OffAir.Paths = map[string]string{"not_on_air_video_path": "/data/clips/remote.ts"} }
+	if v := judge(true, remote, named); v.Action != Serve || v.Path != dir+"cluster/remote.ts" {
+		t.Fatalf("staged copy: %+v", v)
+	}
+	if v := judge(true, func(p *Policy) { p.OffAir.Paths = map[string]string{"not_on_air_video_path": "/data/clips/nope.ts"} }, named); v.Action != Deny {
+		t.Fatalf("no staged copy: %+v", v)
+	}
+	if v := judge(true, nil, func(m map[string]any) { m["off_air"], m["expires"] = "not_on_air", testNow-1 }); v.Action != Deny || v.Reason != "expired" {
+		t.Fatalf("expired off-air token: %+v", v)
+	}
+	if v := judge(false, nil, func(m map[string]any) { m["off_air"], m["expires"] = "not_on_air", testNow-1 }); v.Action != PHP || v.Reason != "expired" {
+		t.Fatalf("expired, not serve-only: %+v", v)
+	}
 	if v := judge(true, nil, func(m map[string]any) { m["off_air"] = "banned" }); v.Action != Deny || v.Reason != "off-air-missing" {
 		t.Fatalf("missing clip: %+v", v)
 	}
