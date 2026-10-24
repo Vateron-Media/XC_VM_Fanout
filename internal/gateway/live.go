@@ -180,11 +180,24 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if p.Live.InstantOff && onDemand == 1 {
 		return php("instant-off")
 	}
+	// Serve-only LB: these two are live.php's gates, which relied on PHP (its
+	// ProcessManager) to start a stopped stream. On a PHP-free node that start
+	// does not exist, so for a registered (serveable) stream we pass them and let
+	// the warmup branch below own the start in-process (serveLive → EnsureRunning;
+	// a genuinely broken stream then fails closed as a 503 retry, not a 502 defer
+	// to a backend that is gone). A non-serve-only node is unchanged.
+	warmable := p.ServeOnly && env.Serveable(r.Stream)
 	if !env.StreamAlive(r.Stream, ch["pid"]) {
-		return php("stream-down")
+		if !warmable {
+			return php("stream-down")
+		}
+		r.Warmup = true
 	}
 	if !env.OnDisk(r.Stream) {
-		return php("no-playlist")
+		if !warmable {
+			return php("no-playlist")
+		}
+		r.Warmup = true
 	}
 	if applies, sure := p.Live.secondIPRule(ui); applies || !sure {
 		return php("second-ip")
