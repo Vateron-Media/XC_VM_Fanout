@@ -37,10 +37,11 @@ type Policy struct {
 		Server     string `json:"server"`
 		Protection bool   `json:"protection"`
 		AltsvcPort int    `json:"altsvc_port"`
-		// UniqueHeader is send_unique_header on: the endpoints that set a fresh
-		// per-response cookie (thumb.php, subtitle.php) are then PHP's, since the
-		// gateway does not reproduce that cookie.
-		UniqueHeader bool `json:"unique_header"`
+		// UniqueName/UniqueDomain are send_unique_header / _domain: the name of
+		// the per-response anti-restream cookie (empty: off) and its configured
+		// domain (empty: derived from the request host).
+		UniqueName   string `json:"unique_header_name"`
+		UniqueDomain string `json:"unique_header_domain"`
 	} `json:"headers"`
 	// ServeUntil is the node's lease fence on this host's clock: nothing is
 	// served past it (PHP answers from then). 0: no lease limits the node.
@@ -90,7 +91,6 @@ type LivePolicy struct {
 	InstantOff       bool  `json:"on_demand_instant_off"`
 	Disallow2ndIP    bool  `json:"disallow_2nd_ip_con"`
 	Disallow2ndIPMax int64 `json:"disallow_2nd_ip_max"`
-	UniqueHeader     bool  `json:"unique_header"`
 	// TS: the panel writes the TS fields below; without them a TS reconnect is PHP's.
 	TS bool `json:"ts"`
 	// The seconds of history a TS viewer joins with (live.php's ?prebuffer=):

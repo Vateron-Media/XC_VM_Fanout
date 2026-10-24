@@ -283,12 +283,6 @@ func JudgeThumb(p *Policy, token string, now int64, env Env) Verdict {
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return reject(p, "lease")
 	}
-	if p.Headers.UniqueHeader {
-		// thumb.php sets a fresh random send_unique_header cookie on every
-		// response; the gateway does not reproduce it (nor does JudgeLive), so a
-		// node with it set hands thumbnails to PHP, which sets the cookie.
-		return verdict(PHP, "unique-header")
-	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
 		// Refused or Unsure: it is not a 404, so PHP answers (TOKEN_EXPIRED).
@@ -331,10 +325,6 @@ func JudgeSubtitle(p *Policy, token string, now int64, env Env) Verdict {
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return reject(p, "lease")
-	}
-	if p.Headers.UniqueHeader {
-		// subtitle.php, like thumb.php, writes a fresh random cookie per response.
-		return verdict(PHP, "unique-header")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {

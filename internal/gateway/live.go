@@ -114,9 +114,6 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return php("lease")
 	}
-	if p.Live.UniqueHeader {
-		return php("unique-header")
-	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
 		return php("token")
@@ -385,8 +382,8 @@ func vodThrottle(p *Policy, ch, ui map[string]json.RawMessage) (int, int64) {
 // JudgeVOD is vod.php's decision on /vauth/<token> as far as the gateway owns
 // it: a local movie file (VOD_PATH/<id>.<ext>) the fanout daemon serves
 // (handOverFile), the viewer tracked in the agent with pid 0, as on a modern
-// fanout node. A direct-proxy movie, a connection a PHP worker still feeds, a
-// node with send_unique_header, or any form PHP reads otherwise goes to PHP.
+// fanout node. A direct-proxy movie, a connection a PHP worker still feeds,
+// or any form PHP reads otherwise goes to PHP.
 func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
 	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
 	if p == nil {
@@ -397,10 +394,6 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return php("lease")
-	}
-	if p.Headers.UniqueHeader {
-		// vod.php's sendStreamHeaders writes a fresh send_unique_header cookie.
-		return php("unique-header")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {
@@ -581,7 +574,7 @@ func gmdateMinute(ts int64) string { return time.Unix(ts, 0).UTC().Format("2006-
 // JudgeTimeshift is timeshift.php's decision on /tsauth/<token> for the arm the
 // gateway owns: the run of archive minute files the daemon serves (handOverFile),
 // the viewer tracked in the agent with pid 0. The m3u8 playlist arm (it mints
-// per-segment tokens), a proxy, a node with send_unique_header, a connection a
+// per-segment tokens), a proxy, a connection a
 // PHP worker still feeds, and any form PHP reads otherwise go to PHP.
 func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
 	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
@@ -593,9 +586,6 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	}
 	if p.ServeUntil != 0 && now > p.ServeUntil {
 		return php("lease")
-	}
-	if p.Headers.UniqueHeader {
-		return php("unique-header")
 	}
 	plain, v := p.Keys.Read(token, p.RawKeys.AcceptLegacyCBC, now)
 	if v != Opened {

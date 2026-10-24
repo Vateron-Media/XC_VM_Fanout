@@ -52,16 +52,16 @@ func TestJudgeSubtitle(t *testing.T) {
 	if v := JudgeSubtitle(p, tok(`{"expires":`+decs(testNow-100)+`,"stream_id":12}`), testNow, have); v.Action != Serve {
 		t.Errorf("within offset: got %+v, want Serve", v)
 	}
-	// The lease fence and send_unique_header hand everything to PHP.
+	// The lease fence hands everything to PHP; send_unique_header does not.
 	p.TimeOffset = 0
 	p.ServeUntil = testNow - 1
 	if v := JudgeSubtitle(p, tok(`{"expires":`+decs(testNow+3600)+`,"stream_id":12}`), testNow, have); v.Action != PHP {
 		t.Errorf("past lease: got %+v, want PHP", v)
 	}
 	p.ServeUntil = 0
-	p.Headers.UniqueHeader = true
-	if v := JudgeSubtitle(p, tok(`{"expires":`+decs(testNow+3600)+`,"stream_id":12}`), testNow, have); v.Action != PHP {
-		t.Errorf("unique-header: got %+v, want PHP", v)
+	p.Headers.UniqueName = "xcuniq"
+	if v := JudgeSubtitle(p, tok(`{"expires":`+decs(testNow+3600)+`,"stream_id":12}`), testNow, have); v.Action != Serve {
+		t.Errorf("unique-header: got %+v, want Serve", v)
 	}
 }
 
@@ -87,6 +87,13 @@ func TestServeSubtitle(t *testing.T) {
 	rec := serveReq(s, "/subauth/"+token, "198.51.100.7")
 	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/octet-stream" || rec.Body.String() != srt {
 		t.Fatalf("served srt: %d %v body=%q", rec.Code, rec.Header(), rec.Body.String())
+	}
+	wantCookies(t, rec, nil)
+	un := NewServer(writeServePolicy(t, dir, "segments+playlist+thumb+subtitle", func(d map[string]any) { withVod(d); withUniqueCookie(d) }), http.NotFoundHandler(), nil)
+	if r2 := serveReq(un, "/subauth/"+token, "198.51.100.7"); r2.Code != 200 || r2.Body.String() != srt {
+		t.Fatalf("subtitle with cookie: %d %q", r2.Code, r2.Body.String())
+	} else {
+		wantCookies(t, r2, []string{"xcuniq="})
 	}
 	if rec.Header().Get("Content-Disposition") != `attachment; filename="12_0.srt"` {
 		t.Fatalf("srt disposition: %v", rec.Header())

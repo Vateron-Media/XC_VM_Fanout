@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -314,7 +316,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		v = j.verdict
 	}
 	if v.Action == Serve && j.kind == "thumb" {
-		why := s.serveThumb(w, p, v, now)
+		why := s.serveThumb(w, r, p, v, now)
 		if why == "" {
 			return
 		}
@@ -322,7 +324,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		v = j.verdict
 	}
 	if v.Action == Serve && j.kind == "subtitle" {
-		why := s.serveSubtitle(w, p, v)
+		why := s.serveSubtitle(w, r, p, v)
 		if why == "" {
 			return
 		}
@@ -435,11 +437,10 @@ func (s *Server) waitHLSPlaylist(id string) bool {
 }
 
 // serveThumb answers thumb.php's happy path: the stream's thumbnail with the
-// headers thumb.php sends. A node with send_unique_header set never reaches
-// here (JudgeThumb hands those to PHP, which writes the per-response cookie),
-// so no cookie is written. "" when served; else why PHP answers after all (the
-// file went away between the judgement and here).
-func (s *Server) serveThumb(w http.ResponseWriter, p *Policy, v Verdict, now time.Time) string {
+// headers thumb.php sends (the send_unique_header cookie included). "" when
+// served; else why PHP answers after all (the file went away between the
+// judgement and here).
+func (s *Server) serveThumb(w http.ResponseWriter, r *http.Request, p *Policy, v Verdict, now time.Time) string {
 	fi, err := os.Stat(v.Path)
 	if err != nil {
 		return "stale"
@@ -451,6 +452,7 @@ func (s *Server) serveThumb(w http.ResponseWriter, p *Policy, v Verdict, now tim
 	// thumb.php's headers: unlike segment.php's policyHeaders, it sets
 	// X-Content-Type-Options only with the protection headers, not always.
 	h := w.Header()
+	setUniqueCookie(h, p, r.Header.Get("X-XC-Host"))
 	h.Set("Access-Control-Allow-Origin", "*")
 	if p.Headers.Server != "" {
 		h.Set("Server", p.Headers.Server)
@@ -474,9 +476,9 @@ func (s *Server) serveThumb(w http.ResponseWriter, p *Policy, v Verdict, now tim
 
 // serveSubtitle answers subtitle.php's happy path: the VOD subtitle file, as
 // WebVTT when the token asked, with the headers subtitle.php sends. Like
-// serveThumb, a node with send_unique_header set never reaches here. "" when
+// serveThumb, it writes the send_unique_header cookie. "" when
 // served; else why PHP answers after all (the file went away since the judgement).
-func (s *Server) serveSubtitle(w http.ResponseWriter, p *Policy, v Verdict) string {
+func (s *Server) serveSubtitle(w http.ResponseWriter, r *http.Request, p *Policy, v Verdict) string {
 	body, err := os.ReadFile(v.Path)
 	if err != nil {
 		return "stale"
@@ -487,6 +489,7 @@ func (s *Server) serveSubtitle(w http.ResponseWriter, p *Policy, v Verdict) stri
 		ext = "vtt"
 	}
 	h := w.Header()
+	setUniqueCookie(h, p, r.Header.Get("X-XC-Host"))
 	h.Set("Access-Control-Allow-Origin", "*")
 	if p.Headers.Server != "" {
 		h.Set("Server", p.Headers.Server)
@@ -514,6 +517,9 @@ func (s *Server) serveSubtitle(w http.ResponseWriter, p *Policy, v Verdict) stri
 // why PHP answers it after all (it then does the same, as before).
 func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time) string {
 	ip := r.Header.Get("X-XC-Client-IP")
+	// live.php writes the send_unique_header cookie on every response, warmup
+	// and 503 included; every path below flushes headers after this.
+	setUniqueCookie(w.Header(), p, r.Header.Get("X-XC-Host"))
 	if ref.New {
 		// live.php's createLive: the record stored, the viewer of a line with a
 		// limit admitted by the agent. One it refuses is PHP's to answer
@@ -684,10 +690,11 @@ func (s *Server) serveTimeshift(w http.ResponseWriter, r *http.Request, p *Polic
 // writes the policy's stream headers — the shared lead of serveVOD and
 // serveTimeshift, before the bytes. refreshPID is the pid a refresh (updateLive)
 // sets — the daemon's "0" for a file serve, nil for the m3u8 playlist (which
-// leaves the viewer's pid as it is). A node with send_unique_header never
-// reaches here. "" when ready to serve, else why PHP answers it after all.
+// leaves the viewer's pid as it is). "" when ready to serve, else why PHP answers it after all.
 func (s *Server) serveFileConn(w http.ResponseWriter, r *http.Request, p *Policy, ref *Refresh, now time.Time, refreshPID json.RawMessage) string {
 	ip := r.Header.Get("X-XC-Client-IP")
+	// One cookie for VOD and timeshift, playlist arm included.
+	setUniqueCookie(w.Header(), p, r.Header.Get("X-XC-Host"))
 	if ref.New {
 		// openRecord: stored, a limited line admitted by the agent.
 		stored, refused := s.agentFor(p.Paths.AgentSock).Register(ref.UUID, ref.Record, ref.Admission)
@@ -836,4 +843,38 @@ func (s *Server) latency() map[string]map[string]uint64 {
 		out[k] = m
 	}
 	return out
+}
+
+// setUniqueCookie writes the send_unique_header anti-restream cookie as PHP's
+// sendStreamHeaders does: a fresh random value, six months out. It is
+// write-only (no endpoint reads it back). Off (empty name) is a no-op. The
+// domain is the configured one, else "." + the request host without its port;
+// a bare IP or empty host leaves Domain empty, as PHP writes it.
+func setUniqueCookie(h http.Header, p *Policy, xcHost string) {
+	if p.Headers.UniqueName == "" {
+		return
+	}
+	domain := p.Headers.UniqueDomain
+	if domain == "" {
+		host, _, _ := strings.Cut(xcHost, ":")
+		if host != "" && net.ParseIP(host) == nil {
+			domain = "." + host
+		}
+	}
+	h.Add("Set-Cookie", p.Headers.UniqueName+"="+randAlnum(11)+"; Domain="+domain+
+		"; Expires="+time.Now().UTC().AddDate(0, 6, 0).Format(time.RFC1123Z)+
+		"; Path=/; Secure; HttpOnly; SameSite=none")
+}
+
+const alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// randAlnum is n random [A-Za-z0-9] characters (modulo bias is irrelevant for a
+// write-only cookie value).
+func randAlnum(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	for i := range b {
+		b[i] = alnum[int(b[i])%len(alnum)]
+	}
+	return string(b)
 }

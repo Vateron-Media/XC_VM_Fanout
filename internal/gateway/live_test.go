@@ -294,7 +294,6 @@ func TestJudgeLive(t *testing.T) {
 	}{
 		{"a known viewer's refresh", liveTokenJSON(nil), testUA, nil, nil, Serve, "playlist"},
 		{"viewers in MAIN's store", liveTokenJSON(nil), testUA, func(p *Policy) { p.ConnStore = "php" }, nil, PHP, "conn-store"},
-		{"a cookie per response", liveTokenJSON(nil), testUA, func(p *Policy) { p.Live.UniqueHeader = true }, nil, PHP, "unique-header"},
 		{"a token this node does not open", tok("x"), testUA, nil, nil, PHP, "token"},
 		{"an off-air token", liveTokenJSON(func(m map[string]any) { m["off_air"] = 1 }), testUA, nil, nil, PHP, "off-air"},
 		{"an adaptive token", liveTokenJSON(func(m map[string]any) { m["adaptive"] = []int{1} }), testUA, nil, nil, PHP, "off-air"},

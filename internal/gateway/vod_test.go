@@ -93,7 +93,6 @@ func TestJudgeVOD(t *testing.T) {
 	}{
 		{"a direct-proxy movie", vodToken(func(m map[string]any) { m["channel_info"].(map[string]any)["proxy"] = 1 }), nil, nil, "proxy"},
 		{"behind an originator", vodToken(func(m map[string]any) { m["channel_info"].(map[string]any)["originator_id"] = 9 }), nil, nil, "proxy"},
-		{"send_unique_header set", vodToken(nil), func(p *Policy) { p.Headers.UniqueHeader = true }, nil, "unique-header"},
 		{"viewers in MAIN's store", vodToken(nil), func(p *Policy) { p.ConnStore = "php" }, nil, "conn-store"},
 		{"the movie is gone", vodToken(nil), nil, func(s *liveEnvState) { s.fileMissing = true }, "missing"},
 		{"no extension", vodToken(func(m map[string]any) { delete(m, "extension") }), nil, nil, "extension"},
@@ -150,6 +149,7 @@ func TestServeVOD(t *testing.T) {
 	a := &fakeAgent{records: map[string]map[string]any{}}
 	sock := startAgent(t, a)
 	path := writeServePolicy(t, dir, "segments+playlist+thumb+subtitle+vod", func(doc map[string]any) {
+		withUniqueCookie(doc)
 		doc["conn_store"] = "agent"
 		doc["vod_limit_perc"], doc["vod_bitrate_plus"] = 80, 20
 		doc["live"] = map[string]any{"use_buffer": true, "create_expiration": 5, "admission": true}
@@ -166,6 +166,7 @@ func TestServeVOD(t *testing.T) {
 			m["channel_info"].(map[string]any)["bitrate"] = 1000
 		}))
 		req.Header.Set("X-XC-Client-IP", "198.51.100.7")
+		req.Header.Set("X-XC-Host", "tv.example.com:8080")
 		req.Header.Set("User-Agent", testUA)
 		rec := httptest.NewRecorder()
 		s.ServeHTTP(rec, req)
@@ -173,6 +174,10 @@ func TestServeVOD(t *testing.T) {
 	}
 
 	rec := ask()
+	wantCookies(t, rec, []string{"xcuniq="})
+	if !strings.Contains(rec.Header().Get("Set-Cookie"), "; Domain=.tv.example.com;") {
+		t.Fatalf("vod cookie domain: %v", rec.Header()["Set-Cookie"])
+	}
 	if rec.Code != 200 || rec.Body.String() != "MOVIE" || rec.Header().Get("Content-Type") != "video/mp4" {
 		t.Fatalf("first VOD request: %d %q %v; stats %v", rec.Code, rec.Body.String(), rec.Header(), s.Stats())
 	}
