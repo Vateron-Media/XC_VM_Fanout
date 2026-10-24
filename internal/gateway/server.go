@@ -310,7 +310,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if why == "" {
 			return
 		}
-		j.verdict = verdict(PHP, why)
+		j.verdict = reject(p, why)
 		v = j.verdict
 	}
 	if v.Action == Serve && j.kind == "thumb" {
@@ -318,7 +318,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if why == "" {
 			return
 		}
-		j.verdict = verdict(PHP, why)
+		j.verdict = reject(p, why)
 		v = j.verdict
 	}
 	if v.Action == Serve && j.kind == "subtitle" {
@@ -326,7 +326,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if why == "" {
 			return
 		}
-		j.verdict = verdict(PHP, why)
+		j.verdict = reject(p, why)
 		v = j.verdict
 	}
 	if v.Action == Serve && j.kind == "vod" {
@@ -334,7 +334,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if why == "" {
 			return
 		}
-		j.verdict = verdict(PHP, why)
+		j.verdict = reject(p, why)
 		v = j.verdict
 	}
 	if v.Action == Serve && j.kind == "timeshift" {
@@ -342,7 +342,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if why == "" {
 			return
 		}
-		j.verdict = verdict(PHP, why)
+		j.verdict = reject(p, why)
 		v = j.verdict
 	}
 	switch v.Action {

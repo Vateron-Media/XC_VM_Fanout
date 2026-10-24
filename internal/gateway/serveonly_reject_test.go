@@ -1,6 +1,13 @@
 package gateway
 
-import "testing"
+import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
 
 // A request PHP answers with its own 404 is denied by the gateway on a
 // serve-only node (no PHP behind the front: a defer would be a 502), and
@@ -96,7 +103,7 @@ func TestServeOnlyRejectsWherePHPWould404(t *testing.T) {
 		{"subtitle lease", func(so bool) Verdict {
 			p := testPolicy()
 			p.ServeOnly, p.ServeUntil = so, testNow-1
-			return JudgeSubtitle(p, tok(exp), testNow, thumbEnv(testNow, true))
+			return JudgeSubtitle(p, tok(exp), testNow, subEnv(true))
 		}, "lease"},
 	}
 	for _, c := range cases {
@@ -107,4 +114,65 @@ func TestServeOnlyRejectsWherePHPWould404(t *testing.T) {
 			t.Errorf("%s transition: %s (%s); want PHP (%s)", c.name, v.Action, v.Reason, c.reason)
 		}
 	}
+}
+
+func TestServeOnlyRejectsMore(t *testing.T) {
+	ip := "198.51.100.7"
+	const exp = `{"expires":1800003600,"stream":%s}`
+	sub := func(extra string) string { return tok(`{"expires":1800003600,"stream_id":` + extra + `,"sub_id":1}`) }
+	cases := []struct {
+		name   string
+		run    func(p *Policy) Verdict
+		reason string
+	}{
+		{"segment token-form", func(p *Policy) Verdict {
+			return JudgeSegment(p, "not-a-token", ip, testNow, envOf(true, true, false, true))
+		}, "token"},
+		{"segment stream-id", func(p *Policy) Verdict {
+			return JudgeSegment(p, tok("TS/u/p/"+ip+"/x_d1.ts/"+testUUID+"/3"), ip, testNow, envOf(true, true, false, true))
+		}, "stream-id"},
+		{"key stream-id", func(p *Policy) Verdict { return JudgeKey(p, tok(ip+"/abc"), ip, testNow) }, "stream-id"},
+		{"thumb token-json", func(p *Policy) Verdict { return JudgeThumb(p, tok("x"), testNow, thumbEnv(testNow, true)) }, "token-json"},
+		{"thumb stream", func(p *Policy) Verdict {
+			return JudgeThumb(p, tok(`{"expires":1800003600,"stream":0}`), testNow, thumbEnv(testNow, true))
+		}, "stream"},
+		{"thumb stale", func(p *Policy) Verdict {
+			return JudgeThumb(p, tok(`{"expires":1800003600,"stream":12}`), testNow, thumbEnv(testNow-120, true))
+		}, "stale"},
+		{"subtitle token-json", func(p *Policy) Verdict { return JudgeSubtitle(p, tok("x"), testNow, subEnv(true)) }, "token-json"},
+		{"subtitle stream", func(p *Policy) Verdict { return JudgeSubtitle(p, sub("0"), testNow, subEnv(true)) }, "stream"},
+		{"subtitle missing", func(p *Policy) Verdict { return JudgeSubtitle(p, sub("12"), testNow, subEnv(false)) }, "missing"},
+	}
+	_ = exp
+	for _, c := range cases {
+		p := testPolicy()
+		p.ServeOnly = true
+		if v := c.run(p); v.Action != Deny {
+			t.Errorf("%s serve-only: %s (%s); want Deny", c.name, v.Action, v.Reason)
+		}
+		p.ServeOnly = false
+		if v := c.run(p); v.Action == Deny && c.name != "segment token-form" {
+			t.Errorf("%s transition: got Deny, want a PHP defer", c.name)
+		}
+	}
+}
+
+// A Deny reaches the viewer through the front as a real 404 page, never an
+// X-Accel-Redirect to a PHP backend that a serve-only node does not have; and a
+// thumbnail that vanishes between judge and serve is the same 404.
+func TestServeOnlyDenyIsA404AtTheFront(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "streams"), 0o755)
+	ip := "198.51.100.7"
+	edit := func(doc map[string]any) { doc["serve_only"] = true }
+	s := NewServer(writeServePolicy(t, dir, "segments+playlist+thumb", edit), http.NotFoundHandler(), nil)
+	check := func(name, uri string) {
+		rec := serveReq(s, uri, ip)
+		if rec.Code != 404 || !strings.Contains(rec.Body.String(), "<h1>404 Not Found</h1>") || rec.Header().Get("X-Accel-Redirect") != "" {
+			t.Errorf("%s: %d %q accel=%q", name, rec.Code, rec.Body.String(), rec.Header().Get("X-Accel-Redirect"))
+		}
+	}
+	check("thumb stale (no file)", "/thauth/"+tok(`{"expires":`+decs(time.Now().Unix()+3600)+`,"stream":12}`))
+	check("thumb bad token", "/thauth/"+tok("x"))
+	check("key stream-id", "/key/"+tok(ip+"/abc"))
 }

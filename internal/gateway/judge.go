@@ -71,7 +71,7 @@ func verdict(a Action, reason string) Verdict { return Verdict{Action: a, Reason
 var serveOnlyRejects = map[string]bool{
 	"token": true, "token-form": true, "token-json": true, "timestamp": true,
 	"stream-id": true, "missing": true, "ip": true, "lease": true,
-	"expired": true, "not-on-air": true,
+	"expired": true, "not-on-air": true, "stream": true, "stale": true,
 }
 
 // reject is the verdict for a request PHP would 404: a Deny on a serve-only
@@ -307,12 +307,12 @@ func JudgeThumb(p *Policy, token string, now int64, env Env) Verdict {
 		return reject(p, "expired")
 	}
 	if td.Stream <= 0 {
-		return verdict(PHP, "stream")
+		return reject(p, "stream")
 	}
 	path := p.Paths.Streams + strconv.Itoa(td.Stream) + "_.jpg"
 	mod, ok := env.Mtime(path)
 	if !ok || now-mod >= 60 {
-		return verdict(PHP, "stale")
+		return reject(p, "stale")
 	}
 	return Verdict{Action: Serve, Reason: "thumb", Stream: td.Stream, Path: path}
 }
@@ -355,7 +355,7 @@ func JudgeSubtitle(p *Policy, token string, now int64, env Env) Verdict {
 		return reject(p, "expired")
 	}
 	if td.StreamID <= 0 {
-		return verdict(PHP, "stream")
+		return reject(p, "stream")
 	}
 	path := p.Paths.Vod + strconv.Itoa(td.StreamID) + "_" + strconv.Itoa(td.SubID) + ".srt"
 	if !env.File(path) {
