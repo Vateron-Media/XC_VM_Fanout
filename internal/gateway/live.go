@@ -104,7 +104,7 @@ var segLineRe = regexp.MustCompile(`(?m)^(\d+)\.ts$`)
 // request, a stream that is not running, a proxied or adaptive link, a line
 // under the second-address rule, and any form PHP could read otherwise.
 func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
-	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
 	if p == nil {
 		return php("policy")
 	}
@@ -388,7 +388,7 @@ func vodThrottle(p *Policy, ch, ui map[string]json.RawMessage) (int, int64) {
 // fanout node. A direct-proxy movie, a connection a PHP worker still feeds, a
 // node with send_unique_header, or any form PHP reads otherwise goes to PHP.
 func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
-	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
 	if p == nil {
 		return php("policy")
 	}
@@ -584,7 +584,7 @@ func gmdateMinute(ts int64) string { return time.Unix(ts, 0).UTC().Format("2006-
 // per-segment tokens), a proxy, a node with send_unique_header, a connection a
 // PHP worker still feeds, and any form PHP reads otherwise go to PHP.
 func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) (Verdict, *Refresh) {
-	php := func(why string) (Verdict, *Refresh) { return verdict(PHP, why), nil }
+	php := func(why string) (Verdict, *Refresh) { return reject(p, why), nil }
 	if p == nil {
 		return php("policy")
 	}
