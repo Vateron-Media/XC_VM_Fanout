@@ -68,3 +68,14 @@ func TestJudgeTimeshiftBadTimezoneServeOnly(t *testing.T) {
 		}
 	}
 }
+
+// A TS token on a panel that writes no TS settings is a gateway limitation (PHP
+// would serve it): a defer even on serve-only, never a definitive Deny.
+func TestJudgeLiveTSSettingsMissingStaysDeferred(t *testing.T) {
+	p := tsPolicy()
+	p.ServeOnly, p.Live.TS = true, false
+	v, _ := JudgeLive(p, tsTokenJSON(nil), "198.51.100.7", testUA, testNow, goodTSEnv().env())
+	if v.Action != PHP || v.Reason != "ts-settings" {
+		t.Fatalf("got %s/%s; want php/ts-settings", v.Action, v.Reason)
+	}
+}

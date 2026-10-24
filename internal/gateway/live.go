@@ -167,7 +167,12 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("extension")
 	}
 	if ext == "ts" && !p.Live.TS {
-		// A panel from before the TS reconnect writes no prebuffer settings.
+		// A panel from before the TS reconnect writes no prebuffer settings. PHP
+		// would serve this token: a gateway limitation, not a bad request, so its
+		// own reason on serve-only (not a Deny); the transition reason is unchanged.
+		if p.ServeOnly {
+			return php("ts-settings")
+		}
 		return php("extension")
 	}
 	var ch, ui map[string]json.RawMessage
