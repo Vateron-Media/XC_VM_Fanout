@@ -34,6 +34,9 @@ type LiveEnv struct {
 	Record func(uuid string) (rec map[string]json.RawMessage, found, ok bool)
 	// AgentAlive: is the agent draining its spool (EventSpool::agentAlive)?
 	AgentAlive func() bool
+	// Oldest is the line's oldest open connection's address (the agent's
+	// /v1/conn/oldest): found, and whether the agent answered. Nil reads as unanswered.
+	Oldest func(lineID int64) (ip string, found, answered bool)
 	// File: does this path exist (vod.php's file_exists on the movie)?
 	File func(path string) bool
 	// FileSize is a file's size and whether it is there (timeshift's archive scan).
@@ -201,7 +204,8 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		return php("token")
 	}
 	r.OnDemand = int(onDemand)
-	if p.Live.InstantOff && onDemand == 1 {
+	// A serve-only node has no php-fpm queue to park the viewer in: it serves.
+	if p.Live.InstantOff && onDemand == 1 && !p.ServeOnly {
 		return php("instant-off")
 	}
 	if !env.StreamAlive(r.Stream, ch["pid"]) {
@@ -210,7 +214,8 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	if !env.OnDisk(r.Stream) {
 		return php("no-playlist")
 	}
-	if applies, sure := p.Live.secondIPRule(ui); applies || !sure {
+	applies2, sure2 := p.Live.secondIPRule(ui)
+	if (applies2 || !sure2) && (!p.ServeOnly || !sure2) {
 		return php("second-ip")
 	}
 
@@ -232,6 +237,13 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		}
 		r.Username, r.Password, r.UserID = user, pass, id
 		r.IdentityKey = "u" + strconv.FormatInt(id, 10)
+	}
+	if applies2 && r.HMAC == "" && env.Oldest != nil {
+		// Serve-only: live.php's disallow_2nd_ip_con against the oldest open
+		// connection (an unanswering agent degrades to serving, as below).
+		if ip, found, answered := env.Oldest(r.UserID); answered && found && !ipMatch(ip, clientIP, p.IPSubnetMatch) {
+			return verdict(Deny, "second-ip"), nil
+		}
 	}
 	codec, ok := phpString(t["video_codec"])
 	if !ok {
@@ -258,10 +270,23 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 
 	// The connection: open, this viewer's, on this server and stream (lookupLive in the agent).
 	rec, found, answered := env.Record(r.UUID)
-	if !answered {
+	if !answered && !p.ServeOnly {
 		return php("agent")
 	}
-	if !found && p.Live.CreateExpiration > 0 {
+	// Serve-only: an agent that does not answer, or a record the lookup would
+	// not return (HLS: ended or other; TS: other, an ended one is reopened), is
+	// a viewer's first request: its connection is created.
+	matches := found && liveMatches(rec, r, container)
+	if found && !matches && p.ServeOnly && r.TS {
+		open := make(map[string]json.RawMessage, len(rec))
+		for k, v := range rec {
+			open[k] = v
+		}
+		delete(open, "hls_end")
+		matches = liveMatches(open, r, container)
+	}
+	fresh := !found || (p.ServeOnly && !matches)
+	if fresh && p.Live.CreateExpiration > 0 {
 		// A viewer's first request: its connection is created (createLive). A TS
 		// viewer is keyed on the token's uuid, an HLS one on its playlist key.
 		var why string
@@ -276,13 +301,13 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		r.New = true
 	} else {
 		// An ended connection is re-opened by PHP (its lookup is not open-only).
-		if !found || !liveMatches(rec, r, container) {
+		if !found || !matches {
 			return php("new-connection")
 		}
 		if !set(rec, "identity") || !set(rec, "uuid") {
 			return php("record")
 		}
-		if r.TS {
+		if r.TS && !phpTruthy(rec["hls_end"]) {
 			// live.php kills a PHP worker still feeding this connection; the
 			// gateway takes over only from fanout's own (pid 0).
 			if pid, ok := jsonInt(rec["pid"]); !ok || pid != 0 {
@@ -298,7 +323,9 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 
 	// The line's limit is MAIN's, told through the agent's spool; a stopped agent means PHP's own limiter.
 	if mc, ok := jsonInt(ui["max_connections"]); ok && mc != 0 {
-		if !env.AgentAlive() {
+		// Serve-only: serve and append conn.limit best-effort (serveLive); MAIN
+		// takes it when the agent drains again.
+		if !p.ServeOnly && !env.AgentAlive() {
 			return php("spool")
 		}
 		r.Limit, r.MaxConns = true, mc
@@ -495,7 +522,7 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 
 	// The connection, under the token's uuid (findByUuid).
 	rec, found, answered := env.Record(r.UUID)
-	if !answered {
+	if !answered && !p.ServeOnly { // serve-only degrades: the connection is created
 		return php("agent")
 	}
 	if !found {
@@ -524,7 +551,9 @@ func JudgeVOD(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv) 
 	r.Record = rec
 	// The line's limit via the agent's spool; a stopped agent is PHP's limiter.
 	if mc, okM := jsonInt(ui["max_connections"]); okM && mc != 0 {
-		if !env.AgentAlive() {
+		// Serve-only: serve and append conn.limit best-effort (serveLive); MAIN
+		// takes it when the agent drains again.
+		if !p.ServeOnly && !env.AgentAlive() {
 			return php("spool")
 		}
 		r.Limit, r.MaxConns = true, mc
@@ -738,7 +767,7 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 
 	// The connection, under the token's uuid.
 	rec, found, answered := env.Record(r.UUID)
-	if !answered {
+	if !answered && !p.ServeOnly { // serve-only degrades: the connection is created
 		return php("agent")
 	}
 	if !found {
@@ -769,7 +798,9 @@ func JudgeTimeshift(p *Policy, token, clientIP, rawUA string, now int64, env Liv
 	}
 	r.Record = rec
 	if mc, okM := jsonInt(ui["max_connections"]); okM && mc != 0 {
-		if !env.AgentAlive() {
+		// Serve-only: serve and append conn.limit best-effort (serveLive); MAIN
+		// takes it when the agent drains again.
+		if !p.ServeOnly && !env.AgentAlive() {
 			return php("spool")
 		}
 		r.Limit, r.MaxConns = true, mc

@@ -184,3 +184,31 @@ func (a *AgentConns) put(client *http.Client, uuid string, rec map[string]json.R
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode == http.StatusOK, false
 }
+
+// Oldest is AgentConnections::oldest: the address of the line's oldest open
+// connection, whether there is one, and whether the agent answered.
+func (a *AgentConns) Oldest(lineID int64) (ip string, found, answered bool) {
+	req, err := http.NewRequest(http.MethodPost, "http://agent/v1/conn/oldest", strings.NewReader(fmt.Sprintf(`{"user_id":%d}`, lineID)))
+	if err != nil {
+		return "", false, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", false, false
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return "", false, true
+	case http.StatusOK:
+	default:
+		return "", false, false
+	}
+	var rec map[string]json.RawMessage
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rec) != nil || rec == nil {
+		return "", false, false
+	}
+	ip, _ = phpString(rec["user_ip"])
+	return ip, true, true
+}

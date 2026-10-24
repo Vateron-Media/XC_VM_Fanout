@@ -210,7 +210,13 @@ func (s *Server) liveEnv(p *Policy, now time.Time) LiveEnv {
 			return s.agentFor(p.Paths.AgentSock).Get(uuid)
 		},
 		AgentAlive: func() bool { return agentAlive(p.Paths.Flows, now) },
-		File:       exists,
+		Oldest: func(line int64) (string, bool, bool) {
+			if p.Paths.AgentSock == "" {
+				return "", false, false
+			}
+			return s.agentFor(p.Paths.AgentSock).Oldest(line)
+		},
+		File: exists,
 		FileSize: func(path string) (int64, bool) {
 			fi, err := os.Stat(path)
 			if err != nil || !fi.Mode().IsRegular() {
@@ -535,7 +541,7 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 		if refused {
 			return "refused"
 		}
-		if !stored {
+		if !stored && !p.ServeOnly { // serve-only degrades: served without the record
 			return "agent-put"
 		}
 	} else {
@@ -556,12 +562,12 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 		}
 		rec["hls_last_read"] = json.RawMessage(strconv.FormatInt(now.Unix()-p.TimeOffset, 10))
 		rec["hls_end"] = json.RawMessage("0")
-		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) {
+		if !s.agentFor(p.Paths.AgentSock).Put(ref.UUID, rec) && !p.ServeOnly {
 			return "agent-put"
 		}
 	}
 	if ref.Limit {
-		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil {
+		if err := spoolAppend(p.Paths.Spool, "p0", "conn.limit", connLimit(ref, ip), now); err != nil && !p.ServeOnly { // serve-only: best-effort
 			return "spool"
 		}
 	}

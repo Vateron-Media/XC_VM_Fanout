@@ -63,6 +63,30 @@ func startAgent(t *testing.T, a *fakeAgent) string {
 			_ = json.NewEncoder(w).Encode(rec)
 			return
 		}
+		if r.Method == http.MethodPost && uuid == "oldest" {
+			var body struct {
+				UserID int64 `json:"user_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			var best map[string]any
+			for _, rec := range a.records {
+				if int64(fmtNum(rec["user_id"])) != body.UserID {
+					continue
+				}
+				if fmtNum(rec["hls_end"]) != 0 {
+					continue
+				}
+				if best == nil || fmtNum(rec["date_start"]) < fmtNum(best["date_start"]) {
+					best = rec
+				}
+			}
+			if best == nil {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(best)
+			return
+		}
 		rec := a.records[uuid]
 		if rec == nil {
 			http.NotFound(w, r)
@@ -245,4 +269,14 @@ func TestAgentConnsRegister(t *testing.T) {
 	if stored, refused := c.Register("u4", rec, `{"line_id":41}`); stored || refused {
 		t.Fatalf("an agent that does not answer: %v %v", stored, refused)
 	}
+}
+
+func fmtNum(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case int:
+		return float64(x)
+	}
+	return 0
 }
