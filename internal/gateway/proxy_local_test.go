@@ -7,7 +7,10 @@ import "testing"
 // is the originator) are served locally with proxy_id = redirect_id.
 func TestServeOnlyProxyLocalSites(t *testing.T) {
 	ip := "198.51.100.7"
-	front := func(m map[string]any) { ci := m["channel_info"].(map[string]any); ci["originator_id"], ci["redirect_id"] = 3, 9 }
+	front := func(m map[string]any) {
+		ci := m["channel_info"].(map[string]any)
+		ci["originator_id"], ci["redirect_id"] = 3, 9
+	}
 	so := func(p *Policy) *Policy { p.ServeOnly = true; return p }
 
 	t.Run("site 1 direct-proxy TS", func(t *testing.T) {
