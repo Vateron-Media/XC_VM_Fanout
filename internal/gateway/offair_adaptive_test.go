@@ -21,6 +21,7 @@ func TestJudgeLiveOffAirClip(t *testing.T) {
 		p := livePolicy()
 		p.ServeOnly = serveOnly
 		p.OffAir.VideoPath = dir
+		p.OffAir.Show = map[string]bool{"not_on_air": true, "banned": true}
 		if edit != nil {
 			edit(p)
 		}
@@ -59,6 +60,22 @@ func TestJudgeLiveOffAirClip(t *testing.T) {
 	}
 	if v := judge(true, nil, func(m map[string]any) { m["off_air"] = "banned" }); v.Action != Deny || v.Reason != "off-air-missing" {
 		t.Fatalf("missing clip: %+v", v)
+	}
+	for _, c := range []struct {
+		name string
+		edit func(*Policy)
+		tok  func(map[string]any)
+	}{
+		{"switch off", func(p *Policy) { p.OffAir.Show["not_on_air"] = false }, named},
+		{"restreamer", nil, func(m map[string]any) { named(m); m["user_info"].(map[string]any)["is_restreamer"] = 1 }},
+		{"restreamer legacy path", nil, func(m map[string]any) { m["video_path"] = custom; m["user_info"].(map[string]any)["is_restreamer"] = 1 }},
+	} {
+		if v := judge(true, c.edit, c.tok); v.Action != Deny || v.Reason != "off-air-disabled" {
+			t.Fatalf("%s: %+v", c.name, v)
+		}
+	}
+	if v := judge(false, func(p *Policy) { p.OffAir.Show["not_on_air"] = false }, named); v.Action != PHP || v.Reason != "off-air" {
+		t.Fatalf("not serve-only ignores the switch: %+v", v)
 	}
 	if v := judge(false, nil, named); v.Action != PHP || v.Reason != "off-air" {
 		t.Fatalf("not serve-only: %+v", v)

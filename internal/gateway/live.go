@@ -143,6 +143,16 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		if !p.ServeOnly {
 			return php("off-air")
 		}
+		// showVideoServer's gate: the clip only for a non-restreamer with the
+		// option on; else PHP errors (EXPIRED/BANNED/STREAM_OFFLINE/404) or, for
+		// expiring, shows nothing. Every case is a Deny here (nothing to play on).
+		// A bare legacy video_path names no option: only is_restreamer applies.
+		var ui map[string]json.RawMessage
+		_ = json.Unmarshal(t["user_info"], &ui)
+		name, _ := jsonString(t["off_air"])
+		if _, named := offAirFiles[name]; phpTruthy(ui["is_restreamer"]) || (named && !p.OffAir.Show[name]) {
+			return verdict(Deny, "off-air-disabled"), nil
+		}
 		// live.php's off-air arm: the clip for the token, as video/mp2t.
 		if path := offAirClip(p, t); path != "" {
 			return Verdict{Action: Serve, Reason: "off-air-clip", Path: path}, nil

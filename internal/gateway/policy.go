@@ -56,6 +56,8 @@ type Policy struct {
 	OffAir struct {
 		VideoPath string            `json:"video_path"`
 		Paths     map[string]string `json:"paths"`
+		// Show is the show_*_video switch per off_air name (not_on_air, ...).
+		Show map[string]bool `json:"show"`
 	} `json:"off_air"`
 	Paths struct {
 		Cons      string `json:"cons"`
