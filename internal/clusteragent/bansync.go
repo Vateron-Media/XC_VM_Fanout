@@ -40,9 +40,11 @@ const (
 )
 
 // banExec runs one ipset/iptables command (optional stdin) and returns its
-// combined output. A test seam. The agent runs as root (noderoot.go), so no sudo.
+// combined output. A test seam. On a serve-only node the agent is xc_vm, so the
+// command is escalated with `sudo -n` (privCmd); as root it runs directly.
 var banExec = func(ctx context.Context, stdin, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	n, a := privCmd(name, args)
+	cmd := exec.CommandContext(ctx, n, a...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}

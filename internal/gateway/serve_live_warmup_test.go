@@ -102,6 +102,63 @@ func TestServeOnlyWarmupStartsAndServes(t *testing.T) {
 	}
 }
 
+// A genuinely COLD serve-only stream — no producer at all (no <id>_.pid, no
+// <id>_.m3u8), the on-demand case a viewer's first request hits — must still
+// start in-process via the warmup branch (EnsureRunning) instead of deferring to
+// a PHP backend that does not exist. This is the on-demand cold-start the legacy
+// StreamAlive/OnDisk gates used to preempt (→ 502 on a PHP-free node).
+func TestServeOnlyColdStartStartsAndServes(t *testing.T) {
+	_, path, _ := warmupPolicy(t, "segments+playlist", true)
+	// Deliberately NO startProducer: the stream is down (StreamAlive/OnDisk false).
+	seg := &recordingHandler{}
+	calls := 0
+	node := &fakeFiles{
+		serveable:     map[string]bool{"12": true},
+		ensureRunning: func(string) bool { return true },
+		fedPlaylist: func(string) string {
+			calls++
+			if calls <= 1 {
+				return "" // idle at judge time → warmup
+			}
+			return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n" // ready once started
+		},
+	}
+	s := NewServer(path, seg, node)
+
+	rec := warmupAsk(s)
+
+	if rec.Code != 200 {
+		t.Fatalf("cold serve-only stream served: code %d; want 200", rec.Code)
+	}
+	if rec.Header().Get("X-Accel-Redirect") != "" {
+		t.Fatalf("cold serve-only start must not defer to PHP: %q", rec.Header().Get("X-Accel-Redirect"))
+	}
+	if node.ensureRunningIDs == nil || node.ensureRunningIDs[0] != "12" {
+		t.Fatalf("EnsureRunning called with %v; want [12]", node.ensureRunningIDs)
+	}
+	if seg.hits != 1 || seg.uri != "/hls/12/index.m3u8" {
+		t.Fatalf("re-dispatch to fanout HLS: hits %d uri %q", seg.hits, seg.uri)
+	}
+}
+
+// A COLD stream on a node that is NOT serve-only still defers to PHP (the backend
+// is there to start it): the cold-start relaxation is serve-only only.
+func TestColdStartNonServeOnlyDefers(t *testing.T) {
+	_, path, _ := warmupPolicy(t, "segments+playlist", false)
+	seg := &recordingHandler{}
+	node := &fakeFiles{serveable: map[string]bool{"12": true}, ensureRunning: func(string) bool { return true }}
+	s := NewServer(path, seg, node)
+
+	rec := warmupAsk(s)
+
+	if rec.Header().Get("X-Accel-Redirect") != "@gw_live_php" {
+		t.Fatalf("a non-serve-only cold stream defers to PHP: X-Accel-Redirect %q", rec.Header().Get("X-Accel-Redirect"))
+	}
+	if node.ensureRunningIDs != nil {
+		t.Fatalf("EnsureRunning must not run off the serve-only path: %v", node.ensureRunningIDs)
+	}
+}
+
 // withFastWarmupPlaylist lowers the HLS readiness-wait tunables so the
 // never-ready case is a fraction of a second. Process-global vars, so tests
 // using it must not call t.Parallel().

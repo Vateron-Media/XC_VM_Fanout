@@ -1,8 +1,10 @@
 package clusteragent
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,15 +24,50 @@ import (
 // nodeRootRunner runs one privileged command.
 type nodeRootRunner func(ctx context.Context, name string, args ...string) error
 
-// nodeRootRun runs one privileged command; a test seam. The agent's service runs
-// as root, so no sudo is needed. A self-stopping command captures it into a local
-// before its goroutine fires, so a test swapping this global never races it.
+// privEscalate is true when the agent is NOT root. A serve-only node's agent runs
+// as xc_vm (so the xc_vm front keeps owning the files they share — the agent
+// socket, the gateway policy, the replica caches); it reaches root for the few
+// privileged node.root/ban operations through `sudo -n`, for which the install
+// grants xc_vm a NOPASSWD allowlist. When the agent is root the commands run
+// directly. Tests force it false (TestMain) to pin the direct, un-escalated path.
+var privEscalate = os.Geteuid() != 0
+
+// privCmd prepends `sudo -n` to a privileged command when the agent is not root.
+func privCmd(name string, args []string) (string, []string) {
+	if privEscalate {
+		return "sudo", append([]string{"-n", name}, args...)
+	}
+	return name, args
+}
+
+// privWriteFile writes a privileged file (e.g. /etc/fstab, /etc/sysctl.conf). As
+// root it writes directly; as xc_vm it pipes through `sudo -n tee` then fixes the
+// mode, since a bare os.WriteFile under /etc would be denied.
+func privWriteFile(ctx context.Context, path string, data []byte, mode os.FileMode) error {
+	if !privEscalate {
+		return os.WriteFile(path, data, mode)
+	}
+	tee := exec.CommandContext(ctx, "sudo", "-n", "tee", path)
+	tee.Stdin = bytes.NewReader(data)
+	tee.Stdout = io.Discard
+	if err := tee.Run(); err != nil {
+		return err
+	}
+	return exec.CommandContext(ctx, "sudo", "-n", "chmod", fmt.Sprintf("%o", mode.Perm()), path).Run()
+}
+
+// nodeRootRun runs one privileged command; a test seam. On a serve-only node the
+// agent is xc_vm, so the command is escalated with `sudo -n` (privCmd); as root it
+// runs directly. A self-stopping command captures it into a local before its
+// goroutine fires, so a test swapping this global never races it.
 var nodeRootRun nodeRootRunner = func(ctx context.Context, name string, args ...string) error {
-	return exec.CommandContext(ctx, name, args...).Run()
+	n, a := privCmd(name, args)
+	return exec.CommandContext(ctx, n, a...).Run()
 }
 
 // nodeRootOutput runs a command and returns its combined output; a test seam for
-// the cpufreq-info reads set_governor makes. A missing binary returns an error, so
+// the cpufreq-info reads set_governor makes. These are /sys reads that need no
+// privilege, so they are not escalated. A missing binary returns an error, so
 // set_governor skips (as PHP's `which cpufreq-info` guard does).
 var nodeRootOutput = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
@@ -123,7 +160,7 @@ func setRamdisk(ctx context.Context, run nodeRootRunner, home string, enable boo
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(fstabPath, []byte(ramdiskFstab(string(cur), enable)), 0o644); err != nil {
+	if err := privWriteFile(ctx, fstabPath, []byte(ramdiskFstab(string(cur), enable)), 0o644); err != nil {
 		return err
 	}
 	streams := filepath.Join(home, "content/streams")
@@ -148,7 +185,7 @@ func setSysctl(ctx context.Context, run nodeRootRunner, args map[string]any) err
 		return nil
 	}
 	_ = run(ctx, "modprobe", "ip_conntrack")
-	if err := os.WriteFile(sysctlPath, []byte(body), 0o644); err != nil {
+	if err := privWriteFile(ctx, sysctlPath, []byte(body), 0o644); err != nil {
 		return err
 	}
 	return run(ctx, "sysctl", "-p")
@@ -157,7 +194,13 @@ func setSysctl(ctx context.Context, run nodeRootRunner, args map[string]any) err
 // reloadNginxRtmp reloads nginx_rtmp (the only nginx on a serve-only node), as
 // xc_vm — matching `service reload`. Shared by reload_nginx and set_port.
 func reloadNginxRtmp(ctx context.Context, run nodeRootRunner, home string) error {
-	return run(ctx, "sudo", "-u", "xc_vm", filepath.Join(home, "bin/nginx_rtmp/sbin/nginx_rtmp"), "-s", "reload")
+	bin := filepath.Join(home, "bin/nginx_rtmp/sbin/nginx_rtmp")
+	if privEscalate {
+		// The agent is already xc_vm — reload nginx_rtmp directly (it owns the master).
+		return exec.CommandContext(ctx, bin, "-s", "reload").Run()
+	}
+	// The agent is root — drop to xc_vm, matching `service reload`.
+	return run(ctx, "sudo", "-u", "xc_vm", bin, "-s", "reload")
 }
 
 // setGovernor sets the CPU frequency governor on every core when MAIN sends a
