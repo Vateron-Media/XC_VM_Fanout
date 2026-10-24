@@ -1,10 +1,8 @@
 package clusteragent
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,20 +38,25 @@ func privCmd(name string, args []string) (string, []string) {
 	return name, args
 }
 
-// privWriteFile writes a privileged file (e.g. /etc/fstab, /etc/sysctl.conf). As
-// root it writes directly; as xc_vm it pipes through `sudo -n tee` then fixes the
-// mode, since a bare os.WriteFile under /etc would be denied.
-func privWriteFile(ctx context.Context, path string, data []byte, mode os.FileMode) error {
-	if !privEscalate {
-		return os.WriteFile(path, data, mode)
-	}
-	tee := exec.CommandContext(ctx, "sudo", "-n", "tee", path)
-	tee.Stdin = bytes.NewReader(data)
-	tee.Stdout = io.Discard
-	if err := tee.Run(); err != nil {
+// noderootHelper is the root-owned trust boundary a serve-only node's xc_vm agent
+// escalates through: the sudoers grant is to this one file only.
+const noderootHelper = "/usr/local/sbin/xcvm-noderoot"
+
+// stageDir is where the agent drops the files the helper reads (sysctl.pending,
+// bans.pending). The helper hardcodes the same path; a var only for tests.
+var stageDir = "/home/xc_vm/tmp/cluster"
+
+// helperVerb runs `sudo -n xcvm-noderoot <verb> [args]` (via nodeRootRun/privCmd).
+func helperVerb(ctx context.Context, verb string, args ...string) error {
+	return nodeRootRun(ctx, noderootHelper, append([]string{verb}, args...)...)
+}
+
+// writeStage writes a helper staging file (as the agent user, 0600).
+func writeStage(name string, data []byte) error {
+	if err := os.MkdirAll(stageDir, 0o750); err != nil {
 		return err
 	}
-	return exec.CommandContext(ctx, "sudo", "-n", "chmod", fmt.Sprintf("%o", mode.Perm()), path).Run()
+	return os.WriteFile(filepath.Join(stageDir, name), data, 0o600)
 }
 
 // nodeRootRun runs one privileged command; a test seam. On a serve-only node the
@@ -101,10 +104,19 @@ var nodeRootSelfStopping = map[string]bool{
 func execNodeRoot(ctx context.Context, run nodeRootRunner, home, action string, args map[string]any) error {
 	switch action {
 	case "reboot":
+		if privEscalate {
+			return helperVerb(ctx, "reboot")
+		}
 		return run(ctx, "reboot")
 	case "stop_services":
+		if privEscalate {
+			return helperVerb(ctx, "service", "stop")
+		}
 		return run(ctx, "systemctl", "stop", "xc_vm")
 	case "restart_services":
+		if privEscalate {
+			return helperVerb(ctx, "service", "restart")
+		}
 		if err := run(ctx, "systemctl", "stop", "xc_vm"); err != nil {
 			return err
 		}
@@ -156,11 +168,18 @@ func ramdiskFstab(fstab string, enable bool) string {
 // unmounts STREAMS_PATH, and hands it back to xc_vm — a port of the
 // enable/disable_ramdisk cases. Serve-only has no DB, so the PHP state write is dropped.
 func setRamdisk(ctx context.Context, run nodeRootRunner, home string, enable bool) error {
+	if privEscalate { // the helper edits fstab, mounts and chowns itself
+		mode := "off"
+		if enable {
+			mode = "on"
+		}
+		return helperVerb(ctx, "ramdisk", mode)
+	}
 	cur, err := os.ReadFile(fstabPath)
 	if err != nil {
 		return err
 	}
-	if err := privWriteFile(ctx, fstabPath, []byte(ramdiskFstab(string(cur), enable)), 0o644); err != nil {
+	if err := os.WriteFile(fstabPath, []byte(ramdiskFstab(string(cur), enable)), 0o644); err != nil {
 		return err
 	}
 	streams := filepath.Join(home, "content/streams")
@@ -184,8 +203,14 @@ func setSysctl(ctx context.Context, run nodeRootRunner, args map[string]any) err
 	if cur, _ := os.ReadFile(sysctlPath); string(cur) == body {
 		return nil
 	}
+	if privEscalate { // the helper validates the staged body and applies it
+		if err := writeStage("sysctl.pending", []byte(body)); err != nil {
+			return err
+		}
+		return helperVerb(ctx, "sysctl")
+	}
 	_ = run(ctx, "modprobe", "ip_conntrack")
-	if err := privWriteFile(ctx, sysctlPath, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(sysctlPath, []byte(body), 0o644); err != nil {
 		return err
 	}
 	return run(ctx, "sysctl", "-p")
@@ -218,6 +243,9 @@ func setGovernor(ctx context.Context, run nodeRootRunner, args map[string]any) e
 	}
 	if cur, _ := nodeRootOutput(ctx, "cpufreq-info", "-p"); curGovernor(string(cur)) == gov {
 		return nil
+	}
+	if privEscalate { // the helper sets every core
+		return helperVerb(ctx, "governor", gov)
 	}
 	for i := 0; i < runtime.NumCPU(); i++ {
 		if err := run(ctx, "cpufreq-set", "-c", strconv.Itoa(i), "-g", gov); err != nil {

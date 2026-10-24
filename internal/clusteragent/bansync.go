@@ -40,11 +40,10 @@ const (
 )
 
 // banExec runs one ipset/iptables command (optional stdin) and returns its
-// combined output. A test seam. On a serve-only node the agent is xc_vm, so the
-// command is escalated with `sudo -n` (privCmd); as root it runs directly.
+// combined output. A test seam; the root path only (a non-root agent goes through
+// the xcvm-noderoot helper instead, see helperVerb).
 var banExec = func(ctx context.Context, stdin, name string, args ...string) ([]byte, error) {
-	n, a := privCmd(name, args)
-	cmd := exec.CommandContext(ctx, n, a...)
+	cmd := exec.CommandContext(ctx, name, args...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -81,8 +80,12 @@ func (a *Agent) flushBans(ctx context.Context) {
 	if !banHaveIpset() {
 		return
 	}
-	_, _ = banExec(ctx, "", "ipset", "flush", banSet4)
-	_, _ = banExec(ctx, "", "ipset", "flush", banSet6)
+	if privEscalate {
+		_ = helperVerb(ctx, "ban-flush")
+	} else {
+		_, _ = banExec(ctx, "", "ipset", "flush", banSet4)
+		_, _ = banExec(ctx, "", "ipset", "flush", banSet6)
+	}
 	if a.ReplicaDir != "" {
 		_ = os.Remove(filepath.Join(a.ReplicaDir, banMarkerName))
 	}
@@ -115,6 +118,13 @@ func (a *Agent) applyBanSets(ctx context.Context, ips []string) error {
 		} else {
 			want6 = append(want6, member)
 		}
+	}
+	if privEscalate { // plain list; the helper builds the restore and the rules
+		list := strings.Join(append(want4, want6...), "\n") + "\n"
+		if err := writeStage("bans.pending", []byte(list)); err != nil {
+			return err
+		}
+		return helperVerb(ctx, "ban-sync")
 	}
 	if err := applyBanFamily(ctx, banSet4, "inet", "iptables", want4); err != nil {
 		return err
