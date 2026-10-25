@@ -241,16 +241,41 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	// does not exist, so for a registered (serveable) stream we pass them and let
 	// the warmup branch below own the start in-process (serveLive → EnsureRunning;
 	// a genuinely broken stream then fails closed as a 503 retry, not a 502 defer
-	// to a backend that is gone). A non-serve-only node is unchanged.
+	// to a backend that is gone). A stream the node cannot source (not serveable)
+	// shows the not_on_air clip, as live.php's showNotOnAir does, instead of
+	// deferring to a backend that is gone. A non-serve-only node is unchanged.
+	//
+	// offAirServe is OffAirHandler::showVideoServer on a serve-only node: the
+	// off_air clip for a non-restreamer with show_<name>_video on and the file
+	// present, else a Deny the front renders (denyReason: STREAM_OFFLINE for
+	// not_on_air, the connected/2nd-IP refusal for connected). Only serve-only.
+	// "off-air-clip" is the reason the serve layer (server.go) renders as the
+	// video/mp2t clip — the arm the token-off_air path uses too. notOnAir /
+	// connectedClip are showNotOnAir and the USER_ALREADY_CONNECTED clip.
+	offAirServe := func(name, denyReason string) (Verdict, *Refresh) {
+		if !phpTruthy(ui["is_restreamer"]) && p.OffAir.Show[name] {
+			if path := offAirNamed(p, name); path != "" {
+				return Verdict{Action: Serve, Reason: "off-air-clip", Path: path}, nil
+			}
+		}
+		return reject(p, denyReason), nil
+	}
+	notOnAir := func() (Verdict, *Refresh) { return offAirServe("not_on_air", "not-on-air") }
 	warmable := p.ServeOnly && env.Serveable(r.Stream)
 	if !env.StreamAlive(r.Stream, ch["pid"]) {
 		if !warmable {
+			if p.ServeOnly {
+				return notOnAir()
+			}
 			return php("stream-down")
 		}
 		r.Warmup = true
 	}
 	if !env.OnDisk(r.Stream) {
 		if !warmable {
+			if p.ServeOnly {
+				return notOnAir()
+			}
 			return php("no-playlist")
 		}
 		r.Warmup = true
@@ -281,9 +306,11 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 	}
 	if applies2 && r.HMAC == "" && env.Oldest != nil {
 		// Serve-only: live.php's disallow_2nd_ip_con against the oldest open
-		// connection (an unanswering agent degrades to serving, as below).
+		// connection (an unanswering agent degrades to serving, as below). A second
+		// address shows the connected clip (live.php's USER_ALREADY_CONNECTED →
+		// showVideoServer show_connected_video), else the second-ip Deny.
 		if ip, found, answered := env.Oldest(r.UserID); answered && found && !ipMatch(ip, clientIP, p.IPSubnetMatch) {
-			return verdict(Deny, "second-ip"), nil
+			return offAirServe("connected", "second-ip")
 		}
 	}
 	codec, ok := phpString(t["video_codec"])
@@ -390,8 +417,12 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 			// Serve-only LB: a serveable idle stream is served-and-started (the
 			// serve path's attach starts a puller; a supervised transcode's encoder
 			// is already feeding the ingest) rather than deferred to a PHP backend
-			// that does not exist. An unknown stream still fails closed.
+			// that does not exist. A stream the node cannot source shows the
+			// not_on_air clip (showNotOnAir); a non-serve-only node still defers.
 			if !(p.ServeOnly && env.Serveable(r.Stream)) {
+				if p.ServeOnly {
+					return notOnAir()
+				}
 				return php("not-on-air")
 			}
 			r.Warmup = true
@@ -419,6 +450,11 @@ func JudgeLive(p *Policy, token, clientIP, rawUA string, now int64, env LiveEnv)
 		if p.ServeOnly && env.Serveable(r.Stream) {
 			r.Warmup = true
 			return Verdict{Action: Serve, Reason: "playlist-warmup", Stream: r.Stream, UUID: r.UUID}, r
+		}
+		// A stream the node cannot source shows the not_on_air clip (showNotOnAir);
+		// a non-serve-only node defers to the PHP backend.
+		if p.ServeOnly {
+			return notOnAir()
 		}
 		return php("not-on-air")
 	}
@@ -1276,19 +1312,40 @@ var offAirFiles = map[string][2]string{
 // off_air name (or VIDEO_PATH's file), else the token's own video_path; ""
 // when no such file exists.
 func offAirClip(p *Policy, t map[string]json.RawMessage) string {
-	path := ""
 	name, _ := jsonString(t["off_air"])
-	if f, ok := offAirFiles[name]; ok {
-		path = p.OffAir.Paths[f[0]]
-		if path == "" && p.OffAir.VideoPath != "" && exists(p.OffAir.VideoPath+f[1]) {
-			path = p.OffAir.VideoPath + f[1]
-		}
-	}
+	path := offAirPath(p, name)
 	if path == "" {
 		path, _ = jsonString(t["video_path"])
 	}
-	// ArtefactStage::offAirVideo: a custom path MAIN configured that is not on
-	// this node is MAIN's staged copy under VIDEO_PATH/cluster/.
+	return resolveClip(p, path)
+}
+
+// offAirNamed is offAirClip for an off_air name the gateway itself determines (no
+// token field): showNotOnAir's not_on_air clip, say. "" when the node has no such
+// file.
+func offAirNamed(p *Policy, name string) string {
+	return resolveClip(p, offAirPath(p, name))
+}
+
+// offAirPath is the configured or default clip for an off_air name, before the
+// staged-copy and existence resolution: the configured <name>_video_path, else
+// VIDEO_PATH/<file> when that is present; "" for an unknown name.
+func offAirPath(p *Policy, name string) string {
+	f, ok := offAirFiles[name]
+	if !ok {
+		return ""
+	}
+	path := p.OffAir.Paths[f[0]]
+	if path == "" && p.OffAir.VideoPath != "" && exists(p.OffAir.VideoPath+f[1]) {
+		path = p.OffAir.VideoPath + f[1]
+	}
+	return path
+}
+
+// resolveClip applies ArtefactStage::offAirVideo — a custom path MAIN configured
+// that is not on this node is MAIN's staged copy under VIDEO_PATH/cluster/ — and
+// returns the path only when the file is present on the node, else "".
+func resolveClip(p *Policy, path string) string {
 	if strings.HasPrefix(path, "/") && !exists(path) {
 		base := filepath.Base(path)
 		if stagedNameRe.MatchString(base) && strings.HasSuffix(path, "/"+base) && p.OffAir.VideoPath != "" {
