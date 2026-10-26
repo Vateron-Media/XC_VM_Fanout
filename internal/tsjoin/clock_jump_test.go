@@ -101,3 +101,43 @@ func TestACorruptAdaptationFieldCannotInjectAPCR(t *testing.T) {
 		t.Fatalf("the ring clock took a PCR (%d) from an adaptation field too short to carry one, want the last real PCR %d", s.lastPCR, last)
 	}
 }
+
+// TestAnOutageUnderMaxCadenceDoesNotWipeTheRing: a source that freezes for tens
+// of seconds (an upstream outage) and resumes with its clock still running opens
+// the next keyframe that many seconds ahead — a forward step well past the
+// cadence but still UNDER maxCadence, which the ring used to take at face value,
+// aging the whole window out in one Update and dropping every follower
+// (XC_VM_Fanout#130). The cadence-relative jump rule keeps the ring, like a jump
+// over maxCadence.
+func TestAnOutageUnderMaxCadenceDoesNotWipeTheRing(t *testing.T) {
+	s, last := jumpState(t, 41) // 1 s GOPs, 40 s ring, 6 s segments
+	gops, segs := len(s.gops), len(s.segs)
+
+	// One follower 20 s back in its history, one parked at the live edge.
+	_, back := s.JoinStart(nil, 20_000)
+	_, back, _, _, pin := s.ReadFrom(back, 1<<16)
+	s.Unpin(pin)
+	open := s.gops[len(s.gops)-1]
+	edge := Cursor{GOP: open.id, Off: len(open.data)}
+
+	// A 30 s outage: past the 40 s window's prebuffer, under maxCadence (60 s),
+	// 30× the 1 s cadence — the shape the old "d <= maxCadence" arm took at face value.
+	jump := last + 30*90000
+	s.Update(tsfixture.Concat(tsfixture.Fill(0x101), tsfixture.KeyframePCR(0x101, jump, jump)))
+
+	if n := len(s.gops); n < gops-1 {
+		t.Errorf("%d blocks left after a 30 s outage, want the %d s window kept (had %d)", n, 40, gops)
+	}
+	if n := len(s.segs); n < segs-1 {
+		t.Errorf("%d HLS segments left after a 30 s outage, want the window kept (had %d)", n, segs)
+	}
+	if s.HLSPlaylist() == "" {
+		t.Error("the HLS playlist went empty after a 30 s outage")
+	}
+	if _, _, _, behind, _ := s.ReadFrom(back, 1<<16); behind {
+		t.Error("a follower taking its history was dropped as behind by a 30 s outage")
+	}
+	if _, _, _, behind, _ := s.ReadFrom(edge, 1<<16); behind {
+		t.Error("a follower at the live edge was dropped as behind by a 30 s outage")
+	}
+}
