@@ -43,6 +43,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/redact"
@@ -589,6 +590,15 @@ func openUDP(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 //     pinned.
 func listenUDP(addr *net.UDPAddr, localaddr string) (*net.UDPConn, error) {
 	if addr.IP.IsMulticast() {
+		// IPv4: bind the GROUP address, not the wildcard net.ListenMulticastUDP
+		// binds. On a host where several multicast groups share one UDP port, a
+		// wildcard bind delivers every group's datagrams to every socket on that
+		// port, so two streams on the same port mix — one's bitrate climbs by the
+		// other's (XC_VM #442). Binding the group makes the kernel filter by
+		// destination, as ffmpeg's udp.c does. IPv6 keeps the stdlib path.
+		if addr.IP.To4() != nil {
+			return listenMulticastGroup4(addr, localaddr)
+		}
 		var ifi *net.Interface
 		if localaddr != "" {
 			var err error
@@ -614,6 +624,59 @@ func listenUDP(addr *net.UDPAddr, localaddr string) (*net.UDPConn, error) {
 		return nil, err // the original failure is the more specific one
 	}
 	return wild, nil
+}
+
+// listenMulticastGroup4 opens an IPv4 multicast socket BOUND TO THE GROUP address
+// — so the kernel filters delivery by destination and groups sharing a UDP port
+// do not mix (XC_VM #442) — and joins the group on the interface that carries
+// localaddr (the kernel's default multicast interface when localaddr is empty).
+// SO_REUSEADDR lets several readers share one group:port, as net.ListenMulticastUDP
+// did. net.ListenMulticastUDP cannot be used because the stdlib rewrites any
+// multicast bind address to the wildcard before binding (net/sock_posix.go).
+func listenMulticastGroup4(addr *net.UDPAddr, localaddr string) (*net.UDPConn, error) {
+	var iface net.IP
+	if localaddr != "" {
+		if iface = net.ParseIP(localaddr); iface == nil || iface.To4() == nil {
+			return nil, fmt.Errorf("%w: localaddr %q is not an ipv4 address", ErrUnsupportedSource, localaddr)
+		}
+	}
+	var group [4]byte
+	copy(group[:], addr.IP.To4())
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	if err != nil {
+		return nil, err
+	}
+	// Any failure from here must close the raw fd.
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Port: addr.Port, Addr: group}); err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	mreq := &syscall.IPMreq{Multiaddr: group}
+	if iface != nil {
+		copy(mreq.Interface[:], iface.To4())
+	}
+	if err := syscall.SetsockoptIPMreq(fd, syscall.IPPROTO_IP, syscall.IP_ADD_MEMBERSHIP, mreq); err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	// Hand the fd to net via an *os.File; net.FilePacketConn dups it, so close ours.
+	f := os.NewFile(uintptr(fd), "udp-multicast")
+	pc, err := net.FilePacketConn(f)
+	f.Close()
+	if err != nil {
+		return nil, err
+	}
+	conn, ok := pc.(*net.UDPConn)
+	if !ok {
+		pc.Close()
+		return nil, fmt.Errorf("%w: multicast socket is not a udp conn", ErrUnsupportedSource)
+	}
+	return conn, nil
 }
 
 // interfaceForIP resolves a localaddr to the interface that carries it, which is

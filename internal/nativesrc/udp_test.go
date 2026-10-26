@@ -159,3 +159,21 @@ func TestInterfaceForIPFindsTheLocalNIC(t *testing.T) {
 		t.Error("a localaddr that is not an address resolved anyway")
 	}
 }
+
+// TestUDPMulticastBindsTheGroupNotTheWildcard: two multicast groups sharing one
+// UDP port must not mix. net.ListenMulticastUDP binds the WILDCARD, so the kernel
+// delivers every group's datagrams to every socket on that port and a stream's
+// bitrate climbs by the other group's (XC_VM #442). Binding the group address
+// makes the kernel filter by destination — which is what ffmpeg's udp.c does.
+func TestUDPMulticastBindsTheGroupNotTheWildcard(t *testing.T) {
+	group := net.IPv4(239, 255, 77, 7)
+	port := freeUDPPort(t)
+	conn, err := listenUDP(&net.UDPAddr{IP: group, Port: port}, "")
+	if err != nil {
+		t.Skipf("this host cannot join a multicast group: %v", err)
+	}
+	defer conn.Close()
+	if ip := conn.LocalAddr().(*net.UDPAddr).IP; !ip.Equal(group) {
+		t.Fatalf("bound %s, want the group %s — a wildcard bind mixes groups that share a port", ip, group)
+	}
+}
