@@ -99,8 +99,10 @@ func TestUniqueCookieOnLive(t *testing.T) {
 		wantCode := http.StatusServiceUnavailable
 		if ready {
 			wantCode = 200
-			if seg.hits != 1 {
-				t.Fatalf("ready: handler hits %d", seg.hits)
+			// The ready warmup now tokenizes the playlist in-process (XC_VM_Fanout#128),
+			// so it no longer re-dispatches to the daemon's raw HLS handler.
+			if seg.hits != 0 {
+				t.Fatalf("ready: handler hits %d; want 0 (tokenized in-process)", seg.hits)
 			}
 		}
 		if rec.Code != wantCode {

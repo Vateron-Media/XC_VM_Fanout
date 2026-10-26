@@ -603,19 +603,20 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, p *Policy, re
 		}
 		if !ref.TS {
 			// HLS: EnsureRunning waited for data to flow, but the first segment may
-			// not be finalized yet. Wait (bounded) for the playlist to have segments,
-			// then route to fanout's own HLS handler to serve it; if it never
-			// finalizes, 503 Retry-After — uniform with the start timeout — rather
-			// than passing the handler's "no segments yet" 404 on to the client.
+			// not be finalized yet. Wait (bounded) for the playlist to have segments;
+			// if it never does, 503 Retry-After — uniform with the start timeout.
 			if !s.waitHLSPlaylist(strconv.Itoa(ref.Stream)) {
 				retryLater(w)
 				return ""
 			}
-			in := r.Clone(r.Context())
-			in.URL = &url.URL{Path: "/hls/" + strconv.Itoa(ref.Stream) + "/index.m3u8"}
-			in.RequestURI = in.URL.RequestURI()
-			s.segments.ServeHTTP(w, in)
-			return ""
+			// The playlist is ready: tokenize it in-process like the non-warmup path
+			// (fall through). The daemon's playlist names segments relatively
+			// ("<seq>.ts"), so proxying it raw made the player resolve them against
+			// /auth/<token> → /auth/<seq>.ts → 404. A puller-fed stream sets no pid
+			// and writes no <id>_.m3u8, so StreamAlive/OnDisk are false for its whole
+			// life and it ALWAYS takes this branch — not just while warming up
+			// (XC_VM_Fanout#128).
+			ref.Playlist = s.node.FedPlaylist(strconv.Itoa(ref.Stream))
 		}
 		// TS warmup: ready now — fall through to the TS serve arm (/live/<id>) below.
 	}

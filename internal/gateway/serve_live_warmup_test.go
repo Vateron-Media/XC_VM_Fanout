@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -64,14 +65,16 @@ func warmupAsk(s *Server) *httptest.ResponseRecorder {
 }
 
 // A serve-only LB serving a registered-but-idle HLS stream: the warmup branch
-// starts it via EnsureRunning, and once ready serves in-process (re-dispatch to
-// fanout's HLS handler) rather than deferring to a PHP backend that does not exist.
+// starts it via EnsureRunning and, once ready, serves the TOKENIZED playlist
+// in-process (as the non-warmup path does) rather than proxying the daemon's
+// raw playlist (relative segment names → 404 at the player, XC_VM_Fanout#128).
 func TestServeOnlyWarmupStartsAndServes(t *testing.T) {
 	dir, path, _ := warmupPolicy(t, "segments+playlist", true)
 	startProducer(t, filepath.Join(dir, "streams"))
 	seg := &recordingHandler{}
 	// The stream is idle at judge time (empty playlist → warmup), and its first
-	// segment has finalized by the time serveLive polls for readiness.
+	// segment has finalized (one relative "166.ts" line) by the time serveLive
+	// polls for readiness.
 	calls := 0
 	node := &fakeFiles{
 		serveable:     map[string]bool{"12": true},
@@ -81,7 +84,7 @@ func TestServeOnlyWarmupStartsAndServes(t *testing.T) {
 			if calls <= 1 {
 				return "" // judge sees an idle stream
 			}
-			return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n" // ready by serve time
+			return "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:4.0,\n166.ts\n"
 		},
 	}
 	s := NewServer(path, seg, node)
@@ -97,8 +100,26 @@ func TestServeOnlyWarmupStartsAndServes(t *testing.T) {
 	if node.ensureRunningIDs == nil || node.ensureRunningIDs[0] != "12" {
 		t.Fatalf("EnsureRunning called with %v; want [12]", node.ensureRunningIDs)
 	}
-	if seg.hits != 1 || seg.uri != "/hls/12/index.m3u8" {
-		t.Fatalf("re-dispatch to fanout HLS: hits %d uri %q", seg.hits, seg.uri)
+	assertTokenizedPlaylist(t, rec, seg)
+}
+
+// assertTokenizedPlaylist fails unless the response is a tokenized HLS playlist
+// served in-process: an x-mpegurl body with /hls/<token> lines and no relative
+// "<seq>.ts" name, and no re-dispatch to the daemon's raw HLS handler.
+func assertTokenizedPlaylist(t *testing.T, rec *httptest.ResponseRecorder, seg *recordingHandler) {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); ct != "application/x-mpegurl" {
+		t.Fatalf("Content-Type %q; want application/x-mpegurl", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "/hls/") {
+		t.Fatalf("playlist not tokenized (no /hls/ lines): %q", body)
+	}
+	if strings.Contains(body, "166.ts") {
+		t.Fatalf("playlist still carries the relative segment name: %q", body)
+	}
+	if seg.hits != 0 {
+		t.Fatalf("a tokenized warmup must not proxy the daemon's raw playlist (seg hits %d)", seg.hits)
 	}
 }
 
@@ -120,7 +141,7 @@ func TestServeOnlyColdStartStartsAndServes(t *testing.T) {
 			if calls <= 1 {
 				return "" // idle at judge time → warmup
 			}
-			return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n" // ready once started
+			return "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:4.0,\n166.ts\n" // ready once started
 		},
 	}
 	s := NewServer(path, seg, node)
@@ -136,9 +157,7 @@ func TestServeOnlyColdStartStartsAndServes(t *testing.T) {
 	if node.ensureRunningIDs == nil || node.ensureRunningIDs[0] != "12" {
 		t.Fatalf("EnsureRunning called with %v; want [12]", node.ensureRunningIDs)
 	}
-	if seg.hits != 1 || seg.uri != "/hls/12/index.m3u8" {
-		t.Fatalf("re-dispatch to fanout HLS: hits %d uri %q", seg.hits, seg.uri)
-	}
+	assertTokenizedPlaylist(t, rec, seg)
 }
 
 // A COLD stream on a node that is NOT serve-only still defers to PHP (the backend
