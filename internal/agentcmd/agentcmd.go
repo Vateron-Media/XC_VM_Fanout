@@ -340,6 +340,11 @@ func Main(version string) {
 		FfmpegRepo: ffmpegRepoFor(*serveOnly, *console, *ffmpegRepo), FfmpegChannel: *ffmpegChannel, FfmpegBinDir: *ffmpegBinDir,
 		CertbotWebroot: certbotWebrootFor(*serveOnly, *console, *certbotWebroot), CertbotBin: *certbotBin, CertbotBinPath: *certbotBinPath,
 		NodeHome: filepath.Dir(*console)}
+	if *serveOnly {
+		// PHP-free: no PHP watchdog writes local.json, so the agent reports the
+		// fanout daemon's status in local.fanout itself (XC_VM #478).
+		a.Telemetry = a.TelemetryWithFanout(sampler.Latest)
+	}
 	if nodeRootGoFor(*serveOnly, *console) {
 		// PHP-free: run the essential node.root commands in Go, and drop the rest
 		// (no console.php cluster:exec to hand anything to).

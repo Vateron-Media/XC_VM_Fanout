@@ -212,3 +212,32 @@ func TestProbeBinaryInvokesAgentVersion(t *testing.T) {
 		t.Fatal("a binary that does not run must give ok=false")
 	}
 }
+
+// healTarget: a newer release upgrades both binaries; when none is newer but the
+// fanout binary is MISSING (a serve-only install ships run.sh but not the daemon,
+// and the PHP fanout_binary updater is gone), install the fleet's release as the
+// fanout only; otherwise nothing. Regression for XC_VM #477.
+func TestHealTargetMissingFanout(t *testing.T) {
+	cases := []struct {
+		name           string
+		tags           []string
+		canary, server int64
+		pin, installed string
+		fanoutMissing  bool
+		wantTag        string
+		wantAgent      bool
+	}{
+		{"newer release upgrades both", []string{"0.15.9", "0.15.8"}, 0, 7, "", "0.15.8", false, "0.15.9", true},
+		{"newer release upgrades both even if also missing", []string{"0.15.9"}, 0, 7, "", "0.15.8", true, "0.15.9", true},
+		{"current + present: nothing", []string{"0.15.8"}, 0, 7, "", "0.15.8", false, "", false},
+		{"current + MISSING: install fleet release, fanout only", []string{"0.15.8"}, 0, 7, "", "0.15.8", true, "0.15.8", false},
+		{"canary holds + missing + no pin: nothing to install", []string{"0.15.9"}, 3, 7, "", "0.15.8", true, "", false},
+		{"no releases + missing: nothing", nil, 0, 7, "", "0.15.8", true, "", false},
+	}
+	for _, c := range cases {
+		tag, agent := healTarget(c.tags, c.canary, c.server, c.pin, c.installed, c.fanoutMissing)
+		if tag != c.wantTag || agent != c.wantAgent {
+			t.Errorf("%s: healTarget=%q/%v want %q/%v", c.name, tag, agent, c.wantTag, c.wantAgent)
+		}
+	}
+}
