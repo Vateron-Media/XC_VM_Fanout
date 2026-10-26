@@ -69,40 +69,28 @@ func certbotDomains(nodeJSONPath string) []string {
 	return out
 }
 
-// certbotSudo is the privilege prefix certbot runs under (certbot writes under
-// bin/certbot/, owned via the install's sudoers entry). Tests set it to "".
-var certbotSudo = "sudo"
+// certbotSudo is the privilege prefix the helper runs under ("sudo -n"; "" in
+// tests), and certbotHelper the root-owned xcvm-noderoot (XC_VM #473) that the
+// serve-only sudoers grants NOPASSWD. The helper carries certbot's
+// certonly/--webroot argv and the fixed bin/certbot + webroot paths, so
+// `sudo certbot` — which could run hooks as root — is never granted
+// (XC_VM_Fanout#129); the agent passes only the validated domains.
+var (
+	certbotSudo   = "sudo"
+	certbotHelper = noderootHelper
+)
 
-// certbotArgs is the argv after the certbot binary: the serve-only --webroot
-// branch of CertbotCommand, one -d per domain.
-func certbotArgs(binPath, webroot string, domains []string) []string {
-	bin := strings.TrimRight(binPath, "/") + "/"
-	args := []string{
-		"certonly",
-		"--config-dir", bin + "certbot/config",
-		"--work-dir", bin + "certbot/work",
-		"--logs-dir", bin + "certbot/logs",
-		"--agree-tos", "--expand", "--non-interactive", "--register-unsafely-without-email",
-		"--webroot", "-w", webroot,
-	}
-	for _, d := range domains {
-		args = append(args, "-d", d)
-	}
-	return args
-}
-
-// runCertbot execs `sudo <certbotBin> certonly --webroot …` (no shell; domains
-// are separate args, so a replica-sourced domain cannot inject). It returns
-// (true,nil) when a cert was obtained/renewed, (false,nil) when certbot reports
-// the cert is not yet due for renewal, and an error on any other non-zero exit.
-func runCertbot(ctx context.Context, certbotBin, binPath, webroot string, domains []string) (bool, error) {
-	args := certbotArgs(binPath, webroot, domains)
-	name := certbotBin
+// runCertbot runs `sudo -n xcvm-noderoot certbot <domain>…` and reads the
+// outcome from certbot's output (the helper passes it through): (true,nil) a
+// cert was obtained/renewed, (false,nil) not yet due for renewal, an error on
+// any other non-zero exit. Domains are separate args, and the helper rejects
+// any that are not a bare hostname, so a replica-sourced domain cannot inject.
+func runCertbot(ctx context.Context, domains []string) (bool, error) {
+	argv := append([]string{certbotHelper, "certbot"}, domains...)
 	if certbotSudo != "" {
-		name = certbotSudo
-		args = append([]string{certbotBin}, args...)
+		argv = append([]string{certbotSudo, "-n"}, argv...)
 	}
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
 	if err == nil {
 		return true, nil
 	}
@@ -222,7 +210,7 @@ func (a *Agent) certbotRefresh(ctx context.Context) error {
 	if len(domains) == 0 {
 		return nil
 	}
-	changed, err := runCertbot(ctx, a.CertbotBin, a.CertbotBinPath, a.CertbotWebroot, domains)
+	changed, err := runCertbot(ctx, domains)
 	if err != nil {
 		return err
 	}
