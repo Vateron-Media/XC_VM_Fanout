@@ -100,108 +100,14 @@ func runCertbot(ctx context.Context, domains []string) (bool, error) {
 	return false, fmt.Errorf("certbot: %w: %s", err, strings.TrimSpace(string(out)))
 }
 
-// certbotLiveDir resolves certbot's live dir for the primary domain:
-// <bin>/certbot/config/live/<primaryDomain>/ when present, else the live subdir
-// whose fullchain.pem is newest (certbot's -NNNN suffix on a domain-set change).
-// "" when none holds a fullchain.pem.
-func certbotLiveDir(binPath, primaryDomain string) string {
-	live := strings.TrimRight(binPath, "/") + "/certbot/config/live/"
-	if exact := live + primaryDomain + "/"; fileExists(exact + "fullchain.pem") {
-		return exact
-	}
-	ents, err := os.ReadDir(live)
-	if err != nil {
-		return ""
-	}
-	var best string
-	var bestMod time.Time
-	for _, e := range ents {
-		if !e.IsDir() {
-			continue
-		}
-		fi, err := os.Stat(live + e.Name() + "/fullchain.pem")
-		if err != nil {
-			continue
-		}
-		if best == "" || fi.ModTime().After(bestMod) {
-			best, bestMod = live+e.Name()+"/", fi.ModTime()
-		}
-	}
-	return best
-}
-
-// stageFrontFile writes data to an O_EXCL temp file in dir (os.CreateTemp, so a
-// local user cannot pre-plant a symlink for this process to follow) at mode, and
-// returns its path for the caller to rename into place.
-func stageFrontFile(dir string, data []byte, mode os.FileMode) (string, error) {
-	f, err := os.CreateTemp(dir, ".xc_cert_")
-	if err != nil {
-		return "", err
-	}
-	name := f.Name()
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(name)
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(name)
-		return "", err
-	}
-	if err := os.Chmod(name, mode); err != nil {
-		os.Remove(name)
-		return "", err
-	}
-	return name, nil
-}
-
-// syncFrontCert installs the certbot cert for primaryDomain as
-// <bin>/nginx/conf/server.{crt,key} (cert 0644, key 0600). Both are staged to
-// owner-only temp files, then the KEY is renamed in before the CERT — the front
-// reloads on the cert's mtime, so the matching key is always already present.
-// Any read/stage failure leaves the installed pair untouched. Ports
-// CertbotCommand::syncFrontCert.
-func syncFrontCert(binPath, primaryDomain string) error {
-	live := certbotLiveDir(binPath, primaryDomain)
-	if live == "" {
-		return fmt.Errorf("certbot: no live cert dir for %s", primaryDomain)
-	}
-	certData, err := os.ReadFile(live + "fullchain.pem")
-	if err != nil {
-		return err
-	}
-	keyData, err := os.ReadFile(live + "privkey.pem")
-	if err != nil {
-		return err
-	}
-	dir := strings.TrimRight(binPath, "/") + "/nginx/conf/"
-	crtTmp, err := stageFrontFile(dir, certData, 0o644)
-	if err != nil {
-		return err
-	}
-	keyTmp, err := stageFrontFile(dir, keyData, 0o600)
-	if err != nil {
-		os.Remove(crtTmp)
-		return err
-	}
-	if err := os.Rename(keyTmp, dir+"server.key"); err != nil {
-		os.Remove(crtTmp)
-		os.Remove(keyTmp)
-		return err
-	}
-	if err := os.Rename(crtTmp, dir+"server.crt"); err != nil {
-		os.Remove(crtTmp)
-		return err
-	}
-	return nil
-}
-
 // certbotEvery is how often a PHP-free node renews its cert; cron:certbot runs daily.
 var certbotEvery = 24 * time.Hour
 
 // certbotRefresh resolves the node's domains from the replica and, if any, runs
-// certbot; on a fresh/renewed cert it syncs it to the front. No domains (IP-only
-// node) or a not-due cert is a no-op.
+// certbot. The xcvm-noderoot helper (root) both issues the cert and installs it
+// as the front's bin/nginx/conf/server.{crt,key}: certbot's own state is
+// root-owned (/etc/letsencrypt), which the xc_vm agent cannot read, so the sync
+// happens in the helper, not here. No domains (IP-only node) is a no-op.
 func (a *Agent) certbotRefresh(ctx context.Context) error {
 	if a.CertbotWebroot == "" {
 		return nil
@@ -210,14 +116,8 @@ func (a *Agent) certbotRefresh(ctx context.Context) error {
 	if len(domains) == 0 {
 		return nil
 	}
-	changed, err := runCertbot(ctx, domains)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return nil
-	}
-	return syncFrontCert(a.CertbotBinPath, domains[0])
+	_, err := runCertbot(ctx, domains)
+	return err
 }
 
 // RunCertbot renews the node's cert once at start and then daily, only on a
