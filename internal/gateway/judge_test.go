@@ -437,3 +437,27 @@ func TestIPMatchIsThePanels(t *testing.T) {
 		}
 	}
 }
+
+// With allow_cdn_access=1 MAIN redirects a viewer to /auth/<stream_id>.<ext>
+// ?token=<T>; ParseURI must take the real token from the query (as a PHP+nginx
+// LB does, last token= wins), not the "<digits>.<ext>" path remainder. A plain
+// /auth/<token> and a query without token= are unchanged. Regression for
+// Vateron-Media/XC_VM_Fanout#127.
+func TestParseURICdnTokenShape(t *testing.T) {
+	cases := map[string][2]string{
+		"/auth/1090640.ts?token=REALTOK":   {"live", "REALTOK"},
+		"/auth/1090640.m3u8?token=REALTOK": {"live", "REALTOK"},
+		"/tsauth/55.ts?token=T2":           {"timeshift", "T2"},
+		"/auth/9.ts?token=A&token=B":       {"live", "B"},          // last wins, like $_GET
+		"/auth/9.ts?token=a%2Db":           {"live", "a-b"},        // URL-unescaped
+		"/auth/1090640.ts":                 {"live", "1090640.ts"}, // no query token: unchanged
+		"/auth/abc?token=T":                {"live", "abc"},        // not <digits>.<ext>: the path IS the token
+		"/key/abc?x=1":                     {"key", "abc"},         // query without token: unchanged
+		"/auth/9.ts?foo=1":                 {"live", "9.ts"},       // query without token: unchanged
+	}
+	for uri, want := range cases {
+		if k, tk := ParseURI(uri); k != want[0] || tk != want[1] {
+			t.Errorf("%q: got %q/%q; want %q/%q", uri, k, tk, want[0], want[1])
+		}
+	}
+}

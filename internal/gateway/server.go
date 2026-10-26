@@ -826,15 +826,61 @@ const notFoundPage = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<bo
 // "timeshift" for /tsauth/<token>) and its token, as nginx's server-level
 // rewrites read it; "" for anything else.
 func ParseURI(uri string) (kind, token string) {
+	path, query := uri, ""
 	if i := strings.IndexByte(uri, '?'); i >= 0 {
-		uri = uri[:i]
+		path, query = uri[:i], uri[i+1:]
 	}
 	for prefix, k := range map[string]string{"/hls/": "segment", "/key/": "key", "/auth/": "live", "/thauth/": "thumb", "/subauth/": "subtitle", "/vauth/": "vod", "/tsauth/": "timeshift"} {
-		if rest, ok := strings.CutPrefix(uri, prefix); ok && !strings.Contains(rest, "/") {
+		if rest, ok := strings.CutPrefix(path, prefix); ok && !strings.Contains(rest, "/") {
+			// allow_cdn_access=1: MAIN redirects a viewer to /auth/<stream_id>.<ext>
+			// ?token=<T> (and /tsauth/… the same). The path remainder is then
+			// "<digits>.<ext>", not a real token — the real token is the query's
+			// token=, as a PHP+nginx LB reads it ($_GET['token'], the last token=).
+			// Use the query token in that shape; a plain /auth/<token> is unchanged.
+			if streamDotExt(rest) {
+				if tok := lastQueryToken(query); tok != "" {
+					return k, tok
+				}
+			}
 			return k, rest
 		}
 	}
 	return "", ""
+}
+
+// streamDotExt reports whether a path remainder is "<digits>.<ext>" — the shape
+// MAIN emits with allow_cdn_access on, never a real (opaque base64url) token.
+func streamDotExt(s string) bool {
+	id, ext, ok := strings.Cut(s, ".")
+	if !ok || id == "" || ext == "" || strings.Contains(ext, ".") {
+		return false
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// lastQueryToken is the last token= value in a raw query (the one PHP's
+// $_GET['token'] keeps), URL-unescaped; "" when there is none.
+func lastQueryToken(query string) string {
+	tok, found := "", false
+	for query != "" {
+		var part string
+		part, query, _ = strings.Cut(query, "&")
+		if v, ok := strings.CutPrefix(part, "token="); ok {
+			tok, found = v, true
+		}
+	}
+	if !found {
+		return ""
+	}
+	if dec, err := url.QueryUnescape(tok); err == nil {
+		return dec
+	}
+	return tok
 }
 
 func (s *Server) count(key string, took time.Duration) {
