@@ -73,13 +73,18 @@ type hlsSeg struct {
 	disc bool
 }
 
+// maxPMTPackets bounds what a PMT PID may stage before a section completes, so a
+// PID that never completes one (corrupt stream) cannot grow lastPMT without end.
+const maxPMTPackets = 8
+
 // State accumulates join information from a packet-aligned byte stream.
 // It is not safe for concurrent use; the caller (Hub) serialises access.
 type State struct {
 	lastPAT  []byte                 // one 188-byte PAT packet, or nil
-	lastPMT  []byte                 // one 188-byte PMT packet, or nil
+	lastPMT  []byte                 // the whole PMT (one or more packets), or nil
 	pmtPID   int                    // PID carrying the PMT, or -1 if unknown
 	pmtAsm   tspes.SectionAssembler // folds a PMT section that spans several packets
+	pmtPkts  []byte                 // PMT packets staged until the section completes, then committed to lastPMT
 	videoPID int                    // PID carrying the video ES (for HLS segment PTS), or -1
 	audioPID int                    // PID carrying the audio ES, or -1 when the source has none
 	// videoType is the PMT stream_type of videoPID. It decides whether a PES
@@ -347,8 +352,21 @@ func (s *State) Update(chunk []byte) {
 		// is not a table, which is then the packet every join burst and every HLS
 		// segment starts with. Multi-packet PMTs are ordinary on DVB passthrough.
 		case s.pmtPID >= 0 && pid == s.pmtPID:
+			// Stage every packet of the PMT so the whole table — not just its
+			// opening (PUSI) packet — is re-emitted on the join header and at each
+			// HLS segment. A PMT too long for one packet continues in packets
+			// carrying no PUSI; caching only the PUSI packet re-emitted a truncated
+			// program map to every joining viewer on a multi-packet (DVB
+			// passthrough) source, so it could not resolve a PID that the
+			// continuation declared and never locked. lastPMT is committed only from
+			// a COMPLETE section (below), mirroring the segmenter (tsseg).
 			if pusi {
-				s.lastPMT = cloneInto(s.lastPMT, pkt)
+				s.pmtPkts = append(s.pmtPkts[:0], pkt...)
+			} else if len(s.pmtPkts) > 0 {
+				s.pmtPkts = append(s.pmtPkts, pkt...)
+			}
+			if len(s.pmtPkts) > maxPMTPackets*tspes.PacketSize {
+				s.pmtPkts = s.pmtPkts[:0] // a PID that never completes a section
 			}
 			// Decide only from a COMPLETE table. A PMT too long for one packet
 			// continues in packets carrying no PUSI, and reading either half as a
@@ -358,6 +376,8 @@ func (s *State) Update(chunk []byte) {
 			// than it has. The declarations below are mirrors of the table, so a
 			// half-read one withdraws streams the source is still sending.
 			if sec := s.pmtAsm.Feed(pkt); sec != nil {
+				s.lastPMT = append(s.lastPMT[:0], s.pmtPkts...)
+				s.pmtPkts = s.pmtPkts[:0]
 				if es, ok := tspes.PMTStreamsSection(sec); ok {
 					// The stream carries what its PMT says it carries, no more and
 					// no longer. Left sticky, "this stream has audio" outlived the
