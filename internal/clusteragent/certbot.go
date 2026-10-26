@@ -3,6 +3,7 @@ package clusteragent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,14 @@ import (
 	"strings"
 	"time"
 )
+
+// errHelperNoCertbot means the node's root helper predates the certbot verb: an
+// existing serve-only node whose agent self-healed to this version before its
+// helper was refreshed. The root-owned helper can only be rewritten by a
+// server:install from MAIN over SSH (never by the xc_vm agent — that is the
+// privilege boundary the helper exists to hold), so auto-TLS stays dormant and
+// the node keeps its current certificate until then. Not a failure.
+var errHelperNoCertbot = errors.New("node.root helper has no certbot verb")
 
 // Certbot orchestration (P3): a PHP-free serve-only node issues/renews its own
 // TLS cert. The agent resolves its domains from the replica, execs the kept
@@ -97,6 +106,9 @@ func runCertbot(ctx context.Context, domains []string) (bool, error) {
 	if strings.Contains(strings.ToLower(string(out)), "not yet due for renewal") {
 		return false, nil
 	}
+	if strings.Contains(strings.ToLower(string(out)), "unknown verb") {
+		return false, errHelperNoCertbot
+	}
 	return false, fmt.Errorf("certbot: %w: %s", err, strings.TrimSpace(string(out)))
 }
 
@@ -116,8 +128,17 @@ func (a *Agent) certbotRefresh(ctx context.Context) error {
 	if len(domains) == 0 {
 		return nil
 	}
-	_, err := runCertbot(ctx, domains)
-	return err
+	if _, err := runCertbot(ctx, domains); err != nil {
+		if errors.Is(err, errHelperNoCertbot) {
+			// An existing node updated ahead of its helper: degrade to the
+			// pre-feature state (keep the current cert) instead of erroring, and
+			// say what refreshes the helper. server:install from MAIN restores it.
+			a.logf("cluster: certbot: node.root helper has no certbot verb yet — re-run server:install from MAIN to enable auto-TLS; keeping the current certificate")
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // RunCertbot renews the node's cert once at start and then daily, only on a

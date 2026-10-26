@@ -2,6 +2,7 @@ package clusteragent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -70,6 +71,37 @@ func TestRunCertbotOutcomes(t *testing.T) {
 	certbotHelper = fail
 	if _, err := runCertbot(ctx, []string{"a.example"}); err == nil {
 		t.Fatal("other non-zero exit must be an error")
+	}
+
+	// An existing node whose helper predates the certbot verb: `unknown verb` is
+	// reported distinctly so the agent degrades to keeping its current cert
+	// instead of logging a hard failure every cycle.
+	oldVerb := filepath.Join(dir, "helper_oldverb")
+	os.WriteFile(oldVerb, []byte("#!/bin/sh\necho 'xcvm-noderoot: unknown verb' >&2\nexit 1\n"), 0o755)
+	certbotHelper = oldVerb
+	if _, err := runCertbot(ctx, []string{"a.example"}); !errors.Is(err, errHelperNoCertbot) {
+		t.Fatalf("an old helper (unknown verb) must be errHelperNoCertbot, got %v", err)
+	}
+}
+
+// certbotRefresh degrades quietly when the helper has no certbot verb: no error
+// bubbles up (the node keeps its current certificate until a server:install
+// refreshes the root helper).
+func TestCertbotRefreshSkipsAnOldHelper(t *testing.T) {
+	dir := t.TempDir()
+	oldSudo, oldHelper := certbotSudo, certbotHelper
+	certbotSudo = ""
+	defer func() { certbotSudo, certbotHelper = oldSudo, oldHelper }()
+
+	oldVerb := filepath.Join(dir, "helper_oldverb")
+	os.WriteFile(oldVerb, []byte("#!/bin/sh\necho 'xcvm-noderoot: unknown verb' >&2\nexit 1\n"), 0o755)
+	certbotHelper = oldVerb
+
+	node := filepath.Join(dir, "node.json")
+	os.WriteFile(node, []byte(`{"data":{"domain_name":"lb1.example.com"}}`), 0o644)
+	a := &Agent{CertbotWebroot: "/home/xc_vm/certbot-webroot", ReplicaDir: dir}
+	if err := a.certbotRefresh(context.Background()); err != nil {
+		t.Fatalf("an old helper must not surface as an error, got %v", err)
 	}
 }
 
