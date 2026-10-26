@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -285,6 +286,23 @@ func targetRelease(tags []string, canary, server int64, pin, installed string) s
 	return tag
 }
 
+// healTarget is the full self-heal decision: the tag to install and whether to
+// re-stage the agent's own binary too. A newer release is an upgrade — install
+// both. Otherwise, if the fanout binary is MISSING (a serve-only install ships
+// bin/xc_fanout/run.sh but not the daemon, and the PHP fanout_binary updater is
+// gone, so the version gate would leave the node daemon-less forever), install
+// the fleet's current release as the fanout only — the agent is current, so it
+// is not re-trialed. "" tag means nothing to do.
+func healTarget(tags []string, canary, server int64, pin, installed string, fanoutMissing bool) (tag string, alsoAgent bool) {
+	if up := targetRelease(tags, canary, server, pin, installed); up != "" {
+		return up, true
+	}
+	if fanoutMissing {
+		return releaseFor(tags, canary, server, pin), false
+	}
+	return "", false
+}
+
 // SelfHealEvery is how often a serve-only node checks for a newer binary (the
 // root_signals fanout_binary cadence it replaces).
 var SelfHealEvery = time.Hour
@@ -320,7 +338,8 @@ func (a *Agent) selfHeal(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	tag := targetRelease(tags, canary, serverID, pin, a.Version)
+	_, statErr := os.Stat(a.node.binary)
+	tag, alsoAgent := healTarget(tags, canary, serverID, pin, a.Version, errors.Is(statErr, os.ErrNotExist))
 	if tag == "" {
 		return nil
 	}
@@ -351,6 +370,13 @@ func (a *Agent) selfHeal(ctx context.Context) error {
 	}
 	if err := installFanout(fdir, fnew); err != nil {
 		return err
+	}
+	// Only a real upgrade re-stages the agent's own binary (run.sh trial). A
+	// missing-fanout-only heal leaves the current agent alone — run.sh respawns
+	// the fanout it just placed.
+	if !alsoAgent {
+		a.logf("cluster: self-heal: installed the missing fanout binary %s", tag)
+		return nil
 	}
 	anew := filepath.Dir(self) + "/.xc_agent.new"
 	if err := linkOrCopy(tmp, anew); err != nil {
