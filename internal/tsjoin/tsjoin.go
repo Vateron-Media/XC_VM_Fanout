@@ -514,6 +514,17 @@ func (s *State) ringClock() int64 {
 	switch {
 	case d < 0:
 		d = s.clockStep // a discontinuity: carry on at the last known cadence
+	case s.clockStep > 0 && d > 2*s.clockStep+s.hlsTargetMS*pcrHz:
+		// A forward step far outside the cadence — INCLUDING one still under
+		// maxCadence — is a timeline jump (a source that froze during an outage
+		// and resumed with its clock running), not time passing. Taken at face
+		// value it aged the ring by the whole outage in one Update: with an
+		// outage past the window every GOP pruned at once and every follower was
+		// dropped as behind (XC_VM_Fanout#130). hlsOnKeyframe already reads a
+		// step this far outside the cadence as a jump; the ring now agrees. (A
+		// stream with no known cadence yet, clockStep == 0, still takes a forward
+		// step in full, below — that is what keeps keyframe-less radio moving.)
+		d = s.clockStep
 	case d <= maxCadence:
 		if d > 0 {
 			s.clockStep = d
