@@ -118,7 +118,7 @@ func NewRegistry(snap string, emit func([]map[string]any) error, logf func(strin
 		var saved map[string]map[string]any
 		if json.Unmarshal(b, &saved) == nil {
 			for k, v := range saved {
-				if connUUID.MatchString(k) {
+				if connUUID.MatchString(k) && !endedTS(v) {
 					r.conns[k] = v
 					// A restart is not a read, but it gives every viewer a
 					// full HLSReapAfter to show up again.
@@ -151,6 +151,12 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 			if p2 {
 				r.pending[uuid] = intOf(rec["hls_last_read"])
 			}
+		}
+		if endedTS(rec) {
+			delete(r.conns, uuid)
+			r.forgetLocked(uuid)
+			r.dirty = true
+			return
 		}
 		r.conns[uuid] = rec
 		r.dirty = true
@@ -380,7 +386,7 @@ func (r *Registry) emitThenLocked(events []map[string]any, apply func()) error {
 func (r *Registry) Close(uuid string, remove bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if remove {
+	if remove || fmt.Sprint(r.conns[uuid]["container"]) == "ts" {
 		delete(r.conns, uuid)
 		r.forgetLocked(uuid)
 	} else if c := r.conns[uuid]; c != nil {
@@ -494,7 +500,7 @@ func (r *Registry) Seed(records []map[string]any, reset bool) int {
 	n := 0
 	for _, c := range records {
 		uuid, _ := c["uuid"].(string)
-		if c == nil || !connUUID.MatchString(uuid) {
+		if c == nil || !connUUID.MatchString(uuid) || endedTS(c) {
 			continue
 		}
 		r.conns[uuid] = c
@@ -504,6 +510,15 @@ func (r *Registry) Seed(records []map[string]any, reset bool) int {
 	}
 	r.dirty = true
 	return n
+}
+
+// endedTS identifies a finished TS request. Unlike an HLS session, it has
+// no later playlist request that needs its ended record. MAIN already received
+// the close through Put's event (or decided it through Close); keeping these
+// records forever makes the registry's locked scans and snapshots grow with
+// historical traffic rather than the number of viewers.
+func endedTS(c map[string]any) bool {
+	return fmt.Sprint(c["container"]) == "ts" && num(c["hls_end"]) != 0
 }
 
 // Save writes the snapshot when something changed (written aside, synced, renamed in).
