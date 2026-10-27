@@ -8,7 +8,7 @@ One process pulls each live source **once** and fans it out to many viewers thro
 keeping PHP out of the byte path and producing HLS (incl. AES-128) **entirely in memory**.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-lightgrey.svg)](#installation)
 [![Release](https://img.shields.io/github/v/release/Vateron-Media/XC_VM_Fanout?sort=semver)](https://github.com/Vateron-Media/XC_VM_Fanout/releases)
 [![Static binary](https://img.shields.io/badge/build-static-success.svg)](#build-from-source)
@@ -41,6 +41,7 @@ of network and memory, not of worker count.
 - **Bounded memory** — a soft `GOMEMLIMIT` derived from the cgroup or host budget, plus periodic idle-heap scavenging back to the OS.
 - **Encoder supervision, if you want it** — one supervisor per node can start, watch and restart stream encoders, judging health from the bytes it is already fanning out and failing over between sources. Off until you turn it on.
 - **Single static binary** — pure Go, `CGO_ENABLED=0`; one self-contained binary per architecture runs on any Linux distro.
+- **One binary for a whole LB node** — the same source also builds `xc_agent` (an LB node's end of the XC_VM cluster API) and `xc_node`, which packs the fan-out daemon *and* the agent into one executable that picks its role from the name it is run under. A **serve-only** node runs `xc_node` alone as its entire data **and** control surface: the front (`-front`) is the sole HTTP listener, so nginx and PHP drop out of the path.
 
 ## How it works
 
@@ -83,14 +84,31 @@ Prebuilt targets: `linux/amd64`, `linux/arm64`, `linux/armv7`, `linux/386`.
 
 ## Usage
 
+The project ships three binaries from one source tree:
+
+| Binary      | Role                                                                                                                              |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `xc_fanout` | The live-stream fan-out daemon (everything above).                                                                                |
+| `xc_agent`  | An LB node's end of the XC_VM cluster API (MAIN ↔ LB): `run`, `health`, `keygen`, `probe`, `install`, `enrol`, `lease`, `version`. |
+| `xc_node`   | Both of the above in **one static binary**. It runs the fan-out daemon or the agent depending on the name it is invoked under (any name containing `xc_fanout` / `xc_agent`), or on an explicit leading subcommand — `xc_node fanout …`, `xc_node agent …`. This is what a serve-only LB node installs. |
+
 ```bash
-# Run the daemon (paths shown are the defaults)
+# Run the fan-out daemon (paths shown are the defaults)
 xc_fanout -sock /home/xc_vm/bin/xc_fanout/sockets/http.sock \
           -ctl  /home/xc_vm/bin/xc_fanout/sockets/control.sock
 
 xc_fanout -version      # print version + attribution
 xc_fanout -h            # full flag reference
+
+# Same daemon via the merged binary
+xc_node fanout -sock … -ctl …
+xc_node agent  run      # the cluster agent
 ```
+
+On a **serve-only** node the front replaces nginx: `-front` makes the daemon the sole HTTP
+listener (viewer ports from `-front-ports-http`/`-https`), and `-front-agent-sock` proxies the
+owner-side paths (e.g. `/xfile`) to the agent. Without `-front` the daemon keeps its unix-socket
+surfaces and nginx serves — the classic layout above.
 
 **Native remux sub-command** — the in-process equivalent of a copy-only `ffmpeg`, which the
 panel runs under the daemon's supervisor in place of a per-stream `ffmpeg`:
@@ -128,12 +146,14 @@ Design decisions are recorded as ADRs in [`docs/adr/`](docs/adr/).
 Pure Go, no external module dependencies — only the standard library.
 
 ```bash
-go build ./cmd/xc_fanout          # local build
-./release.sh                      # all target arches → dist/* + SHA256SUMS (+ LICENSE/NOTICE)
+go build ./cmd/xc_fanout          # the fan-out daemon
+go build ./cmd/xc_agent           # the cluster agent
+go build ./cmd/xc_node            # the merged single binary
+./release.sh                      # all three × all arches → dist/* + SHA256SUMS (+ LICENSE/NOTICE)
 ```
 
-`release.sh` builds a **static** binary (`CGO_ENABLED=0`, `-trimpath`) for every target
-architecture and aborts if any output is not fully statically linked. Requires **Go ≥ 1.21**.
+`release.sh` builds all three as **static** binaries (`CGO_ENABLED=0`, `-trimpath`) for every
+target architecture and aborts if any output is not fully statically linked. Requires **Go ≥ 1.23**.
 
 ## Testing
 
