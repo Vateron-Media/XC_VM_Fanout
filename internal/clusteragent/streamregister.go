@@ -184,7 +184,7 @@ func (a *Agent) superviseStream(ctx context.Context, id int64, spec json.RawMess
 	if err != nil {
 		return err
 	}
-	resolved, err := resolveSpec(spec, a.node, sock)
+	resolved, err := resolveSpec(spec, a.configuredNode(), sock)
 	if err != nil {
 		return err // fail closed: never hand a half-resolved spec to the supervisor
 	}
@@ -326,7 +326,7 @@ func (a *Agent) seedFanoutRecord(id int64, recordJSON []byte) {
 		return
 	}
 	if d, ok := parseRuntimeDirective(recordJSON); ok {
-		if body, reg := d.registerBody(a.FfmpegBin); reg {
+		if body, reg := d.registerBody(a.configuredNode().ffmpegCpu); reg {
 			a.releaseSupervision(id) // a flip transcode->proxy: stop the encoder
 			if err := a.registerStream(context.Background(), id, body); err != nil {
 				a.logf("cluster: fanout register stream %d: %v", id, err)
@@ -437,6 +437,7 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 	// and re-apply all: a transcode re-PUT makes the supervisor adopt the encoder
 	// that outlived the daemon rather than leaving it unwatched.
 	a.supervisedSpec = nil
+	node := a.configuredNode()
 	for _, id := range heldStreams(a.ReplicaDir) {
 		recordJSON, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), strconv.FormatInt(id, 10)+".json"))
 		if err != nil {
@@ -446,7 +447,7 @@ func (a *Agent) seedHeldProxies(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		if body, reg := d.registerBody(a.FfmpegBin); reg {
+		if body, reg := d.registerBody(node.ffmpegCpu); reg {
 			if err := a.registerStream(ctx, id, body); err != nil {
 				a.logf("cluster: fanout re-seed stream %d: %v", id, err)
 			}
@@ -555,13 +556,14 @@ func (a *Agent) reconcileFanout(ctx context.Context) {
 	defer a.streamsMu.Unlock()
 
 	want := map[int64]streamRegisterBody{}
+	node := a.configuredNode()
 	for _, id := range heldStreams(a.ReplicaDir) {
 		recordJSON, err := os.ReadFile(filepath.Join(streamsDir(a.ReplicaDir), strconv.FormatInt(id, 10)+".json"))
 		if err != nil {
 			continue
 		}
 		if d, ok := parseRuntimeDirective(recordJSON); ok {
-			if body, reg := d.registerBody(a.FfmpegBin); reg {
+			if body, reg := d.registerBody(node.ffmpegCpu); reg {
 				want[id] = body
 			} else if d.Kind == "loopback" {
 				// A loopback is a /streams puller registration too, so the reconcile

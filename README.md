@@ -155,6 +155,27 @@ go build ./cmd/xc_node            # the merged single binary
 `release.sh` builds all three as **static** binaries (`CGO_ENABLED=0`, `-trimpath`) for every
 target architecture and aborts if any output is not fully statically linked. Requires **Go ≥ 1.23**.
 
+### External FFmpeg selection on a single-binary node
+
+`xc_node` combines the agent and fanout; FFmpeg itself remains an external
+executable. On a serve-only node the agent resolves `ffmpeg_cpu` and
+`ffmpeg_gpu` from the replicated settings when registering a proxy or handing
+an encoder to the supervisor. Both FFmpeg and FFprobe come from the selected
+CPU build; a distinct GPU selection is resolved separately. Custom build
+folders such as `bin/ffmpeg_bin/4.1-sc/` are supported. The current XC_VM
+settings columns allow eight characters: keep the build ID within that limit
+so the panel can store the complete selection. Install the build on
+MAIN and every affected node before selecting it. Missing builds fall back to
+the same minor/major, then (CPU/probe only) the newest installed build, matching
+the panel's resolver. GPU falls back to the resolved CPU build when its major
+is unavailable. Launcher flags remain the fallback before the replica arrives.
+
+This selection applies when the stream actually needs an external FFmpeg
+process. Direct MPEG-TS forwarding and native Go remux do not launch FFmpeg;
+changing the FFmpeg version does not force those routes to use it. A change is
+read when the next stream registration/spec is applied; it does not restart
+all running producers automatically.
+
 ## Testing
 
 ```bash
