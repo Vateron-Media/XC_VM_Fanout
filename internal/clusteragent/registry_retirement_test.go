@@ -96,3 +96,28 @@ func TestLegacyWorkerReopenRotatesRetirementTokenInSameSecond(t *testing.T) {
 		t.Fatal("same-second reopen reused retirement token")
 	}
 }
+
+func TestReopenWithTokenReadBeforeCloseGetsANewGeneration(t *testing.T) {
+	r, _, _ := newTestRegistry(t)
+	stale := rec(7, "x", 100, 100)
+	stale["retire_token"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := r.Put("same", clone(stale)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close("same", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Put("same", clone(stale)); err != nil {
+		t.Fatal(err)
+	}
+	fresh := r.Get("same")
+	if fresh["retire_token"] == stale["retire_token"] {
+		t.Fatal("reopened retired generation reused a stale token")
+	}
+	if err := r.Close("retire_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true); err != nil {
+		t.Fatal(err)
+	}
+	if r.Get("same") == nil {
+		t.Fatal("old retirement removed fresh lifecycle")
+	}
+}

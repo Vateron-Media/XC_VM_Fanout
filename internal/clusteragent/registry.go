@@ -144,9 +144,12 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 	r.mu.Lock()
 	old := r.conns[uuid]
 	provided, _ := rec["retire_token"].(string)
-	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(provided) {
-		previous, _ := old["retire_token"].(string)
-		if previous != "" && num(old["date_start"]) == num(rec["date_start"]) && !(num(old["hls_end"]) != 0 && num(rec["hls_end"]) == 0) {
+	previous, _ := old["retire_token"].(string)
+	reopened := num(old["hls_end"]) != 0 && num(rec["hls_end"]) == 0
+	// A PHP request may have read the open record just before the reaper
+	// ended it. Its valid but old token must not reopen the retired generation.
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(provided) || (reopened && provided == previous) {
+		if previous != "" && num(old["date_start"]) == num(rec["date_start"]) && !reopened {
 			rec["retire_token"] = previous
 		} else {
 			var value [16]byte
