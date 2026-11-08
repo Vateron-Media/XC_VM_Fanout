@@ -2,9 +2,12 @@ package clusteragent
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -103,6 +106,9 @@ type Registry struct {
 	// never.
 	P2 func() bool
 
+	// RetirementMarker removes markers while the lifecycle lock is held.
+	RetirementMarker func(map[string]any) error
+
 	// Admit decides a PUT that carries an X-XCVM-Admission header
 	// (admission.go): "" admits, anything else is the refusal's reason. nil
 	// admits every viewer.
@@ -137,6 +143,23 @@ func (r *Registry) Put(uuid string, rec map[string]any) error {
 	rec["uuid"] = uuid
 	r.mu.Lock()
 	old := r.conns[uuid]
+	provided, _ := rec["retire_token"].(string)
+	previous, _ := old["retire_token"].(string)
+	reopened := num(old["hls_end"]) != 0 && num(rec["hls_end"]) == 0
+	// A PHP request may have read the open record just before the reaper
+	// ended it. Its valid but old token must not reopen the retired generation.
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(provided) || (reopened && provided == previous) {
+		if previous != "" && num(old["date_start"]) == num(rec["date_start"]) && !reopened {
+			rec["retire_token"] = previous
+		} else {
+			var value [16]byte
+			if _, err := cryptorand.Read(value[:]); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+			rec["retire_token"] = hex.EncodeToString(value[:])
+		}
+	}
 	touchOnly := old != nil && sameBut(old, rec, "hls_last_read")
 	p2 := touchOnly && r.P2 != nil && r.P2()
 	send := !p2 && (old == nil || !touchOnly || r.now().Sub(r.sentAt[uuid]) >= TouchEvery)
@@ -383,7 +406,11 @@ func (r *Registry) emitThenLocked(events []map[string]any, apply func()) error {
 
 // Close applies a close MAIN decided: removed, or ended (an HLS viewer's
 // hls_end = 1, as MAIN's own store now says). No event goes back.
-func (r *Registry) Close(uuid string, remove bool) {
+func (r *Registry) Close(uuid string, remove bool) error {
+	if strings.HasPrefix(uuid, "retire_") && len(uuid) == 39 {
+		_, err := r.Retire(strings.TrimPrefix(uuid, "retire_"))
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if remove || fmt.Sprint(r.conns[uuid]["container"]) == "ts" {
@@ -394,6 +421,47 @@ func (r *Registry) Close(uuid string, remove bool) {
 		delete(r.pending, uuid)
 	}
 	r.dirty = true
+	return nil
+}
+
+// Retire applies an ended lifecycle's opaque ticket. Reusing a UUID, even in
+// the same second, creates a different token; delayed commands cannot remove it.
+func (r *Registry) Retire(token string) (bool, error) {
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(token) {
+		return false, errors.New("invalid retirement ticket")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for uuid, rec := range r.conns {
+		if rec["retire_token"] != token || num(rec["hls_end"]) == 0 {
+			continue
+		}
+		if r.RetirementMarker != nil {
+			if err := r.RetirementMarker(clone(rec)); err != nil {
+				return false, err
+			}
+		}
+		delete(r.conns, uuid)
+		r.forgetLocked(uuid)
+		r.dirty = true
+		return true, nil
+	}
+	return false, nil
+}
+
+// EnsureRetirementTokens mirrors generations for records restored from an older
+// agent. A spool failure leaves the record unchanged and is retried later.
+func (r *Registry) EnsureRetirementTokens() error {
+	for _, rec := range r.Records() {
+		if token, ok := rec["retire_token"].(string); ok && regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(token) {
+			continue
+		}
+		uuid, _ := rec["uuid"].(string)
+		if err := r.Put(uuid, rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ConnDigest is a node's open connections in one short value; MAIN computes
@@ -688,7 +756,10 @@ func (r *Registry) connHandler(w http.ResponseWriter, req *http.Request) {
 		// A close the node's PHP made in MAIN's store itself (its reaper, its
 		// own kick): the registry follows, with no event.
 		remove, _ := body["remove"].(bool)
-		r.Close(strings.TrimSuffix(path, "/close"), remove)
+		if err := r.Close(strings.TrimSuffix(path, "/close"), remove); err != nil {
+			http.Error(w, "retirement marker unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case req.Method == http.MethodPost && strings.HasSuffix(path, "/touch") && connUUID.MatchString(strings.TrimSuffix(path, "/touch")):
 		reply(r.Touch(strings.TrimSuffix(path, "/touch"), body["hls_last_read"]))

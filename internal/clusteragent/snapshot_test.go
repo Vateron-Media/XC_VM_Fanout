@@ -50,11 +50,16 @@ func TestSeedLoadsRecordsWithoutEvents(t *testing.T) {
 	if d := r.Digest(); d.Count != 2 || d.Users != 2 {
 		t.Fatalf("digest after seed %+v", d)
 	}
-	// A seed touch is not re-sent to MAIN as a change: MAIN holds it already.
+	// An older seed gains a retirement token on its first write; MAIN must
+	// receive that generation once, then unchanged touches remain suppressed.
 	c := r.Get("s1")
 	r.Put("s1", c)
-	if len(s.events) != n {
-		t.Fatalf("an unchanged seeded record was mirrored: %s", s.types())
+	if len(s.events) != n+1 {
+		t.Fatalf("seed retirement generation was not mirrored: %s", s.types())
+	}
+	r.Put("s1", r.Get("s1"))
+	if len(s.events) != n+1 {
+		t.Fatal("unchanged generated record mirrored twice")
 	}
 }
 

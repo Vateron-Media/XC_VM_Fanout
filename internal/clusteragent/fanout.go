@@ -307,7 +307,9 @@ func (a *Agent) localExec(next Executor) Executor {
 				return false, []byte("refused: bad uuid")
 			}
 			remove, _ := cmd.Args["remove"].(bool)
-			a.Registry.Close(uuid, remove)
+			if err := a.Registry.Close(uuid, remove); err != nil {
+				return false, []byte(err.Error())
+			}
 			return true, []byte(`{"result":true}`)
 		}
 		if cmd.Type != "conn.drop" || a.FanoutCtl == "" {

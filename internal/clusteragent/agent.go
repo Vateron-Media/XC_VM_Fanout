@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -278,7 +279,7 @@ type Reply struct {
 
 // Features are what this agent tells MAIN at hello that it does, so MAIN
 // stands down its own copy: "hls_reaper" (Registry.Reap).
-var Features = []string{"hls_reaper"}
+var Features = []string{"hls_reaper", "retire_fence"}
 
 // FeatureConfigChanged, said at hello by an agent that keeps the replica and
 // runs MAIN's commands, has MAIN send it config.changed (replica.go); an
@@ -658,11 +659,6 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		backoff = min(backoff*2, time.Minute)
 	}
-	if a.run != nil {
-		cctx, stopCommands := context.WithCancel(ctx)
-		defer stopCommands()
-		a.goBg(func() { a.RunCommands(cctx, a.run) })
-	}
 	if a.run != nil && a.ArtefactDir != "" {
 		// Stopped and waited for on return: a download writes beside the state.
 		actx, stopArtefacts := context.WithCancel(ctx)
@@ -679,13 +675,39 @@ func (a *Agent) Run(ctx context.Context) error {
 		spool := a.SpoolDir
 		a.Registry = NewRegistry(filepath.Join(filepath.Dir(spool), "registry.snap"), func(ev []map[string]any) error { return spoolP0(spool, ev) }, a.logf)
 	}
+	if a.Registry != nil && a.NodeHome != "" {
+		a.Registry.RetirementMarker = func(rec map[string]any) error {
+			uuid, _ := rec["uuid"].(string)
+			if !connUUID.MatchString(uuid) {
+				return fmt.Errorf("invalid marker uuid")
+			}
+			root := filepath.Join(a.NodeHome, "tmp", "cons")
+			if err := os.Remove(filepath.Join(root, uuid)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if sid := intOf(rec["stream_id"]); sid > 0 {
+				if err := os.Remove(filepath.Join(root, strconv.FormatInt(sid, 10), uuid)); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+			return nil
+		}
+	}
 	if a.Registry != nil && a.Registry.Admit == nil {
 		a.Registry.Admit = a.admit
 	}
 	if a.Registry != nil && a.Registry.P2 == nil {
 		a.Registry.P2 = a.p2Touch.Load
 	}
+	if a.run != nil {
+		cctx, stopCommands := context.WithCancel(ctx)
+		defer stopCommands()
+		a.goBg(func() { a.RunCommands(cctx, a.run) })
+	}
 	if a.Registry != nil {
+		if err := a.Registry.EnsureRetirementTokens(); err != nil {
+			a.logf("retirement tokens: %v", err)
+		}
 		// What registry.snap restored, checked against what still serves it.
 		go a.RebuildRegistry(ctx)
 	}

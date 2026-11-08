@@ -305,17 +305,17 @@ func TestConfigChangedSyncsAtOnceAndAcks(t *testing.T) {
 		return false, nil
 	}}
 	// streams: the agent keeps the R2 streams section (streams.go).
-	if f := a.features(); strings.Join(f, ",") != "hls_reaper,config_changed,streams" {
+	if f := a.features(); strings.Join(f, ",") != "hls_reaper,retire_fence,config_changed,streams" {
 		t.Fatalf("features %v", f)
 	}
-	if f := (&Agent{Client: c, ReplicaDir: a.ReplicaDir}).features(); strings.Join(f, ",") != "hls_reaper,streams" {
+	if f := (&Agent{Client: c, ReplicaDir: a.ReplicaDir}).features(); strings.Join(f, ",") != "hls_reaper,retire_fence,streams" {
 		t.Fatalf("features without commands %v", f)
 	}
-	if f := (&Agent{Client: c}).features(); strings.Join(f, ",") != "hls_reaper" {
+	if f := (&Agent{Client: c}).features(); strings.Join(f, ",") != "hls_reaper,retire_fence" {
 		t.Fatalf("features without a replica %v", f)
 	}
 	// relay: the loopback relay proxy runs, so MAIN may switch DATAPLANE on.
-	if f := (&Agent{Client: c, RelayAddr: RelayProxyAddr, RelayKeyDir: t.TempDir()}).features(); strings.Join(f, ",") != "hls_reaper,relay" {
+	if f := (&Agent{Client: c, RelayAddr: RelayProxyAddr, RelayKeyDir: t.TempDir()}).features(); strings.Join(f, ",") != "hls_reaper,retire_fence,relay" {
 		t.Fatalf("features with the relay proxy %v", f)
 	}
 	run := a.localExec(a.Exec)
@@ -338,7 +338,7 @@ func TestHelloSaysConfigChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	f, _ := json.Marshal(m.bodies["hello"][0]["features"])
-	if string(f) != `["hls_reaper","config_changed","streams"]` {
+	if string(f) != `["hls_reaper","retire_fence","config_changed","streams"]` {
 		t.Fatalf("hello features %s", f)
 	}
 }
