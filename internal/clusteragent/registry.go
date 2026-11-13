@@ -84,10 +84,13 @@ const FlowConnections = 64
 var connUUID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 type Registry struct {
-	mu     sync.Mutex
-	conns  map[string]map[string]any
-	sentAt map[string]time.Time // last conn.upsert per uuid
-	readAt map[string]time.Time // last change of hls_last_read per uuid (node clock)
+	// Serialize state-changing operations through their durable P0 append.
+	// Readers still use mu only, so a slow spool does not block snapshots.
+	writeMu sync.Mutex
+	mu      sync.Mutex
+	conns   map[string]map[string]any
+	sentAt  map[string]time.Time // last conn.upsert per uuid
+	readAt  map[string]time.Time // last change of hls_last_read per uuid (node clock)
 	// The P2 touches (touch.go): the latest hls_last_read per uuid not sent
 	// yet, the last value sent on P0 (it reached MAIN's store) and on either
 	// lane (MAIN has it), and when each uuid's touch last went on P2.
@@ -140,6 +143,13 @@ func NewRegistry(snap string, emit func([]map[string]any) error, logf func(strin
 // first: a failure leaves the registry as it was, and the node's PHP falls
 // back to MAIN's store for this write.
 func (r *Registry) Put(uuid string, rec map[string]any) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	return r.put(uuid, rec)
+}
+
+// put runs with writeMu held, including Touch's read of the current lifecycle.
+func (r *Registry) put(uuid string, rec map[string]any) error {
 	rec["uuid"] = uuid
 	r.mu.Lock()
 	old := r.conns[uuid]
@@ -223,6 +233,8 @@ func (r *Registry) reset() {
 // hls_end 1 before the registry changes; one whose event cannot be spooled
 // stays open and is tried again on the next pass.
 func (r *Registry) Reap(after time.Duration) int {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
 	now := r.now()
 	var stale []map[string]any
@@ -274,8 +286,19 @@ func (r *Registry) Touch(uuid string, lastRead any) (map[string]any, error) {
 	if rec == nil {
 		return nil, nil
 	}
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	current := r.Get(uuid)
+	if current == nil {
+		return nil, nil // MAIN removed it while this read waited for the spool.
+	}
+	currentToken, _ := current["retire_token"].(string)
+	readToken, _ := rec["retire_token"].(string)
+	if currentToken != readToken || norm(current["date_start"]) != norm(rec["date_start"]) {
+		rec = current // Never overwrite a newer lifecycle with an older read.
+	}
 	rec["hls_last_read"] = lastRead
-	return rec, r.Put(uuid, rec)
+	return rec, r.put(uuid, rec)
 }
 
 // Find returns the first record matching every column (in uuid order, so it
@@ -349,6 +372,8 @@ func (r *Registry) FanoutClosed(uuids []string) (int, error) {
 // closeWhere ends the open, non-HLS records of uuids that also pass keep:
 // one P0 `conn.close {uuid}` each, spooled before they leave the registry.
 func (r *Registry) closeWhere(uuids []string, pass func(map[string]any) bool) (int, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
 	var events []map[string]any
 	var gone []string
@@ -379,6 +404,8 @@ func (r *Registry) closeWhere(uuids []string, pass func(map[string]any) bool) (i
 
 // Delete removes a connection and tells MAIN.
 func (r *Registry) Delete(uuid string) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	return r.emitThenLocked([]map[string]any{{"type": "conn.remove", "d": map[string]any{"uuid": uuid}}}, func() {
 		if _, had := r.conns[uuid]; had {
 			delete(r.conns, uuid)
@@ -411,6 +438,8 @@ func (r *Registry) Close(uuid string, remove bool) error {
 		_, err := r.Retire(strings.TrimPrefix(uuid, "retire_"))
 		return err
 	}
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if remove || fmt.Sprint(r.conns[uuid]["container"]) == "ts" {
@@ -427,6 +456,8 @@ func (r *Registry) Close(uuid string, remove bool) error {
 // Retire applies an ended lifecycle's opaque ticket. Reusing a UUID, even in
 // the same second, creates a different token; delayed commands cannot remove it.
 func (r *Registry) Retire(token string) (bool, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(token) {
 		return false, errors.New("invalid retirement ticket")
 	}
@@ -559,6 +590,8 @@ func (r *Registry) sortedKeysLocked() []string {
 // them (cluster:seed-connections, before the CONNECTIONS switch). reset
 // empties the registry first. Records without a valid uuid are skipped.
 func (r *Registry) Seed(records []map[string]any, reset bool) int {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if reset {
