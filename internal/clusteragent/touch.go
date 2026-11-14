@@ -110,6 +110,8 @@ func (r *Registry) dropTouches() {
 // hls_last_read differs from the last value sent for it on P0, and forgets
 // the pending touches: P2 was lost and MAIN's store must catch up.
 func (r *Registry) touchesToP0() (int, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
 	var events []map[string]any
 	var recs []map[string]any

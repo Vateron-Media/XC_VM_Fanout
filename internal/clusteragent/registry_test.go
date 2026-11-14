@@ -324,6 +324,13 @@ func TestInteropConnections(t *testing.T) {
 	runPHP("conn.php", "ghost", "g1")
 	var want bool
 	for i := 0; i < 3 && !want; i++ {
+		if i == 1 {
+			// Newer MAIN versions allow in-flight state changes 12 seconds
+			// to settle. Advance the harness clock instead of sleeping.
+			if err := os.WriteFile(filepath.Join(dir, "main.sqlite.clock"), []byte("12000"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		r, err := a.Heartbeat(ctx)
 		if err != nil {
 			t.Fatal(err)
