@@ -25,7 +25,7 @@ Tests live next to the code (`*_test.go`) in every internal package. The common 
 go test ./...                       # all unit tests
 go test -race ./...                 # with the race detector (do this before a release)
 go test -cover ./...                # per-package statement coverage
-go test -v ./internal/server -run TestOverlay   # one package / one test, verbose
+go test -v ./internal/fanout/server -run TestOverlay   # one package / one test, verbose
 ```
 
 The suite is fast (seconds) and needs no network, no sockets set up by hand, and no
@@ -44,7 +44,7 @@ running daemon — each test wires up exactly what it needs in-process.
 | `server` | The HTTP surfaces end to end: control API (register / ingest / signal / probe), live-TS and HLS serving, connection & rate tracking, the idle-stop reaper, the debug-stats snapshot, and a dedicated stalled-viewer reset (`serve_live_stall_test.go`). |
 | `dlog` | The debug log toggles on/off and stays silent when disabled. |
 
-Synthetic MPEG-TS inputs come from the `internal/tsfixture` helper (hand-built PAT/PMT/keyframe
+Synthetic MPEG-TS inputs come from the `internal/testkit/tsfixture` helper (hand-built PAT/PMT/keyframe
 packets), so most tests are pure and deterministic with no external tools.
 
 ### How the ffmpeg paths are tested
@@ -64,7 +64,7 @@ ffmpeg is exercised two ways, on purpose:
   encode path was exercised or skipped, rather than silently passing.
 
 Debug logging is off during tests; a test that wants to assert on log output enables it and
-captures the log writer (see `internal/dlog/*_test.go` for the pattern).
+captures the log writer (see `internal/fanout/dlog/*_test.go` for the pattern).
 
 ### End-to-end bench
 

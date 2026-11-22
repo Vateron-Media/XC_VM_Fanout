@@ -6,7 +6,7 @@
 
 **Architecture:** MAIN classifies a loopback stream as a typed `"loopback"` runtime directive for a `serve_only` target (gated exactly like the transcode Spec). The Go agent, on seeing kind `"loopback"`, composes the node-local relay URL `http://127.0.0.1:31290/relay/<k>/<id>.ts` from its own relay key `k` + the stream id and registers it as the puller source via the existing `registerStream` PUT. The puller pulls it as a plain `video/mp2t` source; the agent's relay proxy signs the upstream connect to the parent with the MAIN-minted relay ticket already in the record. Delivery shifts from PHP's PUSH (IngestFeeder → daemon ingest) to the Go PULL — same bytes. Because that moves the feed to Go, PHP's loopback launcher is gated off for a `serve_only` node so the daemon is never double-fed.
 
-**Tech Stack:** PHP 8.1 (XC_VM: `src/Core/Cluster`, `src/Domain/Stream`), Go (XC_VM_Fanout: `internal/clusteragent`).
+**Tech Stack:** PHP 8.1 (XC_VM: `src/Core/Cluster`, `src/Domain/Stream`), Go (XC_VM_Fanout: `internal/agent/runtime`).
 
 **Spec:** `docs/superpowers/specs/2026-10-17-lb-phase4-5-lifecycle-design.md` (Phase 5 — loopback relay; D2 — the LB runs only the loopback relay among the special modes).
 
@@ -14,7 +14,7 @@
 
 - **Cross-repo, coordinated (atomic):** XC_VM branch off `2.8.0`; XC_VM_Fanout branch off `feat/lb-transcode-serve` (has merged Phase 4a+4b). The PHP "emit loopback kind" + "gate PHP loopback off for serve_only" and the Go "register the relay URL" must land together — a serve-only LB with one side only either double-feeds the daemon or serves nothing.
 - **Loopback is per-target, serve_only-gated.** A non-serve-only node keeps running loopback via PHP (directive stays `"other"`; the PHP gate does not fire). Only a `serve_only` target gets kind `"loopback"` and the Go path.
-- **No new transport/auth/scheme.** The puller already pulls `video/mp2t` direct; the relay proxy (`internal/clusteragent/relayproxy.go`) already signs upstream with the MAIN-minted relay ticket from `record.data.tickets`; `parent_id` is already in `record.data.server`. Do NOT add relay auth, a URL scheme, or parent failover.
+- **No new transport/auth/scheme.** The puller already pulls `video/mp2t` direct; the relay proxy (`internal/agent/runtime/relayproxy.go`) already signs upstream with the MAIN-minted relay ticket from `record.data.tickets`; `parent_id` is already in `record.data.server`. Do NOT add relay auth, a URL scheme, or parent failover.
 - **MAIN never composes the relay URL.** It carries the node-local key `k`, so only the agent can build it. MAIN emits kind + `parent_id` only.
 - **No Claude attribution** in commits or PRs (see the repo's convention / user instruction).
 
@@ -66,18 +66,18 @@
 ### Task 3: Go agent registers the loopback relay URL
 
 **Files:**
-- Modify: `internal/clusteragent/streamregister.go` (the `runtimeDirective` struct; `seedFanoutRecord` routing; a loopback-body composer)
-- Test: `internal/clusteragent/streamregister_test.go`
+- Modify: `internal/agent/runtime/streamregister.go` (the `runtimeDirective` struct; `seedFanoutRecord` routing; a loopback-body composer)
+- Test: `internal/agent/runtime/streamregister_test.go`
 
 **Interfaces:**
-- Consumes: `runtimeDirective{Kind,Source,Spec}` (add `ParentID int64 \`json:"parent_id"\``); `a.registerStream(ctx,id,streamRegisterBody)`; the relay key `k` from the relay-key store in `internal/clusteragent/relayproxy.go` (`RelayKeyStore`/`.relay.key`); the relay proxy's local address `127.0.0.1:31290` (reuse the constant/field relayproxy.go already defines — do not hardcode a second copy).
+- Consumes: `runtimeDirective{Kind,Source,Spec}` (add `ParentID int64 \`json:"parent_id"\``); `a.registerStream(ctx,id,streamRegisterBody)`; the relay key `k` from the relay-key store in `internal/agent/runtime/relayproxy.go` (`RelayKeyStore`/`.relay.key`); the relay proxy's local address `127.0.0.1:31290` (reuse the constant/field relayproxy.go already defines — do not hardcode a second copy).
 - Produces: on kind `"loopback"`, a `streamRegisterBody{URLs:["http://127.0.0.1:31290/relay/<k>/<id>.ts"]}` PUT to `/streams/<id>`; a missing/empty `k` registers nothing (fail closed).
 
 - [ ] **Step 1: Write the failing tests** in `streamregister_test.go` (model on `TestSeedFanoutRecordProxyRegisters`, using the `fanoutStub`): a kind `"loopback"` record → `PUT /streams/<id>` whose body URL is `http://127.0.0.1:31290/relay/<k>/<id>.ts` with the agent's relay key; a kind `"loopback"` with no relay key available → no call (fail closed); a record that flips `loopback`→`other` → `DELETE /streams/<id>` (unregister), and `loopback`→`proxy` → re-register with the proxy source.
-- [ ] **Step 2: Run them; verify they fail** (`GOWORK=off go test ./internal/clusteragent/ -run 'Loopback'`).
+- [ ] **Step 2: Run them; verify they fail** (`GOWORK=off go test ./internal/agent/runtime/ -run 'Loopback'`).
 - [ ] **Step 3: Implement.** Add `ParentID` to `runtimeDirective`; add `(d runtimeDirective) loopbackBody(k, relayAddr string) (streamRegisterBody, bool)` returning the relay-URL body when `Kind=="loopback"` and `k != ""`; in `seedFanoutRecord`, add a `loopback` branch (before the final `unseedFanoutRecord`) that reads `k` from the relay-key store and `registerStream`s the body, else unseeds. Keep the proxy and transcode branches as-is (so a flip routes correctly).
 - [ ] **Step 4: Run them; verify they pass.**
-- [ ] **Step 5: Run the full clusteragent suite** (`GOWORK=off go test ./internal/clusteragent/`), `gofmt -l .` (must be empty), `go vet`.
+- [ ] **Step 5: Run the full clusteragent suite** (`GOWORK=off go test ./internal/agent/runtime/`), `gofmt -l .` (must be empty), `go vet`.
 - [ ] **Step 6: Commit** (`feat(agent): register a loopback stream's node-local relay URL with the puller`).
 
 ### Task 4: Encrypted-HLS key verification + end-to-end notes

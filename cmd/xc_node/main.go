@@ -3,7 +3,7 @@
 // See LICENSE and LICENSE-ADDITIONAL-TERMS.md
 
 // Command xc_node is the single load-balancer binary: the live fan-out daemon
-// (internal/fanoutcmd) and the cluster agent (internal/agentcmd) in one static
+// (internal/fanout/app) and the cluster agent (internal/agent/app) in one static
 // executable. It picks which to run by the name it is invoked under — so the
 // panel's xc_fanout / xc_agent binaries, and the staged/trial/rollback copies
 // it probes (.xc_fanout.new, .xc_agent.new, xc_agent.prev, xc_agent.trial),
@@ -29,8 +29,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Vateron-Media/XC_VM_Fanout/internal/agentcmd"
-	"github.com/Vateron-Media/XC_VM_Fanout/internal/fanoutcmd"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/agent/app"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/fanout/app"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".

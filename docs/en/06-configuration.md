@@ -52,7 +52,7 @@ For isolated testing — feed a single stream directly at startup, without the c
 ## The config file
 
 The operator tuning lives in a small JSON file (`-config`, default
-`/home/xc_vm/bin/xc_fanout/config.json`), owned by [`internal/config`](../../internal/config/config.go).
+`/home/xc_vm/bin/xc_fanout/config.json`), owned by [`internal/fanout/config`](../../internal/fanout/config/config.go).
 An admin edits the values in the panel; the panel writes them to this file; the daemon polls it
 and applies the changes **at runtime — no restart, and no viewer dropped** (with one exception,
 below: shrinking `prebuffer_max_sec`).
@@ -61,7 +61,7 @@ below: shrinking `prebuffer_max_sec`).
 
 The file never has to be created or migrated by hand:
 
-- **Absent** → the daemon writes it with the built-in defaults ([`internal/defaults`](../../internal/defaults/defaults.go),
+- **Absent** → the daemon writes it with the built-in defaults ([`internal/fanout/defaults`](../../internal/fanout/defaults/defaults.go),
   the `Cfg*` constants), so a fresh node starts from a real, editable file instead of nothing.
   This holds not just at startup: if the file is **deleted while the daemon runs**, the next
   poll recreates it — re-saving the values currently in memory (so deleting it never silently

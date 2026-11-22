@@ -48,15 +48,15 @@
 
 | Пакет | Файл | Роль |
 |-------|------|------|
-| `server` | [server.go](../../internal/server/server.go) | Реестр `id → Stream`, обе HTTP-поверхности, жизненный цикл потока on-demand. |
-| `hub` | [hub.go](../../internal/hub/hub.go) | Fan-out одного TS-потока множеству подписчиков; медленных отбрасывает. |
-| `tsjoin` | [tsjoin.go](../../internal/tsjoin/tsjoin.go) | Единый буфер на поток: PAT/PMT + кольцо GOP’ов для «чистого входа» и prebuffer, **и** индекс HLS-сегментов, выведенный из этого кольца. |
-| `hlscrypt` | [hlscrypt.go](../../internal/hlscrypt/hlscrypt.go) | AES-128-CBC шифрование HLS-сегментов (совместимо с панелью), применяется на лету в момент сборки сегмента. |
-| `puller` | [puller.go](../../internal/puller/puller.go) | Захват источника (прямой mp2t, нативное преобразование или ремукс ffmpeg), reconnect с backoff. |
-| `nativesrc` | [nativesrc](../../internal/nativesrc) | Преобразование не-mp2t источника (HLS/udp/rtp) в MPEG-TS внутри процесса, чтобы частому случаю не требовался дочерний ffmpeg. Отклоняет всё, что не может взять, и puller уходит на ffmpeg. |
-| `ingest` | [ingest.go](../../internal/ingest/ingest.go) | Копирование TS-потока в publish-колбэк 188-байт-выровненными чанками. |
-| `config` | [config.go](../../internal/config/config.go) | Мост настройки панель↔демон: самоисцеляющийся JSON-файл, опрашивается и применяется на лету. |
-| `defaults` | [defaults.go](../../internal/defaults/defaults.go) | Встроенные константы операционной настройки (сиды конфиг-файла и прочие инварианты). |
+| `server` | [server.go](../../internal/fanout/server/server.go) | Реестр `id → Stream`, обе HTTP-поверхности, жизненный цикл потока on-demand. |
+| `hub` | [hub.go](../../internal/fanout/hub/hub.go) | Fan-out одного TS-потока множеству подписчиков; медленных отбрасывает. |
+| `tsjoin` | [tsjoin.go](../../internal/media/ts/join/tsjoin.go) | Единый буфер на поток: PAT/PMT + кольцо GOP’ов для «чистого входа» и prebuffer, **и** индекс HLS-сегментов, выведенный из этого кольца. |
+| `hlscrypt` | [hlscrypt.go](../../internal/media/hlscrypt/hlscrypt.go) | AES-128-CBC шифрование HLS-сегментов (совместимо с панелью), применяется на лету в момент сборки сегмента. |
+| `puller` | [puller.go](../../internal/fanout/puller/puller.go) | Захват источника (прямой mp2t, нативное преобразование или ремукс ffmpeg), reconnect с backoff. |
+| `nativesrc` | [nativesrc](../../internal/media/source) | Преобразование не-mp2t источника (HLS/udp/rtp) в MPEG-TS внутри процесса, чтобы частому случаю не требовался дочерний ffmpeg. Отклоняет всё, что не может взять, и puller уходит на ffmpeg. |
+| `ingest` | [ingest.go](../../internal/fanout/ingest/ingest.go) | Копирование TS-потока в publish-колбэк 188-байт-выровненными чанками. |
+| `config` | [config.go](../../internal/fanout/config/config.go) | Мост настройки панель↔демон: самоисцеляющийся JSON-файл, опрашивается и применяется на лету. |
+| `defaults` | [defaults.go](../../internal/fanout/defaults/defaults.go) | Встроенные константы операционной настройки (сиды конфиг-файла и прочие инварианты). |
 | `cmd/xc_fanout` | [main.go](../../cmd/xc_fanout/main.go) | Точка входа: флаги, загрузка/опрос конфига, поднятие сокетов, graceful shutdown. |
 
 ## Ключевые сущности

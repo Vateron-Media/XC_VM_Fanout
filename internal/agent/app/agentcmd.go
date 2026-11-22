@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// XC_VM_Fanout — https://github.com/Vateron-Media/XC_VM_Fanout
+// See LICENSE and LICENSE-ADDITIONAL-TERMS.md
+
+// Command xc_agent is an LB node's end of the XC_VM cluster API (MAIN ↔ LB
+// plan). It holds the node's identity and token epochs, finishes enrolment,
+// says hello, heartbeats and rotates its token. Every heartbeat carries the
+// host sampled each second (Phase 3); with the node's TELEMETRY flow on, MAIN
+// takes the server's stats from it. The mode and flows MAIN sends are written
+// to flows.json beside the state for the node's PHP, and the lease the node
+// holds, with MAIN's clock as the agent vouches for it, to lease_state.json
+// every heartbeat interval, whether MAIN answers or not (the node's PHP fences
+// on it behind lb_lease_fence).
+//
+// With CONNECTIONS on, the agent holds the node's viewers (registry.snap,
+// rebuilt against the fanout and the PHP workers after a restart), admits new
+// ones (the adm claim, MAIN's conn_admit, or MAIN's offline policy), and
+// sends HLS touches on the P2 lane when MAIN takes them. Heartbeats go at
+// most 3 s apart; under https_required the agent follows the signed challenge
+// over plain HTTP while HTTPS fails. Hello and heartbeat say which policy the
+// agent dials (policy_ver), and it keeps its last 3 known-good MAIN URL sets
+// to fall back on. P0 events have a connection of their own, and a busy
+// refusal of an ingest lane is waited out, not logged.
+//
+// The node replica (replica/ beside the state) holds the blocklist, the
+// sections MAIN sends whole (settings, servers, node, crontab, cluster,
+// secrets, bouquets and categories; secrets 0600 and never logged) and,
+// while STREAMS is on, the R2 streams section (replica/streams/, one record
+// per stream held, kept by deltas, full passes and a resync every 5
+// minutes); `console.php cluster:apply` runs after a change, and
+// config.changed fetches at once. Heartbeats relay the node's
+// audit.json (at most 16 KiB) as `audit`.
+//
+// Artefacts MAIN grants (an off-air video's artefact.fetch, a node.root
+// carrying a module archive or the pinned agent) download into artefacts/
+// beside the state, in chunks over the bulk lane, beside the command loop;
+// the agent checks their size and SHA-256 before it hands the command to
+// `console.php cluster:exec`, and says `artefact` at hello only while
+// `cluster:exec --types` lists artefact.fetch.
+//
+// The node's state file (default /home/xc_vm/config/cluster/agent.json, 0600)
+// is written by the panel's install flow over SSH: node uuid, server id, the
+// node's Ed25519 seed, the pinned panel key, MAIN's URLs and epoch 1.
+//
+// With DATAPLANE on (Phase 8), encoders and the fanout pull relays and other
+// servers' files from the loopback relay proxy (127.0.0.1:31290, keyed by
+// relay.key beside the state, published only while the proxy holds the port
+// and removed when it lets go; a port it cannot bind is retried with
+// backoff), which signs each upstream connect with the tickets MAIN sends in
+// the R2 streams section and checks each file chunk against its owner's
+// digest.
+//
+//	xc_agent [-state path] [-interval 2s]   run the control loop
+//	xc_agent run -role main -state …/main_agent.json   MAIN: the loopback relay proxy, as MAIN (main.json beside it)
+//	xc_agent health [-state path]           fetch and verify MAIN's signed health
+//	xc_agent version
+//
+// Install flow (run by the panel over SSH, see internal/agent/runtime/install.go):
+//
+//	xc_agent keygen  -state path -uuid <uuid>          keys stay here; prints the public halves (JSON)
+//	xc_agent probe   -panel-pub <hex> -url <u> [...]   MAIN's health must verify before any token exists
+//	xc_agent install -state path < install.json        checks and saves epoch 1
+//
+// Break-glass enrolment, when MAIN cannot reach the node over SSH:
+//
+//	xc_agent enrol [-state path] [-force] <code>   code from `console.php cluster:enrol-code`;
+//	                                               prints the SAS the admin approves on MAIN
+package agentcmd
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/agent/runtime"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/agent/telemetry"
+)
+
+// applyFunc is the cluster:apply hook for the agent: ApplyViaPHP normally, nil
+// on a serve-only node. A serve-only node's Go agent materialises the whole
+// replica itself, so console.php cluster:apply would only fill PHP FileCache
+// that a PHP-free node never reads — and the node runs no PHP to call.
+func applyFunc(serveOnly bool, php, console string) func(ctx context.Context) error {
+	if serveOnly {
+		return nil
+	}
+	return clusteragent.ApplyViaPHP(php, console, time.Minute)
+}
+
+// selfHealRepoFor returns the repo the Go agent self-heals its binary from, or
+// "" to leave self-heal off. It activates only on a serve-only node that is
+// PHP-free (console.php gone — the P6 end state): while PHP is present it owns
+// binary updates (root_signals fanout_binary), so the Go self-heal stays dormant
+// and the two never race to install the same binary.
+func selfHealRepoFor(serveOnly bool, console, repo string) string {
+	if !serveOnly {
+		return ""
+	}
+	if _, err := os.Stat(console); errors.Is(err, os.ErrNotExist) {
+		return repo
+	}
+	return ""
+}
+
+// ffmpegRepoFor gates the ffmpeg-build refresh exactly like selfHealRepoFor: on
+// only for a serve-only node that is PHP-free (console.php gone), so it never
+// races cron:root_signals' console.php ffmpeg while PHP still owns the refresh.
+func ffmpegRepoFor(serveOnly bool, console, repo string) string {
+	if !serveOnly {
+		return ""
+	}
+	if _, err := os.Stat(console); errors.Is(err, os.ErrNotExist) {
+		return repo
+	}
+	return ""
+}
+
+// certbotWebrootFor gates the certbot loop like ffmpegRepoFor: the webroot only
+// for a serve-only node that is PHP-free (console.php gone), so it never races
+// cron:certbot / root_signals certbot_generate while PHP still owns renewal.
+func certbotWebrootFor(serveOnly bool, console, webroot string) string {
+	if !serveOnly {
+		return ""
+	}
+	if _, err := os.Stat(console); errors.Is(err, os.ErrNotExist) {
+		return webroot
+	}
+	return ""
+}
+
+// nodeRootGoFor reports whether the agent runs node.root commands itself (and
+// drops the rest) — on a serve-only node that is PHP-free (console.php gone), so
+// there is no cluster:exec to hand them to. Same gate as the P2/P3/P4 loops.
+func nodeRootGoFor(serveOnly bool, console string) bool {
+	if !serveOnly {
+		return false
+	}
+	_, err := os.Stat(console)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func Main(version string) {
+	args := os.Args[1:]
+	cmd := "run"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		cmd, args = args[0], args[1:]
+	}
+	fs := flag.NewFlagSet("xc_agent "+cmd, flag.ExitOnError)
+	statePath := fs.String("state", "/home/xc_vm/config/cluster/agent.json", "node state file (written by the panel's install flow)")
+	interval := fs.Duration("interval", 2*time.Second, "heartbeat interval (1s–3s)")
+	uuid := fs.String("uuid", "", "keygen: the node uuid MAIN assigned")
+	panelPub := fs.String("panel-pub", "", "probe: the panel signing key (hex), as received over SSH")
+	force := fs.Bool("force", false, "enrol: replace an identity that already holds tokens")
+	phpBin := fs.String("php", "/home/xc_vm/bin/php/bin/php", "run: the PHP that runs MAIN's commands")
+	console := fs.String("console", "/home/xc_vm/console.php", "run: the panel console (cluster:exec)")
+	signalsDir := fs.String("signals", "/home/xc_vm/signals", "run: the node's SIGNALS_PATH, where a fence past its drain drops the viewers it holds; empty = off")
+	floodDir := fs.String("flood-dir", "/home/xc_vm/tmp/flood/", "run: per-IP RTMP flood counters and block_<ip> markers (match PHP FLOOD_TMP_PATH); empty = off")
+	tmpRoot := fs.String("tmp", "/home/xc_vm/tmp/", "run: the node's TMP_PATH; the agent runs the node-local log drains + tmp sweep off it (replaces the PHP cron:streams_logs/lines_logs/activity/errors/tmp); empty = off")
+	playlistDir := fs.String("playlist", "/home/xc_vm/content/playlists/", "run: PLAYLIST_PATH, pruned by the agent's tmp sweep per cache_playlists; empty = skip")
+	fanoutCtl := fs.String("fanout-ctl", "/home/xc_vm/bin/xc_fanout/sockets/control.sock", "run: xc_fanout's control socket, whose /events feed is followed while STREAMS is on; empty = off")
+	seedFanout := fs.Bool("seed-fanout", false, "run: serve-only LB — register assigned restreams on the fanout from the replica (replaces PHP seedLocal); off leaves registration to PHP")
+	serveOnly := fs.Bool("serve-only", false, "run: serve-only LB — the Go agent is authoritative: no console.php cluster:apply (it materialises the whole replica itself and writes policy.json)")
+	gatewayPolicy := fs.String("gateway-policy", "/home/xc_vm/tmp/gateway/policy.json", "run: serve-only LB — the tmp/gateway/policy.json the agent writes from the sealed policy section (the file the fanout -gw-policy reads); only used with -serve-only")
+	selfhealRepo := fs.String("selfheal-repo", "Vateron-Media/XC_VM_Fanout", "run: serve-only LB — owner/repo the agent self-heals its own xc_node binary from (GitHub releases), replacing console.php fanout_binary; only with -serve-only, empty = off")
+	ffmpegRepo := fs.String("ffmpeg-repo", "Vateron-Media/XC_VM_FFMPEG", "run: serve-only LB — the XC_VM_FFMPEG repo the agent refreshes ffmpeg builds from when PHP-free")
+	ffmpegChannel := fs.String("ffmpeg-channel", "stable", "run: serve-only LB — the XC_VM_FFMPEG release channel (stable/beta/dev)")
+	ffmpegBinDir := fs.String("ffmpeg-bin-dir", "/home/xc_vm/bin/ffmpeg_bin/", "run: serve-only LB — where per-label ffmpeg builds are installed")
+	certbotBin := fs.String("certbot", "certbot", "run: serve-only LB — the certbot binary the agent runs (sudo) when PHP-free")
+	certbotWebroot := fs.String("certbot-webroot", "/home/xc_vm/certbot-webroot", "run: serve-only LB — certbot's --webroot dir; MUST equal the front's -webroot")
+	certbotBinPath := fs.String("certbot-bin-path", "/home/xc_vm/bin/", "run: serve-only LB — BIN_PATH; certbot config/work/logs live under <path>/certbot/, the front cert under <path>/nginx/conf/")
+	selfhealChannel := fs.String("selfheal-channel", "stable", "run: serve-only LB — the release channel to self-heal from (stable/beta/dev)")
+	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "run: node ffmpeg path stamped into a restream's pull config when -seed-fanout is on (also the {ffmpeg_cpu} transcode value)")
+	nodeStreams := fs.String("streams", "/home/xc_vm/streams/", "run: node streams path ({streams}) for applying a transcode directive")
+	nodeLogs := fs.String("logs", "/home/xc_vm/logs/tmp/", "run: node logs-tmp path ({logs}) for applying a transcode directive")
+	nodeServerID := fs.String("server-id", "", "run: this node's server id ({server_id}) for applying a transcode directive")
+	ffmpegGpu := fs.String("ffmpeg-gpu", "", "run: node GPU ffmpeg path ({ffmpeg_gpu}) for applying a transcode directive")
+	ffprobeBin := fs.String("ffprobe", "ffprobe", "run: node ffprobe path ({ffprobe}) for applying a transcode directive")
+	fanoutBinary := fs.String("fanout-binary", "", "run: node xc_fanout binary path ({binary}) for applying a transcode directive")
+	relayAddr := fs.String("relay-addr", clusteragent.RelayProxyAddr, "run: the loopback relay proxy's address (DATAPLANE); empty = off")
+	role := fs.String("role", "lb", "run: lb (a node's agent) or main (MAIN's data-plane client: the loopback relay proxy with MAIN's key, -state main_agent.json)")
+	var urls multiFlag
+	fs.Var(&urls, "url", "probe: a MAIN cluster URL (repeatable)")
+	fs.Parse(args)
+
+	switch cmd {
+	case "version":
+		// The first line is the version (what an install checks); the
+		// second names what run.sh may ask of this agent.
+		fmt.Println(version)
+		fmt.Println("features: " + clusteragent.FeatureReached)
+		return
+	case "keygen":
+		res, err := clusteragent.Keygen(*statePath, *uuid)
+		if err != nil {
+			log.Fatalf("xc_agent keygen: %v", err)
+		}
+		json.NewEncoder(os.Stdout).Encode(res)
+		return
+	case "probe":
+		pub, err := hex.DecodeString(*panelPub)
+		if err != nil {
+			log.Fatalf("xc_agent probe: panel key: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		u, err := clusteragent.Probe(ctx, pub, urls)
+		if err != nil {
+			log.Fatalf("xc_agent probe: %v", err)
+		}
+		fmt.Println("OK " + u)
+		return
+	case "install":
+		var d clusteragent.InstallData
+		if err := json.NewDecoder(io.LimitReader(os.Stdin, 1<<20)).Decode(&d); err != nil {
+			log.Fatalf("xc_agent install: %v", err)
+		}
+		if err := clusteragent.Install(*statePath, d); err != nil {
+			log.Fatalf("xc_agent install: %v", err)
+		}
+		fmt.Println("OK")
+		return
+	case "enrol":
+		// Break-glass enrolment with a code from `console.php cluster:enrol-code`.
+		if fs.NArg() != 1 {
+			log.Fatalf("usage: xc_agent enrol [-state path] [-force] <code>")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		err := clusteragent.EnrolByCode(ctx, *statePath, fs.Arg(0), "xc_agent/"+version, *force, func(sas string) {
+			fmt.Printf("Request sent. On MAIN, approve it with this SAS:\n\n  %s\n\n(console.php cluster:enrol-approve <serverID> %s). Waiting for the decision...\n", sas, sas)
+		})
+		if err != nil {
+			log.Fatalf("xc_agent enrol: %v", err)
+		}
+		// A node MAIN had stopped may run again: the supervisor starts it.
+		if exe, err := os.Executable(); err == nil {
+			os.Remove(filepath.Join(filepath.Dir(exe), "stopped"))
+		}
+		fmt.Println("OK")
+		return
+	case "lease":
+		// Its own case, above the group that loads a complete state: an operator
+		// asks this of a node whose enrolment never finished, or one MAIN stopped.
+		out, err := clusteragent.LeaseReport(*statePath, time.Now())
+		if err != nil {
+			log.Fatalf("xc_agent lease: %v", err)
+		}
+		fmt.Print(out)
+		return
+	case "run", "health":
+		if cmd == "run" && *role == "main" {
+			// MAIN's data-plane client (ADR 0004, Phase 9's eighth increment):
+			// the loopback proxy with MAIN's own key (-state main_agent.json,
+			// from `xc_agent keygen`) and main.json beside it, both written by
+			// `cluster:main-dataplane on`. Without them the listener runs
+			// alone and answers 503, as before: MAIN's reads keep the legacy
+			// URLs.
+			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+			if _, err := os.Stat(*statePath); err == nil {
+				a, err := clusteragent.NewMainAgent(*statePath, *relayAddr, log.Printf)
+				if err != nil {
+					log.Fatalf("xc_agent: role main: %v", err)
+				}
+				log.Printf("xc_agent %s: role main, MAIN's data plane on %s", version, *relayAddr)
+				if err := a.RunMain(ctx); err != nil {
+					log.Fatalf("xc_agent: role main: %v", err)
+				}
+				return
+			}
+			log.Printf("xc_agent %s: role main, relay proxy on %s (no MAIN identity: it answers 503)", version, *relayAddr)
+			if err := (&clusteragent.Agent{}).ServeRelayProxy(ctx, *relayAddr, filepath.Dir(*statePath)); err != nil {
+				log.Fatalf("xc_agent: relay proxy: %v", err)
+			}
+			return
+		}
+		if *role != "lb" && *role != "main" {
+			log.Fatalf("xc_agent: unknown role %q (lb, main)", *role)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q (run, health, keygen, probe, install, enrol, lease, version)\n", cmd)
+		os.Exit(2)
+	}
+
+	st, err := clusteragent.LoadState(*statePath)
+	if err != nil {
+		log.Fatalf("xc_agent: %v", err)
+	}
+	client := clusteragent.NewClient(st, "xc_agent/"+version)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if cmd == "health" {
+		var lastErr error
+		for _, u := range st.MainURLs {
+			doc, err := client.Health(ctx, u)
+			if err != nil {
+				lastErr = err
+				fmt.Printf("%s: %v\n", u, err)
+				continue
+			}
+			b, _ := json.Marshal(doc)
+			fmt.Printf("%s: OK %s\n", u, b)
+			return
+		}
+		log.Fatalf("xc_agent: no MAIN URL answered with a valid health document: %v", lastErr)
+	}
+
+	*interval = max(time.Second, min(3*time.Second, *interval))
+	sampler := telemetry.NewSampler(*statePath)
+	stopSampler := make(chan struct{})
+	defer close(stopSampler)
+	go sampler.Run(stopSampler)
+	// A serve-only node writes tmp/gateway/policy.json itself (from the sealed
+	// policy section); only then does the agent own that file.
+	gwPolicyFile := ""
+	if *serveOnly {
+		gwPolicyFile = *gatewayPolicy
+	}
+	a := &clusteragent.Agent{Client: client, Version: version, Interval: *interval, Telemetry: sampler.Latest, FlowsFile: filepath.Join(filepath.Dir(*statePath), "flows.json"),
+		Exec: clusteragent.ExecViaPHP(*phpBin, *console, time.Minute), SpoolDir: filepath.Join(filepath.Dir(*statePath), "spool"),
+		SocketPath: filepath.Join(filepath.Dir(*statePath), "agent.sock"), FanoutCtl: *fanoutCtl, SeedFanout: *seedFanout, FfmpegBin: *ffmpegBin, LeaseFile: filepath.Join(filepath.Dir(*statePath), clusteragent.LeaseStateFile),
+		ReplicaDir: filepath.Join(filepath.Dir(*statePath), "replica"), Apply: applyFunc(*serveOnly, *phpBin, *console),
+		ArtefactDir: filepath.Join(filepath.Dir(*statePath), "artefacts"), Types: clusteragent.TypesViaPHP(*phpBin, *console, time.Minute),
+		RelayAddr: *relayAddr, RelayKeyDir: filepath.Dir(*statePath),
+		FenceFile: filepath.Join(filepath.Dir(*statePath), "fence.json"), SignalsDir: *signalsDir, FloodDir: *floodDir,
+		TmpRoot: *tmpRoot, PlaylistDir: *playlistDir, NodeCronsFile: filepath.Join(filepath.Dir(*statePath), "node_crons"), GatewayPolicyFile: gwPolicyFile,
+		SelfHealRepo: selfHealRepoFor(*serveOnly, *console, *selfhealRepo), SelfHealChannel: *selfhealChannel, SelfHealArch: runtime.GOARCH,
+		FfmpegRepo: ffmpegRepoFor(*serveOnly, *console, *ffmpegRepo), FfmpegChannel: *ffmpegChannel, FfmpegBinDir: *ffmpegBinDir,
+		CertbotWebroot: certbotWebrootFor(*serveOnly, *console, *certbotWebroot), CertbotBin: *certbotBin, CertbotBinPath: *certbotBinPath,
+		NodeHome: filepath.Dir(*console)}
+	if *serveOnly {
+		// PHP-free: no PHP watchdog writes local.json, so the agent reports the
+		// fanout daemon's status in local.fanout itself (XC_VM #478).
+		a.Telemetry = a.TelemetryWithFanout(sampler.Latest)
+	}
+	if nodeRootGoFor(*serveOnly, *console) {
+		// PHP-free: run the essential node.root commands in Go, and drop the rest
+		// (no console.php cluster:exec to hand anything to).
+		a.NodeRootGo = true
+		a.Exec = clusteragent.DropExec
+	}
+	a.SetNodePaths(*nodeStreams, *nodeLogs, *nodeServerID, *ffmpegGpu, *ffprobeBin, *fanoutBinary)
+	log.Printf("xc_agent %s: node %s, %d MAIN URL(s)", version, st.NodeUUID, len(st.MainURLs))
+	err = a.Run(ctx)
+	switch {
+	case err == nil, errors.Is(err, context.Canceled):
+		log.Printf("xc_agent: stopped")
+	case errors.Is(err, clusteragent.ErrStop):
+		// Exit 3: the supervisor must not restart a node MAIN has stopped
+		// (revoked, unknown, enrolment not completed; expiry re-keys instead).
+		log.Printf("xc_agent: %v", err)
+		a.Unpublish()
+		os.Exit(3)
+	default:
+		log.Fatalf("xc_agent: %v", err)
+	}
+}
+
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }

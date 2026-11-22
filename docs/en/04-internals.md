@@ -16,7 +16,7 @@ Almost the entire "guts" of the daemon revolve around these facts.
 ## Data entry point — `Stream.Publish`
 
 Everything the daemon receives from the source enters the stream through a single method,
-[`Publish`](../../internal/server/server.go):
+[`Publish`](../../internal/fanout/server/server.go):
 
 ```
 Publish(chunk):
@@ -43,7 +43,7 @@ marker is later read by the status (`GET /streams/<id>`) to determine off-air.
 > normal case: for normal streams the daemon always consumes the ffmpeg output, never
 > the raw source link.
 
-[`puller.Run`](../../internal/puller/puller.go) pulls the source for as long as the stream is needed by someone,
+[`puller.Run`](../../internal/fanout/puller/puller.go) pulls the source for as long as the stream is needed by someone,
 and **reconnects with exponential backoff** on a break: the pause grows `1s → 2 → 4 → 8s`
 (capped at 8 s), and resets on cancellation.
 
@@ -64,7 +64,7 @@ This is a port of the `ProxyCommand::getActiveStream` logic from the legacy pane
 Converting a non-mp2t source used to mean one **ffmpeg child process per stream**, which for the
 overwhelmingly common case — HLS whose segments are already MPEG-TS — was a process doing little
 more than concatenating bytes the daemon could concatenate itself. Since 0.12.0
-[`nativesrc`](../../internal/nativesrc) does that in-process: it fetches the playlist, follows the
+[`nativesrc`](../../internal/media/source) does that in-process: it fetches the playlist, follows the
 live window, and yields the segments as one continuous packet-aligned TS stream, which is exactly
 what `ingest.Copy` already consumes on the direct path.
 
@@ -85,7 +85,7 @@ stream**; natively it is a goroutine and a pipe. It also removes the process spa
 | HLS with **packed AAC** segments (`.aac`) | **native** — framed as MPEG-TS in process |
 | HLS with **fMP4/CMAF** segments | **native** — read against the `EXT-X-MAP` init segment and remuxed |
 | HLS with **AC-3 / E-AC-3 / MP3** segments | ffmpeg |
-| HLS whose audio is a **separate rendition** (`EXT-X-MEDIA`), MPEG-TS on both sides | **native** — the variant and every rendition of its audio group are pulled side by side and joined into one programme ([`internal/tsmerge`](../../internal/tsmerge)) |
+| HLS whose audio is a **separate rendition** (`EXT-X-MEDIA`), MPEG-TS on both sides | **native** — the variant and every rendition of its audio group are pulled side by side and joined into one programme ([`internal/media/ts/merge`](../../internal/media/ts/merge)) |
 | HLS whose audio is a separate rendition in **fMP4 or packed AAC** | ffmpeg |
 | HLS encrypted with **SAMPLE-AES** | ffmpeg |
 | RTMP / SRT / RTSP | ffmpeg |
@@ -93,8 +93,8 @@ stream**; natively it is a goroutine and a pipe. It also removes the process spa
 
 The four that moved from ffmpeg to native each cost a **process per channel**
 before: AES-128 and byte ranges needed only fetching differently, packed AAC
-only framing ([`internal/tsmux`](../../internal/tsmux)), and fMP4 a real remux
-of its samples ([`internal/fmp4`](../../internal/fmp4)). What is left on the
+only framing ([`internal/media/ts/mux`](../../internal/media/ts/mux)), and fMP4 a real remux
+of its samples ([`internal/media/fmp4`](../../internal/media/fmp4)). What is left on the
 ffmpeg side needs a decoder or a demuxer, which is what ffmpeg is there for.
 
 Refusing loudly is the whole contract. Every refusal returns `ErrUnsupported` **before a single
@@ -163,7 +163,7 @@ The key point: `-c copy` — **no transcoding**, only repackaging the container 
 
 ## Packet alignment — `ingest`
 
-[`ingest.Copy`](../../internal/ingest/ingest.go) reads the source and calls `publish`
+[`ingest.Copy`](../../internal/fanout/ingest/ingest.go) reads the source and calls `publish`
 **in chunks that are multiples of 188 bytes**. If a given read broke off in the middle of a packet,
 the "tail" is carried over to the next read — so all the parsers downstream (the join ring)
 always receive only whole TS packets. The read size is set by the `chunk_bytes`
@@ -176,7 +176,7 @@ output, and push mode (data from the ingest socket).
 
 ## TS fan-out — `hub`
 
-[`Hub`](../../internal/hub/hub.go) is the point of distribution of a single stream to many viewers.
+[`Hub`](../../internal/fanout/hub/hub.go) is the point of distribution of a single stream to many viewers.
 One `Hub` per stream. Since **ADR 0004** ([`docs/adr/0004`](../adr/0004-ring-is-the-live-tail.md))
 the ring is the one byte store for the join history, the live tail **and** HLS: a viewer **follows
 the ring by cursor** for its whole session — there is no per-viewer channel and no per-viewer copy.
@@ -237,7 +237,7 @@ channel), its OS send buffer fills up, and the write system call blocks
 **forever** — neither the hub's dropping nor cancellation of the HTTP context interrupts a write that has
 already begun.
 
-The solution is in [`serveLive`](../../internal/server/server.go): each write to a viewer is
+The solution is in [`serveLive`](../../internal/fanout/server/server.go): each write to a viewer is
 capped by a **deadline** `write_timeout_sec` (default 15 s). A stalled write
 turns into an error, the deferred `detach`/`removeConn` fire, and `fanout_sync`
 can close the `lines_live` row. A healthy realtime viewer accumulates no more than ~1 s of
@@ -265,7 +265,7 @@ The problem: a viewer connects to a live stream at an arbitrary moment. If you s
 bytes to them "from the current position", their player will see the middle of a video frame with no PAT/PMT and no
 keyframe — and will show nothing. A "clean join" is needed.
 
-[`tsjoin.State`](../../internal/tsjoin/tsjoin.go) honestly **parses the MPEG-TS structure**
+[`tsjoin.State`](../../internal/media/ts/join/tsjoin.go) honestly **parses the MPEG-TS structure**
 (rather than matching by fixed offsets, like the legacy `ProxyCommand`) and holds exactly what
 a new viewer needs to start:
 
@@ -444,7 +444,7 @@ bytes belong to one viewer.
 
 ## HLS encryption — `hlscrypt`
 
-[`hlscrypt.EncryptCBC`](../../internal/hlscrypt/hlscrypt.go) encrypts HLS segments with
+[`hlscrypt.EncryptCBC`](../../internal/media/hlscrypt/hlscrypt.go) encrypts HLS segments with
 **AES-128-CBC + PKCS#7**, byte-for-byte compatible with the PHP panel:
 `openssl_encrypt(data, "aes-128-cbc", key, OPENSSL_RAW_DATA, iv)`.
 

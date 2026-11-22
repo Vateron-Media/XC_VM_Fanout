@@ -14,7 +14,7 @@ Everywhere, `<id>` is the identifier of the stream (a string) under which it is 
 
 ## Client surface (for nginx)
 
-Routing is handled by [`ClientHandler`](../../internal/server/server.go). This is where nginx proxies
+Routing is handled by [`ClientHandler`](../../internal/fanout/server/server.go). This is where nginx proxies
 viewer requests, usually via `X-Accel-Redirect` from `live.php`.
 
 | Method and path | Purpose |
@@ -27,7 +27,7 @@ viewer requests, usually via `X-Accel-Redirect` from `live.php`.
 ### `GET /live/<id>` — live TS
 
 Keeps the connection open and continuously streams MPEG-TS to the viewer. The handler is
-[`serveLive`](../../internal/server/server.go).
+[`serveLive`](../../internal/fanout/server/server.go).
 
 **Query parameters:**
 
@@ -66,7 +66,7 @@ nothing times out, and a half-open client would linger forever. `0` disables it.
 ### `GET /hls/<id>/index.m3u8` — HLS playlist
 
 Returns the current media playlist, generated in memory. The handler is
-[`serveHLS`](../../internal/server/server.go).
+[`serveHLS`](../../internal/fanout/server/server.go).
 
 - If there are no segments yet — `404 no segments yet`.
 - **Response:** `200`, `Content-Type: application/vnd.apple.mpegurl`, `Cache-Control: no-store`.
@@ -93,7 +93,7 @@ Always `200` with body `ok`. For monitoring/keepalive.
 
 ## Control surface (PHP-only)
 
-Enabled by the `-ctl` flag. Routing is handled by [`ControlHandler`](../../internal/server/server.go).
+Enabled by the `-ctl` flag. Routing is handled by [`ControlHandler`](../../internal/fanout/server/server.go).
 Only the **PHP panel** talks to this surface.
 
 | Method and path | Purpose |
@@ -206,7 +206,7 @@ The same as `DELETE /streams/<id>` (shared `Unregister`). **Response:** `204`.
 
 Warms up a registered stream (starts the puller, just as a viewer would) and
 waits for data to appear, then returns the same JSON as `GET /streams/<id>`.
-The handler is [`serveProbe`](../../internal/server/server.go).
+The handler is [`serveProbe`](../../internal/fanout/server/server.go).
 
 | Parameter | Default | Maximum | Meaning |
 |----------|:-----------:|:--------:|-------|
@@ -222,7 +222,7 @@ picked up by it; if no viewer arrives, the reaper stops the puller.
 ### `GET /connections` — viewer reconciliation
 
 Returns a JSON array of the uuids of **all** currently connected live-TS viewers (the values
-of `?c=`) across all streams. The handler is [`serveConnections`](../../internal/server/server.go).
+of `?c=`) across all streams. The handler is [`serveConnections`](../../internal/fanout/server/server.go).
 
 > A uuid is deduplicated **within a single stream** (refcounted per connection). There is no global
 > deduplication across streams: the same uuid connected to two different streams would
@@ -244,7 +244,7 @@ the agent reads the bare array too.
 ### `DELETE /connections/<uuid>` — disconnect a viewer
 
 Ends every live-TS connection carrying `<uuid>` (the `?c=` value), on whichever stream it is
-attached to. The handler is [`serveDropConnection`](../../internal/server/server.go).
+attached to. The handler is [`serveDropConnection`](../../internal/fanout/server/server.go).
 
 Under X-Accel the PHP worker that admitted a viewer returns at hand-off, so the panel cannot
 kill a process to end the session the way it did on the legacy byte path. It calls this instead
@@ -260,7 +260,7 @@ another node), `405` for any method but `DELETE`. Advertised as `drop_connection
 
 Returns a JSON object mapping each active live-TS viewer's uuid to its **average delivery rate
 in KB/s** since the connection attached (`bytes / elapsed / 1024`). The handler is
-[`serveRates`](../../internal/server/server.go); it sums bytes the daemon actually wrote to each
+[`serveRates`](../../internal/fanout/server/server.go); it sums bytes the daemon actually wrote to each
 `?c=<uuid>` connection.
 
 This is the daemon-side replacement for the legacy `live.php` chase-read loop, which measured the
@@ -321,7 +321,7 @@ Queues a **one-shot** text banner to be burned onto the video of the single view
 connection uuid is `<uuid>` (the `?c=` value). This is the daemon-side replacement for the
 legacy PHP byte-path overlay that Phase E removed — the admin "Send Message" feature. The panel
 posts it via [`FanoutClient::sendSignal`](../../../XC_VM/src/Streaming/Fanout/FanoutClient.php);
-the handler is [`serveSignal`](../../internal/server/server.go). The body is JSON:
+the handler is [`serveSignal`](../../internal/fanout/server/server.go). The body is JSON:
 
 ```json
 {

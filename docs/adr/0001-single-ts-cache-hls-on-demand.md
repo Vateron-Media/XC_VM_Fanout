@@ -9,7 +9,7 @@ is not done.
 The daemon keeps **two independent per-stream buffers**, both filled on every
 `Stream.Publish`, unconditionally, for every fed channel regardless of viewers:
 
-- **TS ring** (`internal/tsjoin`) — keyframe-aligned GOPs with PCR timing, kept
+- **TS ring** (`internal/media/ts/join`) — keyframe-aligned GOPs with PCR timing, kept
   `prebuffer_max` seconds. Serves `GET /live/<id>` (MPEG-TS fan-out): clean join
   (PAT/PMT + keyframe) plus client prebuffer.
 - **HLS store** (`internal/hlsseg`) — re-parses the same TS and holds the

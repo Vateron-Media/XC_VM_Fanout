@@ -15,7 +15,7 @@ has no subscribers (the idle case), so an unwatched fed channel allocates nothin
 per chunk.
 
 One copy remains, and it is on the **watched** path. `Hub.Publish`, when a stream
-has viewers (`internal/hub/hub.go`):
+has viewers (`internal/fanout/hub/hub.go`):
 
 ```go
 b := make([]byte, len(chunk)); copy(b, chunk) // fresh heap alloc, every chunk

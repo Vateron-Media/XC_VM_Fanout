@@ -21,13 +21,13 @@ supervisor that does not exist yet.
 What the Go binary already owns (verified in `XC_VM_Fanout`, branch
 `feat/front-static-images`):
 
-- **The supervisor** (`internal/supervisor/`, `supervisor.go` ~58 KB plus
+- **The supervisor** (`internal/fanout/supervisor/`, `supervisor.go` ~58 KB plus
   `adopt.go`, `health.go`, `launch_unix.go`, `sources.go`): launches the encoder
   process, detects audio loss / flap / give-up and restarts, falls back across
   sources, retries probes, adopts running encoders across a daemon restart, and
   honours start windows. This *is* the stream lifecycle execution.
 - **The reaper** (`Manager.StartReaper`): idle-stop of streams with no viewers.
-- **The control API** (`Manager.ControlHandler()`, `internal/server/server.go`):
+- **The control API** (`Manager.ControlHandler()`, `internal/fanout/server/server.go`):
   `/streams`, `/streams/`, `/monitor/`, `/monitors`, `/monitors/state`,
   `/signal/`, `/connections`, `/connections/`, `/events`. These are the
   endpoints PHP drives to start/stop/monitor a stream — labelled in-code "the
@@ -39,7 +39,7 @@ What the Go binary already owns (verified in `XC_VM_Fanout`, branch
 ## What PHP still orchestrates on an LB today (the gap)
 
 1. **On-demand start trigger.** The gateway deliberately defers a
-   not-running stream to PHP. `JudgeLive` (`internal/gateway/live.go:95-96`)
+   not-running stream to PHP. `JudgeLive` (`internal/fanout/gateway/live.go:95-96`)
    lists "a stream that is not running" among the cases that "go to PHP before
    anything is written." PHP's `live.php` then starts the stream (via the
    fanout control `/monitor/`) and the viewer retries. With no php-fpm there is
@@ -57,7 +57,7 @@ What the Go binary already owns (verified in `XC_VM_Fanout`, branch
 
 > Verified: items under "already in Go," and that the gateway defers a
 > not-running stream (live.go:95-96) with `Node` exposing only `HandOverFile`
-> today (`internal/gateway/server.go:60`). To confirm during planning: the
+> today (`internal/fanout/gateway/server.go:60`). To confirm during planning: the
 > exact PHP call path for each of items 1–4 on an LB (named functionally here;
 > the implementation plan enumerates the precise commands/crons from the
 > `make lb` tree).

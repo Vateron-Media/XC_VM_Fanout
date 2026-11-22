@@ -62,7 +62,7 @@ does nothing.
 ## Stop: the reaper
 
 The source is stopped by a background cleanup — the **reaper**
-([`StartReaper`](../../internal/server/server.go)), launched once at daemon startup.
+([`StartReaper`](../../internal/fanout/server/server.go)), launched once at daemon startup.
 
 - **How often:** it ticks every `grace/2` (but no less than once a second).
 - **What it does:** it walks all streams and calls `idleStopLocked` for each.

@@ -218,8 +218,8 @@ It produces the same two outputs as the panel's ffmpeg `-f tee` line: the on-dis
 of the panel reads (`<id>_.m3u8` + `<id>_<n>.ts`, numbered from 0 — for the tv_archive worker,
 loopback children and the on-demand start checks), and the MPEG-TS feed into this daemon's ingest
 socket. Bytes pass through unchanged: no demux of the codec payload, no re-encode. It is built from
-the P2PTV project's native remuxer — its source layer (`internal/nativesrc`), its passthrough
-segmenter (`internal/tsseg`) and its keyframe detection (`internal/tspes`, which also lets the
+the P2PTV project's native remuxer — its source layer (`internal/media/source`), its passthrough
+segmenter (`internal/media/ts/segment`) and its keyframe detection (`internal/media/ts/pes`, which also lets the
 daemon cut HLS from sources that never set `random_access_indicator`).
 
 Segments are cut and timed exactly as ffmpeg's hls muxer does it: at the first keyframe at or

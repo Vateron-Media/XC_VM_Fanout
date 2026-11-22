@@ -14,7 +14,7 @@
 
 ## Клиентская поверхность (для nginx)
 
-Роутинг — [`ClientHandler`](../../internal/server/server.go). Сюда nginx проксирует
+Роутинг — [`ClientHandler`](../../internal/fanout/server/server.go). Сюда nginx проксирует
 запросы зрителей, обычно через `X-Accel-Redirect` из `live.php`.
 
 | Метод и путь | Назначение |
@@ -27,7 +27,7 @@
 ### `GET /live/<id>` — живой TS
 
 Держит соединение открытым и непрерывно льёт зрителю MPEG-TS. Обработчик —
-[`serveLive`](../../internal/server/server.go).
+[`serveLive`](../../internal/fanout/server/server.go).
 
 **Query-параметры:**
 
@@ -66,7 +66,7 @@
 ### `GET /hls/<id>/index.m3u8` — плейлист HLS
 
 Возвращает текущий медиаплейлист, сгенерированный в памяти. Обработчик —
-[`serveHLS`](../../internal/server/server.go).
+[`serveHLS`](../../internal/fanout/server/server.go).
 
 - Если сегментов ещё нет — `404 no segments yet`.
 - **Ответ:** `200`, `Content-Type: application/vnd.apple.mpegurl`, `Cache-Control: no-store`.
@@ -93,7 +93,7 @@
 
 ## Управляющая поверхность (только для PHP)
 
-Включается флагом `-ctl`. Роутинг — [`ControlHandler`](../../internal/server/server.go).
+Включается флагом `-ctl`. Роутинг — [`ControlHandler`](../../internal/fanout/server/server.go).
 Сюда ходит **только PHP-панель**.
 
 | Метод и путь | Назначение |
@@ -207,7 +207,7 @@
 
 Прогревает зарегистрированный поток (запускает puller, как это сделал бы зритель) и
 ждёт появления данных, затем возвращает тот же JSON, что `GET /streams/<id>`.
-Обработчик — [`serveProbe`](../../internal/server/server.go).
+Обработчик — [`serveProbe`](../../internal/fanout/server/server.go).
 
 | Параметр | По умолчанию | Максимум | Смысл |
 |----------|:-----------:|:--------:|-------|
@@ -221,7 +221,7 @@ PHP вызывает это после регистрации proxy-источн
 ### `GET /connections` — реконсиляция зрителей
 
 Возвращает JSON-массив uuid **всех** сейчас подключённых live-TS зрителей (значения
-`?c=`) по всем потокам. Обработчик — [`serveConnections`](../../internal/server/server.go).
+`?c=`) по всем потокам. Обработчик — [`serveConnections`](../../internal/fanout/server/server.go).
 
 > uuid дедуплицируется **в пределах одного потока** (refcount на подключение). Глобальной
 > дедупликации по потокам нет: один и тот же uuid, подключённый к двум разным потокам,
@@ -243,7 +243,7 @@ PHP вызывает это после регистрации proxy-источн
 ### `DELETE /connections/<uuid>` — отключить зрителя
 
 Завершает все live-TS соединения, несущие `<uuid>` (значение `?c=`), на каком бы потоке они ни
-висели. Обработчик — [`serveDropConnection`](../../internal/server/server.go).
+висели. Обработчик — [`serveDropConnection`](../../internal/fanout/server/server.go).
 
 Под X-Accel PHP-воркер, впустивший зрителя, возвращается сразу после hand-off, поэтому панель не
 может завершить сессию, убив процесс, как это делалось на старом байтовом тракте. Вместо этого она
@@ -260,7 +260,7 @@ PHP вызывает это после регистрации proxy-источн
 
 Возвращает JSON-объект: для каждого активного live-TS зрителя его uuid → **средняя скорость отдачи
 в КБ/с** с момента подключения (`bytes / elapsed / 1024`). Обработчик —
-[`serveRates`](../../internal/server/server.go); он суммирует байты, реально записанные демоном в
+[`serveRates`](../../internal/fanout/server/server.go); он суммирует байты, реально записанные демоном в
 каждое соединение `?c=<uuid>`.
 
 Это замена легаси-цикла дочитывания в `live.php`, который сам измерял ту же скорость и писал её в
@@ -284,7 +284,7 @@ PHP вызывает это после регистрации proxy-источн
 зрителя с uuid соединения `<uuid>` (значение `?c=`). Это замена легаси-оверлея из байтового тракта
 PHP, убранного в фазе E, — админская функция «Отправить сообщение». Панель постит его через
 [`FanoutClient::sendSignal`](../../../XC_VM/src/Streaming/Fanout/FanoutClient.php); обработчик —
-[`serveSignal`](../../internal/server/server.go). Тело — JSON:
+[`serveSignal`](../../internal/fanout/server/server.go). Тело — JSON:
 
 ```json
 {

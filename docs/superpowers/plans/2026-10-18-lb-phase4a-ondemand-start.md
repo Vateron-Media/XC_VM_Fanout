@@ -6,16 +6,16 @@
 
 **Architecture:** Add `EnsureRunning(id) bool` to the gateway `Node` interface, implemented on `*server.Manager` as `touch()` (the registered-puller start — idempotent, single-flighted; a no-op for an ingest-fed transcode or an already-running stream) followed by a bounded poll of readiness (`Stream.onAir()`). The gateway serve path already has a serve-only "warmup" branch that cold-starts via `touch()` and relies on a 404-retry; Phase 4a replaces that reliance with an explicit `EnsureRunning` call — serve once ready, return a short `503 Retry-After` on timeout. `EnsureRunning` never drives the `/monitor/` → `Supervisor.Supervise` path (that needs a panel-composed `Spec`; the daemon never composes command lines). Shadow mode and PHP-backed nodes are untouched.
 
-**Tech Stack:** Go (1.23); XC_VM_Fanout; `internal/gateway`, `internal/server`.
+**Tech Stack:** Go (1.23); XC_VM_Fanout; `internal/fanout/gateway`, `internal/fanout/server`.
 
 **Spec:** `docs/superpowers/specs/2026-10-17-lb-phase4-5-lifecycle-design.md` (Phase 4a), copied from XC_VM commit `e0f3f3a0f`.
 
 ## Global Constraints
 
 - **Fork from `feat/lb-transcode-serve` (`fd65395`), not `master`.** `Policy.ServeOnly`, `Node.Serveable`, and the serve-only warmup path exist only on that branch; `master` lacks the #84/#85/#86 serve/transcode stack.
-- **The daemon never composes encoder command lines** (security boundary, `internal/server/monitor.go:30-31`). `EnsureRunning` must use the registered-puller start (`Stream.touch()`/`startLocked()`), never `Supervisor.Supervise`.
-- **Shadow mode must never start a stream.** `EnsureRunning` is called only from the serve path, only under `Policy.ServeOnly`; a shadow node short-circuits to `PHP` before the serve path (`internal/gateway/server.go:291-294`) and never has `ServeOnly` set. Do not call `EnsureRunning` from the judge/shadow path.
-- **Idempotent / single-flight:** `startLocked()` already returns early for `removed || running || cfg==nil` under `s.mu` (`internal/server/server.go:652`). Reuse it via `touch()`; do not reimplement locking or restart a running stream.
+- **The daemon never composes encoder command lines** (security boundary, `internal/fanout/server/monitor.go:30-31`). `EnsureRunning` must use the registered-puller start (`Stream.touch()`/`startLocked()`), never `Supervisor.Supervise`.
+- **Shadow mode must never start a stream.** `EnsureRunning` is called only from the serve path, only under `Policy.ServeOnly`; a shadow node short-circuits to `PHP` before the serve path (`internal/fanout/gateway/server.go:291-294`) and never has `ServeOnly` set. Do not call `EnsureRunning` from the judge/shadow path.
+- **Idempotent / single-flight:** `startLocked()` already returns early for `removed || running || cfg==nil` under `s.mu` (`internal/fanout/server/server.go:652`). Reuse it via `touch()`; do not reimplement locking or restart a running stream.
 
 ## Review Focus
 
@@ -30,14 +30,14 @@
 ### Task 1: `EnsureRunning` on the Manager
 
 **Files:**
-- Modify: `internal/server/server.go` (add the method + two tunables near the other stream timeouts)
-- Test: `internal/server/ensure_running_test.go` (new; model on `internal/server/serve_live_idle_test.go` and `registered_test.go`)
+- Modify: `internal/fanout/server/server.go` (add the method + two tunables near the other stream timeouts)
+- Test: `internal/fanout/server/ensure_running_test.go` (new; model on `internal/fanout/server/serve_live_idle_test.go` and `registered_test.go`)
 
 **Interfaces:**
 - Consumes: `Manager.Get(id) *Stream`, `Stream.touch()` (`server.go:772`), `Stream.onAir() bool` (`server.go:880`).
 - Produces: `func (m *Manager) EnsureRunning(id string) bool` — looks up the stream; if absent, returns false; else `touch()` (starts a registered puller, no-op if already running or ingest-fed) and polls `onAir()` up to `ensureRunningTimeout` (sleeping `ensureRunningPoll` between checks), returning true as soon as it is on air, else a final `onAir()` at timeout. Package vars `ensureRunningTimeout` (default `3 * time.Second`) and `ensureRunningPoll` (default `75 * time.Millisecond`) — **vars, not consts**, so tests can lower them.
 
-- [ ] **Step 1: Write the failing tests** in `internal/server/ensure_running_test.go`:
+- [ ] **Step 1: Write the failing tests** in `internal/fanout/server/ensure_running_test.go`:
 
 ```go
 // Lower the tunables so the timeout case is fast; restore after.
@@ -53,22 +53,22 @@ Use the existing harness for registering streams and feeding/withholding data (s
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd /root/work/XC_VM_Fanout-2.8.0 && GOWORK=off go test ./internal/server/ -run TestEnsureRunning -v`
+Run: `cd /root/work/XC_VM_Fanout-2.8.0 && GOWORK=off go test ./internal/fanout/server/ -run TestEnsureRunning -v`
 Expected: FAIL — `m.EnsureRunning undefined`.
 
-- [ ] **Step 3: Implement `func (m *Manager) EnsureRunning(id string) bool` in `internal/server/server.go`**
+- [ ] **Step 3: Implement `func (m *Manager) EnsureRunning(id string) bool` in `internal/fanout/server/server.go`**
 
 Look up with `m.Get(id)`; `nil` → return false. Else `st.touch()`, then poll `st.onAir()` on a `time.NewTimer(ensureRunningTimeout)` / `time.Ticker(ensureRunningPoll)` loop, returning true on first `onAir()`; on timer fire return `st.onAir()`. Add the two package vars beside the existing stream timeouts.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `GOWORK=off go test ./internal/server/ -run TestEnsureRunning -v`
+Run: `GOWORK=off go test ./internal/fanout/server/ -run TestEnsureRunning -v`
 Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/server/server.go internal/server/ensure_running_test.go
+git add internal/fanout/server/server.go internal/fanout/server/ensure_running_test.go
 git commit -m "feat(server): Manager.EnsureRunning — in-process on-demand puller start + bounded readiness wait"
 ```
 
@@ -77,26 +77,26 @@ git commit -m "feat(server): Manager.EnsureRunning — in-process on-demand pull
 ### Task 2: Expose `EnsureRunning` on the gateway `Node` interface + test fake
 
 **Files:**
-- Modify: `internal/gateway/server.go:60-73` (the `Node` interface)
-- Modify: `internal/gateway/agent_test.go:110-143` (`fakeFiles`)
+- Modify: `internal/fanout/gateway/server.go:60-73` (the `Node` interface)
+- Modify: `internal/fanout/gateway/agent_test.go:110-143` (`fakeFiles`)
 
 **Interfaces:**
 - Consumes: `Manager.EnsureRunning` (Task 1) — `*server.Manager` already satisfies the new method, so it keeps satisfying `Node`.
 - Produces: `Node.EnsureRunning(id string) bool`; `fakeFiles.EnsureRunning` driven by a `ensureRunning func(string) bool` field (default: return `f.Serveable(id)` so existing tests that register a stream behave as "startable → ready").
 
-- [ ] **Step 1: Add `EnsureRunning(id string) bool` to the `Node` interface** (`internal/gateway/server.go:60-73`), documented as "start the stream in-process if registered and wait (bounded) for it to be ready; serve-only path only."
+- [ ] **Step 1: Add `EnsureRunning(id string) bool` to the `Node` interface** (`internal/fanout/gateway/server.go:60-73`), documented as "start the stream in-process if registered and wait (bounded) for it to be ready; serve-only path only."
 
 - [ ] **Step 2: Add the method to `fakeFiles`** (`agent_test.go`): a `ensureRunning func(string) bool` field; the method calls it, defaulting (when nil) to `f.Serveable(id)`.
 
 - [ ] **Step 3: Verify the gateway package compiles and its existing tests pass**
 
-Run: `GOWORK=off go build ./... && GOWORK=off go test ./internal/gateway/ 2>&1 | tail -5`
+Run: `GOWORK=off go build ./... && GOWORK=off go test ./internal/fanout/gateway/ 2>&1 | tail -5`
 Expected: build OK; existing gateway tests still PASS (the new interface method is satisfied by `*Manager` and `fakeFiles`).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add internal/gateway/server.go internal/gateway/agent_test.go
+git add internal/fanout/gateway/server.go internal/fanout/gateway/agent_test.go
 git commit -m "feat(gateway): add EnsureRunning to the Node interface (+ test fake)"
 ```
 
@@ -105,13 +105,13 @@ git commit -m "feat(gateway): add EnsureRunning to the Node interface (+ test fa
 ### Task 3: Serve-only warmup calls `EnsureRunning` (serve on ready, 503 on timeout)
 
 **Files:**
-- Modify: `internal/gateway/server.go` — `(*Server).serveLive` warmup handling (~`:512-521`) and the TS warmup arm it dispatches; add a small `retryLater(w http.ResponseWriter)` helper (503 + `Retry-After: 1`).
-- Test: `internal/gateway/serve_live_warmup_test.go` (new; model on `TestJudgeLiveServeOnlyServesIdleRegistered` `internal/gateway/live_test.go:962-1027` and the `*Server` serve tests via `NewServer`/`serveReq`/`writeServePolicy`).
+- Modify: `internal/fanout/gateway/server.go` — `(*Server).serveLive` warmup handling (~`:512-521`) and the TS warmup arm it dispatches; add a small `retryLater(w http.ResponseWriter)` helper (503 + `Retry-After: 1`).
+- Test: `internal/fanout/gateway/serve_live_warmup_test.go` (new; model on `TestJudgeLiveServeOnlyServesIdleRegistered` `internal/fanout/gateway/live_test.go:962-1027` and the `*Server` serve tests via `NewServer`/`serveReq`/`writeServePolicy`).
 
 **Interfaces:**
 - Consumes: `Node.EnsureRunning` (Task 2); `Policy.ServeOnly` (`policy.go:46`); `Refresh.Warmup` (`live.go:67`) — set by `JudgeLive` only when `p.ServeOnly && env.Serveable` (`live.go:299`, `:324`), so a warmup already implies serve-only.
 
-- [ ] **Step 1: Write the failing gateway tests** in `internal/gateway/serve_live_warmup_test.go`:
+- [ ] **Step 1: Write the failing gateway tests** in `internal/fanout/gateway/serve_live_warmup_test.go`:
 
 ```go
 // ServeOnly policy + a fake node whose EnsureRunning returns true for the registered-but-idle stream.
@@ -127,7 +127,7 @@ Assert PHP-defer via the `X-Accel-Redirect` header (`server.go:344-346`, `phpLoc
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `GOWORK=off go test ./internal/gateway/ -run 'ServeOnlyWarmup|PhpBackendNotRunning|ShadowNeverCalls' -v`
+Run: `GOWORK=off go test ./internal/fanout/gateway/ -run 'ServeOnlyWarmup|PhpBackendNotRunning|ShadowNeverCalls' -v`
 Expected: FAIL (timeout case currently 404-retries / does not 503; the serve case relies on the old re-dispatch).
 
 - [ ] **Step 3: Wire `EnsureRunning` into the warmup branch of `(*Server).serveLive`**
@@ -136,18 +136,18 @@ Where `ref.Warmup` is handled today (the HLS re-dispatch at `~server.go:512-521`
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `GOWORK=off go test ./internal/gateway/ -run 'ServeOnlyWarmup|PhpBackendNotRunning|ShadowNeverCalls' -v`
+Run: `GOWORK=off go test ./internal/fanout/gateway/ -run 'ServeOnlyWarmup|PhpBackendNotRunning|ShadowNeverCalls' -v`
 Expected: PASS (4 tests).
 
 - [ ] **Step 5: Run the full gateway + server suites**
 
-Run: `GOWORK=off go test ./internal/gateway/ ./internal/server/ 2>&1 | tail -8`
+Run: `GOWORK=off go test ./internal/fanout/gateway/ ./internal/fanout/server/ 2>&1 | tail -8`
 Expected: PASS (no regression in the existing serve/warmup/shadow tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/gateway/server.go internal/gateway/serve_live_warmup_test.go
+git add internal/fanout/gateway/server.go internal/fanout/gateway/serve_live_warmup_test.go
 git commit -m "feat(gateway): serve-only warmup starts via EnsureRunning, 503 Retry-After on timeout"
 ```
 

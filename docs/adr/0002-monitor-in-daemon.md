@@ -37,7 +37,7 @@ text is kept as the record.
   panel runs the stream itself. The daemon's built-in default (`defaults.CfgSupervise`) is
   false, but the panel always writes the key.
 - **The event drain is `GET /events`**, not `GET /monitor/events`. It is the control-socket
-  feed `internal/server/events.go` serves (`GET /events?boot=<boot>&since=<seq>&wait=<sec>`) —
+  feed `internal/fanout/server/events.go` serves (`GET /events?boot=<boot>&since=<seq>&wait=<sec>`) —
   the same feed XC_VM ADR 0004's cluster agent (`xc_agent`) reads. No `/monitor/events` route
   exists.
 - **`settings.fanout_enabled = 0` overrides everything.** It restores the pre-fanout path
@@ -66,7 +66,7 @@ process per stream, started by `StreamProcess::startMonitor()` via
 11. Scheduled auto-restart, delay-process supervision, failure-limit give-up
 
 Nine of the eleven are things the daemon is better placed to do, because it already has
-the bytes in RAM. It parses PAT/PMT/PES today (`internal/tsjoin`), tracks per-stream
+the bytes in RAM. It parses PAT/PMT/PES today (`internal/media/ts/join`), tracks per-stream
 liveness (`Stream.lastData`), owns the source URL list (`puller.Source.URLs`), and already
 reconnects with backoff. PHP is doing all of this the hard way — shelling out to ffprobe
 against files on disk, md5-ing a playlist, and reading a progress file ffmpeg writes.
@@ -117,7 +117,7 @@ nothing except a large surface for silent behavioural drift.
 
 | Monitor job | Moves? | Where it lands |
 |---|---|---|
-| ffmpeg spawn / kill / restart | **yes** | daemon `internal/supervisor` |
+| ffmpeg spawn / kill / restart | **yes** | daemon `internal/fanout/supervisor` |
 | single-instance enforcement | **yes** | daemon owns the stream, so it is structural |
 | playlist-appears wait | **replaced** | daemon watches its own ingest socket for first bytes |
 | stalled output | **yes, improved** | `lastData`, continuous, not an md5 poll |
@@ -131,7 +131,7 @@ nothing except a large surface for silent behavioural drift.
 
 ### The seam
 
-Extends the existing control API (`internal/server.ControlHandler`) rather than inventing
+Extends the existing control API (`internal/fanout/server.ControlHandler`) rather than inventing
 a channel:
 
 ```
@@ -147,7 +147,7 @@ GET    /monitor/events?since=<seq>   drain the event log (see below)
 ```
 
 > **Superseded (2026-09-28):** the event drain shipped as `GET /events` on the control
-> socket (`internal/server/events.go`), the feed XC_VM ADR 0004's cluster agent reads. There
+> socket (`internal/fanout/server/events.go`), the feed XC_VM ADR 0004's cluster agent reads. There
 > is no `/monitor/events` route. See the amendment above.
 
 Events are drained by PHP and written to the DB there. The daemon *also* appends them to
