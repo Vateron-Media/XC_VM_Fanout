@@ -47,6 +47,10 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 				if err != nil {
 					return nil, err
 				}
+				if proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h" {
+					request, key := pinProxyRequest(r, ips[0])
+					return t.socksTransport(proxyBase, proxyURL.String()+"\x00"+key, r.URL.Hostname()).RoundTrip(request)
+				}
 				target := pinnedAddress(r.URL, ips[0])
 				key := proxyURL.String() + "\x00" + target
 				transport, err := t.proxyTransport(proxyBase, key, proxyURL, target)
@@ -80,6 +84,44 @@ func (t *Transport) resolvePublic(ctx context.Context, host string) ([]net.IP, e
 		return ips, nil
 	}
 	return publicIPs(ctx, host)
+}
+
+func pinProxyRequest(r *http.Request, ip net.IP) (*http.Request, string) {
+	host := ip.String()
+	if ip.To4() == nil {
+		host = "[" + host + "]"
+	}
+	if port := r.URL.Port(); port != "" {
+		host = net.JoinHostPort(ip.String(), port)
+	}
+	u := *r.URL
+	u.Host = host
+	request := r.Clone(r.Context())
+	request.URL = &u
+	if request.Host == "" {
+		request.Host = r.URL.Host
+	}
+	return request, r.URL.Scheme + "\x00" + host + "\x00" + r.URL.Hostname()
+}
+
+func (t *Transport) socksTransport(base *http.Transport, key, serverName string) *http.Transport {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if transport := t.proxyTransports[key]; transport != nil {
+		return transport
+	}
+	transport := base.Clone()
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	transport.TLSClientConfig.ServerName = serverName
+	if t.proxyTransports == nil {
+		t.proxyTransports = make(map[string]*http.Transport)
+	}
+	t.proxyTransports[key] = transport
+	return transport
 }
 
 func pinnedAddress(u *url.URL, ip net.IP) string {

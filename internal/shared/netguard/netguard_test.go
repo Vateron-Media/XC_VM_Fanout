@@ -112,3 +112,16 @@ func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
 		t.Fatalf("proxy target %q, Host %q, SNI %q", connectTarget, requestHost, serverName)
 	}
 }
+
+func TestSocksProxyPinsIPAndPreservesHostAndSNI(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://provider.example:8443/live.ts", nil)
+	pinned, key := pinProxyRequest(req, net.ParseIP("8.8.8.8"))
+	if pinned.URL.Host != "8.8.8.8:8443" || pinned.Host != "provider.example:8443" {
+		t.Fatalf("pinned URL host %q and Host %q", pinned.URL.Host, pinned.Host)
+	}
+	guard := &Transport{}
+	transport := guard.socksTransport(&http.Transport{}, key, req.URL.Hostname())
+	if transport.TLSClientConfig.ServerName != "provider.example" {
+		t.Fatalf("TLS ServerName = %q", transport.TLSClientConfig.ServerName)
+	}
+}
