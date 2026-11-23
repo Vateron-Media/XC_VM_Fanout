@@ -2,9 +2,12 @@ package netguard
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 )
@@ -39,6 +42,7 @@ func TestRedirectPolicyRejectsDowngradeAndStripsCredentials(t *testing.T) {
 	next.Header.Set("Cookie", "secret")
 	next.Header.Set("X-Provider-Token", "secret")
 	next.Header.Set("User-Agent", "fanout-test")
+	next.Header.Set("Range", "bytes=67108864-")
 	if err := CheckRedirect(false)(next, []*http.Request{prev}); err == nil {
 		t.Fatal("accepted an HTTPS to HTTP redirect")
 	}
@@ -47,5 +51,64 @@ func TestRedirectPolicyRejectsDowngradeAndStripsCredentials(t *testing.T) {
 	}
 	if next.Header.Get("User-Agent") != "fanout-test" {
 		t.Fatal("cross-host redirect removed User-Agent")
+	}
+	if next.Header.Get("Range") != "bytes=67108864-" {
+		t.Fatal("cross-host redirect removed byte range")
+	}
+}
+
+func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
+	var connectTarget, requestHost, serverName string
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestHost = r.Host
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	origin.StartTLS()
+	defer origin.Close()
+	origin.TLS.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		serverName = hello.ServerName
+		return nil, nil
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectTarget = r.Host
+		upstream, err := net.Dial("tcp", origin.Listener.Addr().String())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		client, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		go func() {
+			_, _ = io.Copy(upstream, client)
+			upstream.Close()
+		}()
+		_, _ = io.Copy(client, upstream)
+		client.Close()
+	}))
+	defer proxy.Close()
+	proxyURL, _ := url.Parse(proxy.URL)
+	guard := &Transport{
+		Base: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		BlockPrivate: true,
+		lookupIP: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("8.8.8.8")}, nil
+		},
+	}
+	client := &http.Client{Transport: guard}
+	resp, err := client.Get("https://provider.example/live.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	client.CloseIdleConnections()
+	if connectTarget != "8.8.8.8:443" || requestHost != "provider.example" || serverName != "provider.example" {
+		t.Fatalf("proxy target %q, Host %q, SNI %q", connectTarget, requestHost, serverName)
 	}
 }

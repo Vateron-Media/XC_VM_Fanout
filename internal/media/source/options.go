@@ -149,7 +149,7 @@ func (o Options) client(transport *http.Transport, timeout time.Duration) *http.
 		transport.DialContext = netguard.PublicDialContext(transport.DialContext)
 	}
 	return &http.Client{
-		Transport:     netguard.Transport{Base: transport, BlockPrivate: o.BlockPrivate},
+		Transport:     &netguard.Transport{Base: transport, BlockPrivate: o.BlockPrivate},
 		CheckRedirect: netguard.CheckRedirect(o.BlockPrivate),
 		Timeout:       timeout,
 	}

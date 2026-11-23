@@ -2,7 +2,10 @@
 package netguard
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +13,8 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
 const MaxRedirects = 3
@@ -17,17 +22,167 @@ const MaxRedirects = 3
 type Transport struct {
 	Base         http.RoundTripper
 	BlockPrivate bool
+
+	mu              sync.Mutex
+	proxyTransports map[string]*http.Transport
+	lookupIP        func(context.Context, string) ([]net.IP, error)
 }
 
-func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
+func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	base := t.Base
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	if err := CheckURL(r.Context(), r.URL, t.BlockPrivate); err != nil {
+	if err := validateURL(r.URL); err != nil {
 		return nil, err
 	}
+	if t.BlockPrivate {
+		if proxyBase, ok := base.(*http.Transport); ok && proxyBase.Proxy != nil {
+			proxyURL, err := proxyBase.Proxy(r)
+			if err != nil {
+				return nil, err
+			}
+			if proxyURL != nil {
+				ips, err := t.resolvePublic(r.Context(), r.URL.Hostname())
+				if err != nil {
+					return nil, err
+				}
+				target := pinnedAddress(r.URL, ips[0])
+				key := proxyURL.String() + "\x00" + target
+				transport, err := t.proxyTransport(proxyBase, key, proxyURL, target)
+				if err != nil {
+					return nil, err
+				}
+				return transport.RoundTrip(r)
+			}
+		}
+		if err := CheckURL(r.Context(), r.URL, true); err != nil {
+			return nil, err
+		}
+	}
 	return base.RoundTrip(r)
+}
+
+func (t *Transport) resolvePublic(ctx context.Context, host string) ([]net.IP, error) {
+	if t.lookupIP != nil {
+		ips, err := t.lookupIP(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		for _, ip := range ips {
+			if !public(ip) {
+				return nil, fmt.Errorf("source host resolves to a non-public address: %s", ip)
+			}
+		}
+		if len(ips) == 0 {
+			return nil, errors.New("source host has no address")
+		}
+		return ips, nil
+	}
+	return publicIPs(ctx, host)
+}
+
+func pinnedAddress(u *url.URL, ip net.IP) string {
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(ip.String(), port)
+}
+
+func (t *Transport) proxyTransport(base *http.Transport, key string, proxyURL *url.URL, target string) (*http.Transport, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if transport := t.proxyTransports[key]; transport != nil {
+		return transport, nil
+	}
+	if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
+		return nil, fmt.Errorf("source guard does not support %s proxies", proxyURL.Scheme)
+	}
+	transport := base.Clone()
+	transport.Proxy = nil
+	transport.DialContext = proxyTunnelDial(base, proxyURL, target)
+	if t.proxyTransports == nil {
+		t.proxyTransports = make(map[string]*http.Transport)
+	}
+	t.proxyTransports[key] = transport
+	return transport, nil
+}
+
+func proxyTunnelDial(base *http.Transport, proxyURL *url.URL, target string) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, _ string) (net.Conn, error) {
+		port := proxyURL.Port()
+		if port == "" {
+			if proxyURL.Scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		dial := base.DialContext
+		if dial == nil {
+			dial = (&net.Dialer{}).DialContext
+		}
+		conn, err := dial(ctx, network, net.JoinHostPort(proxyURL.Hostname(), port))
+		if err != nil {
+			return nil, err
+		}
+		if proxyURL.Scheme == "https" {
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: proxyURL.Hostname()})
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			conn = tlsConn
+		}
+		if base.ResponseHeaderTimeout > 0 {
+			_ = conn.SetDeadline(time.Now().Add(base.ResponseHeaderTimeout))
+		}
+		req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target}, Host: target, Header: make(http.Header)}
+		if proxyURL.User != nil {
+			password, _ := proxyURL.User.Password()
+			token := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + password))
+			req.Header.Set("Proxy-Authorization", "Basic "+token)
+		}
+		if err := req.Write(conn); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, req)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			conn.Close()
+			return nil, fmt.Errorf("proxy CONNECT: %s", resp.Status)
+		}
+		_ = conn.SetDeadline(time.Time{})
+		return &bufferedConn{Conn: conn, reader: reader}, nil
+	}
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+func (t *Transport) CloseIdleConnections() {
+	if closer, ok := t.Base.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, transport := range t.proxyTransports {
+		transport.CloseIdleConnections()
+	}
 }
 
 // PublicDialContext makes the DNS answer checked here the address that is
@@ -58,14 +213,21 @@ func PublicDialContext(dial func(context.Context, string, string) (net.Conn, err
 }
 
 func CheckURL(ctx context.Context, u *url.URL, blockPrivate bool) error {
-	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-		return errors.New("source URL must use http or https")
+	if err := validateURL(u); err != nil {
+		return err
 	}
 	if !blockPrivate {
 		return nil
 	}
 	_, err := publicIPs(ctx, u.Hostname())
 	return err
+}
+
+func validateURL(u *url.URL) error {
+	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return errors.New("source URL must use http or https")
+	}
+	return nil
 }
 
 func publicIPs(ctx context.Context, host string) ([]net.IP, error) {
@@ -130,9 +292,13 @@ func CheckRedirect(blockPrivate bool) func(*http.Request, []*http.Request) error
 			prev := via[len(via)-1]
 			if !strings.EqualFold(prev.URL.Host, req.URL.Host) {
 				userAgent := req.Header.Get("User-Agent")
+				byteRange := req.Header.Get("Range")
 				req.Header = make(http.Header)
 				if userAgent != "" {
 					req.Header.Set("User-Agent", userAgent)
+				}
+				if byteRange != "" {
+					req.Header.Set("Range", byteRange)
 				}
 				req.Host = ""
 			}

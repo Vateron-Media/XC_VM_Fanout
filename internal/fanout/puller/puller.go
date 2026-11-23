@@ -658,7 +658,7 @@ func httpClient(src Source) (*http.Client, error) {
 		tr.DialContext = netguard.PublicDialContext(tr.DialContext)
 	}
 	return &http.Client{
-		Transport:     netguard.Transport{Base: tr, BlockPrivate: src.BlockPrivate},
+		Transport:     &netguard.Transport{Base: tr, BlockPrivate: src.BlockPrivate},
 		CheckRedirect: netguard.CheckRedirect(src.BlockPrivate),
 	}, nil // no client timeout: this is a long-lived stream
 }

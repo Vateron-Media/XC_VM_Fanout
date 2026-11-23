@@ -16,9 +16,9 @@ import (
 
 func guardedHTTPTransport(t *testing.T, c *http.Client) *http.Transport {
 	t.Helper()
-	guard, ok := c.Transport.(netguard.Transport)
+	guard, ok := c.Transport.(*netguard.Transport)
 	if !ok {
-		t.Fatalf("transport is %T, want netguard.Transport", c.Transport)
+		t.Fatalf("transport is %T, want *netguard.Transport", c.Transport)
 	}
 	tr, ok := guard.Base.(*http.Transport)
 	if !ok {

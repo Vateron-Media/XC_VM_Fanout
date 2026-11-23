@@ -25,7 +25,7 @@ func TestTransportIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	guard, ok := c.Transport.(netguard.Transport)
+	guard, ok := c.Transport.(*netguard.Transport)
 	if !ok {
 		t.Fatalf("transport is %T", c.Transport)
 	}
@@ -56,7 +56,17 @@ func TestTransportIsBounded(t *testing.T) {
 
 func TestPrivateProxyIsAllowedForPublicDestination(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = rw.Flush()
+		if _, err := http.ReadRequest(rw.Reader); err == nil {
+			_, _ = rw.WriteString("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+			_ = rw.Flush()
+		}
 	}))
 	defer proxy.Close()
 	pu, _ := url.Parse(proxy.URL)
