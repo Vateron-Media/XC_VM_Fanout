@@ -187,8 +187,24 @@ func TestHTTPForwardProxyGetsPinnedAuthorityAndPreservesOriginIdentity(t *testin
 		proxyDone <- err
 	}()
 	proxyURL, _ := url.Parse("http://" + proxy.Addr().String())
+	var selectedHosts []string
+	dialer := &net.Dialer{}
 	guard := &Transport{
-		Base:         &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		Base: &http.Transport{
+			Proxy: func(r *http.Request) (*url.URL, error) {
+				selectedHosts = append(selectedHosts, r.URL.Host)
+				if r.URL.Hostname() == "provider.example" {
+					return proxyURL, nil
+				}
+				return nil, nil
+			},
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				if address != proxy.Addr().String() {
+					return nil, fmt.Errorf("unexpected direct dial to %s", address)
+				}
+				return dialer.DialContext(ctx, network, address)
+			},
+		},
 		BlockPrivate: true,
 		lookupIP: func(context.Context, string) ([]net.IP, error) {
 			return []net.IP{net.ParseIP("8.8.8.8")}, nil
@@ -201,6 +217,9 @@ func TestHTTPForwardProxyGetsPinnedAuthorityAndPreservesOriginIdentity(t *testin
 	resp.Body.Close()
 	if err := <-proxyDone; err != nil {
 		t.Fatal(err)
+	}
+	if len(selectedHosts) != 1 || selectedHosts[0] != "provider.example" {
+		t.Fatalf("proxy selector hosts = %v", selectedHosts)
 	}
 	if proxyMethod != http.MethodGet || proxyAuthority != "8.8.8.8" {
 		t.Fatalf("proxy received method %q and authority %q", proxyMethod, proxyAuthority)

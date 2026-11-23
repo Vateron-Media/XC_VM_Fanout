@@ -58,7 +58,7 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 							path = "/"
 						}
 						request.URL.Opaque = "//" + request.URL.Host + path
-						response, err = proxyBase.RoundTrip(request)
+						response, err = t.forwardProxyTransport(proxyBase, proxyURL).RoundTrip(request)
 					case proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h":
 						request, key := pinProxyRequest(r, ip)
 						response, err = t.socksTransport(proxyBase, proxyURL.String()+"\x00"+key, r.URL.Hostname()).RoundTrip(request)
@@ -144,6 +144,22 @@ func (t *Transport) socksTransport(base *http.Transport, key, serverName string)
 		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	}
 	transport.TLSClientConfig.ServerName = serverName
+	if t.proxyTransports == nil {
+		t.proxyTransports = make(map[string]*http.Transport)
+	}
+	t.proxyTransports[key] = transport
+	return transport
+}
+
+func (t *Transport) forwardProxyTransport(base *http.Transport, proxyURL *url.URL) *http.Transport {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	key := "forward\x00" + proxyURL.String()
+	if transport := t.proxyTransports[key]; transport != nil {
+		return transport
+	}
+	transport := base.Clone()
+	transport.Proxy = http.ProxyURL(proxyURL)
 	if t.proxyTransports == nil {
 		t.proxyTransports = make(map[string]*http.Transport)
 	}
