@@ -173,7 +173,7 @@ func TestCommandLauncherUsesTrustedExecutableAndRejectsShell(t *testing.T) {
 		t.Fatal(err)
 	}
 	launch := CommandLauncher(trusted, "/trusted/xc_fanout")
-	proc, err := launch(context.Background(), "/attacker/ffmpeg -i source", "")
+	proc, err := launch(context.Background(), trusted+" -i source", "")
 	if err != nil {
 		t.Fatalf("trusted launch: %v", err)
 	}
@@ -184,8 +184,37 @@ func TestCommandLauncherUsesTrustedExecutableAndRejectsShell(t *testing.T) {
 	if _, err := launch(context.Background(), "sh -c bad", ""); err == nil {
 		t.Fatal("caller-selected executable accepted")
 	}
+	if _, err := launch(context.Background(), "/attacker/ffmpeg -i source", ""); err == nil {
+		t.Fatal("caller-selected encoder path accepted by basename")
+	}
 	if _, err := launch(context.Background(), "ffmpeg -i x; touch /tmp/no", ""); err == nil {
 		t.Fatal("shell operator accepted")
+	}
+}
+
+func TestCommandLauncherAllowsConfiguredEncoderPath(t *testing.T) {
+	dir := t.TempDir()
+	cpu := filepath.Join(dir, "cpu", "ffmpeg")
+	gpu := filepath.Join(dir, "gpu", "ffmpeg")
+	marker := filepath.Join(dir, "selected")
+	for _, path := range []string{cpu, gpu} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(cpu, []byte("#!/bin/sh\nprintf cpu > \""+marker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gpu, []byte("#!/bin/sh\nprintf gpu > \""+marker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	proc, err := CommandLauncher(cpu, "/trusted/xc_fanout", gpu)(context.Background(), gpu+" -i source", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = proc.Wait()
+	if got, _ := os.ReadFile(marker); string(got) != "gpu" {
+		t.Fatalf("selected encoder = %q, want gpu", got)
 	}
 }
 

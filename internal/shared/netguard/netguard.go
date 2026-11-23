@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 )
@@ -86,8 +87,38 @@ func publicIPs(ctx context.Context, host string) ([]net.IP, error) {
 }
 
 func public(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range specialUsePrefixes {
+		if prefix.Contains(addr) {
+			return false
+		}
+	}
 	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() &&
 		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
+}
+
+var specialUsePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.31.196.0/24"),
+	netip.MustParsePrefix("192.52.193.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.175.48.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2002::/16"),
 }
 
 func CheckRedirect(blockPrivate bool) func(*http.Request, []*http.Request) error {
@@ -98,9 +129,12 @@ func CheckRedirect(blockPrivate bool) func(*http.Request, []*http.Request) error
 		if len(via) > 0 {
 			prev := via[len(via)-1]
 			if !strings.EqualFold(prev.URL.Host, req.URL.Host) {
-				req.Header.Del("Authorization")
-				req.Header.Del("Cookie")
-				req.Header.Del("Proxy-Authorization")
+				userAgent := req.Header.Get("User-Agent")
+				req.Header = make(http.Header)
+				if userAgent != "" {
+					req.Header.Set("User-Agent", userAgent)
+				}
+				req.Host = ""
 			}
 			if prev.URL.Scheme == "https" && req.URL.Scheme != "https" {
 				return errors.New("source redirect downgrades TLS")

@@ -22,8 +22,8 @@ import (
 // stream reaches its source the same way whether it goes down the native path or
 // the ffmpeg one. The upstream project used package-level HTTP clients with
 // ProxyFromEnvironment and default TLS verification; neither is usable here — a
-// panel source routinely needs its OWN proxy, and source_insecure defaults to
-// true only as an explicit compatibility opt-out for a legacy origin.
+// panel source routinely needs its OWN proxy, while source_insecure is only an
+// explicit compatibility opt-out for a trusted legacy origin.
 type Options struct {
 	UserAgent    string // sent unless the caller set one in Header
 	Cookie       string // value of the Cookie header, if any
@@ -145,7 +145,7 @@ func (o Options) transport(dialWait time.Duration) *http.Transport {
 }
 
 func (o Options) client(transport *http.Transport, timeout time.Duration) *http.Client {
-	if o.BlockPrivate {
+	if o.BlockPrivate && transport.Proxy == nil {
 		transport.DialContext = netguard.PublicDialContext(transport.DialContext)
 	}
 	return &http.Client{

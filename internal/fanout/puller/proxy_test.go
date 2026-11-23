@@ -10,7 +10,22 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/netguard"
 )
+
+func guardedHTTPTransport(t *testing.T, c *http.Client) *http.Transport {
+	t.Helper()
+	guard, ok := c.Transport.(netguard.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want netguard.Transport", c.Transport)
+	}
+	tr, ok := guard.Base.(*http.Transport)
+	if !ok {
+		t.Fatalf("guard base is %T, want *http.Transport", guard.Base)
+	}
+	return tr
+}
 
 // argValue returns the value that follows flag in a recorded argv.
 func argValue(t *testing.T, args []string, flag string) string {
@@ -54,8 +69,8 @@ func TestProxyValueWithASchemeIsNotDoubled(t *testing.T) {
 			if err != nil {
 				t.Fatalf("httpClient(proxy=%q): %v", tc.proxy, err)
 			}
-			tr, ok := c.Transport.(*http.Transport)
-			if !ok || tr.Proxy == nil {
+			tr := guardedHTTPTransport(t, c)
+			if tr.Proxy == nil {
 				t.Fatalf("proxy %q produced no transport proxy", tc.proxy)
 			}
 			u, err := tr.Proxy(req)
@@ -129,8 +144,8 @@ func TestProxySchemeSurvivesTheWayNativesrcKeepsIt(t *testing.T) {
 			if err != nil {
 				t.Fatalf("httpClient(proxy=%q): %v", tc.proxy, err)
 			}
-			tr, ok := c.Transport.(*http.Transport)
-			if !ok || tr.Proxy == nil {
+			tr := guardedHTTPTransport(t, c)
+			if tr.Proxy == nil {
 				t.Fatalf("proxy %q produced no transport proxy", tc.proxy)
 			}
 			u, err := tr.Proxy(req)

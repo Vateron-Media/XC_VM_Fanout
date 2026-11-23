@@ -19,7 +19,7 @@ func shellLauncher(context.Context, string, string) (Process, error) {
 	return nil, errors.New("supervisor: launching encoders is only supported on unix")
 }
 
-func CommandLauncher(string, string) Launcher { return shellLauncher }
+func CommandLauncher(string, string, ...string) Launcher { return shellLauncher }
 
 func CommandDriverLauncher(map[string]string) DriverLauncher {
 	return func(context.Context, string, []string, string) (Process, error) {

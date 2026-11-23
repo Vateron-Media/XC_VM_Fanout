@@ -300,6 +300,21 @@ xc_fanout -id test -in ./sample.ts
 xc_fanout -id test -source https://example/live.m3u8 -ua "Mozilla/5.0"
 ```
 
+## Encoder allowlist
+
+`-ffmpeg` is always trusted as the default encoder. Additional CPU, GPU, or legacy builds used by
+panel supervision must be listed in the root-owned `-encoder-config` file (default:
+`/etc/xc_vm/fanout-encoders.json`). The file has the same ownership and mode rules as the driver
+allowlist below and maps operator-defined IDs to exact absolute paths:
+
+```json
+{"gpu":"/home/xc_vm/bin/ffmpeg_bin/7.1-gpu/ffmpeg","legacy":"/home/xc_vm/bin/ffmpeg_bin/4.0/ffmpeg"}
+```
+
+XC_VM's root signals cron writes this file from the installed validated FFmpeg builds.
+The client command may select only an exact listed path; matching an untrusted path by basename is
+not allowed. Changes take effect after a daemon restart.
+
 ## Structured module drivers
 
 Module drivers are disabled unless `-driver-config` names a trusted allowlist (default:

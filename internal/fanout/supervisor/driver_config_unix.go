@@ -20,6 +20,12 @@ func LoadDriverConfig(path string) (map[string]string, error) {
 	return loadDriverConfig(path, 0)
 }
 
+// LoadEncoderConfig applies the same root-owned allowlist contract to the
+// additional ffmpeg builds a panel command may select.
+func LoadEncoderConfig(path string) (map[string]string, error) {
+	return loadDriverConfig(path, 0)
+}
+
 func loadDriverConfig(path string, owner uint32) (map[string]string, error) {
 	out := map[string]string{}
 	if path == "" {

@@ -8,6 +8,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 
@@ -51,6 +52,23 @@ func TestTransportIsBounded(t *testing.T) {
 	if c.Timeout != 0 {
 		t.Errorf("Client.Timeout = %v, must stay 0 — the body is a live stream", c.Timeout)
 	}
+}
+
+func TestPrivateProxyIsAllowedForPublicDestination(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close()
+	pu, _ := url.Parse(proxy.URL)
+	c, err := httpClient(Source{Proxy: pu.Host, BlockPrivate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.Get("http://8.8.8.8/live.ts")
+	if err != nil {
+		t.Fatalf("public destination through private proxy: %v", err)
+	}
+	resp.Body.Close()
 }
 
 // TestProbeReusesConnection: one client per puller means the reconnect loop

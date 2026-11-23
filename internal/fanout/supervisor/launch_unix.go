@@ -21,20 +21,27 @@ import (
 )
 
 // CommandLauncher builds the production no-shell launcher. The request's
-// argv[0] only selects native-remux versus encoder; the executable path itself
-// always comes from daemon startup configuration.
-func CommandLauncher(encoder, fanout string) Launcher {
+// argv[0] only selects native-remux versus an allowlisted encoder; executable
+// paths always come from daemon startup configuration.
+func CommandLauncher(encoder, fanout string, additionalEncoders ...string) Launcher {
 	return func(ctx context.Context, cmdline, stderrPath string) (Process, error) {
 		argv, err := splitCommand(cmdline)
 		if err != nil {
 			return nil, err
 		}
+		requested := filepath.Clean(argv[0])
 		bin := ""
-		switch filepath.Base(argv[0]) {
-		case filepath.Base(encoder):
+		switch {
+		case requested == filepath.Clean(encoder), !filepath.IsAbs(requested) && requested == filepath.Base(encoder):
 			bin = encoder
-		case "xc_fanout":
+		case filepath.Base(requested) == "xc_fanout":
 			bin = fanout
+		}
+		for _, allowed := range additionalEncoders {
+			if requested == filepath.Clean(allowed) {
+				bin = allowed
+				break
+			}
 		}
 		if bin == "" {
 			return nil, fmt.Errorf("monitor executable %q is not allowed", filepath.Base(argv[0]))

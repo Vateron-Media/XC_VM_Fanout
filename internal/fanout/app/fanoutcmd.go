@@ -91,6 +91,7 @@ func Main(ver string) {
 	configPath := flag.String("config", "/home/xc_vm/bin/xc_fanout/config.json", "operator-tuning JSON (prebuffer_max_sec, hls_target_sec, hls_window, grace_sec, write_timeout_sec, chunk_bytes, max_gop_bytes, source_insecure, source_backend). Self-created with defaults if absent; missing keys backfilled; polled and applied live. Empty disables the file (built-in defaults are used)")
 	configInterval := flag.Int("config-interval", 60, "seconds between config-file reloads (re-read only when the file's mtime changes)")
 	driverConfig := flag.String("driver-config", "/etc/xc_vm/fanout-drivers.json", "root-owned JSON map of structured driver IDs to absolute executable paths; missing or empty disables module drivers")
+	encoderConfig := flag.String("encoder-config", "/etc/xc_vm/fanout-encoders.json", "root-owned JSON map of encoder IDs to trusted absolute ffmpeg paths; missing or empty allows only -ffmpeg")
 	gw := flag.String("gw", "", "segment gateway unix socket (nginx-only, Phase 12), e.g. /home/xc_vm/bin/xc_fanout/sockets/gw.sock; empty = no gateway")
 	gwPolicy := flag.String("gw-policy", "/home/xc_vm/tmp/gateway/policy.json", "the panel's segment gateway policy (written every minute by cron:cache)")
 	gwState := flag.String("gw-state", "/home/xc_vm/bin/xc_fanout/gateway_shadow.json", "where the gateway keeps its shadow comparison with PHP across restarts; empty = in memory")
@@ -197,6 +198,10 @@ func Main(ver string) {
 	if err != nil {
 		log.Fatalf("driver config: %v", err)
 	}
+	encoders, err := supervisor.LoadEncoderConfig(*encoderConfig)
+	if err != nil {
+		log.Fatalf("encoder config: %v", err)
+	}
 
 	mgr := server.NewManager(cfg.MaxGOPBytes, int64(cfg.PrebufferMaxSec)*1000, cfg.HLSTargetSec, cfg.HLSWindow, time.Duration(cfg.GraceSec)*time.Second)
 	mgr.ApplyConfig(cfg) // also stamps write-timeout, source-insecure and chunk from the config
@@ -219,7 +224,7 @@ func Main(ver string) {
 	// is supervised only once the panel hands it over, and the daemon accepts a
 	// hand-over only while config.json says `supervise: true` — a live setting,
 	// so the panel can turn it on without a daemon restart dropping every viewer.
-	mgr.EnableSupervisionWithDrivers(*ffmpeg, drivers)
+	mgr.EnableSupervisionWithDrivers(*ffmpeg, drivers, encoders)
 	mgr.StartEvents(ctx)                                                                     // monitor transitions for the node's agent (GET /events)
 	mgr.StartReaper(ctx)                                                                     // idle-stop sweep for control-managed streams (TS + HLS)
 	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS

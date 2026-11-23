@@ -79,3 +79,18 @@ func TestNoProxyStaysDirect(t *testing.T) {
 		t.Fatal("a source with no proxy configured got one")
 	}
 }
+
+func TestPrivateProxyIsAllowedForPublicDestination(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close()
+
+	o := Options{Proxy: proxy.URL, BlockPrivate: true}
+	c := o.client(o.transport(time.Second), 5*time.Second)
+	resp, err := c.Get("http://8.8.8.8/live.ts")
+	if err != nil {
+		t.Fatalf("public destination through private proxy: %v", err)
+	}
+	resp.Body.Close()
+}

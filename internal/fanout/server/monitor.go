@@ -234,11 +234,17 @@ func (m *Manager) EnableSupervision(encoder ...string) {
 	m.EnableSupervisionWithDrivers(bin, nil)
 }
 
-func (m *Manager) EnableSupervisionWithDrivers(bin string, drivers map[string]string) {
+func (m *Manager) EnableSupervisionWithDrivers(bin string, drivers map[string]string, encoderConfigs ...map[string]string) {
 	m.vitals = newVitalsSampler()
 	m.meta = newMetaCache()
 	exe, _ := os.Executable()
-	m.sup = supervisor.New(supervisor.CommandLauncher(bin, exe), m.streamHasData).
+	encoders := []string{}
+	if len(encoderConfigs) > 0 {
+		for _, path := range encoderConfigs[0] {
+			encoders = append(encoders, path)
+		}
+	}
+	m.sup = supervisor.New(supervisor.CommandLauncher(bin, exe, encoders...), m.streamHasData).
 		WithVitals(m.sample).
 		WithProber(supervisor.CommandProber(bin)).
 		WithDrivers(drivers)

@@ -309,6 +309,22 @@ xc_fanout -id test -in ./sample.ts
 xc_fanout -id test -source https://example/live.m3u8 -ua "Mozilla/5.0"
 ```
 
+## Allowlist энкодеров
+
+Путь `-ffmpeg` всегда считается доверенным энкодером по умолчанию. Дополнительные CPU-, GPU- и
+legacy-сборки для supervision панели должны быть перечислены в root-owned файле
+`-encoder-config` (по умолчанию `/etc/xc_vm/fanout-encoders.json`). Для него действуют те же
+требования к владельцу и правам, что и для allowlist драйверов ниже; ID оператора сопоставляется
+с точным абсолютным путём:
+
+```json
+{"gpu":"/home/xc_vm/bin/ffmpeg_bin/7.1-gpu/ffmpeg","legacy":"/home/xc_vm/bin/ffmpeg_bin/4.0/ffmpeg"}
+```
+
+Root signals cron XC_VM пишет этот файл из установленных проверенных сборок FFmpeg.
+Клиентская команда может выбрать только точный путь из списка; совпадения basename недостаточно.
+Изменения применяются после перезапуска демона.
+
 ## Структурированные драйверы модулей
 
 Драйверы модулей отключены, пока `-driver-config` не укажет доверенный allowlist (по умолчанию

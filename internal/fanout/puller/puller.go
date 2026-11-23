@@ -654,7 +654,7 @@ func httpClient(src Source) (*http.Client, error) {
 	if pu != nil {
 		tr.Proxy = http.ProxyURL(pu)
 	}
-	if src.BlockPrivate {
+	if src.BlockPrivate && pu == nil {
 		tr.DialContext = netguard.PublicDialContext(tr.DialContext)
 	}
 	return &http.Client{

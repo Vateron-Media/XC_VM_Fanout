@@ -24,7 +24,7 @@ func TestPublicDialRefusesPrivateAddressBeforeDial(t *testing.T) {
 }
 
 func TestPrivateAndUnsafeDestinationsAreRefused(t *testing.T) {
-	for _, raw := range []string{"http://127.0.0.1/x", "http://169.254.169.254/x", "file:///etc/passwd"} {
+	for _, raw := range []string{"http://127.0.0.1/x", "http://169.254.169.254/x", "http://100.64.0.1/x", "file:///etc/passwd"} {
 		u, _ := url.Parse(raw)
 		if err := CheckURL(context.Background(), u, true); err == nil {
 			t.Errorf("accepted %s", raw)
@@ -37,10 +37,15 @@ func TestRedirectPolicyRejectsDowngradeAndStripsCredentials(t *testing.T) {
 	next, _ := http.NewRequest(http.MethodGet, "http://other.example/x", nil)
 	next.Header.Set("Authorization", "secret")
 	next.Header.Set("Cookie", "secret")
+	next.Header.Set("X-Provider-Token", "secret")
+	next.Header.Set("User-Agent", "fanout-test")
 	if err := CheckRedirect(false)(next, []*http.Request{prev}); err == nil {
 		t.Fatal("accepted an HTTPS to HTTP redirect")
 	}
-	if next.Header.Get("Authorization") != "" || next.Header.Get("Cookie") != "" {
+	if next.Header.Get("Authorization") != "" || next.Header.Get("Cookie") != "" || next.Header.Get("X-Provider-Token") != "" {
 		t.Fatal("cross-host redirect kept credentials")
+	}
+	if next.Header.Get("User-Agent") != "fanout-test" {
+		t.Fatal("cross-host redirect removed User-Agent")
 	}
 }
