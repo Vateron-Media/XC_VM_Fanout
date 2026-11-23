@@ -49,6 +49,12 @@ func TestLoadMissingSelfCreates(t *testing.T) {
 	}
 }
 
+func TestTLSVerificationIsTheDefault(t *testing.T) {
+	if Defaults().SourceInsecure {
+		t.Fatal("source_insecure defaults to true")
+	}
+}
+
 // TestLoadPartialBackfills: a file missing keys keeps its present values, fills
 // the rest from defaults, reports wrote=true, and the rewritten file now carries
 // every key (so an older panel can never make the daemon throw on a version skew).

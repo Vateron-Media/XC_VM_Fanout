@@ -35,10 +35,7 @@ import (
 // the puller goroutine. Per-source rather than package-level, so a stream's proxy
 // and TLS-verification setting reach the segment fetches too.
 func newPullClient(opt Options) *http.Client {
-	return &http.Client{
-		Timeout:   pullRequestTimeout,
-		Transport: opt.transport(8 * time.Second),
-	}
+	return opt.client(opt.transport(8*time.Second), pullRequestTimeout)
 }
 
 // maxHLSSegmentBytes caps a single segment body so a never-ending

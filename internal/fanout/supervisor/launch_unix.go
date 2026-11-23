@@ -9,8 +9,10 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,28 +20,40 @@ import (
 	"time"
 )
 
-// shellLauncher runs one encoder command.
-//
-// The command arrives as a shell line because StreamProcess::buildLive composes
-// one — quoted paths, a `-f tee` output whose argument contains pipes and
-// brackets, `{...}` placeholders already substituted. Re-deriving that as an
-// argv here is precisely the duplication this design exists to avoid, so it goes
-// to /bin/sh.
-//
-// `exec` in front of it is what makes supervision work. Without it the daemon's
-// child is the shell and ffmpeg is its grandchild: killing the child leaves
-// ffmpeg orphaned and still writing, and the pid published to the panel is the
-// shell's, not the encoder's. With `exec`, the shell replaces itself with
-// ffmpeg, so the daemon's direct child IS the encoder — one pid, signals land
-// where they should, and Wait reaps the thing that actually matters.
-//
-// The command must NOT carry buildLive's trailing `>/dev/null 2>>… & echo $! >…`
-// tail: backgrounding it would return control immediately and leave nothing to
-// supervise. Redirection and the pid file are the daemon's job now.
-func shellLauncher(ctx context.Context, cmdline, stderrPath string) (Process, error) {
-	if cmdline == "" {
-		return nil, errors.New("empty command")
+// CommandLauncher builds the production no-shell launcher. The request's
+// argv[0] only selects native-remux versus encoder; the executable path itself
+// always comes from daemon startup configuration.
+func CommandLauncher(encoder, fanout string) Launcher {
+	return func(ctx context.Context, cmdline, stderrPath string) (Process, error) {
+		argv, err := splitCommand(cmdline)
+		if err != nil {
+			return nil, err
+		}
+		bin := ""
+		switch filepath.Base(argv[0]) {
+		case filepath.Base(encoder):
+			bin = encoder
+		case "xc_fanout":
+			bin = fanout
+		}
+		if bin == "" {
+			return nil, fmt.Errorf("monitor executable %q is not allowed", filepath.Base(argv[0]))
+		}
+		return launchArgv(ctx, bin, argv[1:], stderrPath)
 	}
+}
+
+// shellLauncher remains the package's test seam; production uses
+// CommandLauncher with daemon-configured executable paths.
+func shellLauncher(ctx context.Context, cmdline, stderrPath string) (Process, error) {
+	argv, err := splitCommand(cmdline)
+	if err != nil {
+		return nil, err
+	}
+	return launchArgv(ctx, argv[0], argv[1:], stderrPath)
+}
+
+func launchArgv(ctx context.Context, bin string, args []string, stderrPath string) (Process, error) {
 	// exec.Command, NOT exec.CommandContext. CommandContext kills the process
 	// when ctx is cancelled, and this ctx dies with the supervisor -- so a daemon
 	// shutdown would take every encoder on the node with it, and the survivor
@@ -48,7 +62,7 @@ func shellLauncher(ctx context.Context, cmdline, stderrPath string) (Process, er
 	// health verdict) and is otherwise left alone, so stopping the daemon leaves
 	// the channels on air for the next one to adopt.
 	_ = ctx
-	cmd := exec.Command("/bin/sh", "-c", "exec "+cmdline)
+	cmd := exec.Command(bin, args...)
 
 	// Give the encoder its own process group, so a kill can take down anything
 	// it spawned rather than leaving strays behind holding the source open.
@@ -56,9 +70,13 @@ func shellLauncher(ctx context.Context, cmdline, stderrPath string) (Process, er
 
 	var errFile *os.File
 	if stderrPath != "" {
-		f, err := os.OpenFile(stderrPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(stderrPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err == nil {
-			errFile, cmd.Stderr = f, f
+			if err = f.Chmod(0o600); err == nil {
+				errFile, cmd.Stderr = f, f
+			} else {
+				_ = f.Close()
+			}
 		}
 		// A stderr file we cannot open is not a reason to refuse to start the
 		// stream; it just means this run is not logged to it.
@@ -71,6 +89,97 @@ func shellLauncher(ctx context.Context, cmdline, stderrPath string) (Process, er
 		return nil, err
 	}
 	return &execProcess{cmd: cmd, errFile: errFile}, nil
+}
+
+func splitCommand(line string) ([]string, error) {
+	var out []string
+	var word strings.Builder
+	quote := byte(0)
+	escaped := false
+	flush := func() {
+		if word.Len() > 0 {
+			out = append(out, word.String())
+			word.Reset()
+		}
+	}
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if escaped {
+			word.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			} else {
+				word.WriteByte(c)
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case ' ', '\t', '\r', '\n':
+			flush()
+		case ';', '|', '&', '<', '>':
+			return nil, fmt.Errorf("monitor command contains shell operator %q", c)
+		default:
+			word.WriteByte(c)
+		}
+	}
+	if escaped || quote != 0 {
+		return nil, errors.New("monitor command has incomplete quoting")
+	}
+	flush()
+	if len(out) == 0 {
+		return nil, errors.New("empty command")
+	}
+	return out, nil
+}
+
+// CommandProber builds the production no-shell probe. Only the ffprobe
+// arguments supplied by the panel are retained; the executable is derived from
+// the daemon-configured encoder path.
+func CommandProber(encoder string) Prober {
+	probe := filepath.Join(filepath.Dir(encoder), "ffprobe")
+	if filepath.Dir(encoder) == "." {
+		probe = "ffprobe"
+	}
+	return func(ctx context.Context, line string) bool {
+		argv, err := splitCommand(line)
+		if err != nil {
+			return false
+		}
+		for i, arg := range argv {
+			if filepath.Base(arg) == "ffprobe" {
+				return runProbe(ctx, probe, argv[i+1:])
+			}
+		}
+		return false
+	}
+}
+
+func runProbe(ctx context.Context, bin string, args []string) bool {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	c := exec.CommandContext(ctx, bin, args...)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error {
+		if err := syscall.Kill(-c.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return c.Process.Kill()
+		}
+		return nil
+	}
+	c.WaitDelay = probeWaitDelay
+	return c.Run() == nil
 }
 
 // execProcess adapts exec.Cmd to Process. Wait is guarded by a Once because the
@@ -128,38 +237,11 @@ func (p *execProcess) Kill() {
 // stall the health loop that called it. Output is discarded — the only question
 // being asked is whether the source is there.
 func shellProber(ctx context.Context, cmd string) bool {
-	if cmd == "" {
+	argv, err := splitCommand(cmd)
+	if err != nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
-
-	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// End the whole group, not just the shell. A probe command is compound —
-	// the panel's is `timeout N ffprobe …`, often with a pipe — so /bin/sh does
-	// not exec into it and the real work is a child of the shell. os/exec's
-	// default cancel signals the shell's pid alone, which left an ffprobe behind
-	// on every probe that had to be cancelled, holding its connection to an
-	// origin that accepts TCP and never answers. That is what the process group
-	// asked for two lines up was for. Same shape as the encoder launcher's Kill
-	// and internal/fanout/puller's, for the same reason.
-	c.Cancel = func() error {
-		if err := syscall.Kill(-c.Process.Pid, syscall.SIGKILL); err != nil {
-			if errors.Is(err, syscall.ESRCH) {
-				// Already gone: the ordinary case for a probe that answered just
-				// as the cancel landed. os/exec turns any other error from here
-				// into Wait's result, so say it the way it expects.
-				return os.ErrProcessDone
-			}
-			return c.Process.Kill()
-		}
-		return nil
-	}
-	// A backstop for anything the group kill cannot reach (a descendant in a
-	// session of its own): the health loop must never wait on a probe.
-	c.WaitDelay = probeWaitDelay
-	return c.Run() == nil
+	return runProbe(ctx, argv[0], argv[1:])
 }
 
 // probeWaitDelay bounds how long a cancelled probe may be waited on after its

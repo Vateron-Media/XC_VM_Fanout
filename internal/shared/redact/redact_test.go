@@ -25,6 +25,7 @@ func TestURL(t *testing.T) {
 		{"content path is untouched", "http://cdn.example.com/a/b/index.m3u8", "http://cdn.example.com/a/b/index.m3u8"},
 		{"udp is untouched", "udp://239.0.0.1:1234", "udp://239.0.0.1:1234"},
 		{"unparsable keeps host, loses secret", "http://bob:s3cr3t@host name/live.ts", "http://bob:xxxxx@host name/live.ts"},
+		{"bare proxy credentials", "bob:s3cr3t@proxy:3128", "bob:xxxxx@proxy:3128"},
 		{"not a url at all", "/media/movie.ts", "/media/movie.ts"},
 		{"empty", "", ""},
 	}
@@ -48,6 +49,7 @@ func TestNoSecretSurvives(t *testing.T) {
 		"http://host/get.php?username=bob&password=s3cr3t",
 		"http://bob:s3cr3t@host name/live.ts",
 		"http://bob:s3cr3t@host/live/bob/s3cr3t/1234.ts?token=s3cr3t",
+		"bob:s3cr3t@proxy:3128",
 	} {
 		if got := URL(raw); strings.Contains(got, "s3cr3t") {
 			t.Errorf("secret survived redaction: %q -> %q", raw, got)

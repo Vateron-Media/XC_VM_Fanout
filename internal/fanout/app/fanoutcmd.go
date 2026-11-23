@@ -63,6 +63,9 @@ func Main(ver string) {
 	if len(os.Args) > 1 && os.Args[1] == "remux" {
 		os.Exit(runRemux(os.Args[2:]))
 	}
+	// The daemon creates control sockets, config/state and operator logs. Start
+	// private; the nginx-facing sockets are widened explicitly after bind.
+	syscall.Umask(0o077)
 
 	sock := flag.String("sock", "/home/xc_vm/bin/xc_fanout/sockets/http.sock", "client unix socket (nginx-facing)")
 	ctl := flag.String("ctl", "", "control unix socket (PHP-only), e.g. /home/xc_vm/bin/xc_fanout/sockets/control.sock; empty = no control API")
@@ -210,7 +213,7 @@ func Main(ver string) {
 	// is supervised only once the panel hands it over, and the daemon accepts a
 	// hand-over only while config.json says `supervise: true` — a live setting,
 	// so the panel can turn it on without a daemon restart dropping every viewer.
-	mgr.EnableSupervision()
+	mgr.EnableSupervision(*ffmpeg)
 	mgr.StartEvents(ctx)                                                                     // monitor transitions for the node's agent (GET /events)
 	mgr.StartReaper(ctx)                                                                     // idle-stop sweep for control-managed streams (TS + HLS)
 	mgr.StartMemoryScavenger(ctx, defaults.MemScavengeInterval, defaults.MemScavengeIdleMin) // return idle heap to the OS
@@ -225,7 +228,7 @@ func Main(ver string) {
 	clientSrv, cleanupClient := serveUnix(*sock, mgr.ClientHandler())
 	ctlSrv, cleanupCtl := (*http.Server)(nil), func() {}
 	if *ctl != "" {
-		ctlSrv, cleanupCtl = serveUnix(*ctl, mgr.ControlHandler())
+		ctlSrv, cleanupCtl = serveUnixMode(*ctl, 0o600, mgr.ControlHandler())
 	}
 	// The segment gateway drives both surfaces below, so build it once if either
 	// wants it: the unix socket nginx proxies to (-gw), and/or the public TLS
@@ -445,7 +448,11 @@ func pollConfig(ctx context.Context, path string, every time.Duration, mgr confi
 // cleanup that removes the socket file. A socket the daemon cannot bind is
 // fatal: without it nginx has nothing to reach.
 func serveUnix(path string, h http.Handler) (*http.Server, func()) {
-	srv, cleanup, err := listenUnix(path, h)
+	return serveUnixMode(path, 0o660, h)
+}
+
+func serveUnixMode(path string, mode os.FileMode, h http.Handler) (*http.Server, func()) {
+	srv, cleanup, err := listenUnixMode(path, mode, h)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -470,8 +477,13 @@ var unixIdleTimeout = 2 * time.Minute
 // with it. So probe first: if something ANSWERS on the path, another daemon owns
 // it and this one refuses rather than evicting it. Only a dead file is removed.
 func listenUnix(path string, h http.Handler) (*http.Server, func(), error) {
+	return listenUnixMode(path, 0o660, h)
+}
+
+func listenUnixMode(path string, mode os.FileMode, h http.Handler) (*http.Server, func(), error) {
 	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
+		_ = os.Chmod(dir, 0o755)
 	}
 	if socketAnswers(path) {
 		return nil, nil, fmt.Errorf("listen %s: another xc_fanout is already listening there; refusing to take its socket", path)
@@ -481,7 +493,10 @@ func listenUnix(path string, h http.Handler) (*http.Server, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen %s: %w", path, err)
 	}
-	_ = os.Chmod(path, 0o660)
+	if err := os.Chmod(path, mode); err != nil {
+		_ = ln.Close()
+		return nil, nil, fmt.Errorf("chmod %s: %w", path, err)
+	}
 	owned := &ownedListener{Listener: ln}
 
 	// IdleTimeout closes a kept-alive connection no request came on for that

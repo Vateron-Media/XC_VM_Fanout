@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"net"
@@ -42,6 +43,8 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/media/hlscrypt"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/redact"
 )
+
+const maxControlBody = 1 << 20
 
 // Operational defaults live in internal/fanout/defaults; these aliases keep the local
 // names the hot paths read by. See that package for the rationale behind each.
@@ -78,6 +81,7 @@ type Stream struct {
 	grace    time.Duration
 	running  bool
 	cancel   context.CancelFunc
+	pullGen  uint64
 	refs     int  // live TS viewers currently connected
 	buffered bool // true = ring at full prebuffer/HLS; false = gated to the idle floor
 	// removed is set by Unregister once this Stream has left the registry, and is
@@ -645,6 +649,7 @@ func (s *Stream) setConfig(src puller.Source, chunk int) bool {
 func sameSource(a, b puller.Source) bool {
 	return slices.Equal(a.URLs, b.URLs) && a.UserAgent == b.UserAgent && a.Proxy == b.Proxy &&
 		a.Cookie == b.Cookie && a.FfmpegBin == b.FfmpegBin && a.Insecure == b.Insecure &&
+		a.BlockPrivate == b.BlockPrivate &&
 		slices.Equal(a.Headers, b.Headers) && a.Backend == b.Backend
 }
 
@@ -655,6 +660,8 @@ func (s *Stream) startLocked() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.running = true
+	s.pullGen++
+	gen := s.pullGen
 	cfg, chunk := *s.cfg, s.chunk
 	cfg.Label = s.id
 
@@ -676,6 +683,7 @@ func (s *Stream) startLocked() {
 			cfg.Backend = s.mgr.backend()
 		}
 		cfg.Insecure = s.mgr.sourceInsecure.Load()
+		cfg.BlockPrivate = true
 	}
 	s.lastBackend = cfg.Backend
 	// Record the route each attempt actually takes, so the snapshot can report
@@ -683,7 +691,22 @@ func (s *Stream) startLocked() {
 	// configured but every stream is on ffmpeg" is otherwise invisible.
 	cfg.OnPath = s.setSourcePath
 	dlog.Logf("stream", "id=%s puller starting (refs=%d)", s.id, s.refs)
-	go puller.Run(ctx, cfg, chunk, s.Publish)
+	go func() {
+		defer s.finishPuller(gen)
+		puller.Run(ctx, cfg, chunk, s.Publish)
+	}()
+}
+
+func (s *Stream) finishPuller(gen uint64) {
+	if v := recover(); v != nil {
+		dlog.Logf("stream", "id=%s puller recovered from panic: %s", s.id, redact.URL(fmt.Sprint(v)))
+	}
+	s.mu.Lock()
+	if s.pullGen == gen {
+		s.running = false
+		s.cancel = nil
+	}
+	s.mu.Unlock()
 }
 
 // resolvedBackend reports the backend the puller was handed on the last start,
@@ -1003,7 +1026,7 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 	m.hlsTargetMS.Store(int64(hlsTarget * 1000))
 	m.hlsWindow.Store(int64(hlsWindow))
 	m.writeTimeout.Store(int64(defaultWriteTimeout))
-	m.sourceInsecure.Store(true)
+	m.sourceInsecure.Store(defaults.CfgSourceInsecure)
 	m.sourceBackend.Store(defaults.CfgSourceBackend)
 	m.idleBufferGraceNS.Store(int64(time.Duration(defaults.CfgIdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(defaults.CfgIdleBufferRatio))
@@ -1505,6 +1528,7 @@ func (m *Manager) backend() string {
 // SIGTERM) stops the puller and clears running.
 func (m *Manager) RunPinned(ctx context.Context, id string, src puller.Source, chunk int) {
 	src.Insecure = m.sourceInsecure.Load()
+	src.BlockPrivate = true
 	if src.Backend == "" {
 		src.Backend = m.backend()
 	}
@@ -1519,16 +1543,16 @@ func (m *Manager) RunPinned(ctx context.Context, id string, src puller.Source, c
 		st.chunk = chunk
 	}
 	st.running = true
+	st.pullGen++
+	gen := st.pullGen
 	st.refs++ // permanent pin: no viewer needed, and the reaper leaves refs>0 alone
 	cfg, ch := *st.cfg, st.chunk
 	st.mu.Unlock()
 	st.lastAccess.Store(time.Now().UnixNano())
 	dlog.Logf("stream", "id=%s launch puller starting (pinned)", id)
 	go func() {
+		defer st.finishPuller(gen)
 		puller.Run(ctx, cfg, ch, st.Publish)
-		st.mu.Lock()
-		st.running = false
-		st.mu.Unlock()
 		dlog.Logf("stream", "id=%s launch puller stopped", id)
 	}()
 }
@@ -1653,7 +1677,7 @@ func (m *Manager) ControlHandler() http.Handler {
 	mux.HandleFunc("/monitors/state", m.serveMonitorStates)
 	mux.HandleFunc("/events", m.serveEvents)
 	mux.HandleFunc("/memory", m.serveMemory)
-	return mux
+	return http.MaxBytesHandler(mux, maxControlBody)
 }
 
 // serveConnections returns every currently-connected live-TS viewer uuid across

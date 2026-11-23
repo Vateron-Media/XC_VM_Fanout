@@ -30,6 +30,7 @@ import (
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/fanout/dlog"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/fanout/ingest"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/media/source"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/netguard"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/redact"
 )
 
@@ -219,13 +220,14 @@ func isURLEnd(c byte) bool {
 
 // Source describes where and how to pull a live stream.
 type Source struct {
-	URLs      []string // candidate source URLs, tried in order
-	UserAgent string
-	Proxy     string // "host:port" HTTP proxy, optional
-	Cookie    string // optional Cookie header value
-	FfmpegBin string // ffmpeg path; "ffmpeg" if empty
-	Label     string // stream id, for debug logging only (no effect on behaviour)
-	Insecure  bool   // skip upstream TLS certificate verification (see -source-insecure)
+	URLs         []string // candidate source URLs, tried in order
+	UserAgent    string
+	Proxy        string // "host:port" HTTP proxy, optional
+	Cookie       string // optional Cookie header value
+	FfmpegBin    string // ffmpeg path; "ffmpeg" if empty
+	Label        string // stream id, for debug logging only (no effect on behaviour)
+	Insecure     bool   // skip upstream TLS certificate verification (see -source-insecure)
+	BlockPrivate bool   // refuse loopback, link-local and private HTTP(S) destinations
 	// Headers are extra request headers as raw "Key: value" lines, for an
 	// upstream that needs more than a User-Agent and a Cookie to answer. A
 	// source fetched without the headers it was configured with is a DIFFERENT
@@ -476,6 +478,10 @@ func isHLSRefusal(err error) bool {
 func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize int, publish func([]byte)) error {
 	var lastErr error
 	for _, raw := range src.URLs {
+		if err := validateSource(raw, src.BlockPrivate); err != nil {
+			lastErr = err
+			continue
+		}
 		// A scheme an HTTP GET cannot speak must not be probed with one. Every
 		// udp://, rtp:// and file:// source used to fail here with "unsupported
 		// protocol scheme", be counted as a probe failure and be skipped, so the
@@ -534,6 +540,28 @@ func pullOnce(ctx context.Context, client *http.Client, src Source, chunkSize in
 		lastErr = errors.New("no source urls")
 	}
 	return lastErr
+}
+
+func validateSource(raw string, strict bool) error {
+	if !strict {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Hostname() == "" {
+		return errors.New("source URL is invalid")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		return nil
+	case "udp", "rtp":
+		ip := net.ParseIP(u.Hostname())
+		if ip != nil && ip.IsMulticast() {
+			return nil
+		}
+		return errors.New("udp/rtp source must use a multicast address")
+	default:
+		return fmt.Errorf("source protocol %q is not allowed", u.Scheme)
+	}
 }
 
 // nativeOnlyScheme reports whether raw names a source that must bypass the HTTP
@@ -603,10 +631,8 @@ func isMP2T(resp *http.Response) bool {
 }
 
 func httpClient(src Source) (*http.Client, error) {
-	// Upstream TLS verification is opt-in (src.Insecure, from -source-insecure).
-	// The panel commonly pulls sources with self-signed or mismatched certs, so
-	// the daemon defaults to skipping verification — but a deployment that pulls
-	// only trusted HTTPS origins can turn it on.
+	// Upstream TLS verification is the default; src.Insecure is the explicit
+	// compatibility opt-out for a legacy origin.
 	//
 	// The timeouts bound everything EXCEPT the body: connect, TLS and the wait for
 	// response headers each get a deadline, and idle pooled connections expire. A
@@ -628,7 +654,13 @@ func httpClient(src Source) (*http.Client, error) {
 	if pu != nil {
 		tr.Proxy = http.ProxyURL(pu)
 	}
-	return &http.Client{Transport: tr}, nil // no client timeout: this is a long-lived stream
+	if src.BlockPrivate {
+		tr.DialContext = netguard.PublicDialContext(tr.DialContext)
+	}
+	return &http.Client{
+		Transport:     netguard.Transport{Base: tr, BlockPrivate: src.BlockPrivate},
+		CheckRedirect: netguard.CheckRedirect(src.BlockPrivate),
+	}, nil // no client timeout: this is a long-lived stream
 }
 
 // proxyURL turns the configured proxy value into the address the transport and
@@ -733,11 +765,12 @@ func proxyForLog(raw string) string {
 // time, and every path that does not use it closes it.
 func convert(ctx context.Context, src Source, raw string, resp *http.Response, chunkSize int, publish func([]byte)) error {
 	opt := nativesrc.Options{
-		UserAgent: src.ua(),
-		Cookie:    src.Cookie,
-		Proxy:     src.Proxy,
-		Insecure:  src.Insecure,
-		Headers:   src.Headers,
+		UserAgent:    src.ua(),
+		Cookie:       src.Cookie,
+		Proxy:        src.Proxy,
+		Insecure:     src.Insecure,
+		Headers:      src.Headers,
+		BlockPrivate: src.BlockPrivate,
 	}
 
 	if src.Backend == BackendFfmpeg {

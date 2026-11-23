@@ -8,6 +8,7 @@ package supervisor
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -47,13 +48,28 @@ func TestShellProberKillsTheWholeProbeGroup(t *testing.T) {
 	t.Errorf("probe child pid %d outlived the probe's timeout and is still holding the source open", childPID)
 }
 
+func TestCommandProberUsesTrustedFFprobe(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := CommandProber(filepath.Join(dir, "ffmpeg"))
+	if !p(context.Background(), "timeout 30 /attacker/ffprobe -i source") {
+		t.Fatal("trusted ffprobe was not used")
+	}
+	if p(context.Background(), "/bin/true") {
+		t.Fatal("caller-selected probe executable accepted")
+	}
+}
+
 // TestShellProberStillAnswers: the group kill must not change what a probe
 // REPORTS — reachable is a zero exit, and nothing else.
 func TestShellProberStillAnswers(t *testing.T) {
-	if !shellProber(context.Background(), "exit 0") {
+	if !shellProber(context.Background(), "true") {
 		t.Error("a probe that succeeded was reported unreachable")
 	}
-	if shellProber(context.Background(), "exit 1") {
+	if shellProber(context.Background(), "false") {
 		t.Error("a probe that failed was reported reachable")
 	}
 	if shellProber(context.Background(), "") {

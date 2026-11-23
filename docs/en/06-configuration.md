@@ -109,7 +109,7 @@ never push the daemon into a pathological state.
 | `write_timeout_sec` | `15` | `1…600` | Per-write deadline for a live-TS viewer before a stalled connection is dropped. |
 | `chunk_bytes` | `12032` | `188…4 MiB` | Source read size for daemon-pulled streams (rounded down to a multiple of 188). |
 | `max_gop_bytes` | `10528000` | `1 MiB…256 MiB` | Cap on a single ring block. A source that gives no keyframe within this many bytes has a block **cut** here (see [Sources without keyframes](04-internals.md#sources-without-keyframes)). |
-| `source_insecure` | `true` | — | Skip upstream TLS verification when pulling HTTPS sources. `true` because the panel commonly pulls upstreams with self-signed / mismatched certs; set `false` to require valid certificates. |
+| `source_insecure` | `false` | — | Skip upstream TLS verification when pulling HTTPS sources. Leave `false` to require valid certificates; enable only for a trusted legacy origin. |
 | `idle_buffer_grace_sec` | `30` | `0…3600` | No-viewer window before the ring collapses (`0` = the idle gate is off). See [The idle-buffer gate](#the-idle-buffer-gate). |
 | `idle_buffer_ratio` | `0.5` | `0.1…1` | Fraction of the buffer kept while a stream is unwatched. HLS is still cut from the reduced ring, so the channel stays openable. |
 | `viewer_idle_timeout_sec` | `30` | `0`, or `5…3600` | Drop a live-TS viewer that has received **nothing** for this long (`0` = never). This is what bounds a ghost on an off-air stream — `write_timeout_sec` can only fire while there are bytes to write. See [Guarding against stalled and idle viewers](04-internals.md#guarding-against-stalled-viewers). |
@@ -128,7 +128,7 @@ A minimal file the daemon writes on a fresh node:
   "write_timeout_sec": 15,
   "chunk_bytes": 12032,
   "max_gop_bytes": 10528000,
-  "source_insecure": true,
+  "source_insecure": false,
   "default_prebuffer_sec": 0,
   "idle_buffer_grace_sec": 30,
   "idle_buffer_ratio": 0.5,

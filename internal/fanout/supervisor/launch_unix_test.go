@@ -24,7 +24,7 @@ import (
 // TestShellLauncherRunsAndReaps: the basic contract — a command runs, its pid is
 // real, and Wait returns when it ends.
 func TestShellLauncherRunsAndReaps(t *testing.T) {
-	proc, err := shellLauncher(context.Background(), "exit 0", "")
+	proc, err := shellLauncher(context.Background(), "true", "")
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestShellLauncherWritesStderrWhereThePanelLooks(t *testing.T) {
 	dir := t.TempDir()
 	errPath := filepath.Join(dir, "5.errors")
 
-	proc, err := shellLauncher(context.Background(), "echo 'something broke' 1>&2", errPath)
+	proc, err := shellLauncher(context.Background(), "sh -c 'echo something\\ broke 1>&2'", errPath)
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
@@ -162,6 +162,30 @@ func TestShellLauncherWritesStderrWhereThePanelLooks(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "something broke") {
 		t.Errorf("errors file = %q, want the command's stderr", string(b))
+	}
+}
+
+func TestCommandLauncherUsesTrustedExecutableAndRejectsShell(t *testing.T) {
+	dir := t.TempDir()
+	trusted := filepath.Join(dir, "ffmpeg")
+	marker := filepath.Join(dir, "ran")
+	if err := os.WriteFile(trusted, []byte("#!/bin/sh\nprintf ran > \""+marker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launch := CommandLauncher(trusted, "/trusted/xc_fanout")
+	proc, err := launch(context.Background(), "/attacker/ffmpeg -i source", "")
+	if err != nil {
+		t.Fatalf("trusted launch: %v", err)
+	}
+	_ = proc.Wait()
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("configured executable was not run")
+	}
+	if _, err := launch(context.Background(), "sh -c bad", ""); err == nil {
+		t.Fatal("caller-selected executable accepted")
+	}
+	if _, err := launch(context.Background(), "ffmpeg -i x; touch /tmp/no", ""); err == nil {
+		t.Fatal("shell operator accepted")
 	}
 }
 

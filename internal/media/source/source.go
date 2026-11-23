@@ -273,7 +273,7 @@ func openFile(name string) (io.ReadCloser, error) {
 // out the OS connect timeout before the caller can try the next URL. Redirects
 // are still followed: providers commonly 302 first.
 func newStreamClient(opt Options) *http.Client {
-	return &http.Client{Transport: opt.transport(8 * time.Second)}
+	return opt.client(opt.transport(8*time.Second), 0)
 }
 
 // clientBoundReadCloser ties a per-request http.Client's connection pool to the

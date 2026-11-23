@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/fanout/defaults"
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/netguard"
 )
 
 // TestTransportIsBounded pins the transport bounds. A zero-value http.Transport
@@ -23,9 +24,13 @@ func TestTransportIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, ok := c.Transport.(*http.Transport)
+	guard, ok := c.Transport.(netguard.Transport)
 	if !ok {
 		t.Fatalf("transport is %T", c.Transport)
+	}
+	tr, ok := guard.Base.(*http.Transport)
+	if !ok {
+		t.Fatalf("guard base transport is %T", guard.Base)
 	}
 	for _, cse := range []struct {
 		name string

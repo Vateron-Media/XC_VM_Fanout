@@ -156,9 +156,9 @@ const (
 	// stalled behind the lock it holds. 1 MiB is a second or two of a normal
 	// stream — well under any real GOP cap, far above a packet.
 	CfgMinMaxGOPBytes     = 1 << 20
-	CfgSourceInsecure     = true // skip upstream TLS verification when pulling HTTPS sources
-	CfgIdleBufferGraceSec = 30   // no-viewer window before the ring collapses (seconds); 0 = gate off
-	CfgIdleBufferRatio    = 0.5  // fraction of the buffer kept while unwatched (HLS still cut from it)
+	CfgSourceInsecure     = false // verify upstream TLS unless an operator explicitly opts out
+	CfgIdleBufferGraceSec = 30    // no-viewer window before the ring collapses (seconds); 0 = gate off
+	CfgIdleBufferRatio    = 0.5   // fraction of the buffer kept while unwatched (HLS still cut from it)
 	// CfgViewerIdleTimeoutSec bounds how long a live-TS viewer may sit receiving
 	// NOTHING before it is dropped (0 = never). The per-write deadline only fires
 	// while there are bytes to write, so a viewer whose stream went off-air AND

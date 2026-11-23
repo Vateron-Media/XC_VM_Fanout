@@ -34,6 +34,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/redact"
+
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/fanout/dlog"
 )
 
@@ -52,9 +54,9 @@ const (
 // source URL, or "Loopback: #<id>" — whatever it wants echoed back in logs and
 // in `streams_servers.current_source`) and the command that serves it.
 //
-// Cmd is a shell command line, because that is what StreamProcess::buildLive
-// (ffmpeg) and StreamProcess::buildNativeLive (`xc_fanout remux`) produce and
-// re-deriving it here is exactly what this design avoids. It must arrive
+// Cmd is the quoted argument line that StreamProcess::buildLive (ffmpeg) and
+// StreamProcess::buildNativeLive (`xc_fanout remux`) produce. The daemon parses
+// it without a shell and replaces argv[0] with its trusted binary path. It must arrive
 // WITHOUT buildLive's trailing redirect-and-background tail: the daemon
 // supervises the process, so it needs to be its parent and to reap it itself.
 type Source struct {
@@ -280,7 +282,8 @@ const audioLossRetryDefault = 300 * time.Second
 // playlist file. A nil hasData treats a live process as started.
 func New(launch Launcher, hasData func(id string, since time.Time) bool) *Supervisor {
 	if launch == nil {
-		launch = shellLauncher
+		exe, _ := os.Executable()
+		launch = CommandLauncher("ffmpeg", exe)
 	}
 	if hasData == nil {
 		hasData = func(string, time.Time) bool { return true }
@@ -294,7 +297,7 @@ func New(launch Launcher, hasData func(id string, since time.Time) bool) *Superv
 		sleep:          sleepCtx,
 		healthTick:     5 * time.Second,
 		audioLossRetry: audioLossRetryDefault,
-		probe:          shellProber,
+		probe:          CommandProber("ffmpeg"),
 		find:           findProcess,
 		killPID:        killProcess,
 	}
@@ -621,7 +624,7 @@ func (st *stream) run(ctx context.Context) {
 			// it a fallback: that is a choice of pipeline, not a failed start, so
 			// it neither counts towards stop_failures nor waits out the fail sleep.
 			if errors.Is(err, errUnsupported) && st.switchToFallback(src) {
-				dlog.Logf("monitor", "id=%s %v; switching source %q to its fallback command", st.id, err, src.Label)
+				dlog.Logf("monitor", "id=%s %v; switching source %q to its fallback command", st.id, err, redact.URL(src.Label))
 				continue
 			}
 			consecutiveFails++
@@ -641,7 +644,7 @@ func (st *stream) run(ctx context.Context) {
 			// asked, and one that does not answer is walked past at once.
 			if consecutiveFails == 1 && st.sourceStillProbes(ctx, src) {
 				dlog.Logf("monitor", "id=%s source %q still answers its probe; retrying it before walking the list",
-					st.id, src.Label)
+					st.id, redact.URL(src.Label))
 			} else {
 				st.advanceAfterFailure()
 			}
@@ -689,7 +692,7 @@ func (st *stream) run(ctx context.Context) {
 		} else {
 			st.emit(EventStreamRestart, src.Label)
 		}
-		dlog.Logf("monitor", "id=%s started pid=%d source=%q", st.id, proc.Pid(), src.Label)
+		dlog.Logf("monitor", "id=%s started pid=%d source=%q", st.id, proc.Pid(), redact.URL(src.Label))
 
 		// Watch until the encoder exits or a health rule condemns it.
 		verdict := st.watch(ctx, proc)
@@ -734,7 +737,7 @@ func (st *stream) run(ctx context.Context) {
 			// it says so the same way it does at startup.
 			werr := proc.Wait()
 			if isUnsupportedExit(werr) && st.switchToFallback(src) {
-				dlog.Logf("monitor", "id=%s source %q became unservable by its command; switching to its fallback", st.id, src.Label)
+				dlog.Logf("monitor", "id=%s source %q became unservable by its command; switching to its fallback", st.id, redact.URL(src.Label))
 				continue
 			}
 			// Why it ended is the first thing an operator asks, and the exit
@@ -1522,18 +1525,22 @@ func (st *stream) emit(action, source string) {
 		ServerID: spec.ServerID,
 		StreamID: sid,
 		Action:   action,
-		Source:   source,
+		Source:   redact.URL(source),
 		Time:     st.sup.now().Unix(),
 	})
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(spec.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(spec.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		dlog.Logf("monitor", "id=%s could not open stream log %s: %v", st.id, spec.LogPath, err)
 		return
 	}
 	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		dlog.Logf("monitor", "id=%s could not restrict stream log permissions: %v", st.id, err)
+		return
+	}
 	if _, err := f.WriteString(base64.StdEncoding.EncodeToString(b) + "\n"); err != nil {
 		dlog.Logf("monitor", "id=%s could not append to stream log: %v", st.id, err)
 	}

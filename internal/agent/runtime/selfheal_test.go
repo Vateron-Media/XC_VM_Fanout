@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -100,6 +102,27 @@ func TestFetchAssetVerifiesSHA256(t *testing.T) {
 	}
 	if _, err := os.Stat(bad); !os.IsNotExist(err) {
 		t.Fatal("a SHA-mismatched download must leave no file")
+	}
+}
+
+func TestSelfHealFailsClosedWithoutSignedManifestTrust(t *testing.T) {
+	a := &Agent{SelfHealRepo: "owner/repo"}
+	if err := a.selfHeal(context.Background()); !errors.Is(err, errSignedSelfHealUnavailable) {
+		t.Fatalf("selfHeal error = %v", err)
+	}
+}
+
+func TestFetchAssetRejectsOversizeBeforeWriting(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(maxSelfHealAssetBytes+1, 10))
+	}))
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "asset")
+	if err := fetchAsset(context.Background(), srv.Client(), srv.URL, "asset", strings.Repeat("0", 64), dest); err == nil {
+		t.Fatal("oversize asset accepted")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatal("oversize asset left a destination file")
 	}
 }
 

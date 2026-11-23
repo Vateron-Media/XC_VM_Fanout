@@ -129,11 +129,12 @@ func runRemux(args []string) int {
 	cfg := remux.Config{
 		Input: *in,
 		Source: nativesrc.Options{
-			UserAgent: *ua,
-			Cookie:    *cookies,
-			Proxy:     strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(*proxy, "http://"), "https://"), "/"),
-			Insecure:  *insecure,
-			Headers:   splitHeaders(*headers),
+			UserAgent:    *ua,
+			Cookie:       *cookies,
+			Proxy:        strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(*proxy, "http://"), "https://"), "/"),
+			Insecure:     *insecure,
+			BlockPrivate: true,
+			Headers:      splitHeaders(*headers),
 		},
 		Seg: tsseg.Config{
 			Playlist:   playlist,

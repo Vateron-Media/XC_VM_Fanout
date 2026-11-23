@@ -162,7 +162,20 @@ func isStreamID(seg string) bool {
 func maskUserinfo(raw string) string {
 	i := strings.Index(raw, "://")
 	if i < 0 {
-		return raw
+		// Proxy settings commonly use bare user:pass@host:port.
+		end := strings.IndexAny(raw, "/?#")
+		if end < 0 {
+			end = len(raw)
+		}
+		at := strings.LastIndex(raw[:end], "@")
+		if at < 0 {
+			return raw
+		}
+		user := raw[:at]
+		if c := strings.IndexByte(user, ':'); c >= 0 {
+			return user[:c] + ":" + mask + "@" + raw[at+1:]
+		}
+		return mask + "@" + raw[at+1:]
 	}
 	rest := raw[i+3:]
 	end := strings.IndexAny(rest, "/?#")

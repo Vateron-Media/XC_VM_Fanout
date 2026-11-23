@@ -17,6 +17,10 @@ import (
 	"time"
 )
 
+const maxSelfHealAssetBytes = 256 << 20
+
+var errSignedSelfHealUnavailable = errors.New("clusteragent: self-heal disabled until a trusted signed release manifest is configured")
+
 // Binary self-heal (plan P2): a serve-only node keeps its own xc_node binary
 // current with no PHP (replacing console.php fanout_binary + the root_signals
 // self-heal). It resolves the release the fleet allows, downloads the arch
@@ -176,13 +180,16 @@ func fetchAsset(ctx context.Context, client *http.Client, baseURL, asset, sha256
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.ContentLength > maxSelfHealAssetBytes {
+		return fmt.Errorf("clusteragent: %s exceeds %d bytes", asset, maxSelfHealAssetBytes)
+	}
 	part := dest + ".part"
 	f, err := os.OpenFile(part, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err
 	}
 	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxSelfHealAssetBytes+1))
 	closeErr := f.Close()
 	if err == nil {
 		err = closeErr
@@ -190,6 +197,10 @@ func fetchAsset(ctx context.Context, client *http.Client, baseURL, asset, sha256
 	if err != nil {
 		os.Remove(part)
 		return err
+	}
+	if n > maxSelfHealAssetBytes {
+		os.Remove(part)
+		return fmt.Errorf("clusteragent: %s exceeds %d bytes", asset, maxSelfHealAssetBytes)
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != sha256Hex {
 		os.Remove(part)
@@ -329,6 +340,13 @@ func (a *Agent) selfHeal(ctx context.Context) error {
 	if a.SelfHealRepo == "" {
 		return nil
 	}
+	// SHA256SUMS is controlled by the same release that contains the binary and
+	// is not an authenticity check. Fail closed until XCSEC-5's external trust
+	// key and signed-manifest contract are available to this repository.
+	return errSignedSelfHealUnavailable
+}
+
+func (a *Agent) unsignedSelfHeal(ctx context.Context) error {
 	s := a.replicaSettings()
 	canary, _ := settingInt(s["lb_binary_canary_server"])
 	pin, _ := s["lb_release_pin"].(string)

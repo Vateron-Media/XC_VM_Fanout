@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/netguard"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/shared/redact"
 )
 
@@ -22,13 +23,13 @@ import (
 // the ffmpeg one. The upstream project used package-level HTTP clients with
 // ProxyFromEnvironment and default TLS verification; neither is usable here — a
 // panel source routinely needs its OWN proxy, and source_insecure defaults to
-// true precisely because those upstreams commonly present self-signed or
-// mismatched certificates.
+// true only as an explicit compatibility opt-out for a legacy origin.
 type Options struct {
-	UserAgent string // sent unless the caller set one in Header
-	Cookie    string // value of the Cookie header, if any
-	Proxy     string // "host:port" HTTP proxy, optional
-	Insecure  bool   // skip upstream TLS certificate verification
+	UserAgent    string // sent unless the caller set one in Header
+	Cookie       string // value of the Cookie header, if any
+	Proxy        string // "host:port" HTTP proxy, optional
+	Insecure     bool   // skip upstream TLS certificate verification
+	BlockPrivate bool   // refuse non-public HTTP(S) destinations
 	// Headers are extra request headers as raw "Key: value" lines. They apply
 	// to every fetch this package makes for the source — the playlist AND each
 	// segment — because an upstream that gates on a header gates on all of it.
@@ -141,6 +142,17 @@ func (o Options) transport(dialWait time.Duration) *http.Transport {
 		tr.Proxy = http.ProxyURL(pu)
 	}
 	return tr
+}
+
+func (o Options) client(transport *http.Transport, timeout time.Duration) *http.Client {
+	if o.BlockPrivate {
+		transport.DialContext = netguard.PublicDialContext(transport.DialContext)
+	}
+	return &http.Client{
+		Transport:     netguard.Transport{Base: transport, BlockPrivate: o.BlockPrivate},
+		CheckRedirect: netguard.CheckRedirect(o.BlockPrivate),
+		Timeout:       timeout,
+	}
 }
 
 // proxyURL resolves the configured proxy. The panel sends a bare "host:port",

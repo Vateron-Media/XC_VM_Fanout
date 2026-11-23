@@ -223,10 +223,17 @@ var Features = []string{"remux", "drop_connection", "files", "file_urls", "remux
 // The supervisor confirms a start by asking whether the stream actually produced
 // bytes, which is this manager's own liveness mark: the panel could only answer
 // that question by polling for a playlist file to appear.
-func (m *Manager) EnableSupervision() {
+func (m *Manager) EnableSupervision(encoder ...string) {
 	m.vitals = newVitalsSampler()
 	m.meta = newMetaCache()
-	m.sup = supervisor.New(nil, m.streamHasData).WithVitals(m.sample)
+	bin := "ffmpeg"
+	if len(encoder) > 0 && encoder[0] != "" {
+		bin = encoder[0]
+	}
+	exe, _ := os.Executable()
+	m.sup = supervisor.New(supervisor.CommandLauncher(bin, exe), m.streamHasData).
+		WithVitals(m.sample).
+		WithProber(supervisor.CommandProber(bin))
 }
 
 // streamHasData reports whether a registered stream has ever published a
