@@ -47,17 +47,18 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 				if err != nil {
 					return nil, err
 				}
-				if r.URL.Scheme == "http" && (proxyURL.Scheme == "http" || proxyURL.Scheme == "https") {
-					response, err := proxyBase.RoundTrip(r)
-					if response != nil {
-						response.Request = r
-					}
-					return response, err
-				}
 				var lastErr error
 				for i, ip := range ips {
 					var response *http.Response
 					switch {
+					case r.URL.Scheme == "http" && (proxyURL.Scheme == "http" || proxyURL.Scheme == "https"):
+						request, _ := pinProxyRequest(r, ip)
+						path := request.URL.EscapedPath()
+						if path == "" {
+							path = "/"
+						}
+						request.URL.Opaque = "//" + request.URL.Host + path
+						response, err = proxyBase.RoundTrip(request)
 					case proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h":
 						request, key := pinProxyRequest(r, ip)
 						response, err = t.socksTransport(proxyBase, proxyURL.String()+"\x00"+key, r.URL.Hostname()).RoundTrip(request)

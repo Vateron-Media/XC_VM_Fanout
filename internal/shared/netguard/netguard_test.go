@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -121,14 +123,70 @@ func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
 	}
 }
 
-func TestHTTPOriginUsesStandardForwardProxyRoundTrip(t *testing.T) {
-	var method, targetHost string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		method, targetHost = r.Method, r.URL.Host
+func TestHTTPForwardProxyGetsPinnedAuthorityAndPreservesOriginIdentity(t *testing.T) {
+	var proxyMethod, proxyAuthority, upstreamHost string
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHost = r.Host
 		w.WriteHeader(http.StatusNoContent)
 	}))
+	defer origin.Close()
+	proxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer proxy.Close()
-	proxyURL, _ := url.Parse(proxy.URL)
+	proxyDone := make(chan error, 1)
+	go func() {
+		conn, err := proxy.Accept()
+		if err != nil {
+			proxyDone <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			proxyDone <- err
+			return
+		}
+		parts := strings.SplitN(strings.TrimSpace(line), " ", 3)
+		if len(parts) != 3 {
+			proxyDone <- fmt.Errorf("invalid proxy request line: %q", line)
+			return
+		}
+		target, err := url.Parse(parts[1])
+		if err != nil {
+			proxyDone <- err
+			return
+		}
+		proxyMethod, proxyAuthority = parts[0], target.Host
+		var host string
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				proxyDone <- err
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+			if strings.HasPrefix(strings.ToLower(line), "host:") {
+				host = strings.TrimSpace(line[5:])
+			}
+		}
+		upstream, err := net.Dial("tcp", origin.Listener.Addr().String())
+		if err == nil {
+			_, err = fmt.Fprintf(upstream, "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", parts[0], target.RequestURI(), host)
+		}
+		if err == nil {
+			_, err = io.Copy(conn, upstream)
+		}
+		if upstream != nil {
+			upstream.Close()
+		}
+		proxyDone <- err
+	}()
+	proxyURL, _ := url.Parse("http://" + proxy.Addr().String())
 	guard := &Transport{
 		Base:         &http.Transport{Proxy: http.ProxyURL(proxyURL)},
 		BlockPrivate: true,
@@ -141,8 +199,14 @@ func TestHTTPOriginUsesStandardForwardProxyRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if method != http.MethodGet || targetHost != "provider.example" {
-		t.Fatalf("proxy received method %q and target host %q", method, targetHost)
+	if err := <-proxyDone; err != nil {
+		t.Fatal(err)
+	}
+	if proxyMethod != http.MethodGet || proxyAuthority != "8.8.8.8" {
+		t.Fatalf("proxy received method %q and authority %q", proxyMethod, proxyAuthority)
+	}
+	if upstreamHost != "provider.example" {
+		t.Fatalf("upstream Host = %q", upstreamHost)
 	}
 	if resp.Request.URL.Host != "provider.example" {
 		t.Fatalf("response request URL host = %q", resp.Request.URL.Host)
