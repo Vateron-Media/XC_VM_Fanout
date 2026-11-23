@@ -47,6 +47,13 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 				if err != nil {
 					return nil, err
 				}
+				if r.URL.Scheme == "http" && (proxyURL.Scheme == "http" || proxyURL.Scheme == "https") {
+					response, err := proxyBase.RoundTrip(r)
+					if response != nil {
+						response.Request = r
+					}
+					return response, err
+				}
 				var lastErr error
 				for i, ip := range ips {
 					var response *http.Response

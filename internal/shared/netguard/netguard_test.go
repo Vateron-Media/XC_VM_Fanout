@@ -121,6 +121,34 @@ func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
 	}
 }
 
+func TestHTTPOriginUsesStandardForwardProxyRoundTrip(t *testing.T) {
+	var method, targetHost string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, targetHost = r.Method, r.URL.Host
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close()
+	proxyURL, _ := url.Parse(proxy.URL)
+	guard := &Transport{
+		Base:         &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		BlockPrivate: true,
+		lookupIP: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("8.8.8.8")}, nil
+		},
+	}
+	resp, err := (&http.Client{Transport: guard}).Get("http://provider.example/live.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if method != http.MethodGet || targetHost != "provider.example" {
+		t.Fatalf("proxy received method %q and target host %q", method, targetHost)
+	}
+	if resp.Request.URL.Host != "provider.example" {
+		t.Fatalf("response request URL host = %q", resp.Request.URL.Host)
+	}
+}
+
 func TestSocksProxyPinsIPAndPreservesHostAndSNI(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "https://provider.example:8443/live.ts", nil)
 	pinned, key := pinProxyRequest(req, net.ParseIP("8.8.8.8"))
