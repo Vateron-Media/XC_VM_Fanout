@@ -30,6 +30,7 @@ const probeTimeout = 15 * time.Second
 // proxy this source needs, and re-deriving any of that here would be a second
 // implementation to keep in step.
 type Prober func(ctx context.Context, cmd string) bool
+type SourceProber func(ctx context.Context, src Source) bool
 
 // selectNextOnFailure returns the source index a new failure PASS starts at —
 // where the list is picked up again once every source has been tried once (see
@@ -62,15 +63,15 @@ func selectNextOnFailure(cur, n int, priorityBackup bool) int {
 // with no probe command cannot be tested and is skipped rather than switched to
 // blindly: an unverified switch would take a working channel off a source that
 // is at least delivering.
-func backupSwitch(ctx context.Context, probe Prober, sources []Source, cur int) int {
+func backupSwitch(ctx context.Context, probe SourceProber, sources []Source, cur int) int {
 	if probe == nil || cur <= 0 || cur > len(sources) {
 		return -1
 	}
 	for i := 0; i < cur && i < len(sources); i++ {
-		if sources[i].ProbeCmd == "" {
+		if sources[i].ProbeCmd == "" && (sources[i].DriverID == "" || sources[i].DriverProbeArgs == nil) {
 			continue
 		}
-		if probe(ctx, sources[i].ProbeCmd) {
+		if probe(ctx, sources[i]) {
 			return i
 		}
 	}
@@ -193,11 +194,14 @@ func (st *stream) advanceAfterFailure() {
 // The probe is bounded by the prober itself (probeTimeout) and by ctx, so a hung
 // origin delays the next attempt by at most one probe and never wedges the loop.
 func (st *stream) sourceStillProbes(ctx context.Context, src Source) bool {
-	probe := st.sup.probe
-	if probe == nil || src.ProbeCmd == "" {
-		return false
+	return st.sup.probeSource(ctx, src)
+}
+
+func (s *Supervisor) probeSource(ctx context.Context, src Source) bool {
+	if src.DriverID != "" {
+		return s.driverProbe != nil && src.DriverProbeArgs != nil && s.driverProbe(ctx, src.DriverID, src.DriverProbeArgs)
 	}
-	return probe(ctx, src.ProbeCmd)
+	return s.probe != nil && src.ProbeCmd != "" && s.probe(ctx, src.ProbeCmd)
 }
 
 // dueForBackupCheck reports whether it is time to look for a higher-priority

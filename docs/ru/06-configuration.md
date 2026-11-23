@@ -309,6 +309,25 @@ xc_fanout -id test -in ./sample.ts
 xc_fanout -id test -source https://example/live.m3u8 -ua "Mozilla/5.0"
 ```
 
+## Структурированные драйверы модулей
+
+Драйверы модулей отключены, пока `-driver-config` не укажет доверенный allowlist (по умолчанию
+`/etc/xc_vm/fanout-drivers.json`). Это JSON-объект из ID драйвера и абсолютного пути executable;
+файл должен принадлежать root и не быть доступным группе или остальным на запись:
+
+```json
+{"acme-dash":"/usr/local/libexec/xcvm/acme-dash"}
+```
+
+Источник monitor выбирает его полями `driver_id`, `driver_args` и необязательным
+`driver_probe_args`. Клиентские пути executable и shell-команды для структурированных драйверов
+отклоняются; неизвестный ID отклоняется до запуска supervision. Изменения allowlist применяются
+после перезапуска демона.
+
+Self-heal Agent/Fanout остаётся fail-closed, пока в epic-ветке не появятся формат подписанного
+manifest из XCSEC-5 и путь к root-owned public key. Один `SHA256SUMS` из того же release не
+принимается как доказательство подлинности.
+
 ## Миграция с 0.10.0
 
 Следующие флаги существовали в ≤ 0.10.0 и были **удалены** в 0.11.1. Их значения теперь —

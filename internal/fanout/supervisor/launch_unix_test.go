@@ -189,6 +189,27 @@ func TestCommandLauncherUsesTrustedExecutableAndRejectsShell(t *testing.T) {
 	}
 }
 
+func TestDriverLauncherUsesAllowlistedPath(t *testing.T) {
+	dir := t.TempDir()
+	trusted := filepath.Join(dir, "driver")
+	marker := filepath.Join(dir, "argv")
+	if err := os.WriteFile(trusted, []byte("#!/bin/sh\nprintf '%s' \"$1\" > \""+marker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launch := CommandDriverLauncher(map[string]string{"acme": trusted})
+	proc, err := launch(context.Background(), "acme", []string{"structured-value"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = proc.Wait()
+	if got, _ := os.ReadFile(marker); string(got) != "structured-value" {
+		t.Fatalf("driver argv = %q", got)
+	}
+	if _, err := launch(context.Background(), "unknown", nil, ""); err == nil {
+		t.Fatal("unknown driver accepted")
+	}
+}
+
 // TestShellLauncherSurvivesItsContext pins the fix that makes adoption possible.
 // The launcher must NOT tie the encoder's life to the context: that context dies
 // with the supervisor, so binding to it means a daemon shutdown kills every

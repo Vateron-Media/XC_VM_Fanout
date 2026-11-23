@@ -43,6 +43,16 @@ func CommandLauncher(encoder, fanout string) Launcher {
 	}
 }
 
+func CommandDriverLauncher(drivers map[string]string) DriverLauncher {
+	return func(ctx context.Context, id string, args []string, stderrPath string) (Process, error) {
+		bin, ok := drivers[id]
+		if !ok {
+			return nil, fmt.Errorf("driver %q is not allowed", id)
+		}
+		return launchArgv(ctx, bin, append([]string(nil), args...), stderrPath)
+	}
+}
+
 // shellLauncher remains the package's test seam; production uses
 // CommandLauncher with daemon-configured executable paths.
 func shellLauncher(ctx context.Context, cmdline, stderrPath string) (Process, error) {
@@ -161,6 +171,13 @@ func CommandProber(encoder string) Prober {
 			}
 		}
 		return false
+	}
+}
+
+func CommandDriverProber(drivers map[string]string) DriverProber {
+	return func(ctx context.Context, id string, args []string) bool {
+		bin, ok := drivers[id]
+		return ok && runProbe(ctx, bin, append([]string(nil), args...))
 	}
 }
 

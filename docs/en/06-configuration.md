@@ -300,6 +300,24 @@ xc_fanout -id test -in ./sample.ts
 xc_fanout -id test -source https://example/live.m3u8 -ua "Mozilla/5.0"
 ```
 
+## Structured module drivers
+
+Module drivers are disabled unless `-driver-config` names a trusted allowlist (default:
+`/etc/xc_vm/fanout-drivers.json`). The file is a JSON object from driver ID to absolute executable
+path, must be owned by root, and must not be group/other writable:
+
+```json
+{"acme-dash":"/usr/local/libexec/xcvm/acme-dash"}
+```
+
+A monitor source selects it with `driver_id`, `driver_args`, and optional `driver_probe_args`.
+Client executable paths and shell commands are rejected for structured drivers; an unknown ID is
+rejected before supervision starts. Changes to the allowlist take effect after a daemon restart.
+
+Agent/Fanout self-heal remains fail-closed until the XCSEC-5 signed-manifest format and the
+root-owned public-key path are available on the epic branch. A release-provided `SHA256SUMS` file
+alone is not accepted as authenticity proof.
+
 ## Migration from 0.10.0
 
 The following flags existed in ≤ 0.10.0 and were **removed** in 0.11.1. Their values are now keys

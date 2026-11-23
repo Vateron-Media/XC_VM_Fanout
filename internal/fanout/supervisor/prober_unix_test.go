@@ -63,6 +63,21 @@ func TestCommandProberUsesTrustedFFprobe(t *testing.T) {
 	}
 }
 
+func TestDriverProberUsesAllowlistedPath(t *testing.T) {
+	dir := t.TempDir()
+	trusted := filepath.Join(dir, "driver")
+	if err := os.WriteFile(trusted, []byte("#!/bin/sh\n[ \"$1\" = probe ]\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	probe := CommandDriverProber(map[string]string{"acme": trusted})
+	if !probe(context.Background(), "acme", []string{"probe"}) {
+		t.Fatal("allowlisted driver probe failed")
+	}
+	if probe(context.Background(), "unknown", []string{"probe"}) {
+		t.Fatal("unknown driver probe accepted")
+	}
+}
+
 // TestShellProberStillAnswers: the group kill must not change what a probe
 // REPORTS — reachable is a zero exit, and nothing else.
 func TestShellProberStillAnswers(t *testing.T) {

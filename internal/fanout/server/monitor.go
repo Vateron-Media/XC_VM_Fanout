@@ -213,7 +213,10 @@ func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
 //
 // "remux_source_file": `xc_fanout remux -source_file` reads the source URL and
 // its fetch options from a file, so they stay out of /proc/<pid>/cmdline.
-var Features = []string{"remux", "drop_connection", "files", "file_urls", "remux_source_file"}
+//
+// "structured_drivers": monitor sources may select a root-allowlisted driver
+// by ID and pass argv arrays; client executable paths are never used.
+var Features = []string{"remux", "drop_connection", "files", "file_urls", "remux_source_file", "structured_drivers"}
 
 // EnableSupervision gives the manager an encoder supervisor. Streams are only
 // supervised once the panel PUTs a spec for one, so enabling this changes
@@ -224,16 +227,21 @@ var Features = []string{"remux", "drop_connection", "files", "file_urls", "remux
 // bytes, which is this manager's own liveness mark: the panel could only answer
 // that question by polling for a playlist file to appear.
 func (m *Manager) EnableSupervision(encoder ...string) {
-	m.vitals = newVitalsSampler()
-	m.meta = newMetaCache()
 	bin := "ffmpeg"
 	if len(encoder) > 0 && encoder[0] != "" {
 		bin = encoder[0]
 	}
+	m.EnableSupervisionWithDrivers(bin, nil)
+}
+
+func (m *Manager) EnableSupervisionWithDrivers(bin string, drivers map[string]string) {
+	m.vitals = newVitalsSampler()
+	m.meta = newMetaCache()
 	exe, _ := os.Executable()
 	m.sup = supervisor.New(supervisor.CommandLauncher(bin, exe), m.streamHasData).
 		WithVitals(m.sample).
-		WithProber(supervisor.CommandProber(bin))
+		WithProber(supervisor.CommandProber(bin)).
+		WithDrivers(drivers)
 }
 
 // streamHasData reports whether a registered stream has ever published a

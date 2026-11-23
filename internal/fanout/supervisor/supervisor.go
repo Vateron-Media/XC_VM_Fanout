@@ -62,6 +62,11 @@ const (
 type Source struct {
 	Label string `json:"label"`
 	Cmd   string `json:"cmd"`
+	// DriverID selects an executable from the root-owned daemon allowlist.
+	// DriverArgs are passed as argv; no client executable or shell line is used.
+	DriverID        string   `json:"driver_id,omitempty"`
+	DriverArgs      []string `json:"driver_args,omitempty"`
+	DriverProbeArgs []string `json:"driver_probe_args,omitempty"`
 	// FallbackCmd is run in Cmd's place once Cmd has exited ExitUnsupported or
 	// ExitCrashed — the same source, through a pipeline that can take it. The
 	// panel sets it when Cmd is the native remuxer and the node's source backend
@@ -157,6 +162,18 @@ func (s *Spec) valid() error {
 		return errors.New("spec carries no sources")
 	}
 	for i, src := range s.Sources {
+		if src.DriverID != "" {
+			if src.Cmd != "" || src.FallbackCmd != "" || src.ProbeCmd != "" {
+				return fmt.Errorf("source %d mixes a structured driver with client commands", i)
+			}
+			if len(src.DriverArgs) > 256 || len(src.DriverProbeArgs) > 256 {
+				return fmt.Errorf("source %d carries too many driver arguments", i)
+			}
+			continue
+		}
+		if len(src.DriverArgs) != 0 || len(src.DriverProbeArgs) != 0 {
+			return fmt.Errorf("source %d carries driver arguments without a driver id", i)
+		}
 		if src.Cmd == "" {
 			return fmt.Errorf("source %d has an empty command", i)
 		}
@@ -232,6 +249,9 @@ type Process interface {
 // and given to the process, matching where buildLive used to redirect it.
 type Launcher func(ctx context.Context, cmdline, stderrPath string) (Process, error)
 
+type DriverLauncher func(ctx context.Context, id string, args []string, stderrPath string) (Process, error)
+type DriverProber func(ctx context.Context, id string, args []string) bool
+
 // Supervisor holds every stream this node is supervising.
 type Supervisor struct {
 	mu    sync.Mutex
@@ -252,13 +272,16 @@ type Supervisor struct {
 	// data at all, every later start would be confirmed on its first poll — a
 	// dead source then never counts as a failed start, stop_failures never fires
 	// and the backup source is never tried.
-	hasData func(id string, since time.Time) bool
-	vitals  VitalsFunc    // what the output looks like right now
-	probe   Prober        // is a source reachable, without starting it
-	find    ProcessFinder // is this pid alive, and what is it running
-	killPID func(pid int) // end an adopted (non-child) process
-	now     func() time.Time
-	sleep   func(context.Context, time.Duration) bool
+	hasData      func(id string, since time.Time) bool
+	vitals       VitalsFunc // what the output looks like right now
+	probe        Prober     // is a source reachable, without starting it
+	drivers      map[string]string
+	driverLaunch DriverLauncher
+	driverProbe  DriverProber
+	find         ProcessFinder // is this pid alive, and what is it running
+	killPID      func(pid int) // end an adopted (non-child) process
+	now          func() time.Time
+	sleep        func(context.Context, time.Duration) bool
 
 	// healthTick is how often a running stream is judged. A minute is the
 	// coarsest it may be: the panel's scheduled auto-restart matches on HH:MM, so
@@ -316,6 +339,15 @@ func (s *Supervisor) WithVitals(v VitalsFunc) *Supervisor {
 // still fails over when a start fails, which needs no probe.
 func (s *Supervisor) WithProber(p Prober) *Supervisor {
 	s.probe = p
+	return s
+}
+
+// WithDrivers installs the root-owned executable allowlist used by structured
+// module sources. Unknown IDs are rejected before supervision starts.
+func (s *Supervisor) WithDrivers(drivers map[string]string) *Supervisor {
+	s.drivers = drivers
+	s.driverLaunch = CommandDriverLauncher(drivers)
+	s.driverProbe = CommandDriverProber(drivers)
 	return s
 }
 
@@ -405,6 +437,13 @@ func (s *Supervisor) Supervise(id string, spec Spec) error {
 	spec.normalise()
 	if err := spec.valid(); err != nil {
 		return err
+	}
+	for i, src := range spec.Sources {
+		if src.DriverID != "" {
+			if _, ok := s.drivers[src.DriverID]; !ok {
+				return fmt.Errorf("source %d names unknown driver %q", i, src.DriverID)
+			}
+		}
 	}
 
 	l := s.idLock(id)
@@ -864,7 +903,7 @@ func (st *stream) watch(ctx context.Context, proc Process) healthVerdict {
 		// Running on a backup: has the preferred feed come back?
 		if st.dueForBackupCheck(now) {
 			spec := st.spec_()
-			if idx := backupSwitch(ctx, sup.probe, spec.Sources, st.sourceIndex()); idx >= 0 {
+			if idx := backupSwitch(ctx, sup.probeSource, spec.Sources, st.sourceIndex()); idx >= 0 {
 				return healthVerdict{
 					event:        EventPrioritySwitch,
 					reason:       fmt.Sprintf("higher-priority source %d is reachable again", idx),
@@ -1172,7 +1211,13 @@ func (st *stream) startOnce(ctx context.Context, src Source) (Process, bool, err
 
 	cmd, fallback := st.commandFor(src)
 	launchedAt := st.sup.now()
-	proc, err := st.sup.launch(ctx, cmd, spec.ErrorsPath)
+	var proc Process
+	var err error
+	if src.DriverID != "" && !fallback {
+		proc, err = st.sup.driverLaunch(ctx, src.DriverID, src.DriverArgs, spec.ErrorsPath)
+	} else {
+		proc, err = st.sup.launch(ctx, cmd, spec.ErrorsPath)
+	}
 	if err != nil {
 		return nil, false, fmt.Errorf("launch: %w", err)
 	}

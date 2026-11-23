@@ -53,7 +53,9 @@ func srcs(n int, withProbe bool) []Source {
 func TestBackupSwitchPrefersTheHighestReachable(t *testing.T) {
 	list := srcs(4, true)
 	// Only sources 1 and 2 answer; 0 is still down.
-	probe := func(_ context.Context, cmd string) bool { return cmd == "probe-1" || cmd == "probe-2" }
+	probe := func(_ context.Context, src Source) bool {
+		return src.ProbeCmd == "probe-1" || src.ProbeCmd == "probe-2"
+	}
 	list[0].ProbeCmd = "probe-0"
 	list[1].ProbeCmd = "probe-1"
 	list[2].ProbeCmd = "probe-2"
@@ -67,7 +69,7 @@ func TestBackupSwitchPrefersTheHighestReachable(t *testing.T) {
 // would be a demotion, and the whole point of the check is to climb back up.
 func TestBackupSwitchNeverLooksDownTheList(t *testing.T) {
 	list := srcs(4, true)
-	everythingAnswers := func(context.Context, string) bool { return true }
+	everythingAnswers := func(context.Context, Source) bool { return true }
 
 	if got := backupSwitch(context.Background(), everythingAnswers, list, 0); got != -1 {
 		t.Errorf("got %d while already on the top source; want no switch", got)
@@ -79,7 +81,7 @@ func TestBackupSwitchNeverLooksDownTheList(t *testing.T) {
 // an unverified feed is a worse outcome than staying on the backup.
 func TestBackupSwitchSkipsUnprobeableSources(t *testing.T) {
 	list := srcs(3, false) // no ProbeCmd anywhere
-	everythingAnswers := func(context.Context, string) bool { return true }
+	everythingAnswers := func(context.Context, Source) bool { return true }
 
 	if got := backupSwitch(context.Background(), everythingAnswers, list, 2); got != -1 {
 		t.Errorf("switched to %d on an untestable source; want no switch", got)
