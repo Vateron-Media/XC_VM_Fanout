@@ -1,6 +1,7 @@
 package netguard
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 )
 
 func TestPublicDialRefusesPrivateAddressBeforeDial(t *testing.T) {
@@ -58,7 +60,8 @@ func TestRedirectPolicyRejectsDowngradeAndStripsCredentials(t *testing.T) {
 }
 
 func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
-	var connectTarget, requestHost, serverName string
+	var connectTargets []string
+	var requestHost, serverName string
 	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestHost = r.Host
 		w.WriteHeader(http.StatusNoContent)
@@ -70,7 +73,11 @@ func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
 		return nil, nil
 	}
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connectTarget = r.Host
+		connectTargets = append(connectTargets, r.Host)
+		if r.Host == "8.8.8.8:443" {
+			http.Error(w, "try next", http.StatusBadGateway)
+			return
+		}
 		upstream, err := net.Dial("tcp", origin.Listener.Addr().String())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -98,7 +105,7 @@ func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
 		},
 		BlockPrivate: true,
 		lookupIP: func(context.Context, string) ([]net.IP, error) {
-			return []net.IP{net.ParseIP("8.8.8.8")}, nil
+			return []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1")}, nil
 		},
 	}
 	client := &http.Client{Transport: guard}
@@ -108,8 +115,9 @@ func TestProxyReceivesPinnedIPWithOriginalHostAndSNI(t *testing.T) {
 	}
 	resp.Body.Close()
 	client.CloseIdleConnections()
-	if connectTarget != "8.8.8.8:443" || requestHost != "provider.example" || serverName != "provider.example" {
-		t.Fatalf("proxy target %q, Host %q, SNI %q", connectTarget, requestHost, serverName)
+	if len(connectTargets) != 2 || connectTargets[0] != "8.8.8.8:443" || connectTargets[1] != "1.1.1.1:443" ||
+		requestHost != "provider.example" || serverName != "provider.example" {
+		t.Fatalf("proxy targets %v, Host %q, SNI %q", connectTargets, requestHost, serverName)
 	}
 }
 
@@ -123,5 +131,98 @@ func TestSocksProxyPinsIPAndPreservesHostAndSNI(t *testing.T) {
 	transport := guard.socksTransport(&http.Transport{}, key, req.URL.Hostname())
 	if transport.TLSClientConfig.ServerName != "provider.example" {
 		t.Fatalf("TLS ServerName = %q", transport.TLSClientConfig.ServerName)
+	}
+}
+
+func TestSocksRoundTripRestoresOriginalRequestURL(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	target := make(chan string, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			target <- "accept: " + err.Error()
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		greeting := make([]byte, 3)
+		if _, err = io.ReadFull(reader, greeting); err != nil {
+			target <- "greeting: " + err.Error()
+			return
+		}
+		_, _ = conn.Write([]byte{5, 0})
+		header := make([]byte, 4)
+		if _, err = io.ReadFull(reader, header); err != nil {
+			target <- "request: " + err.Error()
+			return
+		}
+		address := make([]byte, 4)
+		if _, err = io.ReadFull(reader, address); err != nil {
+			target <- "address: " + err.Error()
+			return
+		}
+		port := make([]byte, 2)
+		_, _ = io.ReadFull(reader, port)
+		target <- net.IP(address).String()
+		_, _ = conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+		if _, err = http.ReadRequest(reader); err == nil {
+			_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"))
+		}
+	}()
+	proxyURL, _ := url.Parse("socks5://" + listener.Addr().String())
+	guard := &Transport{
+		Base:         &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		BlockPrivate: true,
+		lookupIP: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("8.8.8.8")}, nil
+		},
+	}
+	resp, err := (&http.Client{Transport: guard}).Get("http://provider.example/live.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := <-target; got != "8.8.8.8" {
+		t.Fatalf("SOCKS target = %q", got)
+	}
+	if resp.Request.URL.Host != "provider.example" {
+		t.Fatalf("response request URL host = %q", resp.Request.URL.Host)
+	}
+}
+
+func TestHTTPSProxyHandshakeIsBounded(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			defer conn.Close()
+			time.Sleep(time.Second)
+		}
+	}()
+	proxyURL, _ := url.Parse("https://" + listener.Addr().String())
+	guard := &Transport{
+		Base: &http.Transport{
+			Proxy:               http.ProxyURL(proxyURL),
+			TLSHandshakeTimeout: 30 * time.Millisecond,
+		},
+		BlockPrivate: true,
+		lookupIP: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("8.8.8.8")}, nil
+		},
+	}
+	started := time.Now()
+	if _, err := (&http.Client{Transport: guard}).Get("https://provider.example/live.ts"); err == nil {
+		t.Fatal("stalled HTTPS proxy handshake succeeded")
+	}
+	if time.Since(started) > 500*time.Millisecond {
+		t.Fatal("HTTPS proxy handshake ignored its timeout")
 	}
 }

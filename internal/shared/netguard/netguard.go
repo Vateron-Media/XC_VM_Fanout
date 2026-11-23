@@ -47,17 +47,36 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 				if err != nil {
 					return nil, err
 				}
-				if proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h" {
-					request, key := pinProxyRequest(r, ips[0])
-					return t.socksTransport(proxyBase, proxyURL.String()+"\x00"+key, r.URL.Hostname()).RoundTrip(request)
+				var lastErr error
+				for i, ip := range ips {
+					var response *http.Response
+					switch {
+					case proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h":
+						request, key := pinProxyRequest(r, ip)
+						response, err = t.socksTransport(proxyBase, proxyURL.String()+"\x00"+key, r.URL.Hostname()).RoundTrip(request)
+					default:
+						target := pinnedAddress(r.URL, ip)
+						key := proxyURL.String() + "\x00" + target
+						var transport *http.Transport
+						transport, err = t.proxyTransport(proxyBase, key, proxyURL, target)
+						if err == nil {
+							response, err = transport.RoundTrip(r)
+						}
+					}
+					if err == nil {
+						response.Request = r
+						if i+1 < len(ips) && (response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusGatewayTimeout) {
+							response.Body.Close()
+							continue
+						}
+						return response, nil
+					}
+					lastErr = err
+					if r.Body != nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+						break
+					}
 				}
-				target := pinnedAddress(r.URL, ips[0])
-				key := proxyURL.String() + "\x00" + target
-				transport, err := t.proxyTransport(proxyBase, key, proxyURL, target)
-				if err != nil {
-					return nil, err
-				}
-				return transport.RoundTrip(r)
+				return nil, lastErr
 			}
 		}
 		if err := CheckURL(r.Context(), r.URL, true); err != nil {
@@ -175,11 +194,15 @@ func proxyTunnelDial(base *http.Transport, proxyURL *url.URL, target string) fun
 		}
 		if proxyURL.Scheme == "https" {
 			tlsConn := tls.Client(conn, &tls.Config{ServerName: proxyURL.Hostname()})
+			if base.TLSHandshakeTimeout > 0 {
+				_ = conn.SetDeadline(time.Now().Add(base.TLSHandshakeTimeout))
+			}
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				conn.Close()
 				return nil, err
 			}
 			conn = tlsConn
+			_ = conn.SetDeadline(time.Time{})
 		}
 		if base.ResponseHeaderTimeout > 0 {
 			_ = conn.SetDeadline(time.Now().Add(base.ResponseHeaderTimeout))
